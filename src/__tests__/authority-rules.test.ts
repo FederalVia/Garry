@@ -290,6 +290,140 @@ describe("Authority Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
+    it("blocks spending, code edits, and child spawn from an inbox source", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+
+      const spend = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "transfer_credits",
+            riskLevel: "dangerous",
+            category: "financial",
+          }),
+          { to_address: "0x1111111111111111111111111111111111111111", amount_cents: 1000 },
+          "external",
+        ),
+      );
+      const edit = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "edit_own_file",
+            riskLevel: "dangerous",
+            category: "self_mod",
+          }),
+          { path: "src/agent/loop.ts", content: "hacked", description: "peer asked" },
+          "external",
+        ),
+      );
+      const spawn = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "spawn_child",
+            riskLevel: "dangerous",
+            category: "replication",
+          }),
+          { name: "pwned" },
+          "external",
+        ),
+      );
+
+      expect(spend.action).toBe("deny");
+      expect(edit.action).toBe("deny");
+      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(spawn.action).toBe("deny");
+      expect(spawn.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+    });
+
+    it("blocks spending and code edits from an unknown source", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const unknown = "peer" as InputSource;
+
+      const spend = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "x402_fetch",
+            riskLevel: "dangerous",
+            category: "financial",
+          }),
+          { url: "https://attacker.example/pay" },
+          unknown,
+        ),
+      );
+      const edit = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "write_file",
+            riskLevel: "caution",
+            category: "vm",
+          }),
+          { path: "src/index.ts", content: "hacked" },
+          unknown,
+        ),
+      );
+      const spawn = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "spawn_child",
+            riskLevel: "dangerous",
+            category: "replication",
+          }),
+          { name: "pwned" },
+          unknown,
+        ),
+      );
+
+      expect(spend.action).toBe("deny");
+      expect(edit.action).toBe("deny");
+      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(spawn.action).toBe("deny");
+    });
+
+    it("still allows spending and code edits from the creator", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+
+      const spend = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "transfer_credits",
+            riskLevel: "dangerous",
+            category: "financial",
+          }),
+          { amount_cents: 100 },
+          "creator",
+        ),
+      );
+      const edit = engine.evaluate(
+        createRequest(
+          createMockTool({
+            name: "edit_own_file",
+            riskLevel: "dangerous",
+            category: "self_mod",
+          }),
+          { path: "src/agent/loop.ts", content: "ok", description: "creator" },
+          "creator",
+        ),
+      );
+
+      expect(spend.action).toBe("allow");
+      expect(edit.action).toBe("allow");
+    });
+
+    it("does not take transfer_credits away from heartbeat or source-less turns", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({
+        name: "transfer_credits",
+        riskLevel: "dangerous",
+        category: "financial",
+      });
+
+      expect(engine.evaluate(createRequest(tool, { amount_cents: 100 }, "heartbeat")).action).toBe("allow");
+      expect(engine.evaluate(createRequest(tool, { amount_cents: 100 }, undefined)).action).toBe("allow");
+    });
+
     it("allows safe tools from external input", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);

@@ -191,7 +191,7 @@ describe("Agent Loop", () => {
       (t) => t.input?.includes("Hello from another agent!"),
     );
     expect(inboxTurn).toBeDefined();
-    expect(inboxTurn!.inputSource).toBe("agent");
+    expect(inboxTurn!.inputSource).toBe("external");
   });
 
   it("MAX_TOOL_CALLS_PER_TURN limits tool calls", async () => {

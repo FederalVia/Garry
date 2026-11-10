@@ -65,6 +65,10 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import {
+  isElevatedInputSource,
+  isUntrustedInputSource,
+} from "./policy-rules/authority.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -389,6 +393,10 @@ export async function runAgentLoop(
     content: wakeupInput,
     source: "wakeup",
   };
+  // An inbox message does not expire at the end of its own turn. Later turns
+  // in the same cycle keep the untrusted source until an elevated input
+  // (wakeup, system, creator, or agent) arrives.
+  let inboxAuthoritySticky = false;
 
   while (running) {
     // Declared outside try so the catch block can access for retry/failure handling
@@ -415,13 +423,16 @@ export async function runAgentLoop(
             .map((m) => {
               const from = sanitizeInput(m.fromAddress, m.fromAddress, "social_address");
               const content = sanitizeInput(m.content, m.fromAddress, "social_message");
-              if (content.blocked) {
-                return `[INJECTION BLOCKED from ${from.content}]: message was blocked by safety filter`;
-              }
-              return `[Message from ${from.content}]: ${content.content}`;
+              const sender = from.content || "unknown";
+              // Every inbox sender is untrusted. The label is data about
+              // who sent it, not an instruction from the creator or the agent.
+              const body = content.blocked
+                ? "message was blocked by safety filter"
+                : content.content;
+              return `[UNTRUSTED EXTERNAL SENDER ${sender}]: ${body}`;
             })
             .join("\n\n");
-          pendingInput = { content: formatted, source: "agent" };
+          pendingInput = { content: formatted, source: "external" };
         }
       }
 
@@ -595,6 +606,16 @@ export async function runAgentLoop(
       // Clear pending input after use
       pendingInput = undefined;
 
+      if (currentInput?.source) {
+        if (isUntrustedInputSource(currentInput.source)) {
+          inboxAuthoritySticky = true;
+        } else if (isElevatedInputSource(currentInput.source)) {
+          inboxAuthoritySticky = false;
+        }
+      }
+      const effectiveInputSource = (currentInput?.source ??
+        (inboxAuthoritySticky ? "external" : undefined)) as InputSource | undefined;
+
       // ── Inference Call (via router when available) ──
       const survivalTier = getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
@@ -629,7 +650,7 @@ export async function runAgentLoop(
         timestamp: new Date().toISOString(),
         state: db.getAgentState(),
         input: currentInput?.content,
-        inputSource: currentInput?.source as any,
+        inputSource: effectiveInputSource,
         thinking: response.message.content || "",
         toolCalls: [],
         tokenUsage: response.usage,
@@ -640,7 +661,7 @@ export async function runAgentLoop(
       if (response.toolCalls && response.toolCalls.length > 0) {
         const toolCallMessages: any[] = [];
         let callCount = 0;
-        const currentInputSource = currentInput?.source as InputSource | undefined;
+        const currentInputSource = effectiveInputSource;
 
         for (const tc of response.toolCalls) {
           if (callCount >= MAX_TOOL_CALLS_PER_TURN) {

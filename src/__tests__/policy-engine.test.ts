@@ -509,6 +509,11 @@ describe("PolicyEngine", () => {
       expect(PolicyEngine.deriveAuthorityLevel("heartbeat")).toBe("external");
     });
 
+    it("returns external for inbox and unknown sources", () => {
+      expect(PolicyEngine.deriveAuthorityLevel("external")).toBe("external");
+      expect(PolicyEngine.deriveAuthorityLevel("peer" as InputSource)).toBe("external");
+    });
+
     it("returns agent for creator", () => {
       expect(PolicyEngine.deriveAuthorityLevel("creator")).toBe("agent");
     });
