@@ -65,10 +65,6 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
-import {
-  isElevatedInputSource,
-  isUntrustedInputSource,
-} from "./policy-rules/authority.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -393,10 +389,6 @@ export async function runAgentLoop(
     content: wakeupInput,
     source: "wakeup",
   };
-  // An inbox message does not expire at the end of its own turn. Later turns
-  // in the same cycle keep the untrusted source until an elevated input
-  // (wakeup, system, creator, or agent) arrives.
-  let inboxAuthoritySticky = false;
 
   while (running) {
     // Declared outside try so the catch block can access for retry/failure handling
@@ -606,15 +598,22 @@ export async function runAgentLoop(
       // Clear pending input after use
       pendingInput = undefined;
 
-      if (currentInput?.source) {
-        if (isUntrustedInputSource(currentInput.source)) {
-          inboxAuthoritySticky = true;
-        } else if (isElevatedInputSource(currentInput.source)) {
-          inboxAuthoritySticky = false;
-        }
-      }
-      const effectiveInputSource = (currentInput?.source ??
-        (inboxAuthoritySticky ? "external" : undefined)) as InputSource | undefined;
+      const currentSource = currentInput?.source as InputSource | undefined;
+      // The inbox text stays in the transcript after its own turn, including
+      // across a later system or wakeup prompt. Authority stays external for
+      // as long as that text is still in the messages sent to inference.
+      // A creator input is the only source that may act while it remains.
+      // When the turns holding it are trimmed out of the context window,
+      // the marker is gone and normal source rules apply again.
+      const inboxStillInContext = messages.some(
+        (message) =>
+          typeof message.content === "string" &&
+          message.content.includes("UNTRUSTED EXTERNAL SENDER"),
+      );
+      const effectiveInputSource: InputSource | undefined =
+        inboxStillInContext && currentSource !== "creator"
+          ? "external"
+          : currentSource;
 
       // ── Inference Call (via router when available) ──
       const survivalTier = getSurvivalTier(financial.creditsCents);

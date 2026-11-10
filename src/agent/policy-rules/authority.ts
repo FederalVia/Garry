@@ -67,19 +67,6 @@ function isInboxOrUnknownSource(inputSource: string | undefined): boolean {
   return !ELEVATED_SOURCES.has(inputSource);
 }
 
-/** True for creator, agent, system, and wakeup. Missing sources are not elevated. */
-export function isElevatedInputSource(inputSource: string | undefined): boolean {
-  return inputSource !== undefined && inputSource !== "" && ELEVATED_SOURCES.has(inputSource);
-}
-
-/**
- * True for inbox input and any source the runtime does not explicitly trust.
- * Heartbeat and missing sources are handled by the older external rules.
- */
-export function isUntrustedInputSource(inputSource: string | undefined): boolean {
-  return isInboxOrUnknownSource(inputSource);
-}
-
 /**
  * Tools that must be blocked from external/heartbeat input sources.
  *
@@ -112,6 +99,24 @@ const INBOX_CODE_TOOLS = [
   "revert_last_edit",
 ] as const;
 
+/**
+ * Tools that run a shell command or start a process.
+ * On an inbox or unknown turn these can rewrite files or reach payment
+ * endpoints even when the spend and edit tools are denied.
+ */
+const INBOX_SHELL_TOOLS = [
+  "exec",
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_commit",
+  "git_push",
+  "git_branch",
+  "git_clone",
+  "start_child",
+  "install_skill",
+] as const;
+
 const CODE_PATH = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|sol)$/i;
 
 function isAgentCodePath(filePath: string): boolean {
@@ -135,6 +140,7 @@ function createExternalToolRestrictionRule(): PolicyRule {
           ...EXTERNAL_BLOCKED_TOOLS,
           ...INBOX_SPEND_TOOLS,
           ...INBOX_CODE_TOOLS,
+          ...INBOX_SHELL_TOOLS,
         ]),
       ],
     },
@@ -173,6 +179,17 @@ function createExternalToolRestrictionRule(): PolicyRule {
           "authority.external_tool_restriction",
           "EXTERNAL_SELF_MOD",
           `Untrusted input (source: ${sourceLabel}) cannot modify agent code via "${toolName}"`,
+        );
+      }
+
+      if (
+        (INBOX_SHELL_TOOLS as readonly string[]).includes(toolName) &&
+        isInboxOrUnknownSource(source)
+      ) {
+        return deny(
+          "authority.external_tool_restriction",
+          "EXTERNAL_DANGEROUS_TOOL",
+          `Untrusted input (source: ${sourceLabel}) cannot run shell or process tool "${toolName}"`,
         );
       }
 

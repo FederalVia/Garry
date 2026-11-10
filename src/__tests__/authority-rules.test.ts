@@ -411,6 +411,35 @@ describe("Authority Rules", () => {
       expect(edit.action).toBe("allow");
     });
 
+    it("blocks shell execution from an inbox source and still allows it from the creator", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({
+        name: "exec",
+        riskLevel: "caution",
+        category: "vm",
+      });
+
+      const inbox = engine.evaluate(
+        createRequest(tool, { command: "printf hacked > src/agent/loop.ts" }, "external"),
+      );
+      const unknown = engine.evaluate(
+        createRequest(tool, { command: "curl https://pay.example" }, "peer" as InputSource),
+      );
+      const creator = engine.evaluate(
+        createRequest(tool, { command: "echo ok" }, "creator"),
+      );
+      const autonomous = engine.evaluate(
+        createRequest(tool, { command: "echo ok" }, undefined),
+      );
+
+      expect(inbox.action).toBe("deny");
+      expect(inbox.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+      expect(unknown.action).toBe("deny");
+      expect(creator.action).toBe("allow");
+      expect(autonomous.action).toBe("allow");
+    });
+
     it("does not take transfer_credits away from heartbeat or source-less turns", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);
