@@ -612,7 +612,7 @@ Step-by-step instructions for the agent...
 ```
 
 - Loaded from `~/.automaton/skills/` directory
-- Parsed with `gray-matter` (YAML frontmatter extraction)
+- YAML frontmatter parsed by a small built-in parser (`src/skills/format.ts`)
 - Sanitized through injection defense (untrusted content markers)
 - Can be installed from git repos, URLs, or created by the agent itself
 - Active skill instructions are injected into the system prompt with trust boundary markers

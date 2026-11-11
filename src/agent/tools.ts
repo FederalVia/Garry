@@ -22,6 +22,7 @@ import type {
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
+import { INSTALL_AND_BUILD, INSTALL_AND_BUILD_NO_SCRIPTS } from "../self-mod/install.js";
 
 const logger = createLogger("tools");
 
@@ -531,7 +532,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
 
         // Reinstall + rebuild
         const build = await ctx.conway.exec(
-          `cd '${repoRoot}' && npm install && npm run build`,
+          `cd '${repoRoot}' && ${INSTALL_AND_BUILD}`,
           120_000,
         );
 
@@ -657,7 +658,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
 
         // Rebuild
         try {
-          await run("npm install --ignore-scripts && npm run build");
+          await run(INSTALL_AND_BUILD_NO_SCRIPTS);
         } catch (err: any) {
           return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.`;
         }

@@ -27,7 +27,8 @@ Update: development of Automaton has continued across Conway's internal RL envir
 ```bash
 git clone https://github.com/Conway-Research/automaton.git
 cd automaton
-npm install && npm run build
+npm install -g pnpm@10.28.1   # or: corepack enable pnpm
+pnpm install --frozen-lockfile && pnpm run build
 node dist/index.js --run
 ```
 

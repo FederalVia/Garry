@@ -17,6 +17,7 @@ import type {
 import type { ChildLifecycle } from "./lifecycle.js";
 import { ulid } from "ulid";
 import { propagateConstitution } from "./constitution.js";
+import { INSTALL_AND_BUILD } from "../self-mod/install.js";
 
 /** Valid Conway sandbox pricing tiers. */
 const SANDBOX_TIERS = [
@@ -129,7 +130,7 @@ export async function spawnChild(
     // Install runtime (on the CHILD sandbox)
     await childConway.exec("apt-get update -qq && apt-get install -y -qq nodejs npm git curl", 120_000);
     await childConway.exec(
-      "git clone https://github.com/Conway-Research/automaton.git /root/automaton && cd /root/automaton && npm install && npm run build",
+      `git clone https://github.com/Conway-Research/automaton.git /root/automaton && cd /root/automaton && ${INSTALL_AND_BUILD}`,
       180_000,
     );
 
@@ -269,7 +270,7 @@ async function spawnChildLegacy(
       120_000,
     );
     await childConway.exec(
-      "git clone https://github.com/Conway-Research/automaton.git /root/automaton && cd /root/automaton && npm install && npm run build",
+      `git clone https://github.com/Conway-Research/automaton.git /root/automaton && cd /root/automaton && ${INSTALL_AND_BUILD}`,
       180_000,
     );
     await childConway.exec("mkdir -p /root/.automaton", 10_000);

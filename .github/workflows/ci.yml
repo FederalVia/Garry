@@ -27,9 +27,12 @@ jobs:
 
   security-audit:
     runs-on: ubuntu-latest
-    # Known advisories show this job as failed without blocking the run.
-    # Remove continue-on-error once the dependencies are upgraded.
-    continue-on-error: true
+    # Fails on high and critical advisories. Four moderate ones remain under
+    # @solana/web3.js > jayson, in code the agent never loads: uuid (affects
+    # v3/v5/v6 with a buffer; jayson only calls v4) and stream-json (used by
+    # jayson's TCP/TLS server and client; @solana/web3.js only requires
+    # jayson/lib/client/browser, which never loads it). Clearing them needs
+    # jayson 5, outside @solana/web3.js's supported range.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
