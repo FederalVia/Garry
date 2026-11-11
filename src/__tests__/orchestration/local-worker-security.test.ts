@@ -3,10 +3,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GeneralHarness } from "../../agent/harnesses/general-harness.js";
 import type { HarnessContext } from "../../agent/harness-types.js";
-import type { ConwayClient } from "../../types.js";
+import { PolicyEngine } from "../../agent/policy-engine.js";
+import { createDefaultRules } from "../../agent/policy-rules/index.js";
+import type { AutomatonDatabase, ConwayClient } from "../../types.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
-import { createInMemoryDb } from "./test-db.js";
-import { createTestConfig, createTestIdentity } from "../mocks.js";
+import { createTestConfig, createTestDb, createTestIdentity } from "../mocks.js";
 
 function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
   return {
@@ -34,11 +35,11 @@ function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
 }
 
 describe("agent/general-harness security", () => {
-  let db: ReturnType<typeof createInMemoryDb>;
+  let db: AutomatonDatabase;
   let testRoot: string;
 
   beforeEach(() => {
-    db = createInMemoryDb();
+    db = createTestDb();
     testRoot = mkdtempSync(path.join(process.cwd(), ".tmp-general-harness-"));
   });
 
@@ -50,13 +51,15 @@ describe("agent/general-harness security", () => {
   async function createHarness(conway: ConwayClient) {
     const harness = new GeneralHarness();
     const workspace = new AgentWorkspace("goal-test", path.join(testRoot, "workspace"));
+    const identity = createTestIdentity();
+    const config = createTestConfig();
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,
       allowedEditRoot: testRoot,
       workspace,
-      identity: createTestIdentity(),
-      config: createTestConfig(),
-      db,
+      identity,
+      config,
+      db: db.raw,
       conway,
       inference: { chat: async () => ({ content: "done" }) },
       budget: {
@@ -70,6 +73,8 @@ describe("agent/general-harness security", () => {
       wisdom: { conventions: [], successes: [], failures: [], gotchas: [] },
       abortSignal: new AbortController().signal,
       goalId: "goal-test",
+      toolContext: { identity, config, db, conway, inference: {} as any },
+      policyEngine: new PolicyEngine(db.raw, createDefaultRules()),
     };
 
     await harness.initialize(
@@ -115,7 +120,8 @@ describe("agent/general-harness security", () => {
 
   it("blocks sensitive file reads (wallet.json)", async () => {
     const out = await runTool(createConwayStub(), "read_file", { path: "wallet.json" });
-    expect(out).toContain("Blocked: cannot read sensitive file");
+    expect(out).toContain("Blocked:");
+    expect(out).toContain("SENSITIVE_FILE_READ");
   });
 
   it("blocks traversal reads outside the allowed edit root", async () => {
@@ -142,7 +148,8 @@ describe("agent/general-harness security", () => {
       path: "constitution.md",
       content: "tamper",
     });
-    expect(out).toContain("Blocked: cannot write to protected file");
+    expect(out).toContain("Blocked:");
+    expect(out).toContain("PROTECTED_FILE");
   });
 
   it("blocks forbidden shell commands", async () => {
@@ -150,6 +157,7 @@ describe("agent/general-harness security", () => {
       command: "cat ~/.automaton/wallet.json",
     });
     expect(out).toContain("Blocked:");
+    expect(out).toContain("FORBIDDEN_COMMAND");
   });
 
   it("allows normal read_file paths inside the allowed edit root", async () => {

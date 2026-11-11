@@ -519,6 +519,12 @@ export interface PolicyRequest {
     inputSource: InputSource | undefined;
     turnToolCallCount: number;
     sessionSpend: SpendTrackerInterface;
+    /** On an inbox turn: the sender of the batch being handled. */
+    inboxSender?: string;
+    /** On an inbox turn: ids of the messages in the batch. */
+    inboxMessageIds?: string[];
+    /** On an inbox turn: send_message calls already allowed this turn. */
+    inboxSendCount?: number;
   };
 }
 
@@ -631,7 +637,8 @@ export interface AutomatonDatabase {
 
   // Turns
   insertTurn(turn: AgentTurn): void;
-  getRecentTurns(limit: number): AgentTurn[];
+  /** excludeIsolated drops inbox turns before the limit is applied. */
+  getRecentTurns(limit: number, options?: { excludeIsolated?: boolean }): AgentTurn[];
   getTurnById(id: string): AgentTurn | undefined;
   getTurnCount(): number;
 

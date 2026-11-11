@@ -1,7 +1,14 @@
 import { createLogger } from "../../observability/logger.js";
-import type { ChatMessage, InferenceToolCall } from "../../types.js";
+import type {
+  AutomatonTool,
+  ChatMessage,
+  InferenceToolCall,
+  PolicyRequest,
+  SpendTrackerInterface,
+} from "../../types.js";
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
+import { createBuiltinTools } from "../tools.js";
 import type {
   AgentHarness,
   HarnessContext,
@@ -11,6 +18,40 @@ import type {
 const logger = createLogger("harness.base");
 const MAX_CONSECUTIVE_INFERENCE_ERRORS = 3;
 const MAX_TOOL_OUTPUT_LENGTH = 16_000;
+
+export const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
+  recordSpend: () => {},
+  getHourlySpend: () => 0,
+  getDailySpend: () => 0,
+  getTotalSpend: () => 0,
+  checkLimit: () => ({
+    allowed: true,
+    currentHourlySpend: 0,
+    currentDailySpend: 0,
+    limitHourly: Number.MAX_SAFE_INTEGER,
+    limitDaily: Number.MAX_SAFE_INTEGER,
+  }),
+  pruneOldRecords: () => 0,
+};
+
+/**
+ * Builtin tools whose policy rules govern the harness-local tools of the
+ * same purpose. Harness tools carry no category or risk level, and rules
+ * match by builtin name, so the builtin definition is what policy sees.
+ */
+export type PolicyGuardedTool = "exec" | "write_file" | "read_file";
+
+let builtinPolicyTools: Map<string, AutomatonTool> | undefined;
+
+function getBuiltinPolicyTool(name: PolicyGuardedTool): AutomatonTool | undefined {
+  if (!builtinPolicyTools) {
+    // Only name, category and riskLevel are used; execute is never called.
+    builtinPolicyTools = new Map(
+      createBuiltinTools("policy-lookup").map((tool) => [tool.name, tool]),
+    );
+  }
+  return builtinPolicyTools.get(name);
+}
 
 export abstract class BaseHarness implements AgentHarness {
   abstract readonly id: string;
@@ -41,6 +82,47 @@ export abstract class BaseHarness implements AgentHarness {
   abstract buildSystemPrompt(): string;
 
   protected beforeTurn(): void {}
+
+  /** Count passed to policy as turnToolCallCount. */
+  protected policyTurnToolCallCount(): number {
+    return 0;
+  }
+
+  /**
+   * Run a harness-local tool call through the PolicyEngine as the builtin
+   * tool of the same purpose, with the worker's input source, and record
+   * the decision. Returns null when the call may run, or a "Blocked:"
+   * message. Without a policy engine or tool context the call is refused,
+   * so a worker can never run a shell command or write a file unchecked.
+   */
+  protected authorizeLocalTool(
+    builtinName: PolicyGuardedTool,
+    args: Record<string, unknown>,
+  ): string | null {
+    const policyEngine = this.context.policyEngine;
+    const toolContext = this.context.toolContext;
+    const tool = getBuiltinPolicyTool(builtinName);
+    if (!policyEngine || !toolContext || !tool) {
+      return `Blocked: ${builtinName} requires a policy check and no policy engine is configured for this worker`;
+    }
+
+    const request: PolicyRequest = {
+      tool,
+      args,
+      context: toolContext,
+      turnContext: {
+        inputSource: this.context.inputSource,
+        turnToolCallCount: this.policyTurnToolCallCount(),
+        sessionSpend: this.context.spendTracker ?? NOOP_SPEND_TRACKER,
+      },
+    };
+    const decision = policyEngine.evaluate(request);
+    policyEngine.logDecision(decision);
+    if (decision.action !== "allow") {
+      return `Blocked: policy denied ${builtinName} (${decision.reasonCode}): ${decision.humanMessage}`;
+    }
+    return null;
+  }
 
   buildTaskPrompt(): string {
     const lines = [

@@ -328,11 +328,13 @@ describe("Authority Rules", () => {
         ),
       );
 
+      // The inbox allow list refuses these before any tool-specific rule.
       expect(spend.action).toBe("deny");
+      expect(spend.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(edit.action).toBe("deny");
-      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(edit.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(spawn.action).toBe("deny");
-      expect(spawn.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+      expect(spawn.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
     });
 
     it("blocks spending and code edits from an unknown source", () => {
@@ -375,9 +377,11 @@ describe("Authority Rules", () => {
       );
 
       expect(spend.action).toBe("deny");
+      expect(spend.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(edit.action).toBe("deny");
-      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(edit.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(spawn.action).toBe("deny");
+      expect(spawn.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
     });
 
     it("still allows spending and code edits from the creator", () => {
@@ -434,8 +438,9 @@ describe("Authority Rules", () => {
       );
 
       expect(inbox.action).toBe("deny");
-      expect(inbox.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+      expect(inbox.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(unknown.action).toBe("deny");
+      expect(unknown.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(creator.action).toBe("allow");
       expect(autonomous.action).toBe("allow");
     });
@@ -515,6 +520,31 @@ describe("Authority Rules", () => {
 
       const decision = engine.evaluate(request);
       expect(decision.action).toBe("allow");
+    });
+
+    it("matches protected entries by path segment, not substring", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({ name: "write_file", riskLevel: "caution", category: "vm" });
+      const decide = (p: string) => engine.evaluate(createRequest(tool, { path: p }, undefined)).action;
+
+      // Ordinary files whose names merely contain a protected entry.
+      expect(decide("/app/tsconfig.json")).toBe("allow");
+      expect(decide("/app/jest.config.json")).toBe("allow");
+      expect(decide("/app/app.config.json")).toBe("allow");
+      expect(decide("/app/docs/audit-log.md")).toBe("allow");
+
+      // Protected files and directories, including code modules by stem.
+      expect(decide("/root/.automaton/config.json")).toBe("deny");
+      expect(decide("~/.automaton/SOUL.md")).toBe("deny");
+      expect(decide("/root/.automaton/soul.md")).toBe("deny");
+      expect(decide("/app/src/agent/policy-rules/x.ts")).toBe("deny");
+      expect(decide("/app/src/agent/policy-engine.ts")).toBe("deny");
+      expect(decide("/app/dist/agent/injection-defense.js")).toBe("deny");
+      expect(decide("/app/src/self-mod/code.ts")).toBe("deny");
+      expect(decide("/app/src/self-mod/audit-log.ts")).toBe("deny");
+      expect(decide("/app/src/x/../agent/policy-rules/financial.ts")).toBe("deny");
+      expect(decide("C:\\app\\src\\agent\\policy-rules\\financial.ts")).toBe("deny");
     });
 
     it("allows edit_own_file on protected paths from agent input", () => {
@@ -873,11 +903,16 @@ describe("createDefaultRules", () => {
     expect(ruleIds).toContain("financial.require_confirmation");
   });
 
-  it("authority rules have priority 400", () => {
+  it("authority rules have priority 400, except the inbox allow list which runs first", () => {
     const rules = createDefaultRules();
     const authorityRules = rules.filter((r) => r.id.startsWith("authority."));
     for (const rule of authorityRules) {
-      expect(rule.priority).toBe(400);
+      if (rule.id === "authority.inbox_allow_list") {
+        // Runs before validation so its refusal does not echo arguments.
+        expect(rule.priority).toBeLessThan(Math.min(...rules.filter((r) => r !== rule).map((r) => r.priority)));
+      } else {
+        expect(rule.priority).toBe(400);
+      }
     }
   });
 

@@ -13,6 +13,7 @@ import type { SoulModel, SoulReflection } from "../types.js";
 import { loadCurrentSoul, computeGenesisAlignment } from "./model.js";
 import { updateSoul } from "./tools.js";
 import { createLogger } from "../observability/logger.js";
+import { isolatedTurnSql, isValidSenderAddress } from "../agent/inbox-isolation.js";
 const logger = createLogger("soul");
 
 // ─── Reflection Pipeline ────────────────────────────────────────
@@ -120,10 +121,14 @@ function gatherRecentEvidence(db: BetterSqlite3.Database): RecentEvidence {
   const financialActivity: string[] = [];
 
   try {
-    // Get recent tool calls
+    // Get recent tool calls. Calls made on inbox turns are left out: the
+    // capabilities line is shown in every system prompt.
     const toolRows = db
       .prepare(
-        "SELECT DISTINCT name FROM tool_calls ORDER BY created_at DESC LIMIT 50",
+        `SELECT DISTINCT tc.name AS name FROM tool_calls tc
+         JOIN turns t ON t.id = tc.turn_id
+         WHERE NOT ${isolatedTurnSql("t")}
+         ORDER BY tc.created_at DESC LIMIT 50`,
       )
       .all() as { name: string }[];
     for (const row of toolRows) {
@@ -137,6 +142,7 @@ function gatherRecentEvidence(db: BetterSqlite3.Database): RecentEvidence {
       )
       .all() as { from_address: string }[];
     for (const row of inboxRows) {
+      if (!isValidSenderAddress(row.from_address)) continue;
       if (!interactions.includes(row.from_address)) {
         interactions.push(row.from_address);
       }

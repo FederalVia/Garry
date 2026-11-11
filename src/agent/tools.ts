@@ -16,8 +16,6 @@ import type {
   GenesisConfig,
   RiskLevel,
   PolicyRequest,
-  InputSource,
-  SpendTrackerInterface,
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
@@ -3297,11 +3295,7 @@ export async function executeTool(
   tools: AutomatonTool[],
   context: ToolContext,
   policyEngine?: PolicyEngine,
-  turnContext?: {
-    inputSource: InputSource | undefined;
-    turnToolCallCount: number;
-    sessionSpend: SpendTrackerInterface;
-  },
+  turnContext?: PolicyRequest["turnContext"],
 ): Promise<ToolCallResult> {
   const tool = tools.find((t) => t.name === toolName);
   const startTime = Date.now();

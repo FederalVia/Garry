@@ -16,6 +16,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import { createTokenCounter } from "../memory/context-manager.js";
+import { isIsolatedTurn } from "./inbox-isolation.js";
 
 const MAX_CONTEXT_TURNS = 20;
 const SUMMARY_THRESHOLD = 15;
@@ -166,11 +167,13 @@ export function buildContextMessages(
       });
     }
 
-    // The agent's thinking as assistant message
-    if (turn.thinking) {
+    // The agent's thinking and tool calls as an assistant message. A turn
+    // that only made tool calls still renders them, so the model sees what
+    // it did (for example the reply it sent on an earlier inbox turn).
+    if (turn.thinking || turn.toolCalls.length > 0) {
       const msg: ChatMessage = {
         role: "assistant",
-        content: turn.thinking,
+        content: turn.thinking || "",
       };
 
       // If there were tool calls, include them
@@ -305,9 +308,11 @@ export function formatMemoryBlock(memories: MemoryRetrievalResult): string {
  * Used when context grows too large.
  */
 export async function summarizeTurns(
-  turns: AgentTurn[],
+  allTurns: AgentTurn[],
   inference: InferenceClient,
 ): Promise<string> {
+  // A summary is read by privileged turns, so inbox turns never enter it.
+  const turns = allTurns.filter((t) => !isIsolatedTurn(t));
   if (turns.length === 0) return "No previous activity.";
 
   const turnSummaries = turns.map((t) => {

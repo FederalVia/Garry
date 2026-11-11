@@ -6,11 +6,13 @@
  * or modify protected files.
  */
 
+import path from "node:path";
 import type {
   PolicyRule,
   PolicyRequest,
   PolicyRuleResult,
 } from "../../types.js";
+import { checkInboxToolCall, isInboxSource } from "../inbox-isolation.js";
 
 /** Files protected from external-source self-modification */
 const PROTECTED_PATHS = [
@@ -26,6 +28,30 @@ const PROTECTED_PATHS = [
   "self-mod/code",
   "audit-log",
 ] as const;
+
+const CODE_FILE_EXTENSION = /\.(?:d\.ts|ts|tsx|js|jsx|mjs|cjs)$/i;
+
+/**
+ * Match protected entries against whole path segments. An entry matches a run
+ * of consecutive segments, where a segment matches by its full name or by its
+ * name without a code extension ("policy-engine" matches "policy-engine.ts").
+ * Substring matching would also catch "tsconfig.json" or "docs/audit-log.md".
+ */
+function matchProtectedPath(filePath: string): string | undefined {
+  const normalized = path.posix.normalize(filePath.replace(/\\/g, "/").toLowerCase());
+  const segments = normalized.split("/").filter((s) => s.length > 0 && s !== ".");
+  const stems = segments.map((s) => s.replace(CODE_FILE_EXTENSION, ""));
+  for (const entry of PROTECTED_PATHS) {
+    const parts = entry.toLowerCase().split("/");
+    for (let i = 0; i + parts.length <= segments.length; i++) {
+      const matches = parts.every(
+        (part, j) => segments[i + j] === part || stems[i + j] === part,
+      );
+      if (matches) return entry;
+    }
+  }
+  return undefined;
+}
 
 function deny(
   rule: string,
@@ -230,20 +256,51 @@ function createSelfModFromExternalRule(): PolicyRule {
 
       if (!filePath) return null;
 
-      const normalizedPath = filePath.toLowerCase();
-      for (const protectedPath of PROTECTED_PATHS) {
-        if (
-          normalizedPath.includes(protectedPath.toLowerCase())
-        ) {
-          return deny(
-            "authority.self_mod_from_external",
-            "EXTERNAL_SELF_MOD",
-            `External input cannot modify protected path: "${filePath}" (matches "${protectedPath}")`,
-          );
-        }
+      const protectedPath = matchProtectedPath(filePath);
+      if (protectedPath) {
+        return deny(
+          "authority.self_mod_from_external",
+          "EXTERNAL_SELF_MOD",
+          `External input cannot modify protected path: "${filePath}" (matches "${protectedPath}")`,
+        );
       }
 
       return null;
+    },
+  };
+}
+
+/**
+ * Default deny for inbox turns.
+ *
+ * Applies only when the source is "external" or another non-empty source the
+ * runtime does not set. A missing or empty source and "heartbeat" are
+ * source-less autonomous turns and keep the rules above. This is keyed on the
+ * source string, not on PolicyEngine.deriveAuthorityLevel, which also maps a
+ * missing source to "external".
+ *
+ * Only send_message passes, once per turn, addressed to the sender of the
+ * batch. Every other tool, including tools added later, installed tools and
+ * MCP tools, is denied. Runs before the other rules so the refusal does not
+ * echo arguments chosen on an untrusted turn.
+ */
+function createInboxAllowListRule(): PolicyRule {
+  return {
+    id: "authority.inbox_allow_list",
+    description: "Inbox and unknown-source turns may only reply to the sender",
+    priority: 50,
+    appliesTo: { by: "all" },
+    evaluate(request: PolicyRequest): PolicyRuleResult | null {
+      const turn = request.turnContext;
+      if (!isInboxSource(turn.inputSource)) return null;
+      const refusal = checkInboxToolCall(request.tool.name, request.args, {
+        sender: turn.inboxSender,
+        messageIds: turn.inboxMessageIds,
+        selfAddress: request.context.identity?.address,
+        sendCount: turn.inboxSendCount ?? 0,
+      });
+      if (!refusal) return null;
+      return deny("authority.inbox_allow_list", refusal.code, refusal.message);
     },
   };
 }
@@ -253,6 +310,7 @@ function createSelfModFromExternalRule(): PolicyRule {
  */
 export function createAuthorityRules(): PolicyRule[] {
   return [
+    createInboxAllowListRule(),
     createExternalToolRestrictionRule(),
     createSelfModFromExternalRule(),
   ];

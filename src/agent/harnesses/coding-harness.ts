@@ -76,6 +76,10 @@ When calling task_done, provide:
             typeof args.timeout_ms === "number" ? args.timeout_ms : 30_000,
             MAX_EXEC_TIMEOUT_MS,
           );
+          const denied = this.authorizeLocalTool("exec", { command, timeout: timeoutMs });
+          if (denied) {
+            return denied;
+          }
           const forbidden = getForbiddenCommandMatch(command);
           if (forbidden || isForbiddenCommand(command)) {
             return `Blocked: ${forbidden?.description ?? "Forbidden command pattern"}`;
@@ -105,6 +109,10 @@ When calling task_done, provide:
           const confined = confineToWorkspace(filePath, this.context.allowedEditRoot);
           if (typeof confined !== "string") {
             return confined.error;
+          }
+          const denied = this.authorizeLocalTool("write_file", { path: confined, content });
+          if (denied) {
+            return denied;
           }
           if (isProtectedFile(confined)) {
             return `Blocked: protected file "${filePath}"`;
@@ -137,12 +145,16 @@ When calling task_done, provide:
         },
         execute: async (args) => {
           const filePath = args.path as string;
-          if (isSensitiveFile(filePath)) {
-            return `Blocked: sensitive file "${filePath}"`;
-          }
           const confined = confineToWorkspace(filePath, this.context.allowedEditRoot);
           if (typeof confined !== "string") {
             return confined.error;
+          }
+          const denied = this.authorizeLocalTool("read_file", { path: confined });
+          if (denied) {
+            return denied;
+          }
+          if (isSensitiveFile(filePath)) {
+            return `Blocked: sensitive file "${filePath}"`;
           }
           const offset = typeof args.offset === "number" ? args.offset : 0;
           const limit = typeof args.limit === "number" ? Math.min(args.limit, MAX_READ_SIZE) : MAX_READ_SIZE;
@@ -182,6 +194,11 @@ When calling task_done, provide:
           const confined = confineToWorkspace(filePath, this.context.allowedEditRoot);
           if (typeof confined !== "string") {
             return confined.error;
+          }
+          // A patch is a file write, so it gets the write_file rules.
+          const denied = this.authorizeLocalTool("write_file", { path: confined, search, replace });
+          if (denied) {
+            return denied;
           }
           if (isProtectedFile(confined)) {
             return `Blocked: protected file "${filePath}"`;
@@ -223,6 +240,10 @@ When calling task_done, provide:
           const confined = confineToWorkspace(dirPath, this.context.allowedEditRoot);
           if (typeof confined !== "string") {
             return confined.error;
+          }
+          const denied = this.authorizeLocalTool("read_file", { path: confined });
+          if (denied) {
+            return denied;
           }
           try {
             const entries = await fs.readdir(confined, { withFileTypes: true });

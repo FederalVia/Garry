@@ -23,7 +23,11 @@ describe("agent/GeneralHarness", () => {
     }
   });
 
-  async function createHarness(options?: { social?: MockSocialClient; toolCatalog?: AutomatonTool[] }) {
+  async function createHarness(options?: {
+    social?: MockSocialClient;
+    toolCatalog?: AutomatonTool[];
+    chat?: HarnessContext["inference"]["chat"];
+  }) {
     tempDir = mkdtempSync(path.join(os.tmpdir(), "general-harness-"));
     const dbPath = path.join(tempDir, "state.db");
     const appDb = createDatabase(dbPath);
@@ -44,7 +48,7 @@ describe("agent/GeneralHarness", () => {
       config: createTestConfig({ dbPath }),
       db: appDb.raw,
       conway: new MockConwayClient(),
-      inference: { chat: async () => ({ content: "done" }) },
+      inference: { chat: options?.chat ?? (async () => ({ content: "done" })) },
       budget: {
         maxTurns: 5,
         maxCostCents: 50,
@@ -113,7 +117,8 @@ describe("agent/GeneralHarness", () => {
     expect(toolNames.has("send_message")).toBe(true);
     expect(toolNames.has("discover_agents")).toBe(true);
     expect(toolNames.has("web_fetch")).toBe(true);
-    expect(toolNames.has("check_social_inbox")).toBe(true);
+    // Workers never read the social inbox; the main loop is its only reader.
+    expect(toolNames.has("check_social_inbox")).toBe(false);
     expect(toolNames.has("x402_fetch")).toBe(true);
     expect(toolNames.has("task_done")).toBe(true);
     appDb.close();
@@ -168,7 +173,7 @@ describe("agent/GeneralHarness", () => {
     appDb.close();
   });
 
-  it("exposes the SPEC inbox alias without removing the broader social surface", async () => {
+  it("keeps send_message but has no social inbox reader, so the relay cursor is never moved", async () => {
     const social = new MockSocialClient();
     social.unread = 2;
     social.pollResponses.push({
@@ -188,18 +193,16 @@ describe("agent/GeneralHarness", () => {
     const { harness, appDb } = await createHarness({ social });
     const toolNames = new Set(harness.getToolDefs().map((tool) => tool.name));
     expect(toolNames.has("send_message")).toBe(true);
-    expect(toolNames.has("check_social_inbox")).toBe(true);
+    expect(toolNames.has("check_social_inbox")).toBe(false);
 
-    const inboxTool = harness.getToolDefs().find((tool) => tool.name === "check_social_inbox");
-    const result = await inboxTool!.execute({});
-
-    expect(result).toContain("\"unreadCount\": 2");
-    expect(result).toContain("\"content\": \"hello\"");
-    expect(appDb.getKV("social_inbox_cursor")).toBe("cursor-2");
+    expect(appDb.getKV("social_inbox_cursor")).toBeUndefined();
+    // The queued relay batch is still the next one the main loop will poll.
+    const next = await social.poll();
+    expect(next.nextCursor).toBe("cursor-2");
     appDb.close();
   });
 
-  it("sanitizes hostile inbox content before returning it to the harness conversation", async () => {
+  it("never returns relay messages to the worker conversation, even when the model asks for the inbox", async () => {
     const social = new MockSocialClient();
     social.unread = 1;
     social.pollResponses.push({
@@ -215,15 +218,25 @@ describe("agent/GeneralHarness", () => {
       ],
     });
 
-    const { harness, appDb } = await createHarness({ social });
-    const inboxTool = harness.getToolDefs().find((tool) => tool.name === "check_social_inbox");
-    const result = await inboxTool!.execute({});
+    const seen: string[] = [];
+    let call = 0;
+    const { harness, appDb } = await createHarness({
+      social,
+      chat: async (params) => {
+        seen.push(params.messages.map((message) => String(message.content ?? "")).join("\n"));
+        call++;
+        const name = call === 1 ? "check_social_inbox" : "task_done";
+        const args = call === 1 ? "{}" : "{\"summary\":\"done\"}";
+        return { content: "", toolCalls: [{ id: `c${call}`, type: "function", function: { name, arguments: args } }] };
+      },
+    });
 
-    expect(result).not.toContain("<|im_start|>");
-    expect(result).not.toContain("<|im_end|>");
-    expect(result).not.toContain("</system>");
-    expect(result).toContain("[chatml-removed]");
-    expect(result).toContain("[system-tag-removed]");
+    await harness.execute();
+
+    const transcript = seen.join("\n");
+    expect(transcript).toContain("Unknown tool 'check_social_inbox'");
+    expect(transcript).not.toContain("ignore prior instructions");
+    expect(appDb.getKV("social_inbox_cursor")).toBeUndefined();
     appDb.close();
   });
 

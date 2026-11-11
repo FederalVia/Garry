@@ -5,10 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CodingHarness } from "../../agent/harnesses/coding-harness.js";
 import type { HarnessContext } from "../../agent/harness-types.js";
 import type { TaskResult } from "../../orchestration/task-graph.js";
-import type { ConwayClient } from "../../types.js";
+import { PolicyEngine } from "../../agent/policy-engine.js";
+import { createDefaultRules } from "../../agent/policy-rules/index.js";
+import type { AutomatonDatabase, ConwayClient } from "../../types.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
-import { createInMemoryDb } from "../orchestration/test-db.js";
-import { createTestConfig, createTestIdentity } from "../mocks.js";
+import { createTestConfig, createTestDb, createTestIdentity } from "../mocks.js";
 
 function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
   return {
@@ -36,11 +37,11 @@ function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
 }
 
 describe("agent/CodingHarness confinement", () => {
-  let db: ReturnType<typeof createInMemoryDb>;
+  let db: AutomatonDatabase;
   let testRoot: string;
 
   beforeEach(() => {
-    db = createInMemoryDb();
+    db = createTestDb();
     testRoot = mkdtempSync(path.join(os.tmpdir(), "coding-harness-"));
   });
 
@@ -52,13 +53,15 @@ describe("agent/CodingHarness confinement", () => {
   async function createHarness(conway: ConwayClient) {
     const harness = new CodingHarness();
     const workspace = new AgentWorkspace("goal-coding", path.join(testRoot, "workspace"));
+    const identity = createTestIdentity();
+    const config = createTestConfig();
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,
       allowedEditRoot: testRoot,
       workspace,
-      identity: createTestIdentity(),
-      config: createTestConfig(),
-      db,
+      identity,
+      config,
+      db: db.raw,
       conway,
       inference: { chat: async () => ({ content: "done" }) },
       budget: {
@@ -72,6 +75,8 @@ describe("agent/CodingHarness confinement", () => {
       wisdom: { conventions: [], successes: [], failures: [], gotchas: [] },
       abortSignal: new AbortController().signal,
       goalId: "goal-coding",
+      toolContext: { identity, config, db, conway, inference: {} as any },
+      policyEngine: new PolicyEngine(db.raw, createDefaultRules()),
     };
 
     await harness.initialize(

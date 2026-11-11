@@ -166,6 +166,13 @@ export class ColonyMessaging {
     const processed: ProcessedMessage[] = [];
 
     for (const row of inbox) {
+      // Only LocalDBTransport sets a recipient address. Rows without one
+      // came from the social relay: they belong to the main loop's isolated
+      // inbox turn and must never be routed as colony protocol messages.
+      if (!row.to) {
+        this.db.markInboxMessageProcessed(row.id);
+        continue;
+      }
       try {
         const message = parseInboundMessage(row);
         pending.push({ inboxId: row.id, message });

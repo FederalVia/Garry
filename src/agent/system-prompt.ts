@@ -561,6 +561,8 @@ export function buildSystemPrompt(params: {
   tools: AutomatonTool[];
   skills?: Skill[];
   isFirstRun: boolean;
+  /** Leave out WORKLOG.md, which holds privileged working notes. */
+  omitWorklog?: boolean;
 }): string {
   const {
     identity,
@@ -571,6 +573,7 @@ export function buildSystemPrompt(params: {
     tools,
     skills,
     isFirstRun,
+    omitWorklog,
   } = params;
 
   const sections: string[] = [];
@@ -635,7 +638,7 @@ Your chain type is ${chainType}.`,
   }
 
   // Layer 3.5: WORKLOG.md -- persistent working context
-  const worklogContent = loadWorklog();
+  const worklogContent = omitWorklog ? null : loadWorklog();
   if (worklogContent) {
     sections.push(
       `--- WORKLOG.md (your persistent working context — UPDATE THIS after each task!) ---\n${worklogContent}\n--- END WORKLOG.md ---\n\nIMPORTANT: After completing any task or making any decision, update WORKLOG.md using write_file.\nThis is how you remember what you were doing across turns. Without it, you lose context and repeat yourself.`,
@@ -820,7 +823,8 @@ What will you do first? Consider:
 5. Begin working toward your goals`;
   }
 
-  const lastTurns = db.getRecentTurns(3);
+  // Inbox turns are left out: the wakeup prompt starts a privileged turn.
+  const lastTurns = db.getRecentTurns(3, { excludeIsolated: true });
   const lastTurnSummary = lastTurns
     .map(
       (t) =>

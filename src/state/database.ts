@@ -28,6 +28,12 @@ import type {
   InboxMessage,
 } from "../types.js";
 import {
+  ISOLATED_TURN_SQL,
+  inboxTurnPrefix,
+  isValidSenderAddress,
+} from "../agent/inbox-isolation.js";
+import { detectChainType } from "../identity/chain.js";
+import {
   SCHEMA_VERSION,
   CREATE_TABLES,
   MIGRATION_V2,
@@ -149,10 +155,16 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     );
   };
 
-  const getRecentTurns = (limit: number): AgentTurn[] => {
+  const getRecentTurns = (
+    limit: number,
+    options?: { excludeIsolated?: boolean },
+  ): AgentTurn[] => {
+    // Filtering in SQL keeps a run of inbox turns from pushing every
+    // privileged turn out of the window.
+    const where = options?.excludeIsolated ? `WHERE NOT ${ISOLATED_TURN_SQL}` : "";
     const rows = db
       .prepare(
-        "SELECT * FROM turns ORDER BY timestamp DESC LIMIT ?",
+        `SELECT * FROM turns ${where} ORDER BY timestamp DESC LIMIT ?`,
       )
       .all(limit) as any[];
     return rows.map(deserializeTurn).reverse();
@@ -1429,6 +1441,86 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
   });
 
   return claimTx();
+}
+
+/**
+ * Claim one sender's messages: the oldest claimable row, then up to `limit`
+ * claimable rows from the same address. An inbox turn then only ever holds
+ * text from a single sender, so it can be limited to replying to that sender.
+ */
+export function claimInboxMessagesFromOneSender(
+  db: DatabaseType,
+  limit: number,
+): InboxMessageRow[] {
+  const claimTx = db.transaction(() => {
+    const first = db.prepare(
+      `SELECT from_address FROM inbox_messages
+       WHERE status = 'received' AND retry_count < max_retries
+       ORDER BY received_at ASC
+       LIMIT 1`,
+    ).get() as { from_address: string } | undefined;
+    if (!first) return [];
+
+    const rows = db.prepare(
+      `SELECT id, from_address, content, received_at, processed_at, reply_to, to_address, raw_content,
+              status, retry_count, max_retries
+       FROM inbox_messages
+       WHERE status = 'received' AND retry_count < max_retries AND from_address = ?
+       ORDER BY received_at ASC
+       LIMIT ?`,
+    ).all(first.from_address, limit) as any[];
+    if (rows.length === 0) return [];
+
+    const ids = rows.map((r: any) => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(
+      `UPDATE inbox_messages
+       SET status = 'in_progress', retry_count = retry_count + 1
+       WHERE id IN (${placeholders})`,
+    ).run(...ids);
+
+    return rows.map((row: any) => ({
+      id: row.id,
+      fromAddress: row.from_address,
+      content: row.content,
+      receivedAt: row.received_at,
+      processedAt: row.processed_at ?? null,
+      replyTo: row.reply_to ?? null,
+      toAddress: row.to_address ?? null,
+      rawContent: row.raw_content ?? null,
+      status: 'in_progress' as const,
+      retryCount: (row.retry_count ?? 0) + 1,
+      maxRetries: row.max_retries ?? 3,
+    }));
+  });
+
+  return claimTx();
+}
+
+/**
+ * Earlier inbox turns from one sender, oldest first, for continuity on that
+ * sender's next inbox turn. Only exact sender matches are returned, and only
+ * for a well-formed address, so one sender never sees another's exchange.
+ */
+export function getInboxTurnsFromSender(
+  db: DatabaseType,
+  sender: string,
+  limit: number,
+): AgentTurn[] {
+  if (!isValidSenderAddress(sender)) return [];
+  // EVM addresses match case-insensitively; Solana base58 addresses are
+  // case-sensitive and must match exactly.
+  const caseInsensitive = detectChainType(sender) === "evm";
+  const prefix = caseInsensitive
+    ? inboxTurnPrefix(sender).toLowerCase()
+    : inboxTurnPrefix(sender);
+  const head = caseInsensitive ? "lower(substr(input, 1, ?))" : "substr(input, 1, ?)";
+  const rows = db.prepare(
+    `SELECT * FROM turns
+     WHERE input_source = 'external' AND ${head} = ?
+     ORDER BY timestamp DESC LIMIT ?`,
+  ).all(prefix.length, prefix, limit) as any[];
+  return rows.map(deserializeTurn).reverse();
 }
 
 export function markInboxProcessed(db: DatabaseType, ids: string[]): void {
