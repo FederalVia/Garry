@@ -20,7 +20,7 @@ class PlannerAwareInference implements WorkerInferenceClient {
     private readonly workerResponses: Array<{ content: string; toolCalls?: Array<{ id: string; type?: "function"; function: { name: string; arguments: string } }> }>,
   ) {}
 
-  async chat(params: Parameters<WorkerInferenceClient["chat"]>[0]): Promise<{ content: string; toolCalls?: Array<{ id: string; function: { name: string; arguments: string } }> }> {
+  async chat(params: Parameters<WorkerInferenceClient["chat"]>[0]): ReturnType<WorkerInferenceClient["chat"]> {
     const systemPrompt = params.messages[0]?.content ?? "";
     if (systemPrompt.includes("# Planner Agent") || params.responseFormat?.type === "json_object") {
       const plan = this.plannerOutputs[this.plannerIndex++] ?? this.plannerOutputs[this.plannerOutputs.length - 1];
@@ -32,6 +32,7 @@ class PlannerAwareInference implements WorkerInferenceClient {
       content: response.content,
       toolCalls: response.toolCalls?.map((toolCall) => ({
         id: toolCall.id,
+        type: "function" as const,
         function: toolCall.function,
       })),
     };

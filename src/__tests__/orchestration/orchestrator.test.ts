@@ -484,37 +484,6 @@ describe("orchestration/Orchestrator", () => {
   // ─── collectResults ──────────────────────────────────────────
 
   describe("collectResults", () => {
-    function buildMessagingWithResults(
-      raw: BetterSqlite3.Database,
-      messages: Array<{ type: string; content: string }>,
-    ) {
-      const processedMessages = messages.map((msg) => ({
-        message: {
-          id: ulid(),
-          type: msg.type,
-          from: "0xagent",
-          to: "0x1234",
-          goalId: null,
-          taskId: null,
-          content: msg.content,
-          priority: "normal" as const,
-          requiresResponse: false,
-          expiresAt: null,
-          createdAt: new Date().toISOString(),
-        },
-        handledBy: "handleTaskResult",
-        success: true,
-      }));
-
-      const messaging = {
-        processInbox: vi.fn().mockResolvedValue(processedMessages),
-        createMessage: vi.fn().mockReturnValue({}),
-        send: vi.fn().mockResolvedValue(undefined),
-      } as unknown as ColonyMessaging;
-
-      return messaging;
-    }
-
     it("processes task_result messages from inbox", async () => {
       const goalId = insertGoal(db);
       const taskId = insertTask(db, { goalId });

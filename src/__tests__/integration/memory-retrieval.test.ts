@@ -9,6 +9,21 @@ import {
   type ScoredMemoryRetrievalResult,
 } from "../../memory/enhanced-retriever.js";
 import { KnowledgeStore } from "../../memory/knowledge-store.js";
+import type { ContextUtilization } from "../../memory/context-manager.js";
+
+/** Build a full ContextUtilization; only the token/percent fields matter to calculateMemoryBudget. */
+function makeUtilization(
+  fields: Pick<ContextUtilization, "utilizationPercent" | "totalTokens" | "usedTokens">,
+): ContextUtilization {
+  return {
+    ...fields,
+    turnsInContext: 0,
+    compressedTurns: 0,
+    compressionRatio: 1,
+    headroomTokens: Math.max(0, fields.totalTokens - fields.usedTokens),
+    recommendation: "ok",
+  };
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -357,8 +372,8 @@ describe("integration/memory-retrieval", () => {
 
   describe("calculateMemoryBudget", () => {
     it("returns a larger budget when context utilization is low", () => {
-      const lowUtilization = { utilizationPercent: 40, totalTokens: 10000, usedTokens: 4000 };
-      const highUtilization = { utilizationPercent: 80, totalTokens: 10000, usedTokens: 8000 };
+      const lowUtilization = makeUtilization({ utilizationPercent: 40, totalTokens: 10000, usedTokens: 4000 });
+      const highUtilization = makeUtilization({ utilizationPercent: 80, totalTokens: 10000, usedTokens: 8000 });
 
       const lowBudget = calculateMemoryBudget(lowUtilization, 50000);
       const highBudget = calculateMemoryBudget(highUtilization, 50000);
@@ -368,14 +383,14 @@ describe("integration/memory-retrieval", () => {
 
     it("clamps result to the minimum budget of 2000 tokens", () => {
       // Very small available tokens
-      const utilization = { utilizationPercent: 85, totalTokens: 1000, usedTokens: 850 };
+      const utilization = makeUtilization({ utilizationPercent: 85, totalTokens: 1000, usedTokens: 850 });
       const budget = calculateMemoryBudget(utilization, 100);
       expect(budget).toBeGreaterThanOrEqual(2000);
     });
 
     it("clamps result to the maximum budget of 20000 tokens", () => {
       // Huge available tokens with low utilization
-      const utilization = { utilizationPercent: 10, totalTokens: 1_000_000, usedTokens: 100_000 };
+      const utilization = makeUtilization({ utilizationPercent: 10, totalTokens: 1_000_000, usedTokens: 100_000 });
       const budget = calculateMemoryBudget(utilization, 1_000_000);
       expect(budget).toBeLessThanOrEqual(20000);
     });

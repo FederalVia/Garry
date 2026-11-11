@@ -74,7 +74,10 @@ function estimateTurnTokens(turn: AgentTurn): number {
   }
   for (const tc of turn.toolCalls) {
     total += estimateTokens(JSON.stringify(tc.arguments));
-    total += estimateTokens(tc.error ? `Error: ${tc.error}` : tc.result);
+    // Count what is rendered: tool results are truncated before they are sent.
+    total += estimateTokens(
+      truncateToolResult(tc.error ? `Error: ${tc.error}` : tc.result),
+    );
   }
   return total;
 }

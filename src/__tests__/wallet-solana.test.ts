@@ -7,6 +7,7 @@ import { generateSolanaKeypair, getWalletChainType } from "../identity/wallet.js
 import { isValidSolanaAddress } from "../identity/chain.js";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
+import type { WalletData } from "../types.js";
 
 describe("Solana Wallet", () => {
   describe("generateSolanaKeypair", () => {
@@ -53,8 +54,8 @@ describe("Solana Wallet", () => {
     });
 
     it("EVM wallet data backward compat (missing chainType defaults to evm)", () => {
-      const walletData = {
-        privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as `0x${string}`,
+      const walletData: WalletData = {
+        privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
         createdAt: "2024-01-01T00:00:00.000Z",
       };
 
