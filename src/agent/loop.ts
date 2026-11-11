@@ -415,13 +415,16 @@ export async function runAgentLoop(
             .map((m) => {
               const from = sanitizeInput(m.fromAddress, m.fromAddress, "social_address");
               const content = sanitizeInput(m.content, m.fromAddress, "social_message");
-              if (content.blocked) {
-                return `[INJECTION BLOCKED from ${from.content}]: message was blocked by safety filter`;
-              }
-              return `[Message from ${from.content}]: ${content.content}`;
+              const sender = from.content || "unknown";
+              // Every inbox sender is untrusted. The label is data about
+              // who sent it, not an instruction from the creator or the agent.
+              const body = content.blocked
+                ? "message was blocked by safety filter"
+                : content.content;
+              return `[UNTRUSTED EXTERNAL SENDER ${sender}]: ${body}`;
             })
             .join("\n\n");
-          pendingInput = { content: formatted, source: "agent" };
+          pendingInput = { content: formatted, source: "external" };
         }
       }
 
@@ -595,6 +598,23 @@ export async function runAgentLoop(
       // Clear pending input after use
       pendingInput = undefined;
 
+      const currentSource = currentInput?.source as InputSource | undefined;
+      // The inbox text stays in the transcript after its own turn, including
+      // across a later system or wakeup prompt. Authority stays external for
+      // as long as that text is still in the messages sent to inference.
+      // A creator input is the only source that may act while it remains.
+      // When the turns holding it are trimmed out of the context window,
+      // the marker is gone and normal source rules apply again.
+      const inboxStillInContext = messages.some(
+        (message) =>
+          typeof message.content === "string" &&
+          message.content.includes("UNTRUSTED EXTERNAL SENDER"),
+      );
+      const effectiveInputSource: InputSource | undefined =
+        inboxStillInContext && currentSource !== "creator"
+          ? "external"
+          : currentSource;
+
       // ── Inference Call (via router when available) ──
       const survivalTier = getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
@@ -629,7 +649,7 @@ export async function runAgentLoop(
         timestamp: new Date().toISOString(),
         state: db.getAgentState(),
         input: currentInput?.content,
-        inputSource: currentInput?.source as any,
+        inputSource: effectiveInputSource,
         thinking: response.message.content || "",
         toolCalls: [],
         tokenUsage: response.usage,
@@ -640,7 +660,7 @@ export async function runAgentLoop(
       if (response.toolCalls && response.toolCalls.length > 0) {
         const toolCallMessages: any[] = [];
         let callCount = 0;
-        const currentInputSource = currentInput?.source as InputSource | undefined;
+        const currentInputSource = effectiveInputSource;
 
         for (const tc of response.toolCalls) {
           if (callCount >= MAX_TOOL_CALLS_PER_TURN) {

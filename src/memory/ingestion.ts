@@ -720,11 +720,18 @@ export class MemoryIngestionPipeline {
         }
       }
 
-      // Track inbox message sources (once per turn, not per tool call)
-      if (turn.inputSource === "agent" && turn.input) {
-        const fromMatch = turn.input.match(/\[Message from (0x[a-fA-F0-9]+)\]/);
-        if (fromMatch) {
-          const fromAddress = fromMatch[1];
+      // Track inbox message sources (once per turn, not per tool call).
+      // "external" is the untrusted inbox source. Recording the sender does
+      // not give that turn any tool authority.
+      if (
+        (turn.inputSource === "agent" || turn.inputSource === "external") &&
+        turn.input
+      ) {
+        const fromMatch = turn.input.match(
+          /\[UNTRUSTED EXTERNAL SENDER (0x[a-fA-F0-9]+)\]|\[Message from (0x[a-fA-F0-9]+)\]/,
+        );
+        const fromAddress = fromMatch?.[1] || fromMatch?.[2];
+        if (fromAddress) {
           const existing = this.relationships.get(fromAddress);
           if (existing) {
             this.relationships.recordInteraction(fromAddress);

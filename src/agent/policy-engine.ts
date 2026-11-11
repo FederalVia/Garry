@@ -123,7 +123,11 @@ export class PolicyEngine {
   static deriveAuthorityLevel(
     inputSource: InputSource | undefined,
   ): AuthorityLevel {
-    if (inputSource === undefined || inputSource === "heartbeat") {
+    if (
+      inputSource === undefined ||
+      inputSource === "heartbeat" ||
+      inputSource === "external"
+    ) {
       return "external";
     }
     if (inputSource === "creator" || inputSource === "agent") {

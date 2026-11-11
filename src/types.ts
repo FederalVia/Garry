@@ -120,7 +120,8 @@ export type InputSource =
   | "creator"
   | "agent"
   | "system"
-  | "wakeup";
+  | "wakeup"
+  | "external";
 
 export interface ToolCallResult {
   id: string;

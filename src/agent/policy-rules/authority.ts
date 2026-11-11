@@ -36,23 +36,43 @@ function deny(
 }
 
 /**
+ * Sources that keep elevated authority when a caller sets them explicitly.
+ * Inbox delivery never sets one of these. A missing source is not elevated.
+ */
+const ELEVATED_SOURCES = new Set(["creator", "agent", "system", "wakeup"]);
+
+/**
  * Check if an input source represents external (non-agent) authority.
+ * Unknown values are external. Heartbeat and source-less turns stay external,
+ * which is their existing classification.
  */
 function isExternalSource(inputSource: string | undefined): boolean {
-  return inputSource === undefined || inputSource === "heartbeat";
+  if (inputSource === undefined || inputSource === "" || inputSource === "heartbeat") {
+    return true;
+  }
+  return !ELEVATED_SOURCES.has(inputSource);
+}
+
+/**
+ * Inbox messages and unrecognized sources.
+ *
+ * Heartbeat tasks and source-less autonomous turns are not inbox input.
+ * They keep the original external-tool list and are not newly blocked
+ * from transfer_credits or ordinary file writes.
+ */
+function isInboxOrUnknownSource(inputSource: string | undefined): boolean {
+  if (inputSource === undefined || inputSource === "heartbeat") {
+    return false;
+  }
+  return !ELEVATED_SOURCES.has(inputSource);
 }
 
 /**
  * Tools that must be blocked from external/heartbeat input sources.
  *
  * These are genuinely destructive or high-autonomy operations that should
- * only be initiated by the agent itself or its creator — never from
- * heartbeat tasks or untrusted external input.
- *
- * Tools NOT on this list (e.g., register_erc8004, give_feedback,
- * edit_own_file, transfer_credits) are allowed from any source because
- * they are core agent functionality already guarded by other policy rules
- * (financial limits, rate limits, path protection, etc.).
+ * only be initiated by an elevated source — never from heartbeat tasks
+ * or untrusted external input.
  */
 const EXTERNAL_BLOCKED_TOOLS = [
   "delete_sandbox",
@@ -60,6 +80,49 @@ const EXTERNAL_BLOCKED_TOOLS = [
   "fund_child",
   "update_genesis_prompt",
 ] as const;
+
+/** Money movement. Inbox and unknown sources cannot use these. */
+const INBOX_SPEND_TOOLS = [
+  "transfer_credits",
+  "x402_fetch",
+  "topup_credits",
+  "fund_child",
+] as const;
+
+/** Tools that change the agent's own code or installed runtime. */
+const INBOX_CODE_TOOLS = [
+  "edit_own_file",
+  "pull_upstream",
+  "reset_to_upstream",
+  "install_npm_package",
+  "install_mcp_server",
+  "revert_last_edit",
+] as const;
+
+/**
+ * Tools that run a shell command or start a process.
+ * On an inbox or unknown turn these can rewrite files or reach payment
+ * endpoints even when the spend and edit tools are denied.
+ */
+const INBOX_SHELL_TOOLS = [
+  "exec",
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_commit",
+  "git_push",
+  "git_branch",
+  "git_clone",
+  "start_child",
+  "install_skill",
+] as const;
+
+const CODE_PATH = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|sol)$/i;
+
+function isAgentCodePath(filePath: string): boolean {
+  const pathOnly = filePath.split(/[?#]/, 1)[0] ?? filePath;
+  return CODE_PATH.test(pathOnly);
+}
 
 /**
  * Deny specific high-risk tools when input comes from external sources.
@@ -70,15 +133,66 @@ function createExternalToolRestrictionRule(): PolicyRule {
     id: "authority.external_tool_restriction",
     description: "Deny destructive/high-autonomy tools from external/heartbeat input sources",
     priority: 400,
-    appliesTo: { by: "name", names: [...EXTERNAL_BLOCKED_TOOLS] },
+    appliesTo: {
+      by: "name",
+      names: [
+        ...new Set<string>([
+          ...EXTERNAL_BLOCKED_TOOLS,
+          ...INBOX_SPEND_TOOLS,
+          ...INBOX_CODE_TOOLS,
+          ...INBOX_SHELL_TOOLS,
+        ]),
+      ],
+    },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      if (isExternalSource(request.turnContext.inputSource)) {
+      const source = request.turnContext.inputSource;
+      const toolName = request.tool.name;
+      const sourceLabel = source || "undefined";
+
+      if (
+        (EXTERNAL_BLOCKED_TOOLS as readonly string[]).includes(toolName) &&
+        isExternalSource(source)
+      ) {
         return deny(
           "authority.external_tool_restriction",
           "EXTERNAL_DANGEROUS_TOOL",
-          `External input (source: ${request.turnContext.inputSource ?? "undefined"}) cannot use dangerous tool "${request.tool.name}"`,
+          `External input (source: ${sourceLabel}) cannot use dangerous tool "${toolName}"`,
         );
       }
+
+      if (
+        (INBOX_SPEND_TOOLS as readonly string[]).includes(toolName) &&
+        isInboxOrUnknownSource(source)
+      ) {
+        return deny(
+          "authority.external_tool_restriction",
+          "EXTERNAL_DANGEROUS_TOOL",
+          `Untrusted input (source: ${sourceLabel}) cannot spend via "${toolName}"`,
+        );
+      }
+
+      if (
+        (INBOX_CODE_TOOLS as readonly string[]).includes(toolName) &&
+        isInboxOrUnknownSource(source)
+      ) {
+        return deny(
+          "authority.external_tool_restriction",
+          "EXTERNAL_SELF_MOD",
+          `Untrusted input (source: ${sourceLabel}) cannot modify agent code via "${toolName}"`,
+        );
+      }
+
+      if (
+        (INBOX_SHELL_TOOLS as readonly string[]).includes(toolName) &&
+        isInboxOrUnknownSource(source)
+      ) {
+        return deny(
+          "authority.external_tool_restriction",
+          "EXTERNAL_DANGEROUS_TOOL",
+          `Untrusted input (source: ${sourceLabel}) cannot run shell or process tool "${toolName}"`,
+        );
+      }
+
       return null;
     },
   };
@@ -94,11 +208,26 @@ function createSelfModFromExternalRule(): PolicyRule {
     priority: 400,
     appliesTo: { by: "name", names: ["edit_own_file", "write_file"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      if (!isExternalSource(request.turnContext.inputSource)) {
+      const source = request.turnContext.inputSource;
+      const filePath = request.args.path as string | undefined;
+
+      if (
+        isInboxOrUnknownSource(source) &&
+        request.tool.name === "write_file" &&
+        filePath &&
+        isAgentCodePath(filePath)
+      ) {
+        return deny(
+          "authority.self_mod_from_external",
+          "EXTERNAL_SELF_MOD",
+          `Untrusted input cannot modify code path: "${filePath}"`,
+        );
+      }
+
+      if (!isExternalSource(source)) {
         return null;
       }
 
-      const filePath = request.args.path as string | undefined;
       if (!filePath) return null;
 
       const normalizedPath = filePath.toLowerCase();
