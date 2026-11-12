@@ -170,30 +170,35 @@ export function centsFromAtomic(atomic: bigint): number {
 }
 
 /**
- * Per-year domain price in cents. No real domain costs under $1 a year, so an
- * integer below 100 or any fractional price is read as dollars.
+ * Per-year domain price in cents, or null when the quote is not a whole,
+ * positive number of cents. Conway's domain search quotes whole cents (the
+ * search_domains tool shows price / 100); the unit is never guessed from the
+ * size of the number, so a fractional or other ambiguous quote is no quote.
  */
-export function domainPerYearCents(price: number): number {
-  if (Number.isSafeInteger(price) && price >= 100) return price;
-  return Math.ceil(price * 100);
+export function domainPerYearCents(price: unknown): number | null {
+  return typeof price === "number" && Number.isSafeInteger(price) && price > 0 ? price : null;
 }
 
 /**
  * Cents to reserve for a registration of `years`: the first year at the
  * registration price, every further year at the higher of registration and
  * renewal (registrars usually bill renewal from year two, and a promotional
- * first year is often far cheaper).
+ * first year is often far cheaper). Null when either price given is not a
+ * whole number of cents.
  */
 export function domainRegistrationCents(
-  registrationPrice: number,
-  renewalPrice: number | undefined,
+  registrationPrice: unknown,
+  renewalPrice: unknown,
   years: number,
-): number {
+): number | null {
   const first = domainPerYearCents(registrationPrice);
-  const renewal =
-    typeof renewalPrice === "number" && Number.isFinite(renewalPrice) && renewalPrice > 0
-      ? domainPerYearCents(renewalPrice)
-      : first;
+  if (first === null) return null;
+  let renewal = first;
+  if (renewalPrice !== undefined && renewalPrice !== null) {
+    const r = domainPerYearCents(renewalPrice);
+    if (r === null) return null;
+    renewal = r;
+  }
   return first + (years - 1) * Math.max(first, renewal);
 }
 

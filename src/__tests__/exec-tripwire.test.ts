@@ -254,3 +254,41 @@ describe("exec tripwire", () => {
     });
   }
 });
+
+describe("the operator CLI's money commands are operator only (review TREASURY-1)", () => {
+  const OPERATOR_DENIED = [
+    "automaton-cli fund 900 --to 0x1234567890abcdef1234567890abcdef12345678 --yes",
+    "npx automaton-cli fund 900 --to 0x1234567890abcdef1234567890abcdef12345678 --yes",
+    "npx @conway/automaton-cli send 50 --to 0x1234567890abcdef1234567890abcdef12345678",
+    "node ~/automaton/packages/cli/dist/index.js fund 900 --to 0x12 --yes",
+    "node /root/automaton/packages/cli/dist/index.js fund 900 --to 0x12 --yes",
+    "cd ~/.automaton/runtime && node packages/cli/dist/index.js fund 5 --to 0x12 --yes",
+    "node ./cli/dist/index.js send 1 --to 0x12",
+    "pnpm --dir packages/cli exec tsx src/index.ts fund 5 --to 0x12 --yes",
+    "true; 'automaton-cli' \"fund\" 1 --to 0x12 --yes",
+  ];
+  const OPERATOR_ALLOWED = [
+    "automaton-cli status",
+    "node packages/cli/dist/index.js logs --tail 20",
+    "git send-email --to x@example.com patch",
+    "echo fund the project",
+    "node my-cli/dist/index.js fund 5",
+  ];
+
+  for (const command of OPERATOR_DENIED) {
+    it(`denies: ${command}`, () => {
+      expect(getForbiddenCommandMatch(command), command).not.toBeNull();
+      for (const source of ["agent", "creator"]) {
+        const req = execRequest(command);
+        req.turnContext.inputSource = source as never;
+        expect(rule.evaluate(req)?.reasonCode).toBe("FORBIDDEN_COMMAND");
+      }
+    });
+  }
+
+  for (const command of OPERATOR_ALLOWED) {
+    it(`allows: ${command}`, () => {
+      expect(getForbiddenCommandMatch(command), command).toBeNull();
+    });
+  }
+});

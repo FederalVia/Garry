@@ -735,6 +735,14 @@ export class InferenceGate {
     if (p.survivalAllowanceCents <= 0) {
       return { code: "SURVIVAL_ALLOWANCE", message: "Survival allowance is disabled", retryAfterMs: null };
     }
+    // A daily cap of 0 disables paid inference, survival turns included.
+    if (p.dailyCapCents <= 0) {
+      return {
+        code: "SURVIVAL_ALLOWANCE",
+        message: "Paid inference is disabled (maxInferenceDailyCents is 0)",
+        retryAfterMs: null,
+      };
+    }
     if (p.survivalMinIntervalMs > 0) {
       const last = (this.stmt.lastSurvival.get({ since: now - p.survivalMinIntervalMs, callId }) as { t: number | null }).t;
       if (last !== null && last !== undefined) {

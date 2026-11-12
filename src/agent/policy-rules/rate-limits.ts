@@ -160,6 +160,61 @@ function createSpawnDailyRule(): PolicyRule {
   };
 }
 
+/** Tools that send an on-chain transaction from the agent's wallet (gas in ETH). */
+export const ONCHAIN_WRITE_TOOLS: readonly string[] = Object.freeze(["give_feedback", "register_erc8004"]);
+
+/** Most on-chain writes the agent's tools may send in 24 hours. */
+export const MAX_ONCHAIN_WRITES_PER_DAY = 5;
+
+/**
+ * On-chain writes in the window: every onchain_transactions row, whatever its
+ * status (a reverted transaction still paid gas). created_at is SQLite
+ * datetime() text in UTC.
+ */
+function countOnchainWrites(db: RawDb, windowMs: number): number {
+  const cutoffSql = new Date(Date.now() - windowMs).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  const row = db
+    .prepare("SELECT COUNT(*) AS count FROM onchain_transactions WHERE created_at >= ?")
+    .get(cutoffSql) as { count: number };
+  return row.count;
+}
+
+/**
+ * Gas for ERC-8004 writes is paid in ETH from the agent's wallet, outside the
+ * Treasury's credit and USDC budgets. This caps how many such transactions
+ * the agent can send, so a looping agent cannot burn the wallet's ETH one
+ * transaction at a time.
+ */
+function createOnchainWriteDailyRule(): PolicyRule {
+  return {
+    id: "rate.onchain_writes_daily",
+    description: `Maximum ${MAX_ONCHAIN_WRITES_PER_DAY} on-chain transactions per day`,
+    priority: 600,
+    appliesTo: { by: "name", names: [...ONCHAIN_WRITE_TOOLS] },
+    evaluate(request: PolicyRequest): PolicyRuleResult | null {
+      const db = rawDbOf(request);
+      if (!db) return deny(this.id, "DB_UNAVAILABLE", "Rate limit check failed: database not accessible");
+
+      let recentCount: number;
+      try {
+        recentCount = countOnchainWrites(db, DAY_MS);
+      } catch {
+        return deny(this.id, "DB_UNAVAILABLE", "Rate limit check failed: on-chain transaction log not readable");
+      }
+
+      if (recentCount >= MAX_ONCHAIN_WRITES_PER_DAY) {
+        return deny(
+          "rate.onchain_writes_daily",
+          "RATE_LIMIT_ONCHAIN",
+          `On-chain transaction rate exceeded: ${recentCount} in the last 24 hours (max ${MAX_ONCHAIN_WRITES_PER_DAY}/day); gas is paid from the wallet's ETH`,
+        );
+      }
+
+      return null;
+    },
+  };
+}
+
 /**
  * Create all rate limit policy rules.
  */
@@ -168,5 +223,6 @@ export function createRateLimitRules(): PolicyRule[] {
     createGenesisPromptDailyRule(),
     createSelfModHourlyRule(),
     createSpawnDailyRule(),
+    createOnchainWriteDailyRule(),
   ];
 }

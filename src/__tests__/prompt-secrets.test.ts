@@ -269,8 +269,9 @@ describe("known secrets are redacted at the inference boundary", () => {
             tier: "fast",
             contextWindow: 1000,
             maxOutputTokens: 100,
-            costPerInputToken: 0,
-            costPerOutputToken: 0,
+            // A paid model needs a known price to be served at all.
+            costPerInputToken: 1,
+            costPerOutputToken: 2,
             supportsTools: true,
             supportsVision: false,
             supportsStreaming: false,

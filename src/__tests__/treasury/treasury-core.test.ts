@@ -213,11 +213,13 @@ describe("policy helpers", () => {
     expect(centsFromAtomic(0n)).toBe(0);
   });
 
-  it("reads small or fractional domain prices as dollars", () => {
-    expect(domainPerYearCents(12.99)).toBe(1299);
-    expect(domainPerYearCents(12)).toBe(1200);
+  it("reads domain prices as whole cents only, never guessing the unit (review TREASURY-3)", () => {
     expect(domainPerYearCents(1200)).toBe(1200);
-    expect(domainPerYearCents(99)).toBe(9900);
+    expect(domainPerYearCents(99)).toBe(99);
+    expect(domainPerYearCents(150)).toBe(150);
+    for (const bad of [12.99, 99.99, 0, -5, Number.NaN, Infinity, "1200", undefined]) {
+      expect(domainPerYearCents(bad)).toBeNull();
+    }
   });
 
   it("builds dedupe keys and matches x402 hosts", () => {
@@ -1042,6 +1044,22 @@ describe("crash recovery", () => {
     h.clock.advance(HOUR_MS + 5001);
     expect(t.recover()).toEqual({ released: 0, unknown: 1 });
     expect(t.statusOf("live")).toBe("unknown");
+  });
+
+  it("under the instance lock, startup recovers a dead boot's rows even with the clock behind them (review TREASURY-6)", () => {
+    const h = harness({ balance: 100_000 });
+    // The dead boot wrote its rows 10 minutes "in the future": the clock stepped back since.
+    seedOpenRow(h.raw, "r1", "reserved", "dead-boot", T0 + 10 * 60_000);
+    seedOpenRow(h.raw, "s1", "sent", "dead-boot", T0 + 10 * 60_000);
+    const unlocked = h.newTreasury({ bootId: "boot-b", processStartMs: T0 });
+    expect(unlocked.statusOf("s1")).toBe("sent");
+    const t = h.newTreasury({ bootId: "boot-c", processStartMs: T0, holdsInstanceLock: true });
+    expect(t.statusOf("r1")).toBe("released");
+    expect(t.statusOf("s1")).toBe("unknown");
+    // Its own rows are never touched.
+    seedOpenRow(h.raw, "mine", "sent", "boot-c", T0 + 10 * 60_000);
+    expect(t.recover({ allOtherBoots: true })).toEqual({ released: 0, unknown: 0 });
+    expect(t.statusOf("mine")).toBe("sent");
   });
 
   it("a recovered sent row stays counted and replays with its key", async () => {

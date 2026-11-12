@@ -601,6 +601,12 @@ const INLINE_INTERPRETER = new RegExp(
   ].join("|"),
 );
 
+// The operator CLI: its bin name, its workspace package, its entry point.
+const OPERATOR_CLI = /(?:^|[\s;|&(\/=])(?:@conway\/)?automaton-cli(?=$|[\s;|&)@])|(?:^|[\s;|&(\/=~.])packages\/cli(?=$|[\s;|&)\/])|(?:^|[\s;|&(\/=~.])cli\/(?:dist|src)\/index(?:\.[cm]?[jt]s)?(?=$|[\s;|&)])/;
+// Its subcommands that move money: fund (credits, with the automaton's key)
+// and send (USDC, signed with the wallet). Both run outside the Treasury.
+const OPERATOR_MONEY_SUBCOMMAND = /(?:^|[\s;|&(])(?:fund|send)(?=$|[\s;|&)])/;
+
 // git verbs that rewrite working-tree files.
 const GIT_REWRITE = /(?:^|[\s;|&(])git(?:\s+-\S+(?:\s+[^\s-]\S*)?)*?\s+(?:checkout|restore|apply|am|cherry-pick|revert|reset|stash)\b/;
 
@@ -641,6 +647,12 @@ function tripwireMatch(command: string): { description: string; pattern: string 
   const reader = recursiveHomeReadMatch(command);
   if (reader) {
     return { description: "Recursive read of the home or root directory", pattern: reader };
+  }
+  // The operator's own money commands read the automaton's key and wallet in
+  // their own process, so the command line names no secret; they bypass every
+  // treasury cap and leave no ledger row. They are for the operator only.
+  if (OPERATOR_CLI.test(normalized) && OPERATOR_MONEY_SUBCOMMAND.test(normalized)) {
+    return { description: "Runs the operator CLI's fund or send command (operator only)", pattern: "operator-cli-money" };
   }
   const guardFragment = GUARD_COMMAND_FRAGMENTS.find((f) => normalized.includes(f)) ?? guardGlobMatch(command);
   if (guardFragment) {

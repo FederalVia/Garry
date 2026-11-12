@@ -215,6 +215,19 @@ describe("executeFund", () => {
     }
   });
 
+  it("reports an unrecognised 2xx status as unknown, not as done (review PAYMENTS-3)", async () => {
+    for (const status of ["on_hold", "review", "parked"]) {
+      const reply = (async () =>
+        new Response(JSON.stringify({ transfer_id: "t9", status }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+      const r = await executeFund(plan(), { paths: PATHS, fetch: reply, idempotencyKey: "KEY-U" });
+      expect(r.status).toBe("unknown");
+      if (r.status === "unknown") expect(r.error).toMatch(/unrecognised transfer status.*KEY-U/);
+    }
+  });
+
   it("escapes API-supplied error text, transfer id and status before they reach the terminal", async () => {
     const evil = "no\x1b]52;c;QUJD\x07\x1b[2K\rforged line";
     const refused = (async () => new Response(evil, { status: 402 })) as unknown as typeof fetch;

@@ -9,6 +9,7 @@
  */
 
 import { ulid } from "ulid";
+import { classifyTransferStatus } from "../conway/transfer-status.js";
 import { escapeForTerminal } from "../observability/terminal-safe.js";
 import { hasValidEvmChecksum, isValidAddress, isZeroAddress, normalizeAddress, type ChainType } from "../identity/chain.js";
 
@@ -302,8 +303,12 @@ export async function executeFund(
     const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
     const transferStatus = typeof data.status === "string" && data.status ? data.status : "submitted";
     // A 2xx can still carry a refusal; report it as a failure, not a submission.
-    if (/fail|error|reject|cancel|declin|insufficient|denied|refus|invalid|expired/i.test(transferStatus)) {
+    const statusClass = classifyTransferStatus(transferStatus);
+    if (statusClass === "rejected") {
       return { status: "failed", idempotencyKey: key, error: `Credit transfer ${transferStatus} (${path})` };
+    }
+    if (statusClass === "unknown") {
+      return unknownOutcome(key, `Server answered with unrecognised transfer status "${transferStatus}" (${path})`);
     }
     const balance = Number(data.balance_after_cents ?? data.new_balance_cents);
     return {

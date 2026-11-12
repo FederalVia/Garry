@@ -388,6 +388,12 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "packages/cli/src/commands/fund",
   "packages/cli/src/commands/send",
   "audit-log",
+  // Signs ERC-8004 transactions with the wallet key (gas paid in ETH).
+  "registry/erc8004",
+  // Helpers guard code decides with: injection-defense folds text with
+  // text-normalize; the logger and the operator CLI escape with terminal-safe.
+  "agent/text-normalize",
+  "observability/terminal-safe",
 ]);
 
 /**
@@ -406,11 +412,19 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "operator",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
-const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts"]);
+// packages/ holds the workspace packages the root build compiles after the
+// runtime (`tsc && pnpm -r build`): the operator CLI's built commands, their
+// tsconfig (whose outDir can point at the protected dist/) and node_modules/.bin
+// shims the build runs. All of it is a build input or operator code.
+const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts", "packages"]);
 const CHECKOUT_ROOT_FILES = new Set([
   "package.json",
   "pnpm-lock.yaml",
   "package-lock.json",
+  // Workspace layout and install hooks: both decide what the build runs.
+  "pnpm-workspace.yaml",
+  ".pnpmfile.cjs",
+  ".pnpmfile.mjs",
   ".gitignore",
   "constitution.md",
 ]);
@@ -568,6 +582,8 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "conway/x402",
   "conway/topup",
   "conway/balance",
+  "conway/transfer-status",
+  "registry/erc8004",
   "heartbeat/tick-context",
   "operator/fund",
   "operator/send",

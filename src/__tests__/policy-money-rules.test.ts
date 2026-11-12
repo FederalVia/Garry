@@ -268,6 +268,26 @@ describe("rate limits count real effects, not allow decisions", () => {
       expect(rule(rules, id).evaluate(request(tool, {}))?.reasonCode).toBe("DB_UNAVAILABLE");
     }
   });
+
+  it("caps on-chain writes that spend wallet ETH on gas (review TREASURY-5)", () => {
+    const onchain = rule(rules, "rate.onchain_writes_daily");
+    expect(onchain.appliesTo).toEqual({ by: "name", names: ["give_feedback", "register_erc8004"] });
+    const tx = (id: string, status: string, created: string) =>
+      db.raw.prepare(
+        `INSERT INTO onchain_transactions (id, tx_hash, chain, operation, status, created_at)
+         VALUES (?, ?, 'eip155:8453', 'leaveFeedback', ?, ${created})`,
+      ).run(id, `0x${id}`, status);
+    // Allow decisions alone do not count; a day-old transaction does not either.
+    logAllow("give_feedback", 10);
+    tx("old", "confirmed", "datetime('now', '-25 hours')");
+    for (let i = 0; i < 4; i++) tx(`t${i}`, i === 0 ? "failed" : "pending", "datetime('now')");
+    expect(onchain.evaluate(request("give_feedback", {}, { db }))).toBeNull();
+    // A reverted transaction still paid gas, so every status counts.
+    tx("t4", "failed", "datetime('now', '-1 hours')");
+    const denied = onchain.evaluate(request("register_erc8004", {}, { db }));
+    expect(denied?.action).toBe("deny");
+    expect(denied?.reasonCode).toBe("RATE_LIMIT_ONCHAIN");
+  });
 });
 
 // ─── Confirmation threshold ─────────────────────────────────────

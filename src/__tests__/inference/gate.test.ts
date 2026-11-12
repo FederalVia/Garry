@@ -381,6 +381,17 @@ describe("survival allowance and tier (D7, D8)", () => {
     expect(refusal(() => g.reserve(req(1, SURVIVAL))).code).toBe("SURVIVAL_ALLOWANCE");
   });
 
+  it("a daily cap of 0 refuses paid survival turns too, but not free local ones (review INFERENCE-1)", () => {
+    const g = newGate(policy({ daily: 0 }));
+    expect(refusal(() => g.reserve(req(1))).code).toBe("HOURLY_CAP");
+    const survival = refusal(() => g.reserve(req(1, SURVIVAL, { callId: "s1" })));
+    expect(survival.code).toBe("SURVIVAL_ALLOWANCE");
+    expect(survival.retryAfterMs).toBeNull();
+    expect(g.headroom("survival").allowed).toBe(false);
+    const local = { provider: "ollama", price: { inputUsdPerM: 0, outputUsdPerM: 0, local: true } };
+    expect(() => g.reserve(req(1, SURVIVAL, { callId: "s2", ...local }))).not.toThrow();
+  });
+
   it("pauses paid orchestration at low_compute, critical and unknown, and every paid class at dead", () => {
     const g = newGate(policy({ daily: 50_000 }));
     for (const tier of ["low_compute", "critical", "unknown"] as const) {
@@ -505,6 +516,16 @@ describe("classifyInferenceError", () => {
     expect(classifyInferenceError(new InferenceHttpError("conway", 503, "busy", 1500))).toMatchObject({ retrySameProvider: true, retryAfterMs: 1500 });
     expect(classifyInferenceError(status(502))).toMatchObject({ kind: "server", retrySameProvider: false, failover: true, countsForBreaker: true });
     expect(classifyInferenceError(status(504))).toMatchObject({ kind: "server", retrySameProvider: false, failover: true });
+  });
+
+  it("holds gateway errors and request timeouts after a send as unknown (review INFERENCE-2)", () => {
+    for (const code of [502, 504, 408]) {
+      expect(classifyInferenceError(status(code))).toMatchObject({ kind: "server", settle: "unknown", failover: true });
+    }
+    // The provider's own server errors and rate limits did not bill.
+    for (const code of [500, 503, 429]) {
+      expect(classifyInferenceError(status(code))).toMatchObject({ settle: "release" });
+    }
   });
 
   it("separates never-sent from ambiguous connection failures", () => {

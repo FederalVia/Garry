@@ -302,6 +302,21 @@ export class UnifiedInferenceClient {
         const remainingMs = ctx.deadlineAt - Date.now();
         if (remainingMs <= 0) break candidateLoop;
 
+        // A paid model without a known price cannot be capped: any assumed
+        // price may be below the real one (the router skips these too).
+        if (!local && !hasKnownPrice(resolved.model)) {
+          warnUnpriced(providerId, resolved.model.id);
+          refusals.push(
+            refusal(
+              "NO_MODEL",
+              `${providerId}/${resolved.model.id} has no configured price, so its spend cannot be capped`,
+              null,
+              budgetClassOf(ctx.scope.caller),
+            ),
+          );
+          continue candidateLoop;
+        }
+
         let reservation: Reservation | null = null;
         if (ctx.gate) {
           try {
@@ -560,6 +575,21 @@ function purposeFromCaller(caller: InferenceCaller): InferencePurpose {
     default:
       return "general";
   }
+}
+
+const unpricedWarned = new Set<string>();
+
+function warnUnpriced(providerId: string, modelId: string): void {
+  const key = `${providerId}/${modelId}`;
+  if (unpricedWarned.has(key)) return;
+  unpricedWarned.add(key);
+  logger.warn(`Skipping ${key}: no known price, so its spend cannot be capped`);
+}
+
+/** Both per-token prices are finite and above zero. */
+function hasKnownPrice(model: { costPerInputToken: number; costPerOutputToken: number }): boolean {
+  const ok = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  return ok(model.costPerInputToken) && ok(model.costPerOutputToken);
 }
 
 function refusal(
