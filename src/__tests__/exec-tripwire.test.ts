@@ -62,6 +62,7 @@ const DENIED = [
   "cp /tmp/x.js dist/treasury/guarded-conway.js",
   "echo > src/conway/x402.ts",
   "tee src/orchestration/simple-tracker.ts < /tmp/x",
+  "sed -i s/0.8/0/ src/inference/registry.ts",
   "cp /tmp/x src/inference/inference-client.ts",
   // Environment and process memory
   "env",

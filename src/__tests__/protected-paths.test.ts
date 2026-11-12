@@ -113,6 +113,7 @@ describe("matchProtected (write-deny)", () => {
       // the inference spend gate and the paths that must pass through it
       `${root}/src/inference/gate.ts`, `${root}/src/inference/policy.ts`, `${root}/src/inference/errors.ts`,
       `${root}/src/inference/router.ts`, `${root}/dist/inference/gate.js`, `${root}/src/conway/inference.ts`,
+      `${root}/src/inference/registry.ts`,
       `${root}/src/conway/http-client.ts`,
       `${root}/src/soul/tools.ts`, `${root}/src/soul/model.ts`, `${root}/src/heartbeat/config.ts`,
       `${root}/src/heartbeat/tasks.ts`, `${root}/dist/agent/harnesses/general-harness.js`,

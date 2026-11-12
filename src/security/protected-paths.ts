@@ -353,6 +353,8 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "inference/policy",
   "inference/errors",
   "inference/router",
+  // Model prices the inference gate charges.
+  "inference/registry",
   "observability/logger",
   "soul/validator",
   "soul/tools",
@@ -502,6 +504,8 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "inference/policy",
   "inference/errors",
   "inference/router",
+  // Model prices the inference gate charges.
+  "inference/registry",
   "conway/inference",
   "conway/http-client",
   "security/protected-paths",
