@@ -97,6 +97,42 @@ export async function gitCommit(
 }
 
 /**
+ * Commit only the given paths. Other staged, modified or untracked files in
+ * the repo stay out of the commit. Returns null when the paths have no
+ * changes (no empty commits).
+ */
+export async function gitCommitPaths(
+  conway: ConwayClient,
+  repoPath: string,
+  message: string,
+  paths: string[],
+): Promise<string | null> {
+  if (paths.length === 0) return null;
+  const repo = escapeShellArg(repoPath);
+  const pathspec = paths.map(escapeShellArg).join(" ");
+
+  const add = await conway.exec(`cd ${repo} && git add -- ${pathspec} 2>&1`, 10000);
+  if (add.exitCode !== 0) {
+    throw new Error(`Git add failed: ${add.stderr || add.stdout}`);
+  }
+
+  const status = await conway.exec(`cd ${repo} && git status --porcelain -- ${pathspec}`, 10000);
+  if (status.exitCode !== 0) {
+    throw new Error(`Git status failed: ${status.stderr || status.stdout}`);
+  }
+  if (!status.stdout.trim()) return null;
+
+  const result = await conway.exec(
+    `cd ${repo} && git commit -m ${escapeShellArg(message)} -- ${pathspec} 2>&1`,
+    10000,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`Git commit failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout;
+}
+
+/**
  * Get git log.
  */
 export async function gitLog(

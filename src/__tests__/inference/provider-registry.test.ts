@@ -120,6 +120,9 @@ describe("ProviderRegistry", () => {
     expect(providers).toHaveLength(1);
     expect(providers[0].name).toBe("OpenAI Custom");
     expect(registry.resolveModel("reasoning").model.id).toBe("gpt-x");
+    // The file cannot redirect a known provider: endpoint and key var stay pinned.
+    expect(providers[0].baseUrl).toBe("https://api.openai.com/v1");
+    expect(providers[0].apiKeyEnvVar).toBe("OPENAI_API_KEY");
   });
 
   it("fromConfig applies custom tier defaults", () => {

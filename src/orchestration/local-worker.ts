@@ -5,6 +5,7 @@
  * Each worker executes through a harness chosen by role via HarnessRegistry.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
@@ -25,9 +26,60 @@ import type {
 } from "../types.js";
 import type { Database } from "better-sqlite3";
 import type { PolicyEngine } from "../agent/policy-engine.js";
+import { homeDir, runtimeRoot, stateDir } from "../security/protected-paths.js";
 
 const logger = createLogger("orchestration.local-worker");
-const DEFAULT_ALLOWED_EDIT_ROOT = process.cwd();
+
+function tryRealpath(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function isWithin(child: string, root: string): boolean {
+  return child === root || child.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+function overlaps(a: string, b: string): boolean {
+  return isWithin(a, b) || isWithin(b, a);
+}
+
+const warnedEditRoots = new Set<string>();
+
+/**
+ * Edit root for a worker. Workers write files and run commands there, so it
+ * must not be the runtime checkout, the state directory (outside its
+ * workspace), HOME or /. Any of those, or an unresolvable path, falls back
+ * to the goal's workspace.
+ */
+export function resolveWorkerEditRoot(configured: string | undefined, workspaceBase: string): string {
+  const workspace = tryRealpath(workspaceBase) ?? path.resolve(workspaceBase);
+  if (!configured) return workspace;
+
+  const fallback = (why: string): string => {
+    if (!warnedEditRoots.has(configured)) {
+      warnedEditRoots.add(configured);
+      logger.warn(`Worker edit root ${configured} ${why}; using the goal workspace instead`);
+    }
+    return workspace;
+  };
+
+  const real = tryRealpath(path.resolve(configured));
+  if (!real) return fallback("cannot be resolved");
+  if (real === path.parse(real).root) return fallback("is the filesystem root");
+  const home = tryRealpath(homeDir()) ?? path.resolve(homeDir());
+  if (real === home) return fallback("is the home directory");
+  const runtime = tryRealpath(runtimeRoot()) ?? path.resolve(runtimeRoot());
+  if (overlaps(real, runtime)) return fallback("overlaps the runtime checkout");
+  const state = tryRealpath(stateDir()) ?? path.resolve(stateDir());
+  const stateWorkspace = path.join(state, "workspace");
+  if (overlaps(real, state) && !isWithin(real, stateWorkspace)) {
+    return fallback("overlaps the state directory");
+  }
+  return real;
+}
 
 interface LocalWorkerConfig {
   db: Database;
@@ -101,7 +153,7 @@ export class LocalWorkerPool {
   private async runWorker(workerId: string, task: TaskNode, signal: AbortSignal): Promise<void> {
     const harness = this.config.harnessRegistry.createForRole(task.agentRole);
     const workspace = new AgentWorkspace(task.goalId);
-    const allowedEditRoot = path.resolve(this.config.allowedEditRoot ?? DEFAULT_ALLOWED_EDIT_ROOT);
+    const allowedEditRoot = resolveWorkerEditRoot(this.config.allowedEditRoot, workspace.basePath);
     const workerIdentity = createWorkerIdentity(this.config.identity, workerId, task.agentRole);
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,

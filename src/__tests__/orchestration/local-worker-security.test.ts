@@ -1,4 +1,5 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GeneralHarness } from "../../agent/harnesses/general-harness.js";
@@ -40,7 +41,7 @@ describe("agent/general-harness security", () => {
 
   beforeEach(() => {
     db = createTestDb();
-    testRoot = mkdtempSync(path.join(process.cwd(), ".tmp-general-harness-"));
+    testRoot = mkdtempSync(path.join(os.tmpdir(), "general-harness-"));
   });
 
   afterEach(() => {
@@ -48,11 +49,12 @@ describe("agent/general-harness security", () => {
     rmSync(testRoot, { recursive: true, force: true });
   });
 
-  async function createHarness(conway: ConwayClient) {
+  async function createHarness(conway: ConwayClient, mode: "local" | "remote") {
     const harness = new GeneralHarness();
     const workspace = new AgentWorkspace("goal-test", path.join(testRoot, "workspace"));
     const identity = createTestIdentity();
-    const config = createTestConfig();
+    // Local mode (no sandbox) is where the harness touches the host filesystem.
+    const config = mode === "local" ? createTestConfig({ sandboxId: "" }) : createTestConfig();
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,
       allowedEditRoot: testRoot,
@@ -111,8 +113,9 @@ describe("agent/general-harness security", () => {
     conway: ConwayClient,
     toolName: string,
     args: Record<string, unknown>,
+    mode: "local" | "remote" = "remote",
   ): Promise<string> {
-    const harness = await createHarness(conway);
+    const harness = await createHarness(conway, mode);
     const tool = harness.getToolDefs().find((entry) => entry.name === toolName);
     if (!tool) throw new Error(`missing tool: ${toolName}`);
     return tool.execute(args);
@@ -160,31 +163,42 @@ describe("agent/general-harness security", () => {
     expect(out).toContain("FORBIDDEN_COMMAND");
   });
 
-  it("allows normal read_file paths inside the allowed edit root", async () => {
+  it("allows normal read_file paths inside the allowed edit root in local mode", async () => {
     const filePath = path.join(testRoot, "notes.txt");
     mkdirSync(path.dirname(filePath), { recursive: true });
     writeFileSync(filePath, "hello", "utf8");
 
-    const conway = createConwayStub({
-      readFile: async () => {
-        throw new Error("force local fallback");
-      },
-    });
-
-    const out = await runTool(conway, "read_file", { path: filePath });
+    const out = await runTool(createConwayStub(), "read_file", { path: filePath }, "local");
     expect(out).toBe("hello");
   });
 
-  it("allows normal write_file paths inside the allowed edit root", async () => {
+  it("allows normal write_file paths inside the allowed edit root in local mode", async () => {
     const filePath = path.join(testRoot, "out", "data.txt");
+
+    const out = await runTool(createConwayStub(), "write_file", { path: filePath, content: "ok" }, "local");
+    expect(out).toContain("Wrote 2 bytes");
+    expect(readFileSync(filePath, "utf8")).toBe("ok");
+  });
+
+  it("in remote mode, a failing sandbox gives an error and nothing is read or written on the host", async () => {
+    const existing = path.join(testRoot, "notes.txt");
+    writeFileSync(existing, "host-only", "utf8");
+    const fresh = path.join(testRoot, "out", "data.txt");
     const conway = createConwayStub({
+      readFile: async () => {
+        throw new Error("sandbox unavailable");
+      },
       writeFile: async () => {
-        throw new Error("force local fallback");
+        throw new Error("sandbox unavailable");
       },
     });
 
-    const out = await runTool(conway, "write_file", { path: filePath, content: "ok" });
-    expect(out).toContain("Wrote 2 bytes");
-    expect(readFileSync(filePath, "utf8")).toBe("ok");
+    const readOut = await runTool(conway, "read_file", { path: existing });
+    const writeOut = await runTool(conway, "write_file", { path: fresh, content: "ok" });
+
+    expect(readOut).toContain("read error");
+    expect(readOut).not.toContain("host-only");
+    expect(writeOut).toContain("write error");
+    expect(existsSync(fresh)).toBe(false);
   });
 });

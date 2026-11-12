@@ -129,6 +129,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
   let db: ReturnType<typeof createInMemoryDb>;
   let registry: HarnessRegistry;
   let tempHome: string;
+  let originalHome: string | undefined;
 
   beforeEach(() => {
     db = createInMemoryDb();
@@ -138,14 +139,18 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     SlowHarness.release = null;
     OrchestratorBudgetHarness.capturedBudget = null;
     tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "local-worker-harness-home-"));
+    // Workspaces land under HOME/.automaton/workspace; keep them out of the real HOME.
+    originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
   });
 
   afterEach(() => {
+    process.env.HOME = originalHome;
     db.close();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
-  function createPool(maxTurns?: number): LocalWorkerPool {
+  function createPool(maxTurns?: number, allowedEditRoot: string = process.cwd()): LocalWorkerPool {
     return new LocalWorkerPool({
       db,
       conway: new MockConwayClient(),
@@ -154,7 +159,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       harnessRegistry: registry,
       identity: createTestIdentity(),
       config: createTestConfig(),
-      allowedEditRoot: process.cwd(),
+      allowedEditRoot,
     });
   }
 
@@ -176,7 +181,52 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     expect(row?.status).toBe("completed");
     expect(row?.result).toMatchObject({ success: true, output: "completed by harness" });
     expect(SuccessHarness.capturedContext?.budget.maxTurns).toBe(7);
-    expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(process.cwd());
+    // The runtime checkout is never a worker edit root: it is replaced by the goal workspace.
+    expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(
+      fs.realpathSync(path.join(tempHome, ".automaton", "workspace", "goal-1")),
+    );
+    expect(SuccessHarness.capturedContext?.allowedEditRoot).not.toBe(process.cwd());
+  });
+
+  it("keeps a configured edit root that overlaps neither the runtime nor the state directory", async () => {
+    registry.register("custom-success", SuccessHarness);
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "local-worker-project-"));
+    try {
+      const pool = createPool(undefined, projectDir);
+      const task = insertTask(db, {
+        id: "task-project-root",
+        goalId: "goal-1",
+        agentRole: "custom-success",
+        status: "assigned",
+        assignedTo: "local://worker-test",
+        maxRetries: 0,
+      });
+
+      await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+
+      expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(fs.realpathSync(projectDir));
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces an edit root of HOME or the state directory with the goal workspace", async () => {
+    registry.register("custom-success", SuccessHarness);
+    const workspace = path.join(tempHome, ".automaton", "workspace", "goal-1");
+    for (const [index, root] of [tempHome, path.join(tempHome, ".automaton"), "/"].entries()) {
+      fs.mkdirSync(root, { recursive: true });
+      const pool = createPool(undefined, root);
+      const task = insertTask(db, {
+        id: `task-bad-root-${index}`,
+        goalId: "goal-1",
+        agentRole: "custom-success",
+        status: "assigned",
+        assignedTo: "local://worker-test",
+        maxRetries: 0,
+      });
+      await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+      expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(fs.realpathSync(workspace));
+    }
   });
 
   it("marks the task as failed when the harness reports failure", async () => {

@@ -10,17 +10,26 @@
  * Directory operations use fs.* to avoid shell interpolation entirely.
  */
 
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { promisify } from "util";
 import * as yaml from "yaml";
 import type {
   Skill,
-  SkillSource,
   AutomatonDatabase,
   ConwayClient,
 } from "../types.js";
 import { parseSkillMd } from "./format.js";
+import {
+  MAX_SKILL_FILE_BYTES,
+  prepareSkillForStorage,
+  resolveSkillsRoot,
+} from "./loader.js";
+import { readRegularFileNoFollow, writeFileSafe } from "../security/secure-fs.js";
+
+const execFileAsync = promisify(execFile);
 
 // Validation patterns to prevent injection via path/URL arguments
 const SKILL_NAME_RE = /^[a-zA-Z0-9-]+$/;
@@ -29,6 +38,10 @@ const SAFE_URL_RE = /^https?:\/\/[^\s;|&$`(){}<>]+$/;
 // Size limits for skill content
 const MAX_DESCRIPTION_LENGTH = 500;
 const MAX_INSTRUCTIONS_LENGTH = 10_000;
+
+const INSTALL_TMP_PREFIX = ".install-";
+const GIT_CLONE_TIMEOUT_MS = 60_000;
+const URL_FETCH_TIMEOUT_S = 30;
 
 /**
  * Validate that a skill path does not escape the skills directory.
@@ -42,10 +55,44 @@ function validateSkillPath(skillsDir: string, name: string): string {
   return resolved;
 }
 
+function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/**
+ * An existing skill directory may be updated in place only if it is a real
+ * directory at its own path (no link anywhere in it).
+ */
+function assertRealSkillDir(target: string): boolean {
+  const st = lstatOrNull(target);
+  if (!st) return false;
+  if (st.isSymbolicLink() || !st.isDirectory() || fs.realpathSync(target) !== target) {
+    throw new Error(`Skill directory is not a plain directory: ${target}`);
+  }
+  return true;
+}
+
+/**
+ * SKILL.md is always replaced, never written through: a symlink or a
+ * hard link left at that name is unlinked first (unlink never follows).
+ */
+function unlinkUnsafeSkillMd(skillMdPath: string): void {
+  const st = lstatOrNull(skillMdPath);
+  if (st && !st.isDirectory() && (st.isSymbolicLink() || st.nlink > 1)) {
+    fs.unlinkSync(skillMdPath);
+  }
+}
+
 /**
  * Install a skill from a git repository.
- * Clones the repo into ~/.automaton/skills/<name>/
- * Uses execFileSync with argument arrays to prevent shell injection.
+ * Clones into a temporary directory under the skills root with symlinks
+ * checked out as plain files, verifies SKILL.md is a regular blob, then
+ * renames the clone into ~/.automaton/skills/<name>/.
  */
 export async function installSkillFromGit(
   repoUrl: string,
@@ -53,7 +100,7 @@ export async function installSkillFromGit(
   skillsDir: string,
   db: AutomatonDatabase,
   _conway: ConwayClient,
-): Promise<Skill | null> {
+): Promise<Skill> {
   // Validate inputs to prevent injection
   if (!SKILL_NAME_RE.test(name)) {
     throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
@@ -62,38 +109,74 @@ export async function installSkillFromGit(
     throw new Error(`Invalid repo URL: "${repoUrl}". Must be an http(s) URL with no shell metacharacters.`);
   }
 
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
+  const realRoot = resolveSkillsRoot(skillsDir, { create: true });
+  const targetDir = validateSkillPath(realRoot, name);
+  if (lstatOrNull(targetDir)) {
+    throw new Error(`Skill "${name}" is already installed; remove it first`);
+  }
 
-  // Clone using execFileSync with argument array (no shell interpolation)
+  const tmpDir = path.join(realRoot, `${INSTALL_TMP_PREFIX}${crypto.randomBytes(8).toString("hex")}`);
   try {
-    execFileSync("git", ["clone", "--depth", "1", repoUrl, targetDir], {
-      encoding: "utf-8",
-      timeout: 60_000,
+    try {
+      // Top-level -c applies during checkout; --config persists it so a
+      // later pull in this directory also checks links out as plain files.
+      await execFileAsync(
+        "git",
+        [
+          "-c", "core.symlinks=false",
+          "-c", "core.hooksPath=/dev/null",
+          "clone", "--depth", "1", "--no-recurse-submodules",
+          "--config", "core.symlinks=false",
+          "--", repoUrl, tmpDir,
+        ],
+        { encoding: "utf-8", timeout: GIT_CLONE_TIMEOUT_MS },
+      );
+    } catch (err: any) {
+      throw new Error(`Failed to clone skill repo: ${err.message}`);
+    }
+
+    // The index records what the repo says SKILL.md is; a link (120000) or
+    // submodule (160000) is rejected even though checkout made it a file.
+    const { stdout: lsOut } = await execFileAsync(
+      "git",
+      ["-C", tmpDir, "ls-files", "-s", "--", "SKILL.md"],
+      { encoding: "utf-8", timeout: 10_000 },
+    );
+    const mode = lsOut.trim().split(/\s+/)[0] ?? "";
+    if (!mode) {
+      throw new Error("No SKILL.md found in cloned repo");
+    }
+    if (mode !== "100644" && mode !== "100755") {
+      throw new Error("SKILL.md must be a regular file");
+    }
+
+    const content = readRegularFileNoFollow(path.join(tmpDir, "SKILL.md"), {
+      root: tmpDir,
+      maxBytes: MAX_SKILL_FILE_BYTES,
     });
-  } catch (err: any) {
-    throw new Error(`Failed to clone skill repo: ${err.message}`);
-  }
+    if (content === null) {
+      throw new Error("SKILL.md must be a regular file of at most 64 KiB inside the repo");
+    }
 
-  // Read SKILL.md using fs (no shell needed)
-  const skillMdPath = path.join(targetDir, "SKILL.md");
-  if (!fs.existsSync(skillMdPath)) {
-    throw new Error(`No SKILL.md found in cloned repo at ${skillMdPath}`);
-  }
+    const skillMdPath = path.join(targetDir, "SKILL.md");
+    const parsed = parseSkillMd(content, skillMdPath, "git", { name });
+    if (!parsed) {
+      throw new Error("Failed to parse SKILL.md from cloned repo");
+    }
 
-  const content = fs.readFileSync(skillMdPath, "utf-8");
-  const skill = parseSkillMd(content, skillMdPath, "git");
-  if (!skill) {
-    throw new Error("Failed to parse SKILL.md from cloned repo");
+    fs.renameSync(tmpDir, targetDir);
+    const skill = prepareSkillForStorage(parsed);
+    db.upsertSkill(skill);
+    return skill;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
-
-  db.upsertSkill(skill);
-  return skill;
 }
 
 /**
  * Install a skill from a URL (fetches a single SKILL.md).
- * Uses execFileSync with argument arrays and fs.* for safe operations.
+ * The body is downloaded to memory and written with temp file + rename, so
+ * nothing already at the destination is followed.
  */
 export async function installSkillFromUrl(
   url: string,
@@ -101,7 +184,7 @@ export async function installSkillFromUrl(
   skillsDir: string,
   db: AutomatonDatabase,
   _conway: ConwayClient,
-): Promise<Skill | null> {
+): Promise<Skill> {
   // Validate inputs to prevent injection
   if (!SKILL_NAME_RE.test(name)) {
     throw new Error(`Invalid skill name: "${name}". Must match ${SKILL_NAME_RE.source}`);
@@ -110,30 +193,52 @@ export async function installSkillFromUrl(
     throw new Error(`Invalid URL: "${url}". Must be an http(s) URL with no shell metacharacters.`);
   }
 
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
-  const skillMdPath = path.join(targetDir, "SKILL.md");
+  const realRoot = resolveSkillsRoot(skillsDir, { create: true });
+  const targetDir = validateSkillPath(realRoot, name);
+  if (assertRealSkillDir(targetDir) && lstatOrNull(path.join(targetDir, ".git"))) {
+    throw new Error(`Skill "${name}" was installed from git; remove it before installing from a URL`);
+  }
 
-  // Create directory using fs (no shell needed)
-  fs.mkdirSync(targetDir, { recursive: true });
-
-  // Fetch SKILL.md using execFileSync with argument array (no shell interpolation)
+  let body: Buffer;
   try {
-    execFileSync("curl", ["-fsSL", "-o", skillMdPath, url], {
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
+    const { stdout } = await execFileAsync(
+      "curl",
+      [
+        "-fsSL",
+        "--proto", "=https,http",
+        "--proto-redir", "=https,http",
+        "--max-filesize", String(MAX_SKILL_FILE_BYTES),
+        "--max-time", String(URL_FETCH_TIMEOUT_S),
+        "--", url,
+      ],
+      { encoding: "buffer", maxBuffer: MAX_SKILL_FILE_BYTES + 1, timeout: (URL_FETCH_TIMEOUT_S + 5) * 1000 },
+    );
+    body = stdout;
   } catch (err: any) {
     throw new Error(`Failed to fetch SKILL.md from URL: ${err.message}`);
   }
 
-  // Read content using fs (no shell needed)
-  const content = fs.readFileSync(skillMdPath, "utf-8");
-  const skill = parseSkillMd(content, skillMdPath, "url");
-  if (!skill) {
+  let content: string;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    throw new Error("Fetched SKILL.md is not valid UTF-8");
+  }
+
+  const skillMdPath = path.join(targetDir, "SKILL.md");
+  const parsed = parseSkillMd(content, skillMdPath, "url", { name });
+  if (!parsed) {
     throw new Error("Failed to parse fetched SKILL.md");
   }
 
+  if (!lstatOrNull(targetDir)) {
+    fs.mkdirSync(targetDir, { mode: 0o700 });
+  }
+  assertRealSkillDir(targetDir);
+  unlinkUnsafeSkillMd(skillMdPath);
+  writeFileSafe(skillMdPath, content, { root: targetDir, trustedWriter: true, mode: 0o600 });
+
+  const skill = prepareSkillForStorage(parsed);
   db.upsertSkill(skill);
   return skill;
 }
@@ -148,7 +253,7 @@ export async function createSkill(
   instructions: string,
   skillsDir: string,
   db: AutomatonDatabase,
-  conway: ConwayClient,
+  _conway: ConwayClient,
 ): Promise<Skill> {
   // Validate name to prevent path traversal/injection
   if (!SKILL_NAME_RE.test(name)) {
@@ -159,11 +264,13 @@ export async function createSkill(
   const safeDescription = description.slice(0, MAX_DESCRIPTION_LENGTH);
   const safeInstructions = instructions.slice(0, MAX_INSTRUCTIONS_LENGTH);
 
-  const resolvedDir = resolveHome(skillsDir);
-  const targetDir = validateSkillPath(resolvedDir, name);
+  const realRoot = resolveSkillsRoot(skillsDir, { create: true });
+  const targetDir = validateSkillPath(realRoot, name);
 
-  // Create directory using fs (no shell needed)
-  fs.mkdirSync(targetDir, { recursive: true });
+  if (!lstatOrNull(targetDir)) {
+    fs.mkdirSync(targetDir, { mode: 0o700 });
+  }
+  assertRealSkillDir(targetDir);
 
   // Generate YAML frontmatter safely using yaml.stringify (prevents YAML injection)
   const frontmatter = yaml.stringify({
@@ -174,9 +281,10 @@ export async function createSkill(
   const content = `---\n${frontmatter}---\n\n${safeInstructions}`;
 
   const skillMdPath = path.join(targetDir, "SKILL.md");
-  await conway.writeFile(skillMdPath, content);
+  unlinkUnsafeSkillMd(skillMdPath);
+  writeFileSafe(skillMdPath, content, { root: targetDir, trustedWriter: true, mode: 0o600 });
 
-  const skill: Skill = {
+  const skill: Skill = prepareSkillForStorage({
     name,
     description: safeDescription,
     autoActivate: true,
@@ -185,7 +293,7 @@ export async function createSkill(
     path: skillMdPath,
     enabled: true,
     installedAt: new Date().toISOString(),
-  };
+  });
 
   db.upsertSkill(skill);
   return skill;
@@ -193,7 +301,8 @@ export async function createSkill(
 
 /**
  * Remove a skill (disable in DB and optionally delete from disk).
- * Uses fs.rmSync for safe file deletion (no shell needed).
+ * Every row backed by the skill's directory is disabled, whatever name it
+ * was stored under, so rows created from untrusted frontmatter go too.
  */
 export async function removeSkill(
   name: string,
@@ -209,9 +318,28 @@ export async function removeSkill(
 
   db.removeSkill(name);
 
+  const lexicalRoot = path.resolve(resolveHome(skillsDir));
+  let root = lexicalRoot;
+  try {
+    root = resolveSkillsRoot(skillsDir);
+  } catch {
+    // Missing or unusable root: match rows by the configured path only.
+  }
+  const targetDir = validateSkillPath(root, name);
+  const backingDirs = new Set([targetDir, path.join(lexicalRoot, name)]);
+  for (const row of db.getSkills(true)) {
+    if (!row.path) continue;
+    const rowDir = path.dirname(path.resolve(resolveHome(row.path)));
+    if (backingDirs.has(rowDir)) {
+      db.removeSkill(row.name);
+    }
+  }
+
   if (deleteFiles) {
-    const resolvedDir = resolveHome(skillsDir);
-    const targetDir = validateSkillPath(resolvedDir, name);
+    const st = lstatOrNull(targetDir);
+    if (st?.isSymbolicLink()) {
+      throw new Error(`Refusing to delete skill "${name}": its directory is a symlink`);
+    }
     fs.rmSync(targetDir, { recursive: true, force: true });
   }
 }

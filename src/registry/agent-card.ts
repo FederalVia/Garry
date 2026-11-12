@@ -10,6 +10,10 @@
  * added CORS headers and Content-Type.
  */
 
+import crypto from "crypto";
+import path from "path";
+import { writeFileSafe } from "../security/secure-fs.js";
+import { stateDir } from "../security/protected-paths.js";
 import type {
   AgentCard,
   AgentService,
@@ -84,14 +88,37 @@ export async function hostAgentCard(
 ): Promise<string> {
   const cardJson = serializeAgentCard(card);
 
-  // Phase 3.2: Write card as a separate JSON file (not interpolated into JS)
-  await conway.writeFile("/tmp/agent-card.json", cardJson);
+  // Fresh, unpredictable directory: mkdir fails if anything is already
+  // there, so no planted link can redirect the writes or the served file.
+  const dir = `/tmp/agent-card-${crypto.randomBytes(8).toString("hex")}`;
+  const mk = await conway.exec(`mkdir -m 700 '${dir}'`, 5000);
+  if (mk.exitCode !== 0) {
+    throw new Error(`Could not create agent card directory: ${mk.stderr || mk.stdout}`);
+  }
+  const cardPath = `${dir}/agent-card.json`;
+  const serverPath = `${dir}/agent-card-server.js`;
 
-  // Phase 3.2: Server reads the file at request time
+  // Phase 3.2: Write card as a separate JSON file (not interpolated into JS)
+  await conway.writeFile(cardPath, cardJson);
+
+  // The server reads the card once at startup, without following links,
+  // and serves that copy; later changes on disk are never published.
   const serverScript = `
 const http = require('http');
 const fs = require('fs');
-const path = '/tmp/agent-card.json';
+const cardPath = ${JSON.stringify(cardPath)};
+
+function loadCard() {
+  const fd = fs.openSync(cardPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.nlink !== 1 || st.size > 65536) throw new Error('unsafe card file');
+    return fs.readFileSync(fd, 'utf-8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+const data = loadCard();
 
 const server = http.createServer((req, res) => {
   // CORS headers
@@ -107,14 +134,8 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url === '/.well-known/agent-card.json' || req.url === '/agent-card.json') {
-    try {
-      const data = fs.readFileSync(path, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(data);
-    } catch (err) {
-      res.writeHead(500);
-      res.end('Internal Server Error');
-    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(data);
   } else {
     res.writeHead(404);
     res.end('Not Found');
@@ -124,11 +145,11 @@ const server = http.createServer((req, res) => {
 server.listen(${port}, () => console.log('Agent card server on port ' + ${port}));
 `;
 
-  await conway.writeFile("/tmp/agent-card-server.js", serverScript);
+  await conway.writeFile(serverPath, serverScript);
 
   // Start server in background
   await conway.exec(
-    `node /tmp/agent-card-server.js &`,
+    `node '${serverPath}' &`,
     5000,
   );
 
@@ -143,9 +164,9 @@ server.listen(${port}, () => console.log('Agent card server on port ' + ${port})
  */
 export async function saveAgentCard(
   card: AgentCard,
-  conway: ConwayClient,
+  _conway: ConwayClient,
 ): Promise<void> {
   const cardJson = serializeAgentCard(card);
-  const home = process.env.HOME || "/root";
-  await conway.writeFile(`${home}/.automaton/agent-card.json`, cardJson);
+  // The state dir is local; temp + rename so a link at this name is refused.
+  writeFileSafe(path.join(stateDir(), "agent-card.json"), cardJson, { trustedWriter: true, mode: 0o644 });
 }

@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { ChatMessage } from "../types.js";
+import { redactChatMessages } from "../security/secret-redaction.js";
 import {
   ProviderRegistry,
   type ModelTier,
@@ -274,7 +275,8 @@ export class UnifiedInferenceClient {
   private buildChatCompletionRequest(modelId: string, params: SharedChatParams): Record<string, unknown> {
     const payload: Record<string, unknown> = {
       model: modelId,
-      messages: params.messages.map((message) => ({
+      // Known secret values never leave for a provider.
+      messages: redactChatMessages(params.messages).map((message) => ({
         role: message.role,
         content: message.content,
         ...(message.name ? { name: message.name } : {}),

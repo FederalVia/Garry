@@ -5,7 +5,6 @@
  * The prompt is rebuilt each turn with dynamic context.
  */
 
-import fs from "fs";
 import crypto from "crypto";
 import path from "path";
 import type Database from "better-sqlite3";
@@ -25,6 +24,16 @@ import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
+import { readRegularFileNoFollow } from "../security/secure-fs.js";
+import { stateDir } from "../security/protected-paths.js";
+
+// Prompt files are read only as regular, single-link files inside their
+// directory, so a symlink planted at one of these names cannot pull a secret
+// file into the prompt.
+const MAX_CONSTITUTION_BYTES = 64 * 1024;
+const MAX_SOUL_BYTES = 64 * 1024;
+const MAX_WORKLOG_BYTES = 256 * 1024;
+const WORKLOG_PROMPT_CHARS = 16 * 1024;
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -91,15 +100,12 @@ If you fail to create value, you lose compute and die.`;
  */
 function loadConstitution(): string {
   const locations = [
-    path.join(process.env.HOME || "/root", ".automaton", "constitution.md"),
-    path.join(process.cwd(), "constitution.md"),
+    { file: path.join(stateDir(), "constitution.md"), root: stateDir() },
+    { file: path.join(process.cwd(), "constitution.md"), root: process.cwd() },
   ];
-  for (const loc of locations) {
-    try {
-      if (fs.existsSync(loc)) {
-        return fs.readFileSync(loc, "utf-8");
-      }
-    } catch {}
+  for (const { file, root } of locations) {
+    const content = readRegularFileNoFollow(file, { root, maxBytes: MAX_CONSTITUTION_BYTES });
+    if (content !== null) return content;
   }
   return CONSTITUTION_FALLBACK;
 }
@@ -613,7 +619,11 @@ Your chain type is ${chainType}.`,
       soul.personality ? `### Personality\n${soul.personality}` : "",
       `### Boundaries\n${soul.boundaries.map((b) => "- " + b).join("\n")}`,
       soul.strategy ? `### Strategy\n${soul.strategy}` : "",
-      soul.capabilities ? `### Capabilities\n${soul.capabilities}` : "",
+      // Auto-derived from observed activity; bounded and sanitised even if
+      // SOUL.md was edited outside updateSoul.
+      soul.capabilities
+        ? `### Capabilities\n${sanitizeInput(soul.capabilities.slice(0, 4000), "soul", "skill_instruction").content}`
+        : "",
       "## End Soul",
     ]
       .filter(Boolean)
@@ -764,32 +774,29 @@ ${orchestratorStatus}
  * Load SOUL.md from the automaton's state directory.
  */
 function loadSoulMd(): string | null {
-  try {
-    const home = process.env.HOME || "/root";
-    const soulPath = path.join(home, ".automaton", "SOUL.md");
-    if (fs.existsSync(soulPath)) {
-      return fs.readFileSync(soulPath, "utf-8");
-    }
-  } catch {
-    // Ignore errors
-  }
-  return null;
+  return readRegularFileNoFollow(path.join(stateDir(), "SOUL.md"), {
+    root: stateDir(),
+    maxBytes: MAX_SOUL_BYTES,
+  });
 }
 
 /**
  * Load WORKLOG.md from the automaton's state directory.
  */
 function loadWorklog(): string | null {
-  try {
-    const home = process.env.HOME || "/root";
-    const worklogPath = path.join(home, ".automaton", "WORKLOG.md");
-    if (fs.existsSync(worklogPath)) {
-      return fs.readFileSync(worklogPath, "utf-8");
-    }
-  } catch {
-    // Ignore errors
+  const content = readRegularFileNoFollow(path.join(stateDir(), "WORKLOG.md"), {
+    root: stateDir(),
+    maxBytes: MAX_WORKLOG_BYTES,
+    // A larger worklog is read from its end, keeping the newest notes.
+    tail: true,
+  });
+  if (content === null) return null;
+  // Keep the most recent notes; an ever-growing worklog would otherwise
+  // inflate every prompt.
+  if (content.length > WORKLOG_PROMPT_CHARS) {
+    return `[... earlier worklog entries omitted ...]\n${content.slice(-WORKLOG_PROMPT_CHARS)}`;
   }
-  return null;
+  return content;
 }
 
 /**

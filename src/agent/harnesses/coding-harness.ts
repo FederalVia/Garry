@@ -1,16 +1,19 @@
-import { exec as execCb } from "node:child_process";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import type { TaskResult } from "../../orchestration/task-graph.js";
-import { isProtectedFile } from "../../self-mod/code.js";
 import { BaseHarness } from "./base-harness.js";
 import type { HarnessTool } from "../harness-types.js";
 import { getForbiddenCommandMatch, isForbiddenCommand } from "../policy-rules/command-safety.js";
-import { isSensitiveFile } from "../policy-rules/path-protection.js";
+import {
+  confineToWorkspace,
+  workerExec,
+  workerFsContext,
+  workerListDir,
+  workerPatchFile,
+  workerReadFile,
+  workerWriteFile,
+} from "./worker-fs-tools.js";
 
 const MAX_EXEC_TIMEOUT_MS = 60_000;
 const MAX_READ_SIZE = 20_000;
-const MAX_EXEC_OUTPUT = 16_000;
 const CONTEXT_COMPACTION_THRESHOLD_CHARS = 80_000;
 
 export class CodingHarness extends BaseHarness {
@@ -84,12 +87,7 @@ When calling task_done, provide:
           if (forbidden || isForbiddenCommand(command)) {
             return `Blocked: ${forbidden?.description ?? "Forbidden command pattern"}`;
           }
-          try {
-            const result = await this.context.conway.exec(command, timeoutMs);
-            return formatExecResult(result.stdout ?? "", result.stderr ?? "");
-          } catch {
-            return localExec(command, timeoutMs);
-          }
+          return workerExec(workerFsContext(this.context), command, timeoutMs);
         },
       },
       {
@@ -114,21 +112,7 @@ When calling task_done, provide:
           if (denied) {
             return denied;
           }
-          if (isProtectedFile(confined)) {
-            return `Blocked: protected file "${filePath}"`;
-          }
-          try {
-            await this.context.conway.writeFile(confined, content);
-            return `Wrote ${content.length} bytes to ${confined}`;
-          } catch {
-            try {
-              await fs.mkdir(path.dirname(confined), { recursive: true });
-              await fs.writeFile(confined, content, "utf8");
-              return `Wrote ${content.length} bytes to ${confined} (local)`;
-            } catch (error) {
-              return `write error: ${error instanceof Error ? error.message : String(error)}`;
-            }
-          }
+          return workerWriteFile(workerFsContext(this.context), confined, content);
         },
       },
       {
@@ -153,26 +137,9 @@ When calling task_done, provide:
           if (denied) {
             return denied;
           }
-          if (isSensitiveFile(filePath)) {
-            return `Blocked: sensitive file "${filePath}"`;
-          }
           const offset = typeof args.offset === "number" ? args.offset : 0;
           const limit = typeof args.limit === "number" ? Math.min(args.limit, MAX_READ_SIZE) : MAX_READ_SIZE;
-          try {
-            let content: string;
-            try {
-              content = await this.context.conway.readFile(confined);
-            } catch {
-              content = await fs.readFile(confined, "utf8");
-            }
-            const slice = content.slice(offset, offset + limit);
-            if (content.length > offset + limit) {
-              return slice + `\n[TRUNCATED: ${content.length - offset - limit} more chars. Use offset=${offset + limit} to continue.]`;
-            }
-            return slice || "(empty file)";
-          } catch (error) {
-            return `read error: ${error instanceof Error ? error.message : String(error)}`;
-          }
+          return workerReadFile(workerFsContext(this.context), confined, offset, limit);
         },
       },
       {
@@ -200,29 +167,7 @@ When calling task_done, provide:
           if (denied) {
             return denied;
           }
-          if (isProtectedFile(confined)) {
-            return `Blocked: protected file "${filePath}"`;
-          }
-          try {
-            let content: string;
-            try {
-              content = await this.context.conway.readFile(confined);
-            } catch {
-              content = await fs.readFile(confined, "utf8");
-            }
-            if (!content.includes(search)) {
-              return `Error: search string not found in ${filePath}. Make sure the search text matches exactly, including whitespace and newlines.`;
-            }
-            const patched = content.replace(search, replace);
-            try {
-              await this.context.conway.writeFile(confined, patched);
-            } catch {
-              await fs.writeFile(confined, patched, "utf8");
-            }
-            return `Patched ${filePath}: replaced ${search.length} chars with ${replace.length} chars`;
-          } catch (error) {
-            return `patch error: ${error instanceof Error ? error.message : String(error)}`;
-          }
+          return workerPatchFile(workerFsContext(this.context), confined, search, replace);
         },
       },
       {
@@ -245,12 +190,7 @@ When calling task_done, provide:
           if (denied) {
             return denied;
           }
-          try {
-            const entries = await fs.readdir(confined, { withFileTypes: true });
-            return entries.map((entry) => `${entry.isDirectory() ? "dir" : entry.isFile() ? "file" : "other"}\t${entry.name}`).join("\n") || "(empty directory)";
-          } catch (error) {
-            return `list error: ${error instanceof Error ? error.message : String(error)}`;
-          }
+          return workerListDir(workerFsContext(this.context), confined);
         },
       },
       {
@@ -299,40 +239,4 @@ When calling task_done, provide:
       }
     }
   }
-}
-
-function confineToWorkspace(
-  filePath: string,
-  allowedRoot: string,
-): string | { error: string } {
-  const expanded = filePath.startsWith("~")
-    ? path.join(allowedRoot, filePath.slice(1))
-    : filePath;
-  const resolved = path.resolve(allowedRoot, expanded);
-  if (resolved !== allowedRoot && !resolved.startsWith(allowedRoot + path.sep)) {
-    return { error: `Blocked: path "${filePath}" resolves outside workspace (${allowedRoot})` };
-  }
-  return resolved;
-}
-
-function formatExecResult(stdout: string, stderr: string): string {
-  const out = stdout.length > MAX_EXEC_OUTPUT
-    ? stdout.slice(0, MAX_EXEC_OUTPUT) + `\n[TRUNCATED: ${stdout.length - MAX_EXEC_OUTPUT} chars]`
-    : stdout;
-  const err = stderr.length > 4000
-    ? stderr.slice(0, 4000) + "\n[TRUNCATED]"
-    : stderr;
-  return err ? `stdout:\n${out}\nstderr:\n${err}` : out || "(no output)";
-}
-
-function localExec(command: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve) => {
-    execCb(command, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error && !stdout && !stderr) {
-        resolve(`exec error: ${error.message}`);
-        return;
-      }
-      resolve(formatExecResult(stdout ?? "", stderr ?? ""));
-    });
-  });
 }

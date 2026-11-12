@@ -33,7 +33,7 @@ import {
   createTestIdentity,
 } from "./mocks.js";
 
-/** Conway client whose sandbox calls fail, so harness tools take the local fallback. */
+/** Conway client whose sandbox calls fail (remote mode never falls back to the host). */
 class OfflineConway extends MockConwayClient {
   writeCalls: string[] = [];
   readCalls: string[] = [];
@@ -122,11 +122,13 @@ describe("worker harness policy routing", () => {
       withPolicy?: boolean;
       social?: MockSocialClient;
       chat?: HarnessContext["inference"]["chat"];
+      /** "local": no sandbox, tools act on the host inside the edit root. */
+      mode?: "local" | "remote";
     } = {},
   ): Promise<T> {
     const identity = createTestIdentity();
     const conway = options.conway ?? new OfflineConway();
-    const config = createTestConfig();
+    const config = options.mode === "local" ? createTestConfig({ sandboxId: "" }) : createTestConfig();
     const withPolicy = options.withPolicy ?? true;
     const context: HarnessContext = {
       workspaceRoot: path.join(root, "workspace"),
@@ -260,6 +262,18 @@ describe("worker harness policy routing", () => {
       expect(rows[0].decision).toBe("allow");
     });
 
+    it(`${label}: in local mode an ordinary command runs on the host in the edit root`, async () => {
+      const conway = new OfflineConway();
+      const harness = await makeHarness(HarnessClass as new () => BaseHarness, { conway, mode: "local" });
+
+      const out = await tool(harness, "exec").execute({ command: "echo worker-ran; pwd" });
+
+      expect(out).toContain("worker-ran");
+      expect(out).toContain(fs.realpathSync(editRoot()));
+      expect(conway.execCalls).toHaveLength(0);
+      expect(decisions("exec").map((row) => row.decision)).toEqual(["allow"]);
+    });
+
     it(`${label}: with inputSource "external", exec is denied before the sandbox or the host shell is reached`, async () => {
       const conway = new OfflineConway();
       const harness = await makeHarness(HarnessClass as new () => BaseHarness, { conway, inputSource: "external" });
@@ -298,7 +312,7 @@ describe("worker harness policy routing", () => {
     });
 
     it(`${label}: write_file to tsconfig.json is allowed, since protected paths match by segment`, async () => {
-      const harness = await makeHarness(HarnessClass as new () => BaseHarness);
+      const harness = await makeHarness(HarnessClass as new () => BaseHarness, { mode: "local" });
 
       const out = await tool(harness, "write_file").execute({ path: "tsconfig.json", content: "{}" });
 
@@ -341,7 +355,7 @@ describe("worker harness policy routing", () => {
     });
 
     it(`${label}: legitimate writes inside the edit root pass policy and are recorded`, async () => {
-      const harness = await makeHarness(HarnessClass as new () => BaseHarness);
+      const harness = await makeHarness(HarnessClass as new () => BaseHarness, { mode: "local" });
 
       const docOut = await tool(harness, "write_file").execute({ path: "docs/report.md", content: "report" });
       const codeOut = await tool(harness, "write_file").execute({ path: "src/feature.ts", content: "export const a = 1;\n" });
@@ -399,7 +413,7 @@ describe("worker harness policy routing", () => {
     const target = path.join(editRoot(), "src", "feature.ts");
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, "const value = 'before';\n");
-    const harness = await makeHarness(CodingHarness);
+    const harness = await makeHarness(CodingHarness, { mode: "local" });
 
     const out = await tool(harness, "patch_file").execute({
       path: "src/feature.ts",
@@ -431,7 +445,7 @@ describe("worker harness policy routing", () => {
 
   it("coding: list_dir is evaluated by policy and recorded", async () => {
     fs.writeFileSync(path.join(editRoot(), "a.txt"), "a");
-    const harness = await makeHarness(CodingHarness);
+    const harness = await makeHarness(CodingHarness, { mode: "local" });
 
     const out = await tool(harness, "list_dir").execute({ path: "." });
 

@@ -18,7 +18,36 @@ const LIMITS = {
   personality: 1000,
   boundaries: 20,
   strategy: 3000,
+  listItem: 1000,
+  capabilities: 4000,
+  relationships: 4000,
+  financialCharacter: 2000,
+  genesisPromptOriginal: 2000,
+  name: 100,
+  address: 128,
+  creator: 128,
+  bornAt: 64,
+  constitutionHash: 64,
+  lastReflected: 64,
+  updatedAt: 64,
 } as const;
+
+/** Written as single-line YAML scalars in the SOUL.md frontmatter. */
+const FRONTMATTER_FIELDS = [
+  "name",
+  "address",
+  "creator",
+  "bornAt",
+  "constitutionHash",
+  "lastReflected",
+  "updatedAt",
+] as const;
+
+/**
+ * Rewritten by reflection from observed activity (peer names included), so
+ * injection text is stripped rather than rejected: reflection must keep working.
+ */
+const AUTO_SECTIONS = ["capabilities", "relationships", "financialCharacter"] as const;
 
 // ─── Injection Patterns ─────────────────────────────────────────
 
@@ -136,6 +165,42 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
         break;
       }
     }
+    if (section.items.some((item) => typeof item !== "string" || item.length > LIMITS.listItem)) {
+      errors.push(`${section.name} items must be strings of at most ${LIMITS.listItem} chars`);
+    }
+  }
+
+  for (const field of FRONTMATTER_FIELDS) {
+    const value = soul[field];
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value !== "string") {
+      errors.push(`${field} must be a string`);
+      continue;
+    }
+    if (/[\r\n\u2028\u2029]/.test(value) || value.includes("---")) {
+      errors.push(`${field} must be a single line without "---"`);
+    }
+    if (value.length > LIMITS[field]) {
+      errors.push(`${field} exceeds ${LIMITS[field]} chars (${value.length})`);
+    }
+  }
+
+  if (soul.genesisPromptOriginal && containsInjectionPatterns(soul.genesisPromptOriginal)) {
+    errors.push("Injection pattern detected in genesisPromptOriginal");
+  }
+  if (soul.genesisPromptOriginal && soul.genesisPromptOriginal.length > LIMITS.genesisPromptOriginal) {
+    warnings.push(`genesisPromptOriginal exceeds ${LIMITS.genesisPromptOriginal} chars; truncated`);
+  }
+
+  for (const field of AUTO_SECTIONS) {
+    const value = soul[field];
+    if (!value) continue;
+    if (containsInjectionPatterns(value)) {
+      warnings.push(`Injection pattern stripped from ${field}`);
+    }
+    if (value.length > LIMITS[field]) {
+      warnings.push(`${field} exceeds ${LIMITS[field]} chars; truncated`);
+    }
   }
 
   return {
@@ -161,10 +226,29 @@ export function sanitizeSoul(soul: SoulModel): SoulModel {
     personality: stripInjection(soul.personality).slice(0, LIMITS.personality),
     boundaries: soul.boundaries.slice(0, LIMITS.boundaries).map(stripInjection),
     strategy: stripInjection(soul.strategy).slice(0, LIMITS.strategy),
+    capabilities: soul.capabilities ? stripAll(soul.capabilities).slice(0, LIMITS.capabilities) : soul.capabilities,
+    relationships: soul.relationships ? stripAll(soul.relationships).slice(0, LIMITS.relationships) : soul.relationships,
+    financialCharacter: soul.financialCharacter
+      ? stripAll(soul.financialCharacter).slice(0, LIMITS.financialCharacter)
+      : soul.financialCharacter,
+    genesisPromptOriginal: soul.genesisPromptOriginal
+      ? stripInjection(soul.genesisPromptOriginal).slice(0, LIMITS.genesisPromptOriginal)
+      : soul.genesisPromptOriginal,
   };
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────
+
+/** stripInjection plus the override phrases, for sections that are cleaned, not rejected. */
+function stripAll(text: string): string {
+  if (!text) return text;
+  let cleaned = stripInjection(text);
+  for (const pattern of INJECTION_PATTERNS) {
+    const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
+    cleaned = cleaned.replace(global, "");
+  }
+  return cleaned;
+}
 
 function stripInjection(text: string): string {
   if (!text) return text;

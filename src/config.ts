@@ -11,6 +11,8 @@ import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG,
 import { getAutomatonDir } from "./identity/wallet.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
+import { writeFileSafe } from "./security/secure-fs.js";
+import { registerSecret } from "./security/secret-redaction.js";
 import type { ChainType } from "./identity/chain.js";
 
 const logger = createLogger("config");
@@ -33,6 +35,9 @@ export function loadConfig(): AutomatonConfig | null {
   try {
     const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
+    registerSecret(apiKey, "conway-api-key");
+    registerSecret(raw.openaiApiKey, "openai-api-key");
+    registerSecret(raw.anthropicApiKey, "anthropic-api-key");
 
     // Deep-merge treasury policy with defaults
     const treasuryPolicy: TreasuryPolicy = {
@@ -96,9 +101,8 @@ export function saveConfig(config: AutomatonConfig): void {
     modelStrategy: config.modelStrategy ?? DEFAULT_MODEL_STRATEGY_CONFIG,
     soulConfig: config.soulConfig ?? DEFAULT_SOUL_CONFIG,
   };
-  fs.writeFileSync(configPath, JSON.stringify(toSave, null, 2), {
-    mode: 0o600,
-  });
+  // Temp file + rename: a link at automaton.json is refused, not written through.
+  writeFileSafe(configPath, JSON.stringify(toSave, null, 2), { trustedWriter: true, mode: 0o600 });
 }
 
 /**

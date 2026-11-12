@@ -567,7 +567,7 @@ describe("Source code injection safety", () => {
     expect(source).toMatch(/execFileSync\s*\(\s*"git"/);
   });
 
-  it("registry.ts uses execFileSync not conway.exec with interpolation", async () => {
+  it("registry.ts uses execFile argument arrays not conway.exec with interpolation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
       new URL("../skills/registry.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
@@ -575,8 +575,9 @@ describe("Source code injection safety", () => {
     );
     // Should NOT have template literals in conway.exec calls
     expect(source).not.toMatch(/conway\.exec\s*\(\s*`/);
-    // Should use execFileSync or fs.* instead
-    expect(source).toMatch(/execFileSync\s*\(/);
+    // Should use execFile (async, argument array, no shell) or fs.* instead
+    expect(source).toMatch(/execFileAsync\s*\(\s*\n?\s*"(git|curl)",\s*\n?\s*\[/);
+    expect(source).not.toMatch(/\bexec(Sync)?\s*\(\s*`/);
     expect(source).toMatch(/fs\.mkdirSync\(/);
     expect(source).toMatch(/fs\.rmSync\(/);
   });

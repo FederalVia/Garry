@@ -2,11 +2,22 @@
  * Command Safety Policy Rules
  *
  * Detects shell injection attempts and forbidden command patterns.
- * These rules are the primary defense; isForbiddenCommand() in tools.ts
- * is kept as defense-in-depth.
+ *
+ * The forbidden-command check is a TRIPWIRE, not a security boundary. It
+ * stops accidental damage and copy-pasted injection one-liners: it denies a
+ * command that names a secret (whatever the verb), globs hidden home paths,
+ * dumps the environment, kills the runtime, or writes to guard files. exec
+ * runs as the same OS user that owns the wallet, so interpreters, variable
+ * indirection or scripts written to disk get past any pattern list. Only
+ * privilege separation closes that.
  */
 
 import type { PolicyRule, PolicyRequest, PolicyRuleResult } from "../../types.js";
+import {
+  GUARD_COMMAND_FRAGMENTS,
+  SENSITIVE_COMMAND_FRAGMENTS,
+  homeDir,
+} from "../../security/protected-paths.js";
 
 // Shell metacharacters that could enable injection when interpolated
 const SHELL_METACHAR_RE = /[;|&$`\n(){}<>]/;
@@ -69,13 +80,87 @@ const FORBIDDEN_COMMAND_PATTERNS: { pattern: RegExp; description: string }[] = [
   { pattern: />\s*.*policy-rules/, description: "Overwrite policy rules" },
 ];
 
+/**
+ * Normalised copy of a command for the tripwire: lower-cased, quotes and
+ * backslashes removed, and the home directory spelled "~".
+ */
+export function normalizeCommand(command: string): string {
+  let out = command.replace(/["'\\`]/g, "");
+  const home = homeDir();
+  if (home && home !== "/") out = out.split(home).join("~");
+  out = out.toLowerCase();
+  out = out.replace(/\$\{home\}|\$home\b/g, "~");
+  out = out.replace(/(^|[^a-z0-9_.\-/])\/root(?=\/|$|[^a-z0-9_.\-])/g, "$1~");
+  return out;
+}
+
+/** State-dir entries a command may name. Anything else under .automaton trips. */
+const STATE_DIR_COMMAND_ALLOWED = /^\/(?:workspace|worklog\.md|skills|agent\.log|logs|runtime|soul\.md|heartbeat\.yml|constitution\.md)(?:\/|$)/;
+
+function automatonTokenMatch(normalized: string): string | null {
+  for (const token of normalized.split(/[\s;|&<>()=,]+/)) {
+    let index = token.indexOf(".automaton");
+    while (index >= 0) {
+      const rest = token.slice(index + ".automaton".length);
+      if (!STATE_DIR_COMMAND_ALLOWED.test(rest) || rest.includes("/..")) {
+        return token;
+      }
+      index = token.indexOf(".automaton", index + 1);
+    }
+  }
+  return null;
+}
+
+const WRITE_VERB = /(?:^|[\s;|&(])(?:cp|mv|tee|dd|install|ln|rsync|truncate|chmod|chown|rm|unlink|shred|touch)(?=\s)|(?:^|[\s;|&(])sed\s+(?:-[a-z]*i|--in-place)|(?:^|[\s;|&(])perl\s+-[a-z]*i|>(?!&|\s*\/dev\/null)/;
+
+const ENV_DUMP_PATTERNS: RegExp[] = [
+  /(?:^|[;&|(]|\s)env\s*(?:$|[|;&>])/,
+  /(?:^|[;&|(\s])printenv(?:\s|$|[|;&>])/,
+  /(?:^|[;&|(\s])export\s+-p\b/,
+  /(?:^|[;&|(\s])declare\s+-[a-z]*[xp]/,
+  /(?:^|[;&|(\s])compgen\s+-[a-z]*e/,
+  /(?:^|[;&|(])\s*set\s*(?:$|[|;&>])/,
+];
+
+const SELF_KILL_PATTERNS: RegExp[] = [
+  /(?:^|[;&|(\s])(?:pkill|killall)\b[^;&|]*\b(?:node|tsx|automaton)\b/,
+  /(?:^|[;&|(\s])kill\b[^;&|]*\$\((?:\s*)(?:pgrep|pidof)\b/,
+  /(?:^|[;&|(\s])kill\b[^;&|]*(?:\$\$|\$ppid\b|\s-1\b|\s1(?:\s|$))/,
+];
+
+function tripwireMatch(command: string): { description: string; pattern: string } | null {
+  const normalized = normalizeCommand(command);
+
+  for (const { re, label } of SENSITIVE_COMMAND_FRAGMENTS) {
+    if (re.test(normalized)) return { description: `References ${label}`, pattern: re.source };
+  }
+  const stateToken = automatonTokenMatch(normalized);
+  if (stateToken) {
+    return { description: "References the state directory outside its allowed entries", pattern: stateToken.slice(0, 80) };
+  }
+  if (/~\/\.[^\s/]*[*?[]/.test(normalized) || /(?:^|[\s/=])\.a(?:u(?:t(?:o(?:m(?:a(?:t(?:o(?:n)?)?)?)?)?)?)?)?[*?[]/.test(normalized)) {
+    return { description: "Glob over hidden home paths", pattern: "hidden-home-glob" };
+  }
+  for (const re of ENV_DUMP_PATTERNS) {
+    if (re.test(normalized)) return { description: "Dumps the process environment", pattern: re.source };
+  }
+  for (const re of SELF_KILL_PATTERNS) {
+    if (re.test(normalized)) return { description: "Kills the runtime process", pattern: re.source };
+  }
+  if (WRITE_VERB.test(normalized)) {
+    const fragment = GUARD_COMMAND_FRAGMENTS.find((f) => normalized.includes(f));
+    if (fragment) return { description: `Writes to guard file (${fragment})`, pattern: fragment };
+  }
+  return null;
+}
+
 export function getForbiddenCommandMatch(command: string): { description: string; pattern: string } | null {
   for (const { pattern, description } of FORBIDDEN_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
       return { description, pattern: pattern.source };
     }
   }
-  return null;
+  return tripwireMatch(command);
 }
 
 export function isForbiddenCommand(command: string): boolean {

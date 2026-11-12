@@ -10,6 +10,9 @@ import YAML from "yaml";
 import type { HeartbeatEntry, HeartbeatConfig, AutomatonDatabase } from "../types.js";
 import { getAutomatonDir } from "../identity/wallet.js";
 import { createLogger } from "../observability/logger.js";
+import { readRegularFileNoFollow, writeFileSafe } from "../security/secure-fs.js";
+
+const MAX_HEARTBEAT_CONFIG_BYTES = 256 * 1024;
 
 const logger = createLogger("heartbeat.config");
 
@@ -72,7 +75,15 @@ export function loadHeartbeatConfig(configPath?: string): HeartbeatConfig {
   }
 
   try {
-    const raw = fs.readFileSync(filePath, "utf-8");
+    // No-follow: a link or hard link at heartbeat.yml is ignored.
+    const raw = readRegularFileNoFollow(filePath, {
+      root: path.dirname(path.resolve(filePath)),
+      maxBytes: MAX_HEARTBEAT_CONFIG_BYTES,
+    });
+    if (raw === null) {
+      logger.warn("heartbeat.yml is not a regular file; using defaults");
+      return DEFAULT_HEARTBEAT_CONFIG;
+    }
     const parsed = YAML.parse(raw) || {};
 
     const parsedEntries = (parsed.entries || []).map((e: any) => ({
@@ -114,7 +125,7 @@ export function saveHeartbeatConfig(
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
-  fs.writeFileSync(filePath, YAML.stringify(config), { mode: 0o600 });
+  writeFileSafe(filePath, YAML.stringify(config), { trustedWriter: true, mode: 0o600 });
 }
 
 /**

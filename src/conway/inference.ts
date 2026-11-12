@@ -15,6 +15,7 @@ import type {
   InferenceToolDefinition,
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
+import { redactChatMessages } from "../security/secret-redaction.js";
 
 const INFERENCE_TIMEOUT_MS = 60_000;
 
@@ -58,9 +59,12 @@ export function createInferenceClient(
   let maxTokens = options.maxTokens;
 
   const chat = async (
-    messages: ChatMessage[],
+    rawMessages: ChatMessage[],
     opts?: InferenceOptions,
   ): Promise<InferenceResponse> => {
+    // Known secret values (wallet key, API keys, their hex/base64 forms)
+    // never leave for a provider, whatever a tool printed.
+    const messages = redactChatMessages(rawMessages);
     const model = opts?.model || currentModel;
     const tools = opts?.tools;
 

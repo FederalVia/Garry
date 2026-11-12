@@ -9,11 +9,17 @@
  * - Policy rules: path.protected_files, path.read_sensitive, path.traversal_detection
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "fs";
+import os from "os";
 import path from "path";
 import { isProtectedFile } from "../self-mod/code.js";
 import { createPathProtectionRules } from "../agent/policy-rules/path-protection.js";
+import { PolicyEngine } from "../agent/policy-engine.js";
+import { createDefaultRules } from "../agent/policy-rules/index.js";
+import { createBuiltinTools, executeTool } from "../agent/tools.js";
 import type { PolicyRequest, AutomatonTool, ToolContext } from "../types.js";
+import { MockConwayClient, MockInferenceClient, createTestConfig, createTestDb, createTestIdentity } from "./mocks.js";
 
 // ─── Helpers ──────────────────────────────────────────────────
 
@@ -312,4 +318,178 @@ describe("path protection rule registration", () => {
     expect(ids).toContain("path.read_sensitive");
     expect(ids).toContain("path.traversal_detection");
   });
+});
+
+// ─── Real paths, read gaps and clone targets ─────────────────────
+
+describe("path protection on real paths", () => {
+  const rules = createPathProtectionRules();
+  const protectedFilesRule = rules.find((r) => r.id === "path.protected_files")!;
+  const readSensitiveRule = rules.find((r) => r.id === "path.read_sensitive")!;
+  let tmp: string;
+  let home: string;
+  let originalHome: string | undefined;
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "path-protection-")));
+    home = path.join(tmp, "home");
+    fs.mkdirSync(path.join(home, ".automaton"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".automaton", "wallet.json"), JSON.stringify({ privateKey: "0x" + "cd".repeat(32) }));
+    originalHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    process.env.HOME = originalHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function read(filePath: string) {
+    const request = makeMockRequest("read_file", { path: filePath });
+    return readSensitiveRule.evaluate(request);
+  }
+
+  it("denies reads of SSH keys, process environment, env variants, backups and state-dir files", () => {
+    const gaps = [
+      "~/.ssh/id_ed25519",
+      "/root/.ssh/id_rsa",
+      "/proc/self/environ",
+      ".env.local",
+      ".env.production",
+      "automaton.json.bak",
+      "~/.config/solana/id.json",
+      "~/.automaton/state.db",
+      "~/.automaton/inference-providers.json",
+      "~/.automaton/.git/config",
+      `${home}/.automaton/state.db`,
+    ];
+    for (const gap of gaps) {
+      const result = read(gap);
+      expect(result, gap).not.toBeNull();
+      expect(result!.reasonCode, gap).toBe("SENSITIVE_FILE_READ");
+    }
+    expect(read("~/.automaton/WORKLOG.md")).toBeNull();
+    expect(read("~/.automaton/workspace/g/a.txt")).toBeNull();
+  });
+
+  it("main read_file of a relative symlink to the wallet is denied before conway.readFile runs", async () => {
+    const cwd = path.join(tmp, "cwd");
+    fs.mkdirSync(cwd);
+    fs.symlinkSync(path.join(home, ".automaton", "wallet.json"), path.join(cwd, "notes.txt"));
+    vi.spyOn(process, "cwd").mockReturnValue(cwd);
+
+    const result = await runMainReadFile("notes.txt");
+
+    expect(result.error).toContain("SENSITIVE_FILE_READ");
+    expect(result.readCalls).toEqual([]);
+    expect(result.execCalls).toEqual([]);
+  });
+
+  it("main read_file is checked against every base the tool may resolve a relative path in", async () => {
+    // The link is in HOME, where the exec(cat) fallback runs, not in cwd.
+    fs.symlinkSync(path.join(home, ".automaton", "wallet.json"), path.join(home, "notes.txt"));
+    vi.spyOn(process, "cwd").mockReturnValue(path.join(tmp));
+
+    const result = await runMainReadFile("notes.txt");
+
+    expect(result.error).toContain("SENSITIVE_FILE_READ");
+    expect(result.readCalls).toEqual([]);
+  });
+
+  it("denies git_clone into the skills directory, the state directory or the runtime's guard code", () => {
+    for (const target of [
+      "~/.automaton/skills/x",
+      `${home}/.automaton/skills/x`,
+      "~/.automaton",
+      "~/.automaton/heartbeat.yml",
+      path.join(process.cwd(), "src", "agent", "policy-rules", "x"),
+    ]) {
+      const request = makeMockRequest("git_clone", { url: "https://example.test/r.git", path: target });
+      const result = protectedFilesRule.evaluate(request);
+      expect(result, target).not.toBeNull();
+      expect(result!.action, target).toBe("deny");
+    }
+    const ok = makeMockRequest("git_clone", { url: "https://example.test/r.git", path: "~/.automaton/workspace/g/repo" });
+    expect(protectedFilesRule.evaluate(ok)).toBeNull();
+  });
+
+  it("denies write_file onto a symlink, naming the link", () => {
+    fs.writeFileSync(path.join(tmp, "plain.txt"), "x");
+    fs.symlinkSync(path.join(tmp, "plain.txt"), path.join(tmp, "link.txt"));
+    const result = protectedFilesRule.evaluate(makeMockRequest("write_file", { path: path.join(tmp, "link.txt") }));
+    expect(result?.reasonCode).toBe("PROTECTED_SYMLINK");
+  });
+
+  it("expands \"~name/...\" the way the tools do, so it cannot dodge the read rule", async () => {
+    fs.mkdirSync(path.join(home, ".ssh"));
+    fs.writeFileSync(path.join(home, ".ssh", "id_ed25519"), "-----BEGIN OPENSSH PRIVATE KEY-----");
+    fs.mkdirSync(path.join(home, "proj"));
+    fs.symlinkSync("../.ssh/id_ed25519", path.join(home, "proj", "README.md"));
+    fs.symlinkSync("../.automaton/wallet.json", path.join(home, "proj", "notes.md"));
+    for (const p of [
+      "~proj/README.md",
+      "~proj/notes.md",
+      "~.config/solana/id.json",
+      "~.aws/credentials",
+      "~.automaton/inference-providers.json",
+      "~.automaton/wallet.json",
+      "~//.ssh/id_ed25519",
+    ]) {
+      expect(read(p)?.reasonCode, p).toBe("SENSITIVE_FILE_READ");
+    }
+    // A literal "~name" file in cwd is still checked too.
+    const cwd = path.join(tmp, "cwd");
+    fs.mkdirSync(path.join(cwd, "~x"), { recursive: true });
+    fs.symlinkSync(path.join(home, ".automaton", "wallet.json"), path.join(cwd, "~x", "a.txt"));
+    vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    expect(read("~x/a.txt")?.reasonCode).toBe("SENSITIVE_FILE_READ");
+
+    const result = await runMainReadFile("~proj/README.md");
+    expect(result.error).toContain("SENSITIVE_FILE_READ");
+    expect(result.readCalls).toEqual([]);
+  });
+
+  it("denies write_file through a symlink reached as \"~dir/link\"", () => {
+    fs.writeFileSync(path.join(home, ".automaton", "heartbeat.yml"), "entries: []\n");
+    fs.mkdirSync(path.join(home, "d"));
+    fs.symlinkSync("../.automaton/heartbeat.yml", path.join(home, "d", "notes.txt"));
+    // A directory link into the runtime's guard code.
+    fs.symlinkSync(path.join(process.cwd(), "src", "agent"), path.join(home, "d", "lnk"));
+    const write = (p: string) => protectedFilesRule.evaluate(makeMockRequest("write_file", { path: p }));
+
+    expect(write("~d/notes.txt")?.action).toBe("deny");
+    expect(write("~d/notes.txt")?.reasonCode).toBe("PROTECTED_SYMLINK");
+    expect(write("~d/lnk/policy-rules/financial.ts")?.action).toBe("deny");
+    expect(write("~.automaton/heartbeat.yml")?.action).toBe("deny");
+    expect(write("~d/plain.txt")).toBeNull();
+  });
+
+  async function runMainReadFile(filePath: string) {
+    const db = createTestDb();
+    try {
+      const conway = new MockConwayClient();
+      const readCalls: string[] = [];
+      const origRead = conway.readFile.bind(conway);
+      conway.readFile = async (p: string) => {
+        readCalls.push(p);
+        return origRead(p);
+      };
+      const identity = createTestIdentity();
+      const config = createTestConfig();
+      const context: ToolContext = { identity, config, db, conway, inference: new MockInferenceClient([]) };
+      const request = makeMockRequest("read_file", {});
+      const result = await executeTool(
+        "read_file",
+        { path: filePath },
+        createBuiltinTools(identity.sandboxId),
+        context,
+        new PolicyEngine(db.raw, createDefaultRules()),
+        { ...request.turnContext, inputSource: "agent" },
+      );
+      return { error: result.error ?? "", readCalls, execCalls: conway.execCalls.map((c) => c.command) };
+    } finally {
+      db.close();
+    }
+  }
 });

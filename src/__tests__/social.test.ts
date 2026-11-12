@@ -503,13 +503,14 @@ describe("Agent Card", () => {
 
     await hostAgentCard(card, mockConway);
 
-    // Card should be written as separate JSON file
-    expect(writtenFiles["/tmp/agent-card.json"]).toBeTruthy();
-    const writtenCard = JSON.parse(writtenFiles["/tmp/agent-card.json"]!);
+    // Card should be written as separate JSON file, in a fresh per-run directory
+    const cardPath = Object.keys(writtenFiles).find((p) => /^\/tmp\/agent-card-[0-9a-f]{16}\/agent-card\.json$/.test(p));
+    expect(cardPath).toBeTruthy();
+    const writtenCard = JSON.parse(writtenFiles[cardPath!]!);
     expect(writtenCard.name).toBe("TestBot");
 
     // Server script should NOT contain the card JSON interpolated
-    const serverScript = writtenFiles["/tmp/agent-card-server.js"]!;
+    const serverScript = writtenFiles[cardPath!.replace(/agent-card\.json$/, "agent-card-server.js")]!;
     expect(serverScript).not.toContain('"TestBot"');
     expect(serverScript).toContain("fs.readFileSync");
   });

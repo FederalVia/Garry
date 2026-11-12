@@ -1,5 +1,9 @@
-import fs from "node:fs";
+import path from "node:path";
 import OpenAI from "openai";
+import { readRegularFileNoFollow } from "../security/secure-fs.js";
+import { createLogger } from "../observability/logger.js";
+
+const logger = createLogger("inference.providers");
 
 export type ModelTier = "reasoning" | "fast" | "cheap";
 
@@ -240,6 +244,54 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
 ];
 
+/**
+ * Known providers keep their endpoint and key variable whatever the config
+ * file says: the file is not trusted to redirect a credential elsewhere.
+ */
+const KNOWN_PROVIDER_PINS: Record<string, { baseUrl: string; apiKeyEnvVar: string }> = Object.fromEntries(
+  DEFAULT_PROVIDERS.map((p) => [p.id, { baseUrl: p.baseUrl, apiKeyEnvVar: p.apiKeyEnvVar }]),
+);
+
+/** Credentials the runtime itself holds; never handed to a configured provider. */
+const RESERVED_KEY_VARS = new Set([
+  "CONWAY_API_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GROQ_API_KEY",
+  "TOGETHER_API_KEY",
+]);
+
+/** Operator opt-in (process environment) before unknown provider ids are honoured. */
+export const CUSTOM_PROVIDERS_ENV = "AUTOMATON_ALLOW_CUSTOM_PROVIDERS";
+const CUSTOM_PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const MAX_PROVIDER_CONFIG_BYTES = 256 * 1024;
+
+/** Env var an unknown provider must use: a dedicated prefix, so it can never name an operator key. */
+export function customProviderKeyEnvVar(id: string): string {
+  return `AUTOMATON_PROVIDER_${id.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+/** https with no userinfo, or http on loopback. */
+function isAcceptableBaseUrl(raw: unknown, allowLoopbackHttp: boolean, requireLoopback = false): raw is string {
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password) return false;
+  const loopback = isLoopbackHost(url.hostname);
+  if (requireLoopback && !loopback) return false;
+  if (url.protocol === "https:") return true;
+  return url.protocol === "http:" && allowLoopbackHttp && loopback;
+}
+
 export class ProviderRegistry {
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
@@ -274,12 +326,17 @@ export class ProviderRegistry {
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
     let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;
 
-    if (!fs.existsSync(configPath)) {
+    // No-follow read: a link or hard link at the config path is ignored.
+    const text = readRegularFileNoFollow(configPath, {
+      root: path.dirname(path.resolve(configPath)),
+      maxBytes: MAX_PROVIDER_CONFIG_BYTES,
+    });
+    if (text === null) {
       return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
     }
 
     try {
-      const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ProviderConfigFile;
+      const raw = JSON.parse(text) as ProviderConfigFile;
       const configuredProviders = normalizeProviders(raw.providers);
       if (configuredProviders.length > 0) {
         providers = configuredProviders;
@@ -531,6 +588,11 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
       continue;
     }
 
+    const endpoint = resolveProviderEndpoint(id, candidate);
+    if (!endpoint) {
+      continue;
+    }
+
     const fallback = defaultsById.get(id);
     const models = normalizeModels(candidate.models, fallback?.models ?? []);
     if (models.length === 0) {
@@ -540,8 +602,8 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
     normalized.push({
       id,
       name: stringOr(candidate.name, fallback?.name ?? id),
-      baseUrl: stringOr(candidate.baseUrl, fallback?.baseUrl ?? "https://api.openai.com/v1"),
-      apiKeyEnvVar: stringOr(candidate.apiKeyEnvVar, fallback?.apiKeyEnvVar ?? "OPENAI_API_KEY"),
+      baseUrl: endpoint.baseUrl,
+      apiKeyEnvVar: endpoint.apiKeyEnvVar,
       models,
       maxRequestsPerMinute: numberOr(candidate.maxRequestsPerMinute, fallback?.maxRequestsPerMinute ?? 600),
       maxTokensPerMinute: numberOr(candidate.maxTokensPerMinute, fallback?.maxTokensPerMinute ?? 200000),
@@ -551,6 +613,53 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
   }
 
   return normalized.sort((a, b) => a.priority - b.priority);
+}
+
+/**
+ * Decide where a file-configured provider may send requests and which env
+ * var it may read. Returns null to drop the provider.
+ */
+function resolveProviderEndpoint(
+  id: string,
+  candidate: Record<string, unknown>,
+): { baseUrl: string; apiKeyEnvVar: string } | null {
+  const pin = KNOWN_PROVIDER_PINS[id];
+  if (pin) {
+    let baseUrl = pin.baseUrl;
+    if (id === "local" && candidate.baseUrl !== undefined) {
+      if (isAcceptableBaseUrl(candidate.baseUrl, true, true)) {
+        baseUrl = candidate.baseUrl;
+      } else {
+        logger.warn(`Ignoring non-loopback baseUrl for provider "local"`);
+      }
+    } else if (candidate.baseUrl !== undefined && candidate.baseUrl !== pin.baseUrl) {
+      logger.warn(`Ignoring baseUrl override for known provider "${id}"`);
+    }
+    if (candidate.apiKeyEnvVar !== undefined && candidate.apiKeyEnvVar !== pin.apiKeyEnvVar) {
+      logger.warn(`Ignoring apiKeyEnvVar override for known provider "${id}"`);
+    }
+    return { baseUrl, apiKeyEnvVar: pin.apiKeyEnvVar };
+  }
+
+  if (process.env[CUSTOM_PROVIDERS_ENV] !== "1") {
+    logger.warn(`Dropping unknown provider "${id.slice(0, 40)}": set ${CUSTOM_PROVIDERS_ENV}=1 to allow custom providers`);
+    return null;
+  }
+  if (!CUSTOM_PROVIDER_ID_RE.test(id)) {
+    logger.warn(`Dropping provider with invalid id "${id.slice(0, 40)}"`);
+    return null;
+  }
+  const expectedEnv = customProviderKeyEnvVar(id);
+  const apiKeyEnvVar = candidate.apiKeyEnvVar === undefined ? expectedEnv : candidate.apiKeyEnvVar;
+  if (apiKeyEnvVar !== expectedEnv || RESERVED_KEY_VARS.has(apiKeyEnvVar)) {
+    logger.warn(`Dropping provider "${id}": apiKeyEnvVar must be ${expectedEnv}`);
+    return null;
+  }
+  if (!isAcceptableBaseUrl(candidate.baseUrl, true)) {
+    logger.warn(`Dropping provider "${id}": baseUrl must be https (or http on loopback) without credentials`);
+    return null;
+  }
+  return { baseUrl: candidate.baseUrl, apiKeyEnvVar };
 }
 
 function normalizeModels(input: unknown, fallbackModels: ModelConfig[]): ModelConfig[] {
