@@ -10,6 +10,7 @@
 import { loadChainIdentity } from "../identity/wallet.js";
 import { createSocialClient } from "../social/client.js";
 import type { ChainIdentity, ChainType } from "../identity/chain.js";
+import { escapeForTerminal } from "../observability/terminal-safe.js";
 
 export const DEFAULT_SOCIAL_RELAY_URL = "https://social.conway.tech";
 
@@ -65,4 +66,23 @@ export async function sendOperatorMessage(input: {
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };
   }
+}
+
+/**
+ * Lines `automaton-cli send` prints. The relay chooses the error text and
+ * the message id, so both are escaped for the terminal on one line each.
+ */
+export function formatSendResult(result: SendOperatorResult): { ok: boolean; lines: string[] } {
+  const safe = (s: string) => escapeForTerminal(s, { keepNewlines: false });
+  if (!result.ok) return { ok: false, lines: [`Failed to send message: ${safe(result.error)}`] };
+  return {
+    ok: true,
+    lines: [
+      "Message sent (signed).",
+      `  ID:    ${safe(result.id)}`,
+      `  From:  ${safe(result.from)}`,
+      `  To:    ${safe(result.to)}`,
+      `  Relay: ${safe(result.relayUrl)}`,
+    ],
+  };
 }

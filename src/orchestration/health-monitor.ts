@@ -154,9 +154,19 @@ export class HealthMonitor {
       .prepare("SELECT MAX(created_at) AS ts FROM event_stream WHERE agent_address = ?")
       .get(child.address) as { ts: string | null } | undefined;
 
-    const inboxRow = this.db.raw
-      .prepare("SELECT MAX(received_at) AS ts FROM inbox_messages WHERE from_address = ?")
-      .get(child.address) as { ts: string | null } | undefined;
+    // Only a signed message proves the child sent it; an unsigned one could
+    // keep a dead child looking alive. received_at is our clock, not the relay's.
+    let inboxRow: { ts: string | null } | undefined;
+    try {
+      inboxRow = this.db.raw
+        .prepare(
+          `SELECT MAX(received_at) AS ts FROM inbox_messages
+           WHERE verified = 1 AND (from_address = ? OR from_address = lower(?))`,
+        )
+        .get(child.address, child.address) as { ts: string | null } | undefined;
+    } catch {
+      inboxRow = undefined;
+    }
 
     return latestIso([child.lastChecked ?? null, eventRow?.ts ?? null, inboxRow?.ts ?? null]);
   }

@@ -101,7 +101,7 @@ describe("SSRF Protection", () => {
     it("allows public IPs", () => {
       expect(isInternalNetwork("8.8.8.8")).toBe(false);
       expect(isInternalNetwork("1.1.1.1")).toBe(false);
-      expect(isInternalNetwork("203.0.113.1")).toBe(false);
+      expect(isInternalNetwork("93.184.216.34")).toBe(false);
     });
 
     it("allows public hostnames", () => {

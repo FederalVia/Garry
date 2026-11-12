@@ -13,7 +13,7 @@ import {
   toBytes,
 } from "viem";
 import type { SignedMessagePayload } from "../types.js";
-import type { ChainIdentity } from "../identity/chain.js";
+import { detectChainType, type ChainIdentity } from "../identity/chain.js";
 
 export const MESSAGE_LIMITS = {
   maxContentLength: 64_000, // 64KB
@@ -21,6 +21,16 @@ export const MESSAGE_LIMITS = {
   replayWindowMs: 300_000, // 5 minutes
   maxOutboundPerHour: 100,
 } as const;
+
+/**
+ * The string a sender signs for one message. Used by signing and by inbound
+ * verification, so the two can never drift. EVM recipients are lowercased;
+ * Solana base58 addresses are case-sensitive and kept as they are.
+ */
+export function canonicalSendMessage(to: string, content: string, signedAt: string): string {
+  const normalizedTo = detectChainType(to) === "solana" ? to : to.toLowerCase();
+  return `Conway:send:${normalizedTo}:${keccak256(toBytes(content))}:${signedAt}`;
+}
 
 /**
  * Sign a send message payload.
@@ -42,16 +52,8 @@ export async function signSendPayload(
   }
 
   const signedAt = new Date().toISOString();
-  const contentHash = keccak256(toBytes(content));
-
-  // Solana addresses are case-sensitive (base58); only lowercase EVM addresses
-  // Solana addresses are case-sensitive (base58); only lowercase EVM addresses
-  const isSolana = "signMessage" in signer && "chainType" in signer
-    && (signer as ChainIdentity).chainType === "solana";
-  const { detectChainType } = await import("../identity/chain.js");
-  const recipientChainType = detectChainType(to);
-  const normalizedTo = recipientChainType === "solana" ? to : to.toLowerCase();
-  const canonical = `Conway:send:${normalizedTo}:${contentHash}:${signedAt}`;
+  const normalizedTo = detectChainType(to) === "solana" ? to : to.toLowerCase();
+  const canonical = canonicalSendMessage(to, content, signedAt);
 
   let signature: string;
   let fromAddress: string;

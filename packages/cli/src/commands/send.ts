@@ -7,7 +7,8 @@
  */
 
 import { loadConfig } from "@conway/automaton/config.js";
-import { resolveRelayUrl, sendOperatorMessage } from "@conway/automaton/operator/send.js";
+import { formatSendResult, resolveRelayUrl, sendOperatorMessage } from "@conway/automaton/operator/send.js";
+import { escapeForTerminal } from "@conway/automaton/observability/terminal-safe.js";
 
 const args = process.argv.slice(3);
 const toAddress = args[0];
@@ -24,17 +25,11 @@ try {
 
   const relayUrl = resolveRelayUrl(loadConfig());
   const result = await sendOperatorMessage({ relayUrl, to: toAddress, content: messageText });
-  if (!result.ok) {
-    console.error(`Failed to send message: ${result.error}`);
-    process.exit(1);
-  }
-
-  console.log(`Message sent (signed).`);
-  console.log(`  ID:    ${result.id}`);
-  console.log(`  From:  ${result.from}`);
-  console.log(`  To:    ${result.to}`);
-  console.log(`  Relay: ${result.relayUrl}`);
+  // Relay-chosen text (error, id) is escaped for the terminal.
+  const out = formatSendResult(result);
+  for (const line of out.lines) (out.ok ? console.log : console.error)(line);
+  if (!out.ok) process.exit(1);
 } catch (err: any) {
-  console.error(`Failed to send message: ${err?.message || String(err)}`);
+  console.error(`Failed to send message: ${escapeForTerminal(err?.message || String(err), { keepNewlines: false })}`);
   process.exit(1);
 }

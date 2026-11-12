@@ -22,3 +22,38 @@ export const INSTALL_AND_BUILD = `${ENSURE_PNPM} && pnpm install --frozen-lockfi
  * upstream code, so a changed dependency cannot run code at install time.
  */
 export const INSTALL_AND_BUILD_NO_SCRIPTS = `${ENSURE_PNPM} && pnpm install --frozen-lockfile --ignore-scripts && pnpm run build`;
+
+/**
+ * Separate steps for code fetched from upstream: install with every
+ * dependency script off, then build only the native packages this runtime
+ * names (not whatever list upstream's package.json carries), then build.
+ * `pnpm run build` still runs upstream's own build script, so applying
+ * upstream code trusts origin. Each step has its own timeout.
+ */
+export interface InstallStep {
+  name: string;
+  command: string;
+  timeoutMs: number;
+}
+
+export const NATIVE_BUILD_PACKAGES = ["better-sqlite3", "esbuild"] as const;
+
+export const INSTALL_NO_SCRIPTS: InstallStep = {
+  name: "install (dependency scripts off)",
+  command: `${ENSURE_PNPM} && pnpm install --frozen-lockfile --ignore-scripts`,
+  timeoutMs: 300_000,
+};
+
+export const REBUILD_NATIVE: InstallStep = {
+  name: "native rebuild",
+  command: `pnpm rebuild ${NATIVE_BUILD_PACKAGES.join(" ")}`,
+  timeoutMs: 300_000,
+};
+
+export const BUILD: InstallStep = {
+  name: "build",
+  command: "pnpm run build",
+  timeoutMs: 300_000,
+};
+
+export const UPSTREAM_INSTALL_STEPS: readonly InstallStep[] = [INSTALL_NO_SCRIPTS, REBUILD_NATIVE, BUILD];

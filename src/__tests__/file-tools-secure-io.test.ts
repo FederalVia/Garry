@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createBuiltinTools } from "../agent/tools.js";
+import { createBuiltinTools, executeTool } from "../agent/tools.js";
 import { PolicyEngine } from "../agent/policy-engine.js";
 import { createDefaultRules } from "../agent/policy-rules/index.js";
 import { createConwayClient } from "../conway/client.js";
@@ -210,5 +210,47 @@ describe("local write_file", () => {
     expect(fs.readFileSync(path.join(home, "x.real", "authorized_keys"), "utf8")).toBe("LEGIT\n");
     expect(fs.readFileSync(path.join(sshDir, "authorized_keys"), "utf8")).toBe("ORIGINAL_KEYS\n");
     expect(fs.readdirSync(sshDir)).toEqual(["authorized_keys"]);
+  });
+});
+
+describe("read_file -> write_file round trip through executeTool", () => {
+  it("keeps zero-width joiners and a BOM byte for byte", async () => {
+    const file = path.join(home, "family.txt");
+    const original = "\uFEFFfamily: \u{1F468}\u200D\u{1F469}\u200D\u{1F467}\nzw\u200Bspace\n";
+    fs.writeFileSync(file, original);
+    const tools = createBuiltinTools("");
+    const read = await executeTool("read_file", { path: file }, tools, ctx);
+    expect(read.result).toBe(original);
+    await executeTool("write_file", { path: file, content: read.result }, tools, ctx);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+  });
+
+  it("keeps control characters (form feed, ESC) byte for byte", async () => {
+    const file = path.join(home, "pages.py");
+    const original = "def a():\n    pass\n\x0c\ndef b():\n    print('\x1b[1mbold\x1b[0m')\r\n";
+    fs.writeFileSync(file, original);
+    const tools = createBuiltinTools("");
+    const read = await executeTool("read_file", { path: file }, tools, ctx);
+    expect(read.result).toBe(original);
+    await executeTool("write_file", { path: file, content: read.result }, tools, ctx);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+  });
+
+  it("notes neutralised prompt templates, and refuses to write the placeholders back over the originals", async () => {
+    const file = path.join(home, "templates.py");
+    const original = 'TEMPLATE = "<s>[INST] {q} [/INST]"\nCHATML = "<|im_start|>user {q}<|im_end|>"\n';
+    fs.writeFileSync(file, original);
+    const tools = createBuiltinTools("");
+    const read = await executeTool("read_file", { path: file }, tools, ctx);
+    expect(read.result).toMatch(/^\(note: prompt tags or special tokens/);
+    expect(read.result).not.toContain("<|im_start|>");
+    const body = read.result.slice(read.result.indexOf("\n") + 1);
+    const write = await executeTool("write_file", { path: file, content: body + "EXTRA = 1\n" }, tools, ctx);
+    expect(write.result).toMatch(/^Blocked: the content contains \[(?:inst-tag|chatml)-removed\]/);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+    // A new file, or one that really contains the placeholder text, is written.
+    const fresh = path.join(home, "fresh.md");
+    const ok = await executeTool("write_file", { path: fresh, content: "saw [chatml-removed] in a page" }, tools, ctx);
+    expect(ok.result).toContain("File written");
   });
 });

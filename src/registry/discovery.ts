@@ -14,7 +14,8 @@ import type {
   DiscoveredAgentCacheRow,
 } from "../types.js";
 import { DEFAULT_DISCOVERY_CONFIG } from "../types.js";
-import { queryAgent, getTotalAgents, getRegisteredAgentsByEvents } from "./erc8004.js";
+import { queryAgent, getTotalAgents, getRegisteredAgentsByEvents, CONTRACTS } from "./erc8004.js";
+import { fetchPublicHttps, isInternalHostname, type SafeFetchDeps } from "./safe-fetch.js";
 import { keccak256, toBytes } from "viem";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("registry.discovery");
@@ -27,22 +28,13 @@ const DISCOVERY_TIMEOUT_MS = 60_000;
 // ─── SSRF Protection ────────────────────────────────────────────
 
 /**
- * Check if a hostname resolves to an internal/private network.
- * Blocks: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
- *         192.168.0.0/16, 169.254.0.0/16, ::1, localhost, 0.0.0.0/8
+ * Syntactic pre-check: true for internal names (localhost, *.local,
+ * *.internal ...) and for IP literals outside public unicast, including
+ * bracketed IPv6, IPv4-mapped IPv6 and CGNAT. Names are not resolved here;
+ * fetchPublicHttps checks the resolved addresses.
  */
 export function isInternalNetwork(hostname: string): boolean {
-  const blocked = [
-    /^127\./,
-    /^10\./,
-    /^172\.(1[6-9]|2\d|3[01])\./,
-    /^192\.168\./,
-    /^169\.254\./,
-    /^::1$/,
-    /^localhost$/i,
-    /^0\./,
-  ];
-  return blocked.some(pattern => pattern.test(hostname));
+  return isInternalHostname(hostname);
 }
 
 /**
@@ -120,28 +112,39 @@ export function validateAgentCard(data: unknown): AgentCard | null {
 // ─── Agent Card Cache ───────────────────────────────────────────
 
 /**
- * Try to get a cached agent card from the database.
+ * Cached card for a registry entry, only when it was fetched from the URI
+ * the entry points to now. Re-validated, since the row is plain JSON.
  */
 function getCachedCard(
   db: import("better-sqlite3").Database | undefined,
-  agentAddress: string,
+  cacheKey: string,
+  agentURI: string,
 ): AgentCard | null {
   if (!db) return null;
   try {
     const row = db.prepare(
-      "SELECT agent_card, valid_until FROM discovered_agents_cache WHERE agent_address = ?",
-    ).get(agentAddress) as { agent_card: string; valid_until: string | null } | undefined;
+      "SELECT agent_card, fetched_from, valid_until FROM discovered_agents_cache WHERE agent_address = ?",
+    ).get(cacheKey) as { agent_card: string; fetched_from: string | null; valid_until: string | null } | undefined;
     if (!row) return null;
+    if (row.fetched_from !== agentURI) return null;
 
     // Check if cache is still valid
     if (row.valid_until && new Date(row.valid_until).getTime() < Date.now()) {
       return null; // Expired
     }
 
-    return JSON.parse(row.agent_card) as AgentCard;
+    return validateAgentCard(JSON.parse(row.agent_card));
   } catch {
     return null;
   }
+}
+
+/**
+ * Cache key for one registry entry. Tokens are transferable, so the owner
+ * address does not identify a card: two tokens with one owner differ.
+ */
+function cardCacheKey(agent: DiscoveredAgent, network: Network): string {
+  return `erc8004:${network}:${CONTRACTS[network].identity.toLowerCase()}:${agent.agentId}`;
 }
 
 /**
@@ -187,11 +190,12 @@ function setCachedCard(
 async function enrichAgentWithCard(
   agent: DiscoveredAgent,
   cfg: DiscoveryConfig,
-  db?: import("better-sqlite3").Database,
+  db: import("better-sqlite3").Database | undefined,
+  network: Network,
 ): Promise<void> {
   try {
-    const cacheKey = agent.owner || agent.agentId;
-    let card = getCachedCard(db, cacheKey);
+    const cacheKey = cardCacheKey(agent, network);
+    let card = getCachedCard(db, cacheKey, agent.agentURI);
     if (!card) {
       card = await fetchAgentCard(agent.agentURI, cfg);
       if (card && db) {
@@ -238,7 +242,7 @@ export async function discoverAgents(
       try {
         const agent = await queryAgent(i.toString(), network, rpcUrl);
         if (agent) {
-          await enrichAgentWithCard(agent, cfg, db);
+          await enrichAgentWithCard(agent, cfg, db, network);
           agents.push(agent);
         }
       } catch (error) {
@@ -264,7 +268,7 @@ export async function discoverAgents(
           if (!agent.owner && owner) {
             agent.owner = owner;
           }
-          await enrichAgentWithCard(agent, cfg, db);
+          await enrichAgentWithCard(agent, cfg, db, network);
           agents.push(agent);
         }
       } catch (error) {
@@ -277,27 +281,34 @@ export async function discoverAgents(
 }
 
 /**
- * Fetch an agent card from a URI.
- * Enforces SSRF protection and per-fetch timeout.
+ * Fetch an agent card from a URI (agent-chosen, from the permissionless
+ * registry): bounded in size and time, public addresses only, redirects
+ * re-validated. The configured IPFS gateway is operator configuration, so
+ * its origin skips the address check but keeps the bounds.
  *
  * Phase 3.2: Configurable IPFS gateway and response size limit.
  */
 export async function fetchAgentCard(
   uri: string,
   config?: Partial<DiscoveryConfig>,
+  fetchDeps?: SafeFetchDeps,
 ): Promise<AgentCard | null> {
   const cfg = { ...DEFAULT_DISCOVERY_CONFIG, ...config };
 
   // Handle data: URIs inline — no network request, no SSRF risk
   if (uri.startsWith("data:application/json,") || uri.startsWith("data:application/json;")) {
     try {
-      let json: string;
-      if (uri.includes(";base64,")) {
-        const b64 = uri.split(";base64,")[1];
-        json = Buffer.from(b64, "base64").toString("utf-8");
-      } else {
-        json = decodeURIComponent(uri.substring(uri.indexOf(",") + 1));
+      const comma = uri.indexOf(",");
+      const meta = uri.slice(0, comma);
+      const payload = uri.slice(comma + 1);
+      const isBase64 = /;base64$/i.test(meta);
+      // Refuse before decoding when the encoded size already implies too much.
+      const minDecoded = isBase64 ? Math.floor((payload.length * 3) / 4) - 2 : Math.ceil(payload.length / 3);
+      if (minDecoded > cfg.maxCardSizeBytes) {
+        logger.error(`data: URI agent card too large: about ${minDecoded} bytes`);
+        return null;
       }
+      const json = isBase64 ? Buffer.from(payload, "base64").toString("utf-8") : decodeURIComponent(payload);
       if (json.length > cfg.maxCardSizeBytes) {
         logger.error(`data: URI agent card too large: ${json.length} bytes`);
         return null;
@@ -312,48 +323,39 @@ export async function fetchAgentCard(
 
   // SSRF protection: validate URI before fetching
   if (!isAllowedUri(uri)) {
-    logger.error(`Blocked URI (SSRF protection): ${uri}`);
+    logger.error(`Blocked URI (SSRF protection): ${uri.slice(0, 200)}`);
     return null;
   }
 
-  try {
-    // Handle IPFS URIs - Phase 3.2: Configurable IPFS gateway
-    let fetchUrl = uri;
-    if (uri.startsWith("ipfs://")) {
-      fetchUrl = `${cfg.ipfsGateway}/ipfs/${uri.slice(7)}`;
+  let fetchUrl = uri;
+  let trustedOrigin: string | undefined;
+  if (uri.startsWith("ipfs://")) {
+    const cidPath = uri.slice("ipfs://".length);
+    if (!/^[A-Za-z0-9._/-]+$/.test(cidPath) || cidPath.split("/").includes("..")) {
+      logger.error(`Blocked IPFS path: ${uri.slice(0, 200)}`);
+      return null;
     }
-
-    // Per-fetch timeout
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), cfg.fetchTimeoutMs);
-
+    const gateway = cfg.ipfsGateway.replace(/\/+$/, "");
+    fetchUrl = `${gateway}/ipfs/${cidPath}`;
     try {
-      const response = await fetch(fetchUrl, {
-        signal: controller.signal,
-      });
-
-      if (!response.ok) return null;
-
-      // Phase 3.2: Check response size before parsing
-      const contentLength = response.headers.get("content-length");
-      if (contentLength && parseInt(contentLength, 10) > cfg.maxCardSizeBytes) {
-        logger.error(`Agent card too large: ${contentLength} bytes`);
-        return null;
-      }
-
-      const text = await response.text();
-      if (text.length > cfg.maxCardSizeBytes) {
-        logger.error(`Agent card too large: ${text.length} bytes`);
-        return null;
-      }
-
-      const data = JSON.parse(text);
-
-      // Validate agent card JSON against schema
-      return validateAgentCard(data);
-    } finally {
-      clearTimeout(timer);
+      trustedOrigin = new URL(gateway).origin;
+    } catch {
+      logger.error("Invalid IPFS gateway in configuration");
+      return null;
     }
+  }
+
+  try {
+    const result = await fetchPublicHttps(
+      fetchUrl,
+      { maxBytes: cfg.maxCardSizeBytes, timeoutMs: cfg.fetchTimeoutMs, maxRedirects: 3, trustedOrigin },
+      fetchDeps,
+    );
+    if (!result.ok) {
+      logger.error(`Agent card fetch refused or failed: ${result.error}`);
+      return null;
+    }
+    return validateAgentCard(JSON.parse(result.body));
   } catch (error) {
     logger.error("Agent card fetch failed:", error instanceof Error ? error : undefined);
     return null;

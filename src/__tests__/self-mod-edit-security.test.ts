@@ -145,6 +145,16 @@ describe("self-mod editFile security", () => {
     expect(fs.readFileSync(path.join(repo, "src/memory/notes.ts"), "utf8")).toBe("export const notes = 2;\n");
   });
 
+  it("refuses text whose neutralisation placeholders would replace the file's own prompt markers", async () => {
+    const rel = "src/memory/prompt.ts";
+    const original = 'export const T = "<|im_start|>user {q}<|im_end|>";\n';
+    fs.writeFileSync(path.join(repo, rel), original);
+    const result = await edit(rel, 'export const T = "[chatml-removed]user {q}[chatml-removed]";\nexport const U = 1;\n');
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("[chatml-removed]");
+    expect(fs.readFileSync(path.join(repo, rel), "utf8")).toBe(original);
+  });
+
   it("edit_own_file and write_file through the policy engine deny guard files and heartbeat.yml", async () => {
     const mock = new MockConwayClient();
     const identity = createTestIdentity();

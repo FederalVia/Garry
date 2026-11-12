@@ -7,6 +7,7 @@
 import chalk from "chalk";
 import { loadConfig, resolvePath } from "@conway/automaton/config.js";
 import { createDatabase } from "@conway/automaton/state/database.js";
+import { formatTurnLines } from "@conway/automaton/operator/turn-log.js";
 
 const accent = chalk.rgb(131, 127, 255);
 
@@ -28,16 +29,6 @@ const db = createDatabase(dbPath);
 
 const turns = db.getRecentTurns(limit);
 
-function stateColor(state: string): string {
-  switch (state) {
-    case "normal": return chalk.green(state);
-    case "low_compute": return chalk.yellow(state);
-    case "critical": return chalk.red(state);
-    case "dead": return chalk.gray(state);
-    default: return chalk.white(state);
-  }
-}
-
 const divider = chalk.dim("─".repeat(72));
 
 if (turns.length === 0) {
@@ -46,34 +37,7 @@ if (turns.length === 0) {
   console.log(accent.bold(`\nShowing last ${turns.length} turn(s)\n`));
   for (const turn of turns) {
     console.log(divider);
-    console.log(
-      accent.bold(`Turn #${turn.id}`) +
-      chalk.dim(`  ${turn.timestamp}  `) +
-      stateColor(turn.state)
-    );
-
-    if (turn.input) {
-      console.log(accent("▸ Input") + chalk.dim(` [${turn.inputSource}]`) + "  " + turn.input.slice(0, 200));
-    }
-
-    console.log(chalk.dim("▸ Thinking  ") + chalk.white(turn.thinking.slice(0, 500)));
-
-    if (turn.toolCalls.length > 0) {
-      console.log(accent("▸ Tools"));
-      for (const tc of turn.toolCalls) {
-        if (tc.error) {
-          console.log("  " + chalk.red(`✗ ${tc.name}`) + "  " + chalk.red(tc.error.slice(0, 100)));
-        } else {
-          console.log("  " + chalk.green(`✓ ${tc.name}`) + "  " + chalk.dim(tc.result.slice(0, 100)));
-        }
-      }
-    }
-
-    console.log(
-      chalk.yellow(`tokens: ${turn.tokenUsage.totalTokens}`) +
-      chalk.dim("  |  ") +
-      chalk.yellow(`cost: $${(turn.costCents / 100).toFixed(4)}`)
-    );
+    for (const line of formatTurnLines(turn)) console.log(line);
   }
   console.log(divider);
 }

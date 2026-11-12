@@ -8,6 +8,9 @@
 
 import chalk from "chalk";
 import type { LogEntry } from "../types.js";
+import { escapeForTerminal } from "./terminal-safe.js";
+
+const ONE_LINE = { keepNewlines: false } as const;
 
 const accent = chalk.rgb(131, 127, 255);
 
@@ -72,16 +75,18 @@ export function prettySink(entry: LogEntry): void {
     const levelFn = LEVEL_STYLES[entry.level] ?? chalk.white;
     const level = levelFn(entry.level.toUpperCase().padEnd(5));
     const mod = chalk.dim(entry.module.padEnd(12));
-    const msg = formatMessage(entry.message);
+    // Messages quote tool output and peer text; escape before styling. One
+    // entry is one line: a raw newline would let quoted text forge a line.
+    const msg = formatMessage(escapeForTerminal(entry.message, ONE_LINE));
 
     let line = `${time} ${level} ${mod} ${msg}`;
 
     if (entry.error) {
-      line += "\n" + chalk.red("  " + entry.error.message);
+      line += "\n" + chalk.red("  " + escapeForTerminal(entry.error.message, ONE_LINE));
     }
 
     process.stdout.write(line + "\n");
   } catch {
-    process.stdout.write(entry.message + "\n");
+    process.stdout.write(escapeForTerminal(String(entry.message), ONE_LINE) + "\n");
   }
 }

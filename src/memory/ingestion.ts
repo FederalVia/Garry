@@ -85,6 +85,13 @@ export interface Contradiction {
 /** Below the 0.3 threshold that memory retrieval uses for trusted entities. */
 const INBOX_SENDER_TRUST = 0.2;
 
+/** A sender of an inbox batch, from the inbox rows (never from message text). */
+export interface InboxSender {
+  address: string;
+  /** Whether the sender's signature was checked at ingest. */
+  verified: boolean;
+}
+
 export class MemoryIngestionPipeline {
   private working: WorkingMemoryManager;
   private episodic: EpisodicMemoryManager;
@@ -113,7 +120,7 @@ export class MemoryIngestionPipeline {
     sessionId: string,
     turn: AgentTurn,
     toolCallResults: ToolCallResult[],
-    options?: { inboxSenders?: string[] },
+    options?: { inboxSenders?: InboxSender[] },
   ): void {
     try {
       // An inbox turn read untrusted text, so its thinking, tool arguments and
@@ -695,14 +702,19 @@ export class MemoryIngestionPipeline {
           });
         }
 
-        if (tc.name === "discover_agents" && tc.result && !tc.result.includes("No agents")) {
-          this.semantic.store({
-            category: "environment",
-            key: "known_agents",
-            value: tc.result.slice(0, 500),
-            confidence: 0.8,
-            source: sessionId,
-          });
+        if (tc.name === "discover_agents" && tc.result) {
+          // Card names and descriptions come from attacker-hosted URIs; only
+          // the on-chain ids and owners are kept.
+          const summary = summarizeDiscoveredAgents(tc.result);
+          if (summary) {
+            this.semantic.store({
+              category: "environment",
+              key: "known_agents",
+              value: summary,
+              confidence: 0.8,
+              source: sessionId,
+            });
+          }
         }
       }
     } catch (error) {
@@ -743,24 +755,25 @@ export class MemoryIngestionPipeline {
   }
 
   /**
-   * Record each distinct, well-formed sender of an inbox batch. Unsigned
-   * senders get a trust score below the retrieval threshold, so they do not
-   * fill the Known Entities section of every later turn.
+   * Record each distinct, well-formed, verified sender of an inbox batch.
+   * An unsigned sender's address is only what the relay reported, so it
+   * earns no relationship record or interaction count.
    */
-  private recordInboxSenders(senders: string[]): void {
+  private recordInboxSenders(senders: InboxSender[]): void {
     try {
       const seen = new Set<string>();
       for (const sender of senders) {
-        const key = normalizeSenderAddress(sender);
+        if (!sender || sender.verified !== true) continue;
+        const key = normalizeSenderAddress(sender.address);
         if (!key) continue;
         if (seen.has(key)) continue;
         seen.add(key);
-        const existing = this.relationships.get(sender);
+        const existing = this.relationships.get(sender.address);
         if (existing) {
-          this.relationships.recordInteraction(sender);
+          this.relationships.recordInteraction(sender.address);
         } else {
           this.relationships.record({
-            entityAddress: sender,
+            entityAddress: sender.address,
             relationshipType: "messaged_us",
             trustScore: INBOX_SENDER_TRUST,
           });
@@ -806,4 +819,43 @@ export class MemoryIngestionPipeline {
       logger.error("Working memory update failed", error instanceof Error ? error : undefined);
     }
   }
+}
+
+const MAX_SUMMARIZED_AGENTS = 20;
+
+/**
+ * "<n> agents: #id owner, ..." from a discover_agents result (its JSON or
+ * text format). Only digit ids and well-formed owner addresses are kept, so
+ * no card text reaches stored memory. Null when nothing parses.
+ */
+export function summarizeDiscoveredAgents(result: string): string | null {
+  const agents: Array<{ id: string; owner: string }> = [];
+  const add = (id: unknown, owner: unknown): void => {
+    const idStr = typeof id === "number" ? String(id) : id;
+    if (typeof idStr !== "string" || !/^\d{1,30}$/.test(idStr)) return;
+    const normalized = normalizeSenderAddress(owner);
+    if (!normalized) return;
+    agents.push({ id: idStr, owner: normalized });
+  };
+  const trimmed = result.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) for (const a of parsed) add(a?.agentId, a?.owner);
+    } catch {
+      // Not JSON after all; fall through to the text format.
+    }
+  }
+  if (agents.length === 0) {
+    // Text format: "#<id> (<owner>) <name>: <description>" per line. Only
+    // the prefix is read; card text follows it and cannot move it.
+    for (const line of trimmed.split("\n")) {
+      const m = /^#(\d{1,30}) \((0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\) /.exec(line);
+      if (m) add(m[1], m[2]);
+    }
+  }
+  if (agents.length === 0) return null;
+  const shown = agents.slice(0, MAX_SUMMARIZED_AGENTS).map((a) => `#${a.id} ${a.owner}`);
+  const more = agents.length > shown.length ? `, +${agents.length - shown.length} more` : "";
+  return `${agents.length} agents: ${shown.join(", ")}${more}`;
 }

@@ -1,7 +1,8 @@
 /**
  * Self-update tools report what they really did: revert_last_edit reverts
  * only commits edit_own_file recorded, newest first (no toggling, no
- * operator commits, no protected files); pull_upstream runs in the repo;
+ * operator commits, no protected files); pull_upstream runs in the repo and
+ * applies only reviewed commits;
  * every rebuild says the running process keeps the old code until restart.
  */
 
@@ -247,7 +248,7 @@ describe("revert_last_edit", () => {
 });
 
 describe("pull_upstream", () => {
-  it("runs every command inside the repo and validates the commit", async () => {
+  it("runs every command inside the repo, validates the commit and refuses unreviewed commits", async () => {
     const conway = new MockConwayClient();
     const mockCtx = { ...ctx, conway } as ToolContext;
     const pull = tool("pull_upstream");
@@ -256,31 +257,44 @@ describe("pull_upstream", () => {
     expect(conway.execCalls).toHaveLength(0);
 
     const out = await pull.execute({ commit: "abc1234" }, mockCtx);
-    expect(out).toContain("Cherry-picked abc1234");
-    expect(out).toContain(RESTART_NOTICE);
-    expect(conway.execCalls.length).toBeGreaterThanOrEqual(2);
+    expect(out).toMatch(/^Refused: nothing has been reviewed/);
+    expect(conway.execCalls.length).toBeGreaterThanOrEqual(1);
     for (const call of conway.execCalls) {
       expect(call.command.startsWith(`cd '${repo}' && `)).toBe(true);
+      expect(call.command).not.toContain("cherry-pick");
     }
-    expect(db.getKV(RESTART_REQUIRED_KEY)).toBeTruthy();
   });
 
-  it("aborts its own failed cherry-pick and reports git's output", async () => {
-    const main = git("rev-parse", "--abbrev-ref", "HEAD");
-    git("checkout", "-q", "-b", "upstream");
-    fs.writeFileSync(path.join(repo, "src", "a.ts"), "export const a = 'upstream';\n");
-    git("commit", "-qam", "upstream change");
-    const sha = git("rev-parse", "HEAD");
-    git("checkout", "-q", main);
-    fs.writeFileSync(path.join(repo, "src", "a.ts"), "export const a = 'local';\n");
-    git("commit", "-qam", "local change");
+  it("aborts its own failed cherry-pick of a reviewed commit and reports git's output", async () => {
+    // origin/main carries an upstream change to src/a.ts; HEAD changes it locally.
+    const upstreamDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "selfmod-origin-")));
+    try {
+      execFileSync("git", ["clone", "-q", repo, upstreamDir]);
+      const up = (...a: string[]) => execFileSync("git", a, { cwd: upstreamDir, encoding: "utf8" }).trim();
+      up("config", "user.email", "test@example.com");
+      up("config", "user.name", "Test");
+      up("config", "commit.gpgsign", "false");
+      up("checkout", "-q", "-B", "main");
+      fs.writeFileSync(path.join(upstreamDir, "src", "a.ts"), "export const a = 'upstream';\n");
+      up("commit", "-qam", "upstream change");
+      const sha = up("rev-parse", "HEAD");
+      git("remote", "add", "origin", upstreamDir);
+      fs.writeFileSync(path.join(repo, "src", "a.ts"), "export const a = 'local';\n");
+      git("commit", "-qam", "local change");
 
-    const out = await tool("pull_upstream").execute({ commit: sha }, ctx);
-    expect(out).toMatch(/^Git operation failed/);
-    expect(out).toContain("CONFLICT");
-    expect(fs.existsSync(path.join(repo, ".git", "CHERRY_PICK_HEAD"))).toBe(false);
-    expect(readA()).toBe("export const a = 'local';\n");
-    expect(git("status", "--porcelain")).toBe("");
+      const index = await tool("review_upstream_changes").execute({}, ctx);
+      expect(index).toContain(sha);
+      await tool("review_upstream_changes").execute({ commit: sha }, ctx);
+
+      const out = await tool("pull_upstream").execute({ commit: sha }, ctx);
+      expect(out).toMatch(/^Git operation failed/);
+      expect(out).toContain("CONFLICT");
+      expect(fs.existsSync(path.join(repo, ".git", "CHERRY_PICK_HEAD"))).toBe(false);
+      expect(readA()).toBe("export const a = 'local';\n");
+      expect(git("status", "--porcelain")).toBe("");
+    } finally {
+      fs.rmSync(upstreamDir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it("refuses to start on top of the operator's cherry-pick in progress", async () => {

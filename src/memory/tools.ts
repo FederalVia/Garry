@@ -11,25 +11,35 @@ import { EpisodicMemoryManager } from "./episodic.js";
 import { SemanticMemoryManager } from "./semantic.js";
 import { ProceduralMemoryManager } from "./procedural.js";
 import { RelationshipMemoryManager } from "./relationship.js";
-import type { SemanticCategory, ProceduralStep } from "../types.js";
+import type { SemanticCategory, ProceduralStep, InputSource } from "../types.js";
 
 type Database = BetterSqlite3.Database;
 
 /**
  * Store a semantic memory (fact).
+ *
+ * The source comes from the turn, never from tool args. Known Facts shows
+ * the creator category as the creator's word, so only a creator-sourced turn
+ * may write it; any other turn (one steered by a page, a file or a tool
+ * result) is refused, both for new keys and for overwriting existing ones.
  */
 export function rememberFact(
   db: Database,
   args: { category: string; key: string; value: string; confidence?: number; source?: string },
+  inputSource?: InputSource | string,
 ): string {
   try {
     const semantic = new SemanticMemoryManager(db);
+    const fromCreator = inputSource === "creator";
+    if (args.category === "creator" && !fromCreator) {
+      return "Creator memories are protected: only the creator can set facts in the creator category. Use another category.";
+    }
     const id = semantic.store({
       category: args.category as SemanticCategory,
       key: args.key,
       value: args.value,
       confidence: args.confidence ?? 1.0,
-      source: args.source ?? "agent",
+      source: fromCreator ? "creator" : "agent",
     });
     return `Fact stored: [${args.category}/${args.key}] = ${args.value} (id: ${id})`;
   } catch (error) {

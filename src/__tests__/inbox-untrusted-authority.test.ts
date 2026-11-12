@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runAgentLoop } from "../agent/loop.js";
+import { inboxTurnPrefix } from "../agent/inbox-isolation.js";
 import { PolicyEngine } from "../agent/policy-engine.js";
 import { createDefaultRules } from "../agent/policy-rules/index.js";
 import { SpendTracker } from "../agent/spend-tracker.js";
@@ -121,7 +122,7 @@ describe("F039 inbox messages are untrusted", () => {
     const startingCredits = conway.creditsCents;
     await runLoop(inference, turns);
 
-    const marker = `[external] [UNTRUSTED EXTERNAL SENDER ${SENDER}]:`;
+    const marker = `[external] ${inboxTurnPrefix(SENDER, false)}`;
     const delivered = inference.calls[1].messages.find(
       (message) => message.role === "user" && message.content.includes(marker),
     );

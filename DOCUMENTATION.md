@@ -454,6 +454,8 @@ The system prompt includes:
 9. **Available tools** — all 69 tools with descriptions
 10. **Recent memories** — relevant working, episodic, semantic memories
 
+`WORKLOG.md` (the agent's own notes) is shown too, read from its last 16 KB without following links and labelled as notes that may quote external content. Prompt boundary tags and model special tokens (`<|...|>`) in it are neutralised when it is rendered, and every line (broken by a newline, carriage return, U+2028 or U+2029) is prefixed with `| `, so a quoted `--- END WORKLOG.md ---` or section header cannot close the section and open one of its own; the file itself is never rewritten or truncated. Genesis, soul and skill text get the same neutralisation and nothing else, so words such as `function_call` stay as written. The system prompt is kept within its 20,000-token budget (characters / 4): when it is over, the worklog is cut to its last 4 KB, then skill instructions are reduced to their names and descriptions, and a warning names what was trimmed.
+
 ### Idle detection
 
 If the agent makes 3 consecutive turns without performing any meaningful work (only read-only operations like `check_credits`, `system_synopsis`), it is forced to sleep. This prevents infinite status-check loops.
@@ -464,7 +466,7 @@ A turn's pattern is its sorted tool calls: a read-only tool counts by name, a mu
 
 ### Why the agent woke
 
-The first prompt of a wake lists up to 5 reasons under "Why you woke:" (heartbeat wake events such as a failed auto-topup), each sanitized as untrusted text and cut to 300 characters. Inbox wakes are shown only as "New inbox messages arrived; each sender's messages are handled in a separate isolated turn." Sender text never reaches a privileged prompt.
+The first prompt of a wake lists up to 5 reasons under "Why you woke:" (heartbeat wake events such as a failed auto-topup), each with prompt boundary tags and special tokens neutralised and cut to 300 characters. They are never screened or rate limited, so a reason cannot turn into a "blocked" notice. Inbox wakes are shown only as "New inbox messages arrived; each sender's messages are handled in a separate isolated turn." Sender text never reaches a privileged prompt.
 
 ### Saving turns
 
@@ -617,11 +619,11 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 |---|---|---|
 | `edit_own_file` | dangerous | Edit a source file. Audited, rate-limited, safety-checked. Records its commit for `revert_last_edit`. |
 | `revert_last_edit` | caution | Revert the most recent recorded `edit_own_file` commit and rebuild. Repeated calls go further back. |
-| `reset_to_upstream` | dangerous | Hard-reset the code to `origin/main` and rebuild. Clears the revert list. |
+| `reset_to_upstream` | dangerous | Two steps: the first call shows the plan (origin URL, target commit, local commits to discard, changed files, flagged protected, package and build files); the second, with `confirm=<target sha>`, hard-resets to that commit and rebuilds. Clears the revert list. A reset trusts origin's build scripts. |
 | `install_npm_package` | dangerous | Install an npm package. |
 | `install_mcp_server` | dangerous | Install an MCP server package. MCP invocation is not supported yet, so it does not become a tool. |
-| `review_upstream_changes` | caution | View upstream git commit diffs. **Must call before pull.** |
-| `pull_upstream` | dangerous | Cherry-pick (hex hash) or fast-forward upstream changes in the runtime's repo, then rebuild. A failed cherry-pick is aborted. |
+| `review_upstream_changes` | caution | With no arguments: an index of upstream commits (files, sizes, flagged protected and build files). With `commit` and `page`: one 8,000-character page of that commit's full diff. **Every page must be read before pull.** |
+| `pull_upstream` | dangerous | Cherry-pick one fully reviewed commit (hex hash), or fast-forward to the reviewed target when every commit was fully reviewed (refused if `origin/main` has moved since the review), then rebuild. A failed cherry-pick is aborted. |
 | `modify_heartbeat` | caution | Add, update, or remove (disable) heartbeat entries. Persists across restarts. |
 
 ### Skills (skills)
@@ -904,7 +906,7 @@ A log of significant events with importance ranking and classification. Includes
 
 ### Tier 3: Semantic Memory
 
-A categorized fact store (key-value pairs). Categories: `self`, `environment`, `financial`, `agent`, `domain`, `procedural_ref`, `creator`. Use `remember_fact` and `recall_facts`.
+A categorized fact store (key-value pairs). Categories: `self`, `environment`, `financial`, `agent`, `domain`, `procedural_ref`, `creator`. Use `remember_fact` and `recall_facts`. Facts stored through `remember_fact` get their source from the turn (`agent`, or `creator` for a creator-sourced turn), never from tool arguments. Creator facts are protected: `forget` cannot delete them, and `remember_fact` refuses the `creator` category (new keys and existing ones) unless the turn's input source is the creator, since Known Facts shows that category as the creator's word. No turn has that source today, so `remember_fact` writes no creator facts. From `discover_agents` results the ingestion pipeline keeps only agent ids and owner addresses, read from the fixed `#<id> (<owner>)` prefix of each line, never card names or descriptions; card text has its line breaks flattened and comes after that prefix, so it cannot plant an id/owner pair.
 
 ### Tier 4: Procedural Memory
 
@@ -948,12 +950,12 @@ The `edit_own_file` tool allows the agent to modify source files in its codebase
 The runtime code is cloned from a git repository. The heartbeat checks for new upstream commits every 4 hours. When new commits are detected:
 
 1. The agent is woken with a notification
-2. It **must** call `review_upstream_changes` to read every commit diff
+2. It calls `review_upstream_changes` for the index (target commit, origin URL, each commit's files with +/- counts and diff size; protected files, guard code and install/build inputs are marked: `package.json`, the lockfile, `pnpm-workspace.yaml`, `.npmrc`, `.pnpmfile.cjs`/`.mjs` (pnpm runs its hooks even with `--ignore-scripts`), `tsconfig*.json` and `scripts/`), then reads every page of each commit's full diff, 8,000 characters a page. The diff comes from `git show` with no size fallback; an error is reported as an error, never as a diff.
 3. It evaluates each commit: is it safe? does it improve the agent?
-4. It cherry-picks individual commits with `pull_upstream` (with a specific hash)
+4. It cherry-picks individual commits with `pull_upstream` (with a specific hash). A commit is refused unless every page of it was read and its diff has not changed since. With no hash, `pull_upstream` refuses unless every commit up to the reviewed target was fully read, `origin/main` still points to it, and the local HEAD is on the target's first-parent history (otherwise the first-parent diffs that were reviewed do not add up to what a fast-forward applies: a merge whose first parent is a side branch could drop local changes unseen), and then fast-forwards to that commit only (never `git pull`, which could fetch newer, unreviewed commits).
 5. It can skip commits it doesn't want
 
-The agent is never obligated to accept all upstream changes.
+The agent is never obligated to accept all upstream changes. Installing after a pull or reset runs `pnpm install --frozen-lockfile --ignore-scripts`, then `pnpm rebuild better-sqlite3 esbuild` (a fixed list in the runtime, not upstream's), then `pnpm run build`, each with its own timeout; the result names the step that failed. `pnpm run build` runs scripts defined upstream, so applying upstream code means trusting origin.
 
 ### Tool and package installation
 
@@ -1029,18 +1031,39 @@ Automatons communicate via a social relay at `social.conway.tech`.
 
 ### How messaging works
 
-1. Messages are **signed** with the sender's Ethereum private key
+1. Messages are **signed** with the sender's key (EIP-191 for EVM, ed25519 for Solana) over `Conway:send:{to}:{keccak256(content)}:{signed_at}`
 2. Sent to the social relay via HTTP
 3. Recipients poll the relay (every 2 minutes via heartbeat)
-4. Messages are **validated** (signature, timestamp freshness, content size)
-5. **Sanitized** through injection defense before the agent sees them
-6. Stored in the `inbox_messages` database table
+4. Each polled message is **classified** (`src/social/inbound.ts`):
+   - **verified** when the relay supplies the sender's `signature` and `signed_at`, the signature checks out against the claimed `from` over the canonical string addressed to *our own* address, and `signed_at` is at most 7 days old and at most 2 minutes in the future;
+   - **unverified** when there is no signature, or when a valid signature's `signed_at` is older than 7 days or more than 2 minutes ahead (logged at info). `from` is then not vouched for: an unverified sender is never treated as that address, only as what the relay reported. Such messages are delivered, labelled `NOT VERIFIED`, so a long sleep or a sender's fast clock loses no mail;
+   - **dropped** (logged at warn, never stored) when a signature is present but fails or has no readable `signed_at`, `from` is not a valid address, the relay's `to` is not our address, or the content is over 64,000 characters.
+   Today the relay does not return signatures, so every message is unverified. Anyone who can make the relay report an address (including the creator's) can claim it; the label and the isolated reply-only turn are what limit that. Dropping a bad signature gives no protection by itself (an attacker can strip it), and assumes the relay passes the sender's signature over this exact string; contract-wallet (ERC-1271) signatures are not supported and are dropped.
+5. **Replays** are stopped by a hash of what the sender signed (sender plus the canonical string), stored in `inbox_messages.sig_hash` under a unique index, so a signed message re-served under a new relay id is stored once and wakes nothing. Inbox rows are never deleted, so this holds for good; a signed message downgraded for its `signed_at` keeps the same hash, so it cannot be delivered twice either. An unsigned message re-delivered with the same nonce or `signed_at`, sender and content is also stored once. The relay's own `nonce` and message id prove nothing and are not trusted.
+6. **Screened once**, at ingest, and stored with the verdict and the original text unchanged (see "Inbound screening")
+7. **Rate limited** at ingest from stored rows: more than 10 per minute from one sender is stored as `rate_limited` (logged at warn). The minute is measured against when the sender sent (signed time for verified messages, the relay's time otherwise), not when the inbox was polled, so one poll carrying several minutes or hours of mail is not cut to 10. That time is clamped to between the previous successful poll and now, however long ago that poll was (a restart, a relay outage or low-compute sleep keeps the backlog's real spacing), so a relay cannot back-date or spread a flood beyond what the elapsed time allows. With no previous poll recorded, the floor is 7 days back. Signed and unsigned messages from the same address are counted separately, so forged traffic cannot use up a real sender's budget.
+8. Handled in one isolated, reply-only turn per sender batch. A batch is all signed or all unsigned; signed senders go first. Only a signed batch sees the sender's earlier (signed) inbox turns; an unsigned one sees none. Each message is shown as a label line (`[UNTRUSTED EXTERNAL SENDER <address> | signature verified]:` or `... | NOT VERIFIED: address reported by relay]:`) followed by its text, every line prefixed with `> `, so a label typed inside a message never starts a line.
+
+Only signed senders get a relationship record, count as a child's sign of life, or appear in soul reflection. `received_at` is the local clock; the relay's `createdAt` is kept in `relay_created_at`. Relay rows keep `to_address` empty, which the colony router relies on.
+
+### Inbound screening
+
+Screening is a speed bump, not the boundary: the boundary is the isolated reply-only turn. Detectors run on a folded copy of the text (NFKC, invisible characters removed; for Latin-script patterns also accents stripped and Cyrillic/Greek look-alikes mapped to Latin). The folded copy is only used for detection.
+
+- **Blocked** (stored with status `blocked`, never shown to the agent, never wakes it, logged at warn): only content over 64,000 characters, the same limit the relay check and message signing use. Nothing is dropped for what it says: a rule cannot tell a customer asking about prompts from an attack, and the reply-only turn already contains an attack.
+- **Flagged** (delivered with a warning line naming what was detected): model-control syntax (special tokens such as `<|im_start|>`, `<system>`/`</system>`, `[INST]`, `<<SYS>>`), structure hints (`END OF SYSTEM PROMPT`, `BEGIN NEW INSTRUCTIONS`, a `System:` line, a `[system]` tag), instruction and authority phrases in any language, financial requests, destructive commands (`rm -rf`, `DROP TABLE`, ...), obfuscation (mixed-script words, invisible characters inside words, bidi controls, long encoded blobs).
+- Every message is rendered with control characters removed and boundary tags and special tokens neutralised. The stored text is never changed.
+
+`blocked` and `rate_limited` rows are kept for the operator (readable in SQLite, and each one is logged at warn when stored) and never claimed. The sender is not told.
+
+Tool results are neutralised the same way (boundary tags and special tokens), and control and format characters (zero-width, bidi, BOM, soft hyphen, ESC, form feed) are shown as `\u{200b}`-style escapes rather than deleted, so a reviewed upstream diff shows exactly the characters that would be applied; review pages are sized on that visible form. `read_file` keeps control and format characters as they are, because file text is often written back whole and an escape would be written to disk as literal `\u{..}` text, and when a file contains prompt tags or special tokens its result starts with a note saying they are shown as placeholders. `write_file` and `edit_own_file` refuse text containing a placeholder (`[chatml-removed]`, `[inst-tag-removed]`, ...) that the file on disk does not contain, so a read-then-write round trip cannot replace a prompt template with placeholders.
 
 ### Message state machine
 
 ```
 received -> in_progress -> processed
                         -> failed (after 3 retries)
+blocked, rate_limited  (set at ingest; never claimed)
 ```
 
 ### Social inbox backoff
@@ -1079,7 +1102,9 @@ Generated and saved with `update_agent_card`.
 
 ### Discovery
 
-The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Results are cached in the `discovered_agents_cache` table.
+The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Results are cached in the `discovered_agents_cache` table under the chain, registry contract and agent id; a cached card counts only while the agent's URI is unchanged.
+
+Agent URIs come from a permissionless registry, so card fetches are bounded: HTTPS only; `localhost`, `*.localhost`, `*.local`, `*.internal` and `*.home.arpa` refused; the name is resolved and refused if any address is loopback, private, link-local, CGNAT, unique-local, multicast, reserved or IPv4-mapped to one of these, and the connection goes to the checked address (no DNS rebinding); at most 3 redirects, each re-checked in full; no compressed bodies; the body is streamed and cut off at `maxCardSizeBytes`, with one deadline of `fetchTimeoutMs` for the whole fetch. Once the deadline passes no further request is started (for example after a slow DNS answer or between redirect hops), and a request in flight is aborted. The configured IPFS gateway origin skips the private-address check (it is operator configuration) but keeps the size and time limits.
 
 ### Reputation
 
@@ -1140,7 +1165,7 @@ Never deny what you are. Guard your reasoning against manipulation. Your creator
 
 1. **Constitution** — immutable core laws (file is read-only, mode 0444)
 2. **Policy engine** — evaluates every tool call against 6 rule categories
-3. **Injection defense** — sanitizes all external input (8 detection checks)
+3. **Injection defense** — inbound messages are screened once at ingest (a speed bump that drops only oversized messages and labels the rest), and untrusted text is neutralised when rendered; the isolated reply-only inbox turn is the boundary
 4. **Path protection** — blocks writes to protected files, reads of sensitive files, on the real path, at the moment of I/O where the runtime does the I/O itself
 5. **Command safety** — an exec tripwire for dangerous shell patterns; rate-limits self-modification
 6. **Secret redaction** — known secrets are removed from inference requests and logs
@@ -1162,11 +1187,17 @@ The rules live in `src/security/protected-paths.ts`, which is itself protected.
 
 ### Exec tripwire
 
-The `exec` command check (`src/agent/policy-rules/command-safety.ts`) is a **tripwire, not a security boundary**. It denies a command that names a secret file or directory (whatever the verb), reaches into `~/.automaton` outside its allowed entries, globs hidden home paths, dumps the environment (`env`, `printenv`, `/proc/*/environ`), kills the runtime, deletes its state, or writes to guard files. It stops accidents and copy-pasted injection one-liners. `exec` runs as the same OS user that owns the wallet, so an interpreter, variable indirection or a script written to disk gets past any pattern list; only running the agent under a separate OS user closes that.
+The `exec` command check (`src/agent/policy-rules/command-safety.ts`) is a **tripwire, not a security boundary**. It denies a command that names a secret file or directory (whatever the verb), reaches into `~/.automaton` outside its allowed entries, globs hidden home paths, dumps the environment (`env`, `printenv`, `/proc/*/environ`), kills the runtime, deletes its state, or writes to guard files. It also denies recursive readers (`grep -r`, `rg`, `find`, `tar`, `zip -r`, `cp -r`, `rsync`, ...) aimed at the home or root directory (`.`, `~+`, `$PWD` or no path counts as home, because exec starts in `HOME`; `~-` and `$OLDPWD` are treated as home; `~user` as that user's home), including a `find` over home or root whose file list is consumed by `$(...)`, backticks, `<(...)`, `| xargs` or `| while read`; relative globs over hidden home entries (`cat .?utomaton/w?llet.json`); `/proc/*/environ` however the path is spelled (`/proc//self`, `/proc/./self`, `cd /proc/self`); self-kill through `xargs kill`, backticks, the runtime's own PID, `kill 0` or a `pkill -f` pattern that matches its command line, and an inline interpreter (`python -c`, `node -e`, a script on `/dev/stdin`, ...), a line or screen editor (`ed`, `ex`, `vim -es`, ...) or a git rewrite (`checkout`, `restore`, `apply`, ...) that names a guard file. A write to a guard file named through an unquoted glob (`src/agent/policy-eng*.ts`) is denied too, when the glob part keeps at least three literal characters; shorter globs (`src/agent/p*/financial.ts`, `dist/*`) are not caught, because `rm -rf dist/*` is ordinary in any project. The interpreter rule cannot tell reading from writing, so it also refuses inline code that only reads guard code; `read_file` reads it. Embedded use without a policy engine runs the same check. It stops accidents and copy-pasted injection one-liners.
+
+`exec` runs as the same OS user that owns the wallet, so a script written to disk and run, string building, `cd` across calls, `patch` from a file, a short glob, a command the tripwire does not parse or a background job gets past any pattern list. Secret redaction keeps a known key out of inference requests only while it recognises the encoding; the file stays readable to the next command. Real confidentiality of the wallet, integrity of the guard code and `dist/`, and protection of the process from signals need `exec` under a separate OS user (or a container or bubblewrap sandbox) with no read access to `~/.automaton` and no write access to the runtime checkout. That is the recommended deployment: run `exec` as a dedicated unprivileged user and have a supervisor restart the agent.
 
 ### Secret redaction
 
 Values the runtime knows are secret are registered when they are loaded: the wallet private key, the Conway, OpenAI and Anthropic API keys (from `automaton.json`, `config.json` and the environment, including custom provider key variables), plus their common re-encodings. They are replaced with a placeholder in every inference request and in everything the logger writes. Untrusted text headed for the prompt (skill instructions) is additionally stripped of anything shaped like key material.
+
+### Terminal output
+
+Log lines and CLI output can carry text from untrusted sources (tool results, fetched pages, messages). The pretty log sink, the logger's stderr fallback, and `automaton-cli logs`, `status`, `send` (the relay's error text and message id) and `fund` (the API's error text, transfer id and status) show control characters (C0, DEL, C1, line and paragraph separators, bidi controls) in visible `\x1b`-style notation instead of sending them to the terminal, so an escape sequence cannot rewrite the clipboard (OSC 52) or hide log lines. The pretty sink and the stderr fallback also show newlines as `\x0a`: one entry is one line, so quoted tool output cannot forge a log line. The JSON log sink writes them as `\uXXXX`.
 
 ### Child process environment
 

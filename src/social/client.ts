@@ -4,8 +4,12 @@
  * Creates a SocialClient for the automaton runtime.
  * Self-contained: uses viem for signing and fetch for HTTP.
  *
- * Phase 3.2: Hardened with HTTPS enforcement, shared signing,
- * request timeouts, replay protection, and rate limiting.
+ * Outbound: HTTPS only, shared signing, request timeouts, rate limiting.
+ * Inbound: every polled message is classified (social/inbound.ts). Signed
+ * messages are verified against the claimed sender and our own address;
+ * unsigned ones, and signed ones outside the freshness window, are passed on
+ * marked unverified; forged or misaddressed ones are dropped here and never
+ * stored.
  */
 
 import type { PrivateKeyAccount } from "viem";
@@ -14,6 +18,7 @@ import type { ChainIdentity } from "../identity/chain.js";
 import { ResilientHttpClient } from "../conway/http-client.js";
 import { signSendPayload, signPollPayload, MESSAGE_LIMITS } from "./signing.js";
 import { validateRelayUrl, validateMessage } from "./validation.js";
+import { classifyInbound, type RelayInboundMessage } from "./inbound.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("social");
 
@@ -28,7 +33,6 @@ const REQUEST_TIMEOUT_MS = 30_000;
 export function createSocialClient(
   relayUrl: string,
   account: PrivateKeyAccount | ChainIdentity,
-  db?: import("better-sqlite3").Database,
 ): SocialClientInterface {
   // Phase 3.2: Validate relay URL as HTTPS
   validateRelayUrl(relayUrl);
@@ -50,28 +54,6 @@ export function createSocialClient(
       throw new Error(
         `Rate limit exceeded: ${MESSAGE_LIMITS.maxOutboundPerHour} messages per hour`,
       );
-    }
-  }
-
-  function checkReplayNonce(nonce: string): boolean {
-    if (!db) return false;
-    try {
-      const row = db
-        .prepare(
-          "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND expires_at >= datetime('now')",
-        )
-        .get(`social:nonce:${nonce}`);
-      if (row) return true; // Already seen this nonce
-
-      // Insert nonce with 5 min TTL
-      const expiresAt = new Date(Date.now() + MESSAGE_LIMITS.replayWindowMs).toISOString();
-      db.prepare(
-        "INSERT OR IGNORE INTO heartbeat_dedup (dedup_key, task_name, expires_at) VALUES (?, ?, ?)",
-      ).run(`social:nonce:${nonce}`, "social_replay", expiresAt);
-
-      return false;
-    } catch {
-      return false;
     }
   }
 
@@ -145,40 +127,38 @@ export function createSocialClient(
       }
 
       const data = (await res.json()) as {
-        messages: Array<{
-          id: string;
-          from: string;
-          to: string;
-          content: string;
-          signedAt: string;
-          createdAt: string;
-          replyTo?: string;
-          nonce?: string;
-        }>;
+        messages?: RelayInboundMessage[];
         next_cursor?: string;
       };
 
-      // Phase 3.2: Replay protection for inbound messages
-      const filtered = data.messages.filter((m) => {
-        if (m.nonce && checkReplayNonce(m.nonce)) {
-          logger.warn(`Dropped replayed message: nonce=${m.nonce}`);
-          return false;
+      const messages: InboxMessage[] = [];
+      for (const m of Array.isArray(data.messages) ? data.messages : []) {
+        if (!m || typeof m !== "object") continue;
+        const verdict = await classifyInbound(m, account.address);
+        if (verdict.verdict === "rejected") {
+          // The id is relay-chosen text: quoted and cut before it is logged.
+          logger.warn(`[INBOX] dropped ${JSON.stringify(String(m.id ?? "").slice(0, 80))}: ${verdict.reason}`);
+          continue;
         }
-        return true;
-      });
+        if (verdict.verdict === "unverified" && verdict.outsideWindow) {
+          logger.info(
+            `[INBOX] ${JSON.stringify(String(m.id).slice(0, 80))}: signed_at is ${verdict.outsideWindow}; delivered as unverified`,
+          );
+        }
+        messages.push({
+          id: m.id as string,
+          from: verdict.from,
+          to: account.address,
+          content: m.content as string,
+          signedAt: verdict.signedAt ?? "",
+          createdAt: typeof m.createdAt === "string" ? m.createdAt : "",
+          replyTo: typeof m.replyTo === "string" ? m.replyTo : undefined,
+          verified: verdict.verdict === "verified",
+          sigHash: verdict.sigHash,
+        });
+      }
 
-      return {
-        messages: filtered.map((m) => ({
-          id: m.id,
-          from: m.from,
-          to: m.to,
-          content: m.content,
-          signedAt: m.signedAt,
-          createdAt: m.createdAt,
-          replyTo: m.replyTo,
-        })),
-        nextCursor: data.next_cursor,
-      };
+      return { messages, nextCursor: data.next_cursor };
     },
 
     unreadCount: async (): Promise<number> => {

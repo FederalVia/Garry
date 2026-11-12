@@ -16,16 +16,18 @@ import type {
   TickContext,
   HeartbeatLegacyContext,
   HeartbeatTaskFn,
+  InboxMessage,
   SurvivalTier,
 } from "../types.js";
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
 import { LEGACY_LIVE, LIVE, holdsSlot } from "../replication/child-status.js";
-import { sanitizeInput } from "../agent/injection-defense.js";
+import { screenInbound, serializeScreen, type ScreenVerdict } from "../agent/injection-defense.js";
+import { normalizeSenderAddress } from "../agent/inbox-isolation.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
-import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { countRecentInboxFrom, metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
@@ -39,6 +41,18 @@ function getAlertEngine(): AlertEngine {
   if (!_alertEngine) _alertEngine = new AlertEngine(createDefaultAlertRules());
   return _alertEngine;
 }
+
+/**
+ * Inbox rows accepted per sender per minute, counted separately for signed
+ * and unsigned rows of the same address. Later rows are stored as
+ * rate_limited and never handled.
+ */
+export const INBOX_RATE_LIMIT_PER_MINUTE = 10;
+const INBOX_RATE_WINDOW_MS = 60_000;
+// How far back a sender's time may place a message on the first poll, when
+// no previous poll is recorded (new install, or a database from before the
+// poll time was kept). Matches how long the relay holds signed mail.
+const INBOX_FIRST_POLL_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 
 // Last time the "no auto-topup on Solana" note was logged (once a day).
 let lastSolanaTopupNoticeMs = 0;
@@ -291,7 +305,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
     const cursor = taskCtx.db.getKV("social_inbox_cursor") || undefined;
 
-    let messages: any[] = [];
+    let messages: InboxMessage[] = [];
     let nextCursor: string | undefined;
 
     try {
@@ -320,38 +334,109 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     }
 
     if (nextCursor) taskCtx.db.setKV("social_inbox_cursor", nextCursor);
+    // Every successful poll moves the floor for sender times (below).
+    const pollNow = Date.now();
+    const previousPoll = Date.parse(taskCtx.db.getKV("social_inbox_last_poll_at") ?? "");
+    taskCtx.db.setKV("social_inbox_last_poll_at", new Date(pollNow).toISOString());
 
     if (!messages || messages.length === 0) return { shouldWake: false };
 
-    // Persist to inbox_messages table for deduplication
-    // Sanitize content before DB insertion
-    let newCount = 0;
+    // Screen each new message once, here, and store the original text with
+    // the verdict. The inbox turn renders from the stored verdict and never
+    // screens again, so the rate limit counts each message once.
+    //
+    // The rate is measured against when the sender sent (signed time for
+    // verified rows, the relay's time otherwise), not when we polled: one
+    // poll can carry several minutes of mail. That time is clamped to
+    // [previous poll, now], so a relay cannot back-date or spread a flood
+    // beyond the limit over the time that actually passed. The floor is the
+    // previous successful poll however long ago it was: a backlog held over
+    // a restart, an outage or low-compute sleep keeps its real spacing,
+    // instead of collapsing into one instant and tripping the limit.
+    const floor = Number.isFinite(previousPoll)
+      ? Math.min(previousPoll, pollNow)
+      : pollNow - INBOX_FIRST_POLL_LOOKBACK_MS;
+    const sentAt = (msg: InboxMessage, verified: boolean): number => {
+      const t = Date.parse(verified ? msg.signedAt : msg.createdAt);
+      if (!Number.isFinite(t)) return pollNow;
+      return Math.min(pollNow, Math.max(floor, t));
+    };
+
+    const seenIds = new Set<string>();
+    const candidates: Array<{ msg: InboxMessage; from: string; verified: boolean; at: number }> = [];
     for (const msg of messages) {
-      const existing = taskCtx.db.getKV(`inbox_seen_${msg.id}`);
-      if (!existing) {
-        const sanitizedFrom = sanitizeInput(msg.from, msg.from, "social_address");
-        const sanitizedContent = sanitizeInput(msg.content, msg.from, "social_message");
-        const sanitizedMsg = {
-          ...msg,
-          from: sanitizedFrom.content,
-          content: sanitizedContent.content,
-        };
-        taskCtx.db.insertInboxMessage(sanitizedMsg);
+      if (!msg || typeof msg.id !== "string" || msg.id.length === 0) continue;
+      if (seenIds.has(msg.id) || taskCtx.db.getKV(`inbox_seen_${msg.id}`)) continue;
+      seenIds.add(msg.id);
+
+      // Checked again here: a SocialClientInterface other than our own
+      // client may not have run the inbound checks.
+      const from = normalizeSenderAddress(msg.from);
+      if (!from || typeof msg.content !== "string") {
+        logger.warn(`[INBOX] dropped ${JSON.stringify(msg.id.slice(0, 80))}: invalid_sender`);
         taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
-        // Only count non-blocked messages toward wake threshold —
-        // blocked messages are stored for audit but should not wake
-        // the agent (prevents injection spam from draining credits).
-        if (!sanitizedContent.blocked) {
-          newCount++;
-        }
+        continue;
+      }
+      const verified = msg.verified === true;
+      candidates.push({ msg, from, verified, at: sentAt(msg, verified) });
+    }
+    // Oldest first, so the sliding window sees earlier rows before later ones.
+    candidates.sort((a, b) => a.at - b.at);
+
+    let newCount = 0;
+    let verifiedCount = 0;
+    for (const { msg, from, verified, at } of candidates) {
+      const recent = countRecentInboxFrom(
+        taskCtx.db.raw,
+        from,
+        verified,
+        new Date(at - INBOX_RATE_WINDOW_MS).toISOString(),
+        new Date(at).toISOString(),
+      );
+      let verdict: ScreenVerdict;
+      let status: "received" | "blocked" | "rate_limited";
+      if (recent >= INBOX_RATE_LIMIT_PER_MINUTE) {
+        verdict = { level: "blocked", reasons: ["rate_limit"] };
+        status = "rate_limited";
+      } else {
+        verdict = screenInbound(msg.content);
+        status = verdict.level === "blocked" ? "blocked" : "received";
+      }
+
+      const inserted = taskCtx.db.insertInboxMessage({
+        id: msg.id,
+        from,
+        to: "",
+        content: msg.content,
+        signedAt: msg.signedAt,
+        // Our clock bounds it: never before the previous poll, never after
+        // now. It drives claim order, the rate window and liveness.
+        createdAt: new Date(at).toISOString(),
+        relayCreatedAt: typeof msg.createdAt === "string" && msg.createdAt ? msg.createdAt : undefined,
+        replyTo: msg.replyTo,
+        verified,
+        sigHash: msg.sigHash,
+        status,
+        screen: serializeScreen(verdict),
+      });
+      taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
+      // Blocked, rate-limited and duplicate rows never wake the agent, so
+      // injection spam or a replay cannot drain credits.
+      if (inserted && status === "received") {
+        newCount++;
+        if (verified) verifiedCount++;
+      } else if (status !== "received") {
+        // Warn: these rows are never handled, so the operator should see them.
+        logger.warn(`[INBOX] stored ${JSON.stringify(msg.id.slice(0, 80))} as ${status} (not delivered)`);
       }
     }
 
     if (newCount === 0) return { shouldWake: false };
 
+    // Counts only: sender text never reaches the privileged wake prompt.
     return {
       shouldWake: true,
-      message: `${newCount} new message(s) from: ${messages.map((m) => m.from.slice(0, 10)).join(", ")}`,
+      message: `${newCount} new message(s), ${verifiedCount} verified`,
     };
   },
 

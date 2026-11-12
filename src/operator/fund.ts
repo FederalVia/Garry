@@ -9,6 +9,7 @@
  */
 
 import { ulid } from "ulid";
+import { escapeForTerminal } from "../observability/terminal-safe.js";
 import { hasValidEvmChecksum, isValidAddress, isZeroAddress, normalizeAddress, type ChainType } from "../identity/chain.js";
 
 export interface OperatorFundConfig {
@@ -205,6 +206,32 @@ export type FundResult =
     }
   | { status: "failed"; idempotencyKey: string; error: string }
   | { status: "unknown"; idempotencyKey: string; error: string };
+
+/**
+ * Text `automaton-cli fund` prints for a result. Error text, transfer id and
+ * status come from the API response, so they are escaped for the terminal.
+ */
+export function formatFundResult(plan: FundPlan, result: FundResult): string {
+  const safe = (s: string) => escapeForTerminal(s, { keepNewlines: false });
+  if (result.status !== "ok") return safe(result.error);
+  return `
+Transfer submitted.
+From:      ${plan.from || "(automaton)"}
+To:        ${plan.to}
+Amount:    ${formatUsd(plan.amountCents)} (${plan.amountCents} cents)
+Status:    ${safe(result.transferStatus)}
+Transfer:  ${safe(result.transferId)}
+Key:       ${result.idempotencyKey}
+${result.balanceAfterCents !== undefined ? `Balance:   ${formatUsd(result.balanceAfterCents)} after transfer` : ""}
+`;
+}
+
+/** An unexpected error from the fund command, on one escaped line. */
+export function formatFundError(err: unknown): string {
+  const message = (err as { message?: unknown } | null)?.message;
+  const text = typeof message === "string" && message ? message : String(err);
+  return `Credit transfer failed: ${escapeForTerminal(text, { keepNewlines: false })}`;
+}
 
 export const FUND_TIMEOUT_MS = 30_000;
 

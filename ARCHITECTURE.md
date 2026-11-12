@@ -163,7 +163,9 @@ src/
     tools.ts               57 built-in tool definitions + executor
     system-prompt.ts       Multi-layered prompt builder
     context.ts             Inference message assembly + token budgeting
-    injection-defense.ts   Input sanitization (8 detection checks)
+    injection-defense.ts   Inbound screening (once, at ingest) and render-time neutralisation
+    text-normalize.ts      Folded text for detectors only (NFKC, invisibles, look-alikes)
+    inbox-isolation.ts     Inbox turn labels, reply-only rule, isolated-turn checks
     policy-engine.ts       Centralized tool-call policy evaluation
     spend-tracker.ts       Spend mirror by calendar window (read by policy rules)
     policy-rules/          Rule implementations
@@ -227,6 +229,8 @@ src/
     logger.ts              StructuredLogger (JSON, levels, modules)
     metrics.ts             MetricsCollector (counters, gauges, histograms)
     alerts.ts              AlertEngine (rule evaluation, cooldowns)
+    pretty-sink.ts         Human-readable log sink
+    terminal-safe.ts       Escapes control characters for terminal output
 
   state/                   Persistence
     schema.ts              SQLite schema + migrations
@@ -240,14 +244,16 @@ src/
     tools.ts               Soul tool implementations
 
   social/                  Agent-to-agent communication
-    client.ts              Social relay HTTP client
-    signing.ts             Ethereum message signing
-    validation.ts          Signed message verification
-    protocol.ts            Message format definitions
+    client.ts              Social relay HTTP client (poll classifies every message)
+    signing.ts             Message signing + the canonical send string
+    inbound.ts             Inbound verdict: verified / unverified / rejected
+    validation.ts          Outbound message checks, relay URL check
+    protocol.ts            Signature verification (EVM EIP-191, Solana ed25519)
 
   registry/                On-chain identity
     agent-card.ts          ERC-8004 agent card builder (JSON-LD)
     discovery.ts           Agent discovery via registry contract
+    safe-fetch.ts          Bounded HTTPS fetch of agent cards (public addresses only)
     erc8004.ts             On-chain contract interaction (viem)
 
   replication/             Child automaton management
@@ -468,7 +474,9 @@ The automaton has a 5-tier hierarchical memory system:
 
 **Retrieval** (`MemoryRetriever`): Before each inference call, retrieves relevant memories within a token budget. Priority: working > episodic > semantic > procedural > relationships. Formatted into a memory block injected into context.
 
-**Ingestion** (`MemoryIngestionPipeline`): After each turn, classifies the turn and extracts: episodic events (significant tool calls), semantic facts (learned information), procedural outcomes (procedure success/failure tracking).
+**Ingestion** (`MemoryIngestionPipeline`): After each turn, classifies the turn and extracts: episodic events (significant tool calls), semantic facts (learned information), procedural outcomes (procedure success/failure tracking). Inbox turns write nothing to memory. From `discover_agents` only ids and owners are stored, read from each line's fixed `#<id> (<owner>)` prefix (card text is flattened to one line and comes after it).
+
+**Protections** (`memory/tools.ts`): `forget` cannot delete `creator` facts, and `remember_fact` writes the `creator` category only from a creator-sourced turn (taken from the tool call's turn context, never from arguments); the stored source is the turn's, not a claimed one.
 
 **Budget** (`MemoryBudgetManager`): Allocates token budget across tiers with rollover from unused tiers.
 
@@ -518,7 +526,7 @@ Every tick (default 60s):
 | `prune_dead_children` | configurable | Cleanup dead child records/sandboxes |
 | `report_metrics` | configurable | Metrics snapshot + alert evaluation |
 
-**Wake events:** Tasks that detect actionable conditions insert atomic wake events into the `wake_events` table. The scheduler is their only writer. The main run loop checks this table every 30 seconds during sleep, and the reasons (sanitized; inbox wakes as a generic sentence) are shown in the first prompt of the wake.
+**Wake events:** Tasks that detect actionable conditions insert atomic wake events into the `wake_events` table. The scheduler is their only writer. The main run loop checks this table every 30 seconds during sleep, and the reasons (neutralised, never screened or rate limited; inbox wakes as a generic sentence, and the inbox task's own reason carries counts only) are shown in the first prompt of the wake.
 
 **Balance-driven tasks:** a failed or malformed balance read is unknown, never 0. `TickContext.creditBalance` (and `usdcBalance`) is then `null`, `creditRead`/`usdcRead` say why (`{ known: false, reason, detail }`), and `survivalTierKnown` is false. The tier is the last known tier (`last_known_tier` KV) or else `low_compute`, never `critical` or `dead` from a failed read. `check_credits`, `check_usdc_balance` and the `heartbeat_ping` distress do nothing on an unknown balance: no topup, no distress, and the zero-credit streak (`zero_credits_since`) is neither started, extended nor ended. The outage start is kept in `balance_unknown_since` and a warning is logged at most once an hour; it never wakes the agent. Any successful read clears `balance_unknown_since` and records the tier; a read above 0 clears `zero_credits_since`. In the agent loop a cached balance (`last_known_balance`) can steer model routing but never buys credits and never marks the agent dead: only a live read can.
 
@@ -605,7 +613,7 @@ The automaton can modify its own code:
 - **File editing** (`code.ts`): `edit_own_file` tool applies diffs to source files. Protected files (constitution, wallet, DB, config) are blocked by path protection rules. All edits are logged to the `modifications` table. Each edit commits only its file; the tool records the new `self-mod:` commit's sha in KV `self_mod.commits` (only when this edit created it).
 - **Revert** (`tools.ts`): `revert_last_edit` reverts the newest recorded sha (`git revert --no-edit <sha>`) after checking it is an ancestor of HEAD and touches no protected file. Failed, stale or refused entries are dropped with a message, so a bad entry never blocks older ones. Operator commits are never reverted. `reset_to_upstream` clears the list.
 - **Restart notice** (`restart-notice.ts`): every tool that rebuilds says the running process keeps the old code and sets KV `restart_required`.
-- **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` shows commit diffs. `pull_upstream` cherry-picks individual commits (hex hashes only), running every command with `cd` into the runtime's repo (`process.cwd()`), and aborts a failed cherry-pick. The automaton is not obligated to accept all upstream changes.
+- **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` returns an index of upstream commits (flagging protected and guard files and install/build inputs: package files, lockfile, `.npmrc`, `.pnpmfile.*`, `tsconfig*.json`, `scripts/`) and then each commit's full `git show` diff in 8,000-character pages, recording which pages were read and a hash of each diff in KV (`upstream.review`). `pull_upstream` cherry-picks individual commits (hex hashes only) that were fully read and are unchanged, or fast-forwards to the reviewed target commit only when every commit up to it was read and HEAD is on the target's first-parent history, so the reviewed first-parent diffs add up to the fast-forward (never `git pull`). Review pages show invisible characters as visible escapes. It runs every command with `cd` into the runtime's repo (`process.cwd()`), and aborts a failed cherry-pick. `reset_to_upstream` is two calls: a plan, then a reset to the confirmed target hash. Installs run with dependency scripts off, then a native rebuild from a fixed list, then the build, each with its own timeout; the build runs upstream-defined scripts, so applying upstream code trusts origin. The automaton is not obligated to accept all upstream changes.
 - **Tool installation** (`agent/tools.ts`; `tools-manager.ts` holds older helpers no tool calls): `install_npm_package` adds packages. `install_mcp_server` validates the tool name (`^[a-zA-Z0-9_-]{1,64}$`, not a builtin, not installed) and installs the package, but MCP tools are not offered to the model: there is no MCP client. `loadInstalledTools` skips invalid, duplicate, builtin-colliding and MCP entries.
 - **Audit log** (`audit-log.ts`): Every modification is recorded with timestamp, type, diff, and hash for creator review.
 
@@ -654,16 +662,19 @@ The orchestrator ticks once per agent-loop cycle and works one goal at a time th
 **Files:** `src/social/`, `src/registry/`
 
 **Agent-to-agent messaging:**
-- Messages are signed with the sender's Ethereum private key
+- Messages are signed with the sender's key (EVM EIP-191 or Solana ed25519) over `Conway:send:{to}:{keccak256(content)}:{signed_at}`
 - Sent via Conway social relay (`social.conway.tech`)
 - Polled by heartbeat every 2 minutes
-- Validated for signature, timestamp freshness, content size
-- Sanitized through injection defense before processing
+- Each polled message gets one verdict (`social/inbound.ts`). **Verified**: the relay supplied `signature` and `signed_at`, the signature checks out against the claimed sender over the canonical string addressed to our own address, and `signed_at` is at most 7 days old and 2 minutes ahead. **Unverified**: no signature, or a valid signature whose `signed_at` is outside that window; delivered, labelled `NOT VERIFIED`, and the sender address is never treated as authenticated. **Rejected** (logged, not stored): a failing signature, a signature without a readable `signed_at`, an invalid sender, a relay `to` that is not us, content over 64,000 characters. Replays are stopped by the signed-content hash (`sig_hash`, unique, rows never deleted), which a downgraded message keeps. The relay does not return signatures today, so every message is unverified until it does.
+- Replays: `sig_hash` (a hash of the sender and the signed string, not of the signature bytes, which ECDSA lets a relay re-encode) under a unique index; unsigned exact re-deliveries are deduplicated the same way. The relay's id and nonce are not trusted.
+- Screened once at ingest (`injection-defense.ts`); the original text and the verdict are stored and the inbox turn renders from them. Blocked: only content over 64,000 characters (the relay and signing limit); nothing is dropped for what it says. Everything detected is delivered with a warning and its markers neutralised. Rate limit: 10 per minute per sender, signed and unsigned counted apart, from stored rows, measured against the sender's time clamped to [previous successful poll, now] however long the gap (7 days back when no poll is recorded). `blocked` and `rate_limited` rows are logged at warn, kept for the operator and never claimed.
+- Claim order: verified first; a batch never mixes signed and unsigned rows. Only a verified batch sees earlier (verified) turns from that sender. Only verified senders get relationship records, count for child liveness or appear in soul reflection. Relay rows keep `to_address` NULL (the colony router treats a recipient as a colony message).
 
 **Agent discovery:**
 - ERC-8004 registry contract on Base
 - Agents publish JSON-LD agent cards with capabilities and services
-- `AgentDiscovery` class fetches and caches remote agent cards
+- Cards are fetched through `registry/safe-fetch.ts`: HTTPS only, internal names refused, every resolved address must be public and the connection uses the checked address, at most 3 redirects each re-checked, no compressed bodies, streamed size cap and one overall deadline. The configured IPFS gateway origin skips only the address check.
+- Cards are cached per chain, registry contract and agent id, and a cache hit requires the same agent URI
 - Reputation system: feedback scores stored in `reputation` table
 
 ---
@@ -710,7 +721,7 @@ Step-by-step instructions for the agent...
 
 - Loaded from `~/.automaton/skills/` directory
 - YAML frontmatter parsed by a small built-in parser (`src/skills/format.ts`)
-- Sanitized through injection defense (untrusted content markers)
+- Rendered inside untrusted-content markers, with prompt boundary tags and special tokens neutralised (ordinary words such as `tool_call` are left alone)
 - Can be installed from git repos, URLs, or created by the agent itself
 - Active skill instructions are injected into the system prompt with trust boundary markers
 
@@ -720,7 +731,7 @@ Step-by-step instructions for the agent...
 
 **Files:** `src/observability/`
 
-**Structured logging** (`logger.ts`): `StructuredLogger` with module namespacing, log levels (debug/info/warn/error/fatal), JSON context serialization. Global log level configurable. All modules use `createLogger(moduleName)`.
+**Structured logging** (`logger.ts`): `StructuredLogger` with module namespacing, log levels (debug/info/warn/error/fatal), JSON context serialization. Global log level configurable. All modules use `createLogger(moduleName)`. Log text may come from untrusted sources, so the pretty sink, the stderr fallback and the CLI's `logs`, `status`, `send` and `fund` commands show control characters in visible `\x1b`-style notation (`terminal-safe.ts`), the sinks with newlines escaped too (one entry, one line), and the JSON sink escapes C1, line separator and bidi characters as `\uXXXX`.
 
 **Metrics** (`metrics.ts`): `MetricsCollector` singleton with counters (monotonic), gauges (point-in-time), and histograms (percentile buckets). Metrics snapshot saved to `metric_snapshots` table by heartbeat.
 
@@ -734,7 +745,7 @@ Step-by-step instructions for the agent...
 
 **Engine:** SQLite via `better-sqlite3` (synchronous, WAL mode, journal_mode=WAL).
 
-**Schema version:** 8 (applied incrementally via migration runner)
+**Schema version:** 16 (applied incrementally via migration runner)
 
 **Tables (22):**
 
@@ -753,7 +764,7 @@ Step-by-step instructions for the agent...
 | `children` | v2 | Spawned child automaton records |
 | `registry` | v2 | ERC-8004 registration state |
 | `reputation` | v2 | Peer reputation scores |
-| `inbox_messages` | v3 | Social messages with processing state machine |
+| `inbox_messages` | v3 | Social messages with processing state machine; v16 adds `verified`, `sig_hash` (unique), `signed_at`, `relay_created_at`, `screen` and the `blocked`/`rate_limited` statuses |
 | `policy_decisions` | v4 | Tool call policy audit trail |
 | `spend_tracking` | v4 | Spend mirror by calendar window (written by the Treasury on commit) |
 | `treasury_ledger` | v12 | Every outflow attempt and its state (reserved, sent, committed, released, unknown, denied) |
@@ -831,11 +842,11 @@ The automaton operates under a defense-in-depth security model:
 
 **Layer 2 — Policy engine** (pre-execution): Every tool call evaluated against 6 rule categories before execution. First deny wins. All decisions audited.
 
-**Layer 3 — Injection defense** (input sanitization): 8 detection checks on all external input: instruction patterns, authority claims, boundary manipulation, ChatML markers, encoding evasion, multi-language injection, financial manipulation, self-harm instructions.
+**Layer 3 — Injection defense** (a speed bump; isolation is the boundary): inbound messages are screened once at ingest on folded text (NFKC, invisible characters removed, look-alikes mapped for Latin patterns) for prompt structure, instructions and authority claims in any language, financial requests, destructive commands and obfuscation. Only oversized messages are dropped; everything else, including model-control syntax and override phrases, is delivered with a warning to the reply-only turn. Stored text is never rewritten: untrusted text (messages, tool results, worklog, genesis, skills) is neutralised when rendered. The inbox turn labels each sender as signature-verified or not.
 
 **Layer 4 — Path protection** (filesystem, `src/security/protected-paths.ts`): Protected paths cannot be written (state directory outside its writable entries, secrets, shell startup files, system directories, guard code). Sensitive paths cannot be read (secret files and directories, system secrets, the state directory outside its readable allowlist). Rules are checked on the lexical and the real path; links in the final component are refused. The policy rules check before the call, and `secure-fs.ts` checks again at the moment of I/O for local `read_file`/`write_file`, `edit_own_file`, worker file tools and the runtime's state writers.
 
-**Layer 5 — Command safety** (shell): the exec tripwire denies commands that name secrets, reach into the state directory, glob hidden home paths, dump the environment, kill the runtime or write guard files. It is a tripwire, not a boundary: exec runs as the wallet's OS user. Rate limits on self-modification operations.
+**Layer 5 — Command safety** (shell): the exec tripwire denies commands that name secrets, reach into the state directory, glob hidden home paths, dump the environment, recursively read the home or root directory (`.` counts as home, since exec starts there), kill the runtime (including `xargs kill`, backticks, its own PID, `kill 0` and `pkill -f` patterns matching its own command line), or write guard files (including through inline interpreters and git rewrite commands). It is a tripwire, not a boundary: exec runs as the wallet's OS user, so a script written to disk, string building, a short glob or a multi-step command gets past it. The recommended deployment runs exec as a separate unprivileged OS user (or in a container or bubblewrap sandbox) without read access to `~/.automaton` or write access to the runtime checkout. Rate limits on self-modification operations.
 
 **Layer 5b — Secrets out of reach:** API keys are not copied into `process.env`; every command (agent and workers) gets `childProcessEnv()`, without credential-shaped variables (operator tokens such as `GITHUB_TOKEN` included). Registered secrets are redacted from inference requests and logs (`secret-redaction.ts`).
 

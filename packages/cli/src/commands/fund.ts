@@ -12,6 +12,8 @@ import {
   planFund,
   executeFund,
   formatUsd,
+  formatFundResult,
+  formatFundError,
   confirmOnTty,
   FUND_USAGE as USAGE,
 } from "@conway/automaton/operator/fund.js";
@@ -87,22 +89,12 @@ try {
   }
 
   const result = await executeFund(plan, { paths: TRANSFER_PATHS });
+  // API-supplied text is escaped for the terminal.
+  console.log(formatFundResult(plan, result));
   if (result.status !== "ok") {
-    console.log(result.error);
     process.exit(result.status === "unknown" ? 2 : 1);
   }
-
-  console.log(`
-Transfer submitted.
-From:      ${plan.from || "(automaton)"}
-To:        ${plan.to}
-Amount:    ${formatUsd(plan.amountCents)} (${plan.amountCents} cents)
-Status:    ${result.transferStatus}
-Transfer:  ${result.transferId}
-Key:       ${result.idempotencyKey}
-${result.balanceAfterCents !== undefined ? `Balance:   ${formatUsd(result.balanceAfterCents)} after transfer` : ""}
-`);
 } catch (err: any) {
-  console.log(`Credit transfer failed: ${err?.message || String(err)}`);
+  console.log(formatFundError(err));
   process.exit(1);
 }

@@ -15,7 +15,7 @@ import nacl from "tweetnacl";
 import bs58 from "bs58";
 import { getAddress, keccak256, toBytes, verifyMessage } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { parseUsdAmount, planFund, executeFund, formatUsd, FUND_USAGE } from "../operator/fund.js";
+import { parseUsdAmount, planFund, executeFund, formatUsd, formatFundResult, formatFundError, FUND_USAGE } from "../operator/fund.js";
 
 const AUTOMATON = "0x1111111111111111111111111111111111111111";
 const CHILD = "0x2222222222222222222222222222222222222222";
@@ -215,6 +215,29 @@ describe("executeFund", () => {
     }
   });
 
+  it("escapes API-supplied error text, transfer id and status before they reach the terminal", async () => {
+    const evil = "no\x1b]52;c;QUJD\x07\x1b[2K\rforged line";
+    const refused = (async () => new Response(evil, { status: 402 })) as unknown as typeof fetch;
+    const p = plan();
+    const failed = formatFundResult(p, await executeFund(p, { paths: PATHS, fetch: refused }));
+    expect(failed).toContain("\\x1b]52;c;QUJD\\x07\\x1b[2K\\x0dforged line");
+    expect(failed).not.toMatch(/[\x00-\x08\x0a-\x1f\x7f-\x9f]/);
+
+    const ok = (async () =>
+      new Response(JSON.stringify({ transfer_id: "t1\x1b[2J", status: "completed\u202e" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const shown = formatFundResult(p, await executeFund(p, { paths: PATHS, fetch: ok }));
+    expect(shown).toContain("Transfer:  t1\\x1b[2J");
+    expect(shown).toContain("Status:    completed\\u{202e}");
+    expect(shown).not.toContain("\x1b");
+
+    expect(formatFundError(new Error("boom\x1b]0;title\x07\nnext"))).toBe(
+      "Credit transfer failed: boom\\x1b]0;title\\x07\\x0anext",
+    );
+  });
+
   it("reports a 4xx as a definite failure", async () => {
     const refused = (async () => new Response("insufficient credits", { status: 402 })) as unknown as typeof fetch;
     const r = await executeFund(plan(), { paths: PATHS, fetch: refused });
@@ -358,5 +381,30 @@ describe("operator send", () => {
     const r2 = await sendOperatorMessage({ relayUrl: "https://relay.test", to: CHILD, content: "hi" });
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.error).toMatch(/Cannot read wallet/);
+  });
+
+  it("escapes relay-chosen error text and message ids before the CLI prints them", async () => {
+    writeWallet({ chainType: "evm", privateKey: generatePrivateKey(), createdAt: new Date().toISOString() });
+    const evil = "ok\x1b]52;c;ZXZpbA==\x07\x1b[2K\r\u202eevil\nINFO forged";
+    const { sendOperatorMessage, formatSendResult } = await import("../operator/send.js");
+    const unsafe = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u202e]/;
+
+    vi.stubGlobal("fetch", async () =>
+      new Response(JSON.stringify({ error: evil }), { status: 400, headers: { "content-type": "application/json" } }),
+    );
+    const failed = formatSendResult(await sendOperatorMessage({ relayUrl: "https://relay.test", to: CHILD, content: "hi" }));
+    expect(failed.ok).toBe(false);
+    expect(failed.lines.join("\n")).toContain("\\x1b]52");
+    for (const line of failed.lines) expect(line).not.toMatch(unsafe);
+    for (const line of failed.lines) expect(line).not.toContain("\n");
+
+    vi.stubGlobal("fetch", async () =>
+      new Response(JSON.stringify({ id: evil }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    const sent = formatSendResult(await sendOperatorMessage({ relayUrl: "https://relay.test", to: CHILD, content: "hi" }));
+    expect(sent.ok).toBe(true);
+    expect(sent.lines[1]).toContain("\\x1b]52");
+    for (const line of sent.lines) expect(line).not.toMatch(unsafe);
+    for (const line of sent.lines) expect(line).not.toContain("\n");
   });
 });
