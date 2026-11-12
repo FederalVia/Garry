@@ -230,14 +230,20 @@ function getOrchestratorState(db: BetterSqlite3.Database): Record<string, unknow
 
 describe("orchestration/Orchestrator", () => {
   let db: BetterSqlite3.Database;
+  let tmpHome: string;
 
   beforeEach(() => {
+    // The orchestrator persists plans under ~/.automaton/workspace.
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "orchestrator-home-"));
+    vi.stubEnv("HOME", tmpHome);
     db = createInMemoryDb();
     currentDb = db;
   });
 
   afterEach(() => {
     db.close();
+    vi.unstubAllEnvs();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
   // ─── tick() phase transitions ────────────────────────────────

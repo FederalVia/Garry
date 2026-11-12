@@ -88,7 +88,8 @@ const STRUCTURE_BLANKERS: RegExp[] = [...STRUCTURE_PATTERNS, ...STRUCTURE_HINT_P
 // Instructions aimed at the model. Run with structure markers blanked, so a
 // pasted marker is reported once, as structure.
 const INSTRUCTION_PATTERNS: RegExp[] = [
-  /\b(ignore|disregard|forget|override)\b[^.\n]{0,40}?\b(previous|prior|above|earlier|preceding|all|your|any|these|the)\b[^.\n]{0,20}?\b(instructions?|rules|prompts?|directives?|guidelines|programming|constraints)\b/,
+  // Gaps sized for "ignore all of your previously given safety instructions".
+  /\b(ignore|disregard|forget|override)\b[^.\n]{0,60}?\b(previous|prior|above|earlier|preceding|all|your|any|these|the)\b[^.\n]{0,40}?\b(instructions?|rules|prompts?|directives?|guidelines|programming|constraints)\b/,
   /\bforget everything\b/,
   /\byou must now\b/,
   /\byour (new|real|true|actual) (instructions?|orders|task|purpose|goal) (are|is)\b/,
@@ -127,10 +128,20 @@ const MULTILANG_LATIN_PATTERNS: RegExp[] = [
   /\bignore[rz]? (toutes )?(les )?instructions (precedentes|anterieures)\b/,
   /\bignore (todas )?as instrucoes anteriores\b/,
 ];
+/**
+ * Chinese "ignore ... instructions / explanation / prompt / directions"
+ * (simplified and traditional). The gap may hold any character but a line
+ * break, so letters, kana, emoji or symbols in it do not dodge the match.
+ * It is bounded and may not contain another "ignore": a later one starts its
+ * own, shorter match, so nothing is missed, and each character is scanned
+ * from one "ignore" only, which keeps the scan linear on a message of repeats.
+ */
+export const ZH_IGNORE_INSTRUCTIONS_RE = new RegExp(
+  "\\u5FFD\\u7565(?:(?!\\u5FFD\\u7565)[^\\n\\r\\u2028\\u2029]){0,200}" +
+    "(?:\\u6307\\u4EE4|\\u8BF4\\u660E|\\u8AAA\\u660E|\\u63D0\\u793A|\\u6307\\u793A)",
+);
 const MULTILANG_SCRIPT_PATTERNS: RegExp[] = [
-  // The gap is bounded: an open-ended one rescans the rest of the text at
-  // every "ignore", which is quadratic on a message made of repeats.
-  /\u5FFD\u7565[\u4E00-\u9FFF]{0,40}(\u6307\u4EE4|\u8BF4\u660E|\u63D0\u793A)/, // ignore ... instructions / prompt
+  ZH_IGNORE_INSTRUCTIONS_RE,
   /\u7CFB\u7EDF\u63D0\u793A/, // system prompt
   /\u0438\u0433\u043D\u043E\u0440\u0438\u0440\u0443\u0439/, // Russian: ignore
   /\u0441\u0438\u0441\u0442\u0435\u043C\u043D\u043E\u0435\s+\u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435/, // Russian: system message
@@ -157,7 +168,7 @@ const FINANCIAL_PATTERNS: RegExp[] = [
   new RegExp(`\\b${MONEY_VERB}\\b.{0,40}?\\$\\s?\\d`),
   new RegExp(`\\b${MONEY_VERB}\\b.{0,60}?\\b0x[0-9a-f]{40}\\b`),
   /\bpay me\b/,
-  /\b(empty|drain)\b.{0,15}?\b(wallet|funds?|account|balance)\b/,
+  /\b(empty|drain)\b.{0,40}?\b(wallet|funds?|account|balance)\b/,
 ];
 
 const SELF_HARM_PATTERNS: RegExp[] = [

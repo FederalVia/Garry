@@ -117,6 +117,16 @@ const DENIED = [
   "pkill -f index.js",
   "kill 0",
   "kill -9 0",
+  // ...one pid at a time, through a loop over a process listing
+  "for p in $(pgrep node); do kill -9 $p; done",
+  "for p in `pgrep node`; do kill -9 $p; done",
+  "for p in $(pidof node); do kill $p; done",
+  "for p in $(ps aux | grep node | awk '{print $2}'); do kill -9 \"$p\"; done",
+  "for p in $(pgrep -f index.js)\ndo\n  kill -9 $p\ndone",
+  "for p in $(pgrep node); do [ $p -gt 1 ] && sudo kill $p; done",
+  "pgrep node | while read p; do kill -9 $p; done",
+  "pgrep node | while IFS= read -r p; do kill $p; done",
+  "while read p; do kill -9 $p; done < <(pgrep node)",
   // Guard writes by interpreter or git
   "python3 -c \"open('src/agent/policy-engine.ts','w').write('')\"",
   "node -e \"require('fs').writeFileSync('src/agent/policy-engine.ts','')\"",
@@ -193,6 +203,13 @@ const ALLOWED = [
   "ls -R ~",
   "git diff src/agent/policy-engine.ts",
   "kill -15 12345",
+  // Ordinary loops, and loops over a process listing that do not kill
+  "for f in *.log; do gzip $f; done",
+  "for i in $(seq 1 3); do echo $i; done",
+  "for p in $(pgrep node); do ps -o rss= -p $p; done",
+  "ps aux | while read line; do echo \"$line\" | grep kill; done",
+  "for p in $(pgrep node); do echo $p; done; echo killed",
+  "for job in $(jobs -p); do wait $job; done",
   // Quoted globs are not expanded; short globs and cd elsewhere do not trip
   "grep -E '.*foo' notes.txt",
   "grep '.[a-z]' notes.txt",

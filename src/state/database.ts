@@ -498,8 +498,8 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     const info = db.prepare(
       `INSERT OR IGNORE INTO inbox_messages
          (id, from_address, content, received_at, reply_to, status, verified, sig_hash,
-          signed_at, relay_created_at, screen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          signed_at, relay_created_at, screen, available_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       msg.id,
       msg.from,
@@ -512,6 +512,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
       msg.verified === true ? msg.signedAt ?? null : null,
       msg.relayCreatedAt ?? null,
       msg.screen ?? null,
+      msg.availableAt ?? null,
     );
     return info.changes > 0;
   };
@@ -1817,6 +1818,67 @@ export function countRecentInboxFrom(
      WHERE from_address = ? AND verified = ? AND received_at >= ? AND received_at <= ?`,
   ).get(from, verified ? 1 : 0, sinceIso, untilIso ?? "9999") as { n: number };
   return row.n;
+}
+
+/** Deferred rows waiting for one sender bucket (address plus verified flag). */
+export function countDeferredInboxFrom(db: DatabaseType, from: string, verified: boolean): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM inbox_messages
+     WHERE status = 'deferred' AND from_address = ? AND verified = ?`,
+  ).get(from, verified ? 1 : 0) as { n: number };
+  return row.n;
+}
+
+/**
+ * Rows of one sender bucket made claimable (shown to the agent) at or after
+ * `sinceIso`, by the real time they became claimable, not their sender time.
+ * Rows stamped later than now (a clock step back) count too.
+ */
+export function countShownInboxSince(db: DatabaseType, from: string, verified: boolean, sinceIso: string): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM inbox_messages
+     WHERE from_address = ? AND verified = ? AND available_at >= ?`,
+  ).get(from, verified ? 1 : 0, sinceIso) as { n: number };
+  return row.n;
+}
+
+/** Sender buckets (address plus verified flag) with deferred rows waiting. */
+export function listDeferredInboxBuckets(db: DatabaseType): Array<{ from: string; verified: boolean }> {
+  return (db.prepare(
+    "SELECT DISTINCT from_address, verified FROM inbox_messages WHERE status = 'deferred'",
+  ).all() as Array<{ from_address: string; verified: number }>).map((r) => ({
+    from: r.from_address,
+    verified: r.verified === 1,
+  }));
+}
+
+/**
+ * Make up to `max` of one bucket's oldest deferred rows claimable, stamped
+ * available_at = nowIso. received_at (the clamped sender time) is kept, so
+ * claim order and the ingest window are unchanged. Returns how many.
+ */
+export function releaseDeferredInbox(
+  db: DatabaseType,
+  from: string,
+  verified: boolean,
+  max: number,
+  nowIso: string,
+): number {
+  if (max <= 0) return 0;
+  return db.transaction(() => {
+    const rows = db.prepare(
+      `SELECT id FROM inbox_messages
+       WHERE status = 'deferred' AND from_address = ? AND verified = ?
+       ORDER BY received_at ASC, rowid ASC
+       LIMIT ?`,
+    ).all(from, verified ? 1 : 0, max) as Array<{ id: string }>;
+    const update = db.prepare(
+      "UPDATE inbox_messages SET status = 'received', available_at = ? WHERE id = ? AND status = 'deferred'",
+    );
+    let released = 0;
+    for (const { id } of rows) released += update.run(nowIso, id).changes;
+    return released;
+  })();
 }
 
 export function getUnprocessedInboxCount(db: DatabaseType): number {

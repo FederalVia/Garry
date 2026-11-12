@@ -203,8 +203,11 @@ export interface InboxMessage {
   sigHash?: string;
 }
 
-/** Inbox row statuses written at ingest; blocked and rate_limited are never claimed. */
-export type InboxIngestStatus = "received" | "blocked" | "rate_limited";
+/**
+ * Inbox row statuses written at ingest. blocked and rate_limited are never
+ * claimed; deferred becomes received when the sender's rate allows.
+ */
+export type InboxIngestStatus = "received" | "deferred" | "blocked" | "rate_limited";
 
 /** Fields stored with an inbox row besides the message itself. */
 export interface InboxMessageInsert extends InboxMessage {
@@ -213,6 +216,8 @@ export interface InboxMessageInsert extends InboxMessage {
   screen?: string;
   /** The relay's own createdAt; received_at is our local clock. */
   relayCreatedAt?: string;
+  /** When the row became claimable (local clock); unset while it is not. */
+  availableAt?: string;
 }
 
 // ─── Heartbeat ───────────────────────────────────────────────────

@@ -16,6 +16,7 @@ import type {
   TickContext,
   HeartbeatLegacyContext,
   HeartbeatTaskFn,
+  InboxIngestStatus,
   InboxMessage,
   SurvivalTier,
 } from "../types.js";
@@ -27,7 +28,15 @@ import { getSurvivalTier } from "../conway/credits.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
-import { countRecentInboxFrom, metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import {
+  countDeferredInboxFrom,
+  countRecentInboxFrom,
+  countShownInboxSince,
+  listDeferredInboxBuckets,
+  metricsInsertSnapshot,
+  metricsPruneOld,
+  releaseDeferredInbox,
+} from "../state/database.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
@@ -44,10 +53,17 @@ function getAlertEngine(): AlertEngine {
 
 /**
  * Inbox rows accepted per sender per minute, counted separately for signed
- * and unsigned rows of the same address. Later rows are stored as
- * rate_limited and never handled.
+ * and unsigned rows of the same address. Later rows wait as deferred and are
+ * released at this rate.
  */
 export const INBOX_RATE_LIMIT_PER_MINUTE = 10;
+/**
+ * Deferred rows one sender bucket may have waiting: three hours at the rate,
+ * enough for the backlog of a multi-hour outage paged by the relay. Past it,
+ * rows are stored as rate_limited and never handled, so one burst cannot
+ * queue more than that many hours of inbox turns.
+ */
+export const INBOX_DEFER_MAX_PER_SENDER = INBOX_RATE_LIMIT_PER_MINUTE * 180;
 const INBOX_RATE_WINDOW_MS = 60_000;
 // How far back a sender's time may place a message on the first poll, when
 // no previous poll is recorded (new install, or a database from before the
@@ -339,8 +355,6 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     const previousPoll = Date.parse(taskCtx.db.getKV("social_inbox_last_poll_at") ?? "");
     taskCtx.db.setKV("social_inbox_last_poll_at", new Date(pollNow).toISOString());
 
-    if (!messages || messages.length === 0) return { shouldWake: false };
-
     // Screen each new message once, here, and store the original text with
     // the verdict. The inbox turn renders from the stored verdict and never
     // screens again, so the rate limit counts each message once.
@@ -352,7 +366,16 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     // beyond the limit over the time that actually passed. The floor is the
     // previous successful poll however long ago it was: a backlog held over
     // a restart, an outage or low-compute sleep keeps its real spacing,
-    // instead of collapsing into one instant and tripping the limit.
+    // instead of collapsing into one instant and tripping the limit. Rows
+    // that still exceed the limit (a backlog the relay pages over several
+    // polls, or delivers late) wait as deferred for a later poll.
+    //
+    // Separately, the rows made claimable in this poll are bounded in real
+    // time: per sender bucket, the limit times the minutes since the previous
+    // successful poll (at least one minute's worth), less what was shown in
+    // the last real minute. Sender times are clamped into the poll interval
+    // but are not when the agent sees a row, so this keeps a flood at the
+    // limit per minute of real time however close together polls run.
     const floor = Number.isFinite(previousPoll)
       ? Math.min(previousPoll, pollNow)
       : pollNow - INBOX_FIRST_POLL_LOOKBACK_MS;
@@ -362,9 +385,40 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       return Math.min(pollNow, Math.max(floor, t));
     };
 
+    const pollIso = new Date(pollNow).toISOString();
+    const pollBudget = Math.floor(
+      INBOX_RATE_LIMIT_PER_MINUTE * Math.max(1, (pollNow - floor) / INBOX_RATE_WINDOW_MS),
+    );
+    const shownSince = new Date(pollNow - INBOX_RATE_WINDOW_MS).toISOString();
+    const room = new Map<string, number>();
+    const bucketKey = (from: string, verified: boolean) => `${verified ? 1 : 0}:${from}`;
+    const roomFor = (from: string, verified: boolean): number => {
+      const key = bucketKey(from, verified);
+      let left = room.get(key);
+      if (left === undefined) {
+        left = pollBudget - countShownInboxSince(taskCtx.db.raw, from, verified, shownSince);
+        room.set(key, left);
+      }
+      return left;
+    };
+    const take = (from: string, verified: boolean, n: number) =>
+      room.set(bucketKey(from, verified), roomFor(from, verified) - n);
+
+    let newCount = 0;
+    let verifiedCount = 0;
+
+    // Rows deferred by earlier polls go first, oldest first, so a backlog
+    // keeps its order. Only after a successful poll.
+    for (const { from, verified } of listDeferredInboxBuckets(taskCtx.db.raw)) {
+      const released = releaseDeferredInbox(taskCtx.db.raw, from, verified, roomFor(from, verified), pollIso);
+      take(from, verified, released);
+      newCount += released;
+      if (verified) verifiedCount += released;
+    }
+
     const seenIds = new Set<string>();
     const candidates: Array<{ msg: InboxMessage; from: string; verified: boolean; at: number }> = [];
-    for (const msg of messages) {
+    for (const msg of messages ?? []) {
       if (!msg || typeof msg.id !== "string" || msg.id.length === 0) continue;
       if (seenIds.has(msg.id) || taskCtx.db.getKV(`inbox_seen_${msg.id}`)) continue;
       seenIds.add(msg.id);
@@ -383,8 +437,6 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     // Oldest first, so the sliding window sees earlier rows before later ones.
     candidates.sort((a, b) => a.at - b.at);
 
-    let newCount = 0;
-    let verifiedCount = 0;
     for (const { msg, from, verified, at } of candidates) {
       const recent = countRecentInboxFrom(
         taskCtx.db.raw,
@@ -393,14 +445,19 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         new Date(at - INBOX_RATE_WINDOW_MS).toISOString(),
         new Date(at).toISOString(),
       );
+      // A row waits behind the sender's deferred rows, so delivery keeps
+      // sender order.
+      const waiting = countDeferredInboxFrom(taskCtx.db.raw, from, verified);
+      const overRate = recent >= INBOX_RATE_LIMIT_PER_MINUTE || waiting > 0 || roomFor(from, verified) <= 0;
       let verdict: ScreenVerdict;
-      let status: "received" | "blocked" | "rate_limited";
-      if (recent >= INBOX_RATE_LIMIT_PER_MINUTE) {
+      let status: InboxIngestStatus;
+      if (overRate && waiting >= INBOX_DEFER_MAX_PER_SENDER) {
         verdict = { level: "blocked", reasons: ["rate_limit"] };
         status = "rate_limited";
       } else {
         verdict = screenInbound(msg.content);
-        status = verdict.level === "blocked" ? "blocked" : "received";
+        if (verdict.level === "blocked") status = "blocked";
+        else status = overRate ? "deferred" : "received";
       }
 
       const inserted = taskCtx.db.insertInboxMessage({
@@ -418,14 +475,18 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         sigHash: msg.sigHash,
         status,
         screen: serializeScreen(verdict),
+        availableAt: status === "received" ? pollIso : undefined,
       });
       taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
-      // Blocked, rate-limited and duplicate rows never wake the agent, so
-      // injection spam or a replay cannot drain credits.
+      // Blocked, rate-limited, deferred and duplicate rows do not wake the
+      // agent, so injection spam or a replay cannot drain credits.
       if (inserted && status === "received") {
+        take(from, verified, 1);
         newCount++;
         if (verified) verifiedCount++;
-      } else if (status !== "received") {
+      } else if (inserted && status === "deferred") {
+        logger.info(`[INBOX] deferred ${JSON.stringify(msg.id.slice(0, 80))}: over the per-sender rate`);
+      } else if (status === "blocked" || status === "rate_limited") {
         // Warn: these rows are never handled, so the operator should see them.
         logger.warn(`[INBOX] stored ${JSON.stringify(msg.id.slice(0, 80))} as ${status} (not delivered)`);
       }

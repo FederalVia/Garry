@@ -913,6 +913,8 @@ export const MIGRATION_V16_INBOX_COLUMNS: ReadonlyArray<[string, string]> = [
   ["signed_at", "ALTER TABLE inbox_messages ADD COLUMN signed_at TEXT"],
   ["relay_created_at", "ALTER TABLE inbox_messages ADD COLUMN relay_created_at TEXT"],
   ["screen", "ALTER TABLE inbox_messages ADD COLUMN screen TEXT"],
+  // When the row became claimable, for the per-sender rate in real time.
+  ["available_at", "ALTER TABLE inbox_messages ADD COLUMN available_at TEXT"],
 ];
 
 export const MIGRATION_V16 = `
@@ -921,6 +923,10 @@ export const MIGRATION_V16 = `
     ON inbox_messages(sig_hash) WHERE sig_hash IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_inbox_from_received
     ON inbox_messages(from_address, received_at);
+  CREATE INDEX IF NOT EXISTS idx_inbox_deferred
+    ON inbox_messages(from_address, verified, received_at) WHERE status = 'deferred';
+  CREATE INDEX IF NOT EXISTS idx_inbox_available
+    ON inbox_messages(from_address, verified, available_at) WHERE available_at IS NOT NULL;
 `;
 
 // Rows the old ingest blocked were stored as 'received' with a placeholder

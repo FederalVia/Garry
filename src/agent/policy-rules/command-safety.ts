@@ -143,6 +143,48 @@ const SELF_KILL_PATTERNS: RegExp[] = [
 // normalizeCommand strips backticks, so this one runs on the raw command.
 const BACKTICK_KILL = /(?:^|[;&|(\s])kill\b[^;&|]*`\s*(?:pgrep|pidof|ps)\b/i;
 
+// Pids from a process listing handed to kill one at a time by a shell loop:
+// `for p in $(pgrep node); do kill $p; done`, `pgrep node | while read p; do
+// kill $p; done`, `while read p; do kill $p; done < <(pgrep node)`. kill
+// must start a command in the loop body (after do, then, a separator, sudo
+// or xargs), so a loop that only prints or greps for "kill" passes. Done in
+// linear passes: a single regex over the body rescans the rest of the
+// command from every loop header.
+const PID_LIST = /(?:^|[\s(`|])(?:sudo\s+)?(?:pgrep|pidof|ps)\b/;
+const FOR_OVER_PIDS = /(?:^|[;&|(\s])for\s+\w+\s+in\s+(?:\$\(|`)\s*(?:sudo\s+)?(?:pgrep|pidof|ps)\b/;
+const PIPE_INTO_READ = /\|\s*while\s+(?:ifs=\S*\s+)?read\b/g;
+const WHILE_READ = /(?:^|[;&|(\s])while\s+(?:ifs=\S*\s+)?read\b/;
+const PIDS_AFTER_DONE = /^\s*<\s*<\(\s*(?:sudo\s+)?(?:pgrep|pidof|ps)\b/;
+const BODY_KILL = /(?:\bdo|\bthen|\belse|[;&|(\n]|\bsudo|\bxargs(?:\s+-\S+)*)\s*kill\b/;
+
+function loopKillMatch(command: string): boolean {
+  // Lower-cased, quotes and backslashes removed, backticks kept.
+  const text = command.replace(/["'\\]/g, "").toLowerCase();
+  const chunks = text.split(/\bdone\b/);
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    let header = -1;
+    const forLoop = FOR_OVER_PIDS.exec(chunk);
+    if (forLoop) header = forLoop.index + forLoop[0].length;
+    let offset = 0;
+    for (const segment of chunk.split(/[;&\n]/)) {
+      const pids = segment.search(PID_LIST);
+      let lastRead = -1;
+      for (const m of segment.matchAll(PIPE_INTO_READ)) lastRead = (m.index ?? 0) + m[0].length;
+      if (pids >= 0 && lastRead > pids) {
+        header = header < 0 ? offset + lastRead : Math.min(header, offset + lastRead);
+      }
+      offset += segment.length + 1;
+    }
+    if (header < 0 && c + 1 < chunks.length && PIDS_AFTER_DONE.test(chunks[c + 1])) {
+      const read = WHILE_READ.exec(chunk);
+      if (read) header = read.index + read[0].length;
+    }
+    if (header >= 0 && BODY_KILL.test(chunk.slice(header))) return true;
+  }
+  return false;
+}
+
 // ─── Shell-word parsing (approximate; enough for a tripwire) ─────
 
 const SEGMENT_OPERATORS = new Set([";", "&", "&&", "|", "||", "\n", "(", ")"]);
@@ -590,6 +632,9 @@ function tripwireMatch(command: string): { description: string; pattern: string 
   }
   if (BACKTICK_KILL.test(command)) {
     return { description: "Kills the runtime process", pattern: BACKTICK_KILL.source };
+  }
+  if (loopKillMatch(command)) {
+    return { description: "Kills the runtime process", pattern: "kill in a loop over a process listing" };
   }
   const selfKill = selfKillMatch(command);
   if (selfKill) return { description: "Kills the runtime process", pattern: selfKill };

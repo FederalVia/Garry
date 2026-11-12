@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { stateDir } from "../security/protected-paths.js";
 
 const CHARS_PER_TOKEN = 3.5;
 const SUMMARY_SNIPPET_LENGTH = 100;
@@ -41,9 +41,8 @@ export class AgentWorkspace implements AgentWorkspace {
     }
 
     this.goalId = normalizedGoalId;
-    this.basePath = path.resolve(
-      basePath ?? path.join(os.homedir(), ".automaton", "workspace", normalizedGoalId),
-    );
+    // The same state directory the path rules and worker checks use.
+    this.basePath = path.resolve(basePath ?? path.join(stateDir(), "workspace", normalizedGoalId));
 
     this.outputsPath = path.join(this.basePath, "outputs");
     this.contextPath = path.join(this.basePath, "context");

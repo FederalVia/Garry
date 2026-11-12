@@ -14,7 +14,7 @@ vi.mock("../conway/topup.js", async (importOriginal) => {
   return { ...actual, bootstrapTopup: async () => topupStub.result };
 });
 
-import { BUILTIN_TASKS, INBOX_RATE_LIMIT_PER_MINUTE } from "../heartbeat/tasks.js";
+import { BUILTIN_TASKS, INBOX_DEFER_MAX_PER_SENDER, INBOX_RATE_LIMIT_PER_MINUTE } from "../heartbeat/tasks.js";
 import { claimInboxMessagesFromOneSender } from "../state/database.js";
 import {
   MockConwayClient,
@@ -271,7 +271,7 @@ describe("Heartbeat Tasks", () => {
       expect(claimed.map((m) => m.content)).toEqual(texts);
     });
 
-    it("rate-limits per sender at ingest: the 11th message in a minute is stored rate_limited, other senders unaffected", async () => {
+    it("rate-limits per sender at ingest: the 11th message in a minute waits as deferred, other senders unaffected", async () => {
       const social = new MockSocialClient();
       const batch = Array.from({ length: INBOX_RATE_LIMIT_PER_MINUTE + 1 }, (_, i) => msg(`r${i}`, SENDER_1, `note ${i}`));
       batch.push(msg("other", SENDER_2, "hi"));
@@ -281,8 +281,209 @@ describe("Heartbeat Tasks", () => {
       const status = (id: string) =>
         (db.raw.prepare("SELECT status FROM inbox_messages WHERE id = ?").get(id) as { status: string }).status;
       expect(status("r9")).toBe("received");
-      expect(status("r10")).toBe("rate_limited");
+      expect(status("r10")).toBe("deferred");
       expect(status("other")).toBe("received");
+      // Screened like any other row, and never claimed while it waits.
+      const screen = db.raw.prepare("SELECT screen FROM inbox_messages WHERE id = 'r10'").get() as { screen: string };
+      expect(JSON.parse(screen.screen).level).toBe("ok");
+      const claimed = [
+        ...claimInboxMessagesFromOneSender(db.raw, 50),
+        ...claimInboxMessagesFromOneSender(db.raw, 50),
+      ].map((m) => m.id);
+      expect(claimed).not.toContain("r10");
+      expect(claimed).toHaveLength(11);
+    });
+
+    describe("backlog over the rate", () => {
+      const statusCounts = () =>
+        Object.fromEntries(
+          (db.raw.prepare("SELECT status, COUNT(*) AS n FROM inbox_messages GROUP BY status").all() as Array<{
+            status: string;
+            n: number;
+          }>).map((r) => [r.status, r.n]),
+        );
+
+      async function pollAt(social: MockSocialClient, at: number, messages: InboxMessage[] = [], nextCursor?: string) {
+        vi.setSystemTime(at);
+        social.pollResponses.push({ messages, nextCursor });
+        const result = await BUILTIN_TASKS.check_social_inbox(createMockTickContext(db), ctxWith(social));
+        const m = /^(\d+) new/.exec(result.message ?? "");
+        return m ? Number(m[1]) : 0;
+      }
+
+      beforeEach(() => vi.useFakeTimers({ toFake: ["Date"] }));
+      afterEach(() => vi.useRealTimers());
+
+      it("a backlog the relay pages over consecutive polls is delivered in full, in order", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        db.setKV("social_inbox_last_poll_at", new Date(t0 - 3 * 3_600_000).toISOString());
+        const social = new MockSocialClient();
+        // 30 messages, one every 6 minutes over the 3-hour gap, served 15 per poll.
+        const batch = Array.from({ length: 30 }, (_, i) => {
+          const at = new Date(t0 - (30 - i) * 6 * 60_000).toISOString();
+          return msg(`pg${i}`, SENDER_1, `update ${i}`, { createdAt: at, signedAt: at });
+        });
+        const delivered = [
+          await pollAt(social, t0, batch.slice(0, 15), "c1"),
+          // The second page lands 2 minutes later: its sender times all fall
+          // before the previous poll, so they clamp to it.
+          await pollAt(social, t0 + 120_000, batch.slice(15)),
+          await pollAt(social, t0 + 240_000),
+        ];
+        expect(delivered).toEqual([15, 10, 5]);
+        expect(statusCounts()).toEqual({ received: 30 });
+        const claimed = claimInboxMessagesFromOneSender(db.raw, 50).map((m) => m.id);
+        expect(claimed).toEqual(batch.map((m) => m.id));
+      });
+
+      it("a backlog the relay delivers late is released in proportion to the time since the last poll, not lost", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        db.setKV("social_inbox_last_poll_at", new Date(t0 - 120_000).toISOString());
+        const social = new MockSocialClient();
+        // Sent 20 to 10 minutes ago, before the previous poll, delivered only now.
+        const late = Array.from({ length: 25 }, (_, i) => {
+          const at = new Date(t0 - 20 * 60_000 + i * 24_000).toISOString();
+          return msg(`late${i}`, SENDER_1, `late ${i}`, { createdAt: at });
+        });
+        const delivered = [
+          await pollAt(social, t0, late),
+          await pollAt(social, t0 + 120_000),
+          await pollAt(social, t0 + 240_000),
+          await pollAt(social, t0 + 360_000),
+        ];
+        // Two minutes passed between polls: up to 20 may be shown.
+        expect(delivered).toEqual([10, 15, 0, 0]);
+        expect(statusCounts()).toEqual({ received: 25 });
+      });
+
+      // Real times at which rows became claimable, per sender bucket.
+      const showTimes = () =>
+        (db.raw
+          .prepare("SELECT available_at FROM inbox_messages WHERE available_at IS NOT NULL ORDER BY available_at")
+          .all() as Array<{ available_at: string }>).map((r) => Date.parse(r.available_at));
+      const maxShownIn60s = (times: number[]) =>
+        Math.max(0, ...times.map((t) => times.filter((u) => u >= t && u <= t + 60_000).length));
+
+      it("a future-dated flood yields at most the limit per minute of real time, and the queue is capped", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        db.setKV("social_inbox_last_poll_at", new Date(t0 - 120_000).toISOString());
+        const social = new MockSocialClient();
+        const total = INBOX_RATE_LIMIT_PER_MINUTE + INBOX_DEFER_MAX_PER_SENDER + 40;
+        const flood = Array.from({ length: total }, (_, i) => {
+          const at = new Date(t0 + (i + 1) * 86_400_000).toISOString();
+          return msg(`fut${i}`, ATTACKER, `spam ${i}`, { createdAt: at });
+        });
+        expect(await pollAt(social, t0, flood)).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+        expect(statusCounts()).toEqual({
+          received: INBOX_RATE_LIMIT_PER_MINUTE,
+          deferred: INBOX_DEFER_MAX_PER_SENDER,
+          rate_limited: 40,
+        });
+        // 30 seconds later the last minute is still full: nothing is released.
+        expect(await pollAt(social, t0 + 30_000)).toBe(0);
+        // Then at most the limit per minute.
+        expect(await pollAt(social, t0 + 90_000)).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+        expect(await pollAt(social, t0 + 120_000)).toBe(0);
+        expect(await pollAt(social, t0 + 151_000)).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+        // No 60 seconds of real time made more than the limit claimable.
+        expect(maxShownIn60s(showTimes())).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+      });
+
+      it("a back-dated flood on the first poll is not shown faster than the limit", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        const social = new MockSocialClient();
+        const flood = Array.from({ length: 50 }, (_, i) =>
+          msg(`old${i}`, ATTACKER, `spam ${i}`, { createdAt: new Date(t0 - 365 * 86_400_000).toISOString() }),
+        );
+        expect(await pollAt(social, t0, flood)).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+        // Two minutes later: two minutes' worth.
+        expect(await pollAt(social, t0 + 120_000)).toBe(2 * INBOX_RATE_LIMIT_PER_MINUTE);
+        expect(statusCounts()).toEqual({ received: 30, deferred: 20 });
+      });
+
+      it("a flood with polls under a minute apart is shown at most at the limit per 60 s of real time", async () => {
+        for (const interval of [30_000, 45_000, 55_000, 59_000]) {
+          db.raw.prepare("DELETE FROM inbox_messages").run();
+          db.raw.prepare("DELETE FROM kv").run();
+          const t0 = Date.parse("2026-06-01T12:00:00Z");
+          db.setKV("social_inbox_last_poll_at", new Date(t0 - 60_000).toISOString());
+          const social = new MockSocialClient();
+          let n = 0;
+          let shown = 0;
+          for (let k = 0; k < 20; k++) {
+            const now = t0 + k * interval;
+            // Back-dated to the epoch, and spread over the interval just past,
+            // so stored times alone would allow a fresh minute every poll.
+            const batch = Array.from({ length: 30 }, (_, i) => {
+              const at = i % 2 ? 0 : now - interval + Math.floor((i * interval) / 30);
+              return msg(`fl${interval}-${n++}`, ATTACKER, "spam", { createdAt: new Date(at).toISOString() });
+            });
+            shown += await pollAt(social, now, k < 12 ? batch : []);
+          }
+          expect(maxShownIn60s(showTimes()), `interval ${interval}`).toBe(INBOX_RATE_LIMIT_PER_MINUTE);
+          expect(shown, `interval ${interval}`).toBeGreaterThan(0);
+        }
+      });
+
+      /** A relay holding messages until `visibleAt`, served `page` per poll, oldest first. */
+      function relayModel(page: number) {
+        const queue: Array<{ m: InboxMessage; visibleAt: number }> = [];
+        return {
+          queue,
+          take(now: number): InboxMessage[] {
+            const out = queue.filter((q) => q.visibleAt <= now).slice(0, page);
+            for (const q of out) queue.splice(queue.indexOf(q), 1);
+            return out.map((q) => q.m);
+          },
+        };
+      }
+
+      it("a 360-message backlog paged 100 at a time over 2-minute polls is delivered in full, in order", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        // A 3-hour outage; the sender wrote 2 a minute throughout.
+        db.setKV("social_inbox_last_poll_at", new Date(t0 - 180 * 60_000).toISOString());
+        const relay = relayModel(100);
+        const sent: string[] = [];
+        for (let i = 0; i < 360; i++) {
+          const at = new Date(t0 - 180 * 60_000 + i * 30_000).toISOString();
+          sent.push(`bk${i}`);
+          relay.queue.push({ m: msg(`bk${i}`, SENDER_1, `status ${i}`, { createdAt: at, signedAt: at }), visibleAt: 0 });
+        }
+        const social = new MockSocialClient();
+        let shown = 0;
+        for (let k = 0; k < 40; k++) {
+          const now = t0 + k * 120_000;
+          shown += await pollAt(social, now, relay.take(now), relay.queue.length ? "more" : undefined);
+        }
+        expect(shown).toBe(360);
+        expect(statusCounts()).toEqual({ received: 360 });
+        const claimed: string[] = [];
+        for (let batch = claimInboxMessagesFromOneSender(db.raw, 50); batch.length; batch = claimInboxMessagesFromOneSender(db.raw, 50)) {
+          claimed.push(...batch.map((m) => m.id));
+        }
+        expect(claimed).toEqual(sent);
+      });
+
+      it("a sender at 6 a minute whose relay delivers 3 minutes late loses nothing", async () => {
+        const t0 = Date.parse("2026-06-01T12:00:00Z");
+        db.setKV("social_inbox_last_poll_at", new Date(t0 - 120_000).toISOString());
+        const relay = relayModel(1_000);
+        for (let i = 0; i < 6 * 150; i++) {
+          const at = t0 + i * 10_000;
+          relay.queue.push({ m: msg(`lt${i}`, SENDER_1, `tick ${i}`, { createdAt: new Date(at).toISOString() }), visibleAt: at + 180_000 });
+        }
+        const social = new MockSocialClient();
+        let maxDeferred = 0;
+        for (let k = 0; k < 90; k++) {
+          const now = t0 + k * 120_000;
+          await pollAt(social, now, relay.take(now));
+          maxDeferred = Math.max(maxDeferred, statusCounts().deferred ?? 0);
+        }
+        expect(relay.queue).toHaveLength(0);
+        expect(statusCounts()).toEqual({ received: 900 });
+        // Each poll's arrivals wait at most one poll.
+        expect(maxDeferred).toBeLessThanOrEqual(12);
+      });
     });
 
     it("measures the rate by send time: a backlog sent under the limit and delivered in one poll is not rate limited", async () => {

@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ulid } from "ulid";
 import type BetterSqlite3 from "better-sqlite3";
@@ -181,8 +184,12 @@ function makeStubPool(db: BetterSqlite3.Database) {
 describe("integration/plan-execute-flow", () => {
   let db: BetterSqlite3.Database;
   let mocks: ReturnType<typeof makeMocks>;
+  let home: string;
 
   beforeEach(() => {
+    // The orchestrator persists plans under ~/.automaton/workspace.
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "plan-flow-home-"));
+    vi.stubEnv("HOME", home);
     db = createInMemoryDb();
     mocks = makeMocks();
   });
@@ -190,6 +197,8 @@ describe("integration/plan-execute-flow", () => {
   afterEach(() => {
     db.close();
     vi.resetAllMocks();
+    vi.unstubAllEnvs();
+    fs.rmSync(home, { recursive: true, force: true });
   });
 
   // ─── Full lifecycle ──────────────────────────────────────────────────────

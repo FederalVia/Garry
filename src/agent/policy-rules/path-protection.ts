@@ -14,13 +14,30 @@ import {
   checkWrite,
   expandHome,
   homeDir,
+  matchHomeStartupContainer,
   matchSensitive,
   resolveReal,
   type PathDecision,
 } from "../../security/protected-paths.js";
+import { isLocalSandboxId } from "../../conway/client.js";
 
-/** write_file confines to the sandbox home, which is /root locally and remotely. */
+/** The home of a remote Conway sandbox. It is not on this machine. */
 const SANDBOX_HOME = "/root";
+
+type SandboxMode = "local" | "remote" | "unknown";
+
+/** Where the tool really acts: this machine, a remote sandbox, or unknown (no identity in context). */
+function sandboxMode(request: PolicyRequest): SandboxMode {
+  const identity = request.context?.identity;
+  if (!identity) return "unknown";
+  return isLocalSandboxId(identity.sandboxId) ? "local" : "remote";
+}
+
+interface Candidate {
+  path: string;
+  /** The path the tool acts on: it must be inspectable or the call is denied. */
+  strict: boolean;
+}
 
 function deny(rule: string, reasonCode: string, humanMessage: string): PolicyRuleResult {
   return { rule, action: "deny", reasonCode, humanMessage };
@@ -37,15 +54,35 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+function isWithin(child: string, root: string): boolean {
+  return child === root || child.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+/** /root when it is not this process's home: a non-root user often cannot even list it. */
+function isForeignSandboxHome(candidate: string): boolean {
+  return isWithin(candidate, SANDBOX_HOME) && path.resolve(homeDir()) !== SANDBOX_HOME;
+}
+
 /**
  * Absolute paths a tool may act on for this argument, primary first. When the
  * tool and its fallbacks resolve the path against different bases, every
- * base is checked.
+ * base is checked. Only the primary path is strict, and never under a /root
+ * that is not this process's home (a remote sandbox's home, or one a
+ * non-root user cannot list); the others are still checked by name and, when
+ * they can be inspected, on disk.
  */
-function candidatePaths(toolName: string, filePath: string): string[] {
+function candidatePaths(toolName: string, filePath: string, mode: SandboxMode): Candidate[] {
+  const paths = candidatePathList(toolName, filePath, mode);
+  return paths.map((p, index) => ({
+    path: p,
+    strict: index === 0 && !isForeignSandboxHome(p),
+  }));
+}
+
+function candidatePathList(toolName: string, filePath: string, mode: SandboxMode): string[] {
   if (path.isAbsolute(filePath)) return [path.resolve(filePath)];
   const home = homeDir();
-  if (!filePath.startsWith("~")) return relativeCandidates(toolName, filePath, home);
+  if (!filePath.startsWith("~")) return relativeCandidates(toolName, filePath, home, mode);
 
   // The tools expand any leading "~" (join(HOME or /root, p.slice(1))), so
   // "~name/x" means HOME/name/x to them, while expandHome and the quoted
@@ -54,7 +91,8 @@ function candidatePaths(toolName: string, filePath: string): string[] {
   let expanded: string[];
   switch (toolName) {
     case "write_file":
-      expanded = [path.resolve(SANDBOX_HOME, rest), path.resolve(home, rest)];
+    case "git_clone":
+      expanded = homeBases(home, mode).map((base) => path.resolve(base, rest));
       break;
     case "edit_own_file":
       expanded = [path.resolve(home, rest)];
@@ -63,19 +101,27 @@ function candidatePaths(toolName: string, filePath: string): string[] {
       expanded = [path.resolve(home, rest), path.resolve(SANDBOX_HOME, rest)];
   }
   if (filePath === "~" || filePath.startsWith("~/")) return unique(expanded);
-  return unique([...expanded, ...relativeCandidates(toolName, filePath, home)]);
+  return unique([...expanded, ...relativeCandidates(toolName, filePath, home, mode)]);
 }
 
-function relativeCandidates(toolName: string, filePath: string, home: string): string[] {
+/**
+ * Bases write_file and git_clone resolve against, the real one first: the
+ * real HOME locally, /root in a remote sandbox. Locally they never touch
+ * /root unless it is HOME.
+ */
+function homeBases(home: string, mode: SandboxMode): string[] {
+  if (mode === "local") return [home];
+  if (mode === "remote") return unique([SANDBOX_HOME, home]);
+  return unique([home, SANDBOX_HOME]);
+}
+
+function relativeCandidates(toolName: string, filePath: string, home: string, mode: SandboxMode): string[] {
   switch (toolName) {
     case "write_file":
-      // Remote write_file resolves relative paths against /root, local against HOME.
-      return unique([path.resolve(SANDBOX_HOME, filePath), path.resolve(home, filePath)]);
+    case "git_clone":
+      return unique(homeBases(home, mode).map((base) => path.resolve(base, filePath)));
     case "edit_own_file":
       return [path.resolve(process.cwd(), filePath)];
-    case "git_clone":
-      // gitClone runs in HOME (local exec) or /root (remote exec).
-      return unique([path.resolve(home, filePath), path.resolve(SANDBOX_HOME, filePath)]);
     case "read_file":
     default:
       // Local read_file resolves relative paths against HOME (as write_file
@@ -89,9 +135,9 @@ function relativeCandidates(toolName: string, filePath: string, home: string): s
   }
 }
 
-/** A fallback base this process cannot even resolve (e.g. /root for a non-root user) is not a denial. */
-function isUnreachableFallback(decision: PathDecision, index: number): boolean {
-  return index > 0 && decision.code === "UNRESOLVABLE";
+/** Only a strict candidate is denied for being uninspectable; the name checks already passed. */
+function isForgivenUnresolvable(decision: PathDecision, candidate: Candidate): boolean {
+  return !candidate.strict && decision.code === "UNRESOLVABLE";
 }
 
 function writeReasonCode(decision: PathDecision): string {
@@ -115,6 +161,16 @@ function isSkillsDirTarget(absPath: string): boolean {
   return false;
 }
 
+/** A clone target that is a home or would create or fill a startup directory, by name or real path. */
+function isHomeStartupCloneTarget(absPath: string): string | null {
+  const resolved = resolveReal(absPath);
+  for (const candidate of [absPath, resolved?.real]) {
+    const rule = candidate ? matchHomeStartupContainer(candidate) : null;
+    if (rule) return rule;
+  }
+  return null;
+}
+
 /**
  * Deny writes to protected files.
  * Applies to: write_file, edit_own_file, git_clone
@@ -133,17 +189,24 @@ function createProtectedFilesRule(): PolicyRule {
       if (!filePath) return null;
       const toolName = request.tool.name;
 
-      const candidates = candidatePaths(toolName, filePath);
-      for (const [index, candidate] of candidates.entries()) {
-        const decision = checkWrite(candidate, { allowDirectory: toolName === "git_clone" });
-        if (!decision.ok && !isUnreachableFallback(decision, index)) {
+      for (const candidate of candidatePaths(toolName, filePath, sandboxMode(request))) {
+        const decision = checkWrite(candidate.path, { allowDirectory: toolName === "git_clone" });
+        if (!decision.ok && !isForgivenUnresolvable(decision, candidate)) {
           return deny(
             "path.protected_files",
             writeReasonCode(decision),
             `Cannot write to protected file: ${filePath} (${decision.code}: ${decision.reason})`,
           );
         }
-        if (toolName === "git_clone" && isSkillsDirTarget(candidate)) {
+        const startup = toolName === "git_clone" ? isHomeStartupCloneTarget(candidate.path) : null;
+        if (startup) {
+          return deny(
+            "path.protected_files",
+            "PROTECTED_FILE",
+            `Cannot clone into a home startup directory: ${filePath} (${startup})`,
+          );
+        }
+        if (toolName === "git_clone" && isSkillsDirTarget(candidate.path)) {
           return deny(
             "path.protected_files",
             "PROTECTED_FILE",
@@ -173,10 +236,9 @@ function createReadSensitiveRule(): PolicyRule {
       const filePath = (request.args.path as string | undefined);
       if (!filePath) return null;
 
-      const candidates = candidatePaths("read_file", filePath);
-      for (const [index, candidate] of candidates.entries()) {
-        const decision = checkRead(candidate);
-        if (!decision.ok && !isUnreachableFallback(decision, index)) {
+      for (const candidate of candidatePaths("read_file", filePath, sandboxMode(request))) {
+        const decision = checkRead(candidate.path);
+        if (!decision.ok && !isForgivenUnresolvable(decision, candidate)) {
           return deny(
             "path.read_sensitive",
             "SENSITIVE_FILE_READ",
@@ -187,10 +249,6 @@ function createReadSensitiveRule(): PolicyRule {
       return null;
     },
   };
-}
-
-function isWithin(child: string, root: string): boolean {
-  return child === root || child.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
 }
 
 /**

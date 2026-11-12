@@ -4,7 +4,7 @@
  * js-tiktoken is quadratic within one pre-tokenizer piece, so an unbroken
  * run of letters, CJK text, symbols or whitespace used to block the process
  * for seconds to minutes. These tests pin the bounded behaviour and check
- * that ordinary text is still counted exactly.
+ * that ordinary text is still counted exactly and no text is counted low.
  */
 
 import { describe, expect, it } from "vitest";
@@ -89,24 +89,33 @@ describe("token counter: long single-class runs take bounded time", () => {
 });
 
 describe("token counter: sliced runs stay close to the encoder's count", () => {
-  it("repeated letter", () => {
+  // A sliced run is counted as an upper bound: one extra token per cut, where
+  // the run meets other text and between its slices.
+  const slicesOf = (run: string) => Math.ceil(Buffer.byteLength(run) / MAX_BPE_RUN_BYTES);
+
+  it("repeated letter: at most one token per cut over the encoder", () => {
     const text = "x".repeat(2_000);
-    expect(count(text)).toBe(rawCount(text));
+    const got = count(text);
+    const want = rawCount(text);
+    expect(got).toBeGreaterThanOrEqual(want);
+    expect(got - want).toBeLessThanOrEqual(slicesOf(text) - 1);
   });
 
   it("CJK run", () => {
     const text = CJK_SENTENCE.repeat(25);
     const got = count(text);
     const want = rawCount(text);
-    expect(Math.abs(got - want) / want).toBeLessThan(0.05);
+    expect(got).toBeGreaterThanOrEqual(want);
+    expect((got - want) / want).toBeLessThan(0.1);
   });
 
   it("does not split surrogate pairs", () => {
-    // 100 emoji are 400 bytes, so the run is sliced. A split pair would be
-    // encoded as two replacement characters and change the count.
+    // 100 emoji are 400 bytes: six slices of 16 emoji (64 bytes) and one of
+    // 4, plus one token per cut. A split pair would be encoded as two
+    // replacement characters and change the count.
     const text = "😀".repeat(100);
     expect(Buffer.byteLength(text)).toBeGreaterThan(MAX_BPE_RUN_BYTES);
-    expect(count(text)).toBe(rawCount(text));
+    expect(count(text)).toBe(6 * rawCount("😀".repeat(16)) + rawCount("😀".repeat(4)) + 6);
   });
 
   it("a long run inside ordinary text only changes the count near the run", () => {
@@ -114,7 +123,64 @@ describe("token counter: sliced runs stay close to the encoder's count", () => {
     const run = "z".repeat(500);
     const got = count(prose + run + " " + prose);
     const want = rawCount(prose + run + " " + prose);
-    expect(Math.abs(got - want)).toBeLessThanOrEqual(3);
+    expect(got).toBeGreaterThanOrEqual(want);
+    // Cuts: before the run, after it, and between its slices.
+    expect(got - want).toBeLessThanOrEqual(slicesOf(run) + 1 + 3);
+  });
+});
+
+describe("token counter: an upper bound of the encoder below the exact cap", () => {
+  // Seeded, so a failure reproduces. Runs are short enough for the exact
+  // encoder to stay fast, and long enough to be sliced: the classes that
+  // used to come out low (emoji, zero-width characters, quotes, Hangul next
+  // to long runs) are all in the mix.
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const CLASSES: string[][] = [
+    ["a", "b", "x", "e", "q", "Z"],
+    ["我", "们", "正", "在", "的", "一"],
+    ["한", "국", "어", "가", "나"],
+    ["😀", "👍", "🎉", "👨‍👩‍👧"],
+    ["\u200b", "\u200d", "\ufeff"],
+    ['"', "'", "\u201c", "\u201d", "`"],
+    [" ", "\t", "  ", "\u00a0", "\u3000"],
+    ["\n", "\r\n"],
+    ["0", "1", "9"],
+    ["=", "-", "!", "#", ".", "\uff0c", "\u3002"],
+    ["é", "ß", "ж", "λ"],
+    ["'s", "'ll", " '"],
+  ];
+
+  it("never counts below js-tiktoken on 2,000 mixed-class strings", () => {
+    const rnd = mulberry32(0x5eed);
+    const pick = <T,>(items: T[]): T => items[Math.floor(rnd() * items.length)];
+    const fuzzCounter = createTokenCounter();
+    let sliced = 0;
+    for (let i = 0; i < 2_000; i++) {
+      let text = "";
+      const segments = 1 + Math.floor(rnd() * 5);
+      for (let k = 0; k < segments; k++) {
+        const cls = pick(CLASSES);
+        const long = rnd() < 0.5;
+        const length = long ? 10 + Math.floor(rnd() * 65) : 1 + Math.floor(rnd() * 4);
+        const repeat = rnd() < 0.5 ? pick(cls) : null;
+        for (let j = 0; j < length; j++) text += repeat ?? pick(cls);
+      }
+      const got = fuzzCounter.countTokens(text);
+      const want = rawCount(text);
+      if (got !== want) sliced += 1;
+      expect(got, JSON.stringify(text)).toBeGreaterThanOrEqual(want);
+    }
+    // The mix really exercises slicing.
+    expect(sliced).toBeGreaterThan(500);
   });
 });
 

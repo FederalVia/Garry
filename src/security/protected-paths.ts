@@ -460,6 +460,25 @@ function matchHomeStartup(segs: string[]): string | null {
   return null;
 }
 
+/**
+ * A directory target (git clone) that is a home, or a home startup directory
+ * or one of its parents: the clone would create it and fill it with the
+ * repository's files (git's global config, executables on PATH).
+ */
+export function matchHomeStartupContainer(absPath: string): string | null {
+  const segs = segmentsOf(absPath);
+  for (const home of new Set([homeDir(), "/root"])) {
+    const homeSegs = segmentsOf(home);
+    if (!startsWithSegments(segs, homeSegs)) continue;
+    const rel = segs.slice(homeSegs.length);
+    if (rel.length === 0) return "home-startup:home";
+    for (const dir of HOME_STARTUP_DIRS) {
+      if (startsWithSegments(dir, rel)) return `home-startup:${dir.join("/")}`;
+    }
+  }
+  return null;
+}
+
 /** Write-deny. Lexical, no fs. A superset of matchSensitive. */
 export function matchProtected(absPath: string): string | null {
   const secret = matchSecret(absPath);

@@ -138,7 +138,10 @@ function formatCacheKey(text: string, model?: string): string {
  * 20,000 letters takes about 34 seconds. Runs larger than this are cut out
  * and encoded in slices, which keeps the work linear in the text length.
  * Ordinary words and identifiers are far shorter, so text without such runs
- * is encoded exactly as before.
+ * is counted exactly. Text with them is counted as an upper bound: a cut
+ * can merge one token less than the encoder would (it separates a run from
+ * the character the encoder attaches to it, or splits one piece), so each
+ * cut adds one token.
  */
 export const MAX_BPE_RUN_BYTES = 64;
 
@@ -187,7 +190,10 @@ function utf8Width(codePoint: number): number {
   return 4;
 }
 
-/** Encode one long single-class run in slices of MAX_BPE_RUN_BYTES. */
+/**
+ * Encode one long single-class run in slices of MAX_BPE_RUN_BYTES. Returns
+ * the tokens plus one per cut between slices (see MAX_BPE_RUN_BYTES).
+ */
 function countRunInSlices(run: string, encoder: Tiktoken): number {
   let total = 0;
   let sliceStart = 0;
@@ -197,7 +203,7 @@ function countRunInSlices(run: string, encoder: Tiktoken): number {
     const codePoint = run.codePointAt(index) ?? 0;
     const bytes = utf8Width(codePoint);
     if (sliceBytes + bytes > MAX_BPE_RUN_BYTES && index > sliceStart) {
-      total += encodeAsText(encoder, run.slice(sliceStart, index));
+      total += encodeAsText(encoder, run.slice(sliceStart, index)) + 1;
       sliceStart = index;
       sliceBytes = 0;
     }
@@ -212,12 +218,19 @@ function countRunInSlices(run: string, encoder: Tiktoken): number {
 
 /**
  * Token count with every oversized single-class run sliced before encoding.
- * Runs within the byte limit stay in their surrounding text, so they are
- * tokenized in context exactly as the encoder would on its own.
+ * Runs within the byte limit stay in their surrounding text, so text without
+ * long runs is tokenized exactly as the encoder would on its own. Every cut
+ * (where a long run meets other text, and between its slices) adds one
+ * token, so the result is never below the encoder's count.
  */
 function countWithBoundedRuns(text: string, encoder: Tiktoken): number {
   let total = 0;
   let cursor = 0;
+  let lastCut = -1;
+  const cutAt = (offset: number) => {
+    if (offset > 0 && offset < text.length && offset !== lastCut) total += 1;
+    lastCut = offset;
+  };
   for (const match of text.matchAll(LONG_RUN_CANDIDATE)) {
     const run = match[0];
     if (Buffer.byteLength(run, "utf8") <= MAX_BPE_RUN_BYTES) continue;
@@ -225,8 +238,10 @@ function countWithBoundedRuns(text: string, encoder: Tiktoken): number {
     if (runStart > cursor) {
       total += encodeAsText(encoder, text.slice(cursor, runStart));
     }
+    cutAt(runStart);
     total += countRunInSlices(run, encoder);
     cursor = runStart + run.length;
+    cutAt(cursor);
   }
   if (cursor < text.length) {
     total += encodeAsText(encoder, text.slice(cursor));
@@ -248,7 +263,8 @@ function countTokensBounded(text: string, encoder: Tiktoken): number {
     prefixEnd += 1;
   }
   const prefixTokens = countWithBoundedRuns(text.slice(0, prefixEnd), encoder);
-  return prefixTokens + Buffer.byteLength(text.slice(prefixEnd), "utf8");
+  // One more for the cut at the end of the prefix.
+  return prefixTokens + 1 + Buffer.byteLength(text.slice(prefixEnd), "utf8");
 }
 
 export function createTokenCounter(): TokenCounter {
