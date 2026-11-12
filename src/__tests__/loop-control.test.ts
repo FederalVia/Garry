@@ -21,7 +21,7 @@ import {
   noToolResponse,
   toolCallResponse,
 } from "./mocks.js";
-import type { AgentState, AgentTurn, AutomatonDatabase, ChatMessage, InferenceOptions } from "../types.js";
+import type { AgentState, AgentTurn, AutomatonDatabase, ChatMessage, FinancialState, InferenceOptions } from "../types.js";
 
 const identity = createTestIdentity();
 
@@ -289,11 +289,11 @@ describe("loop control", () => {
   });
 
   describe("survival tier in prompts", () => {
-    function tierFor(creditsCents: number, usdc = 0): string {
+    function tierFor(creditsCents: number | null, usdc: number | null = 0, extra: Partial<FinancialState> = {}): string {
       return buildSystemPrompt({
         identity,
         config: createTestConfig(),
-        financial: { creditsCents, usdcBalance: usdc, lastChecked: "" },
+        financial: { creditsCents, usdcBalance: usdc, lastChecked: "", ...extra },
         state: "running",
         db,
         tools: [],
@@ -301,13 +301,28 @@ describe("loop control", () => {
       });
     }
 
-    it("uses the runtime's thresholds and shows the unknown sentinel as unknown", () => {
+    it("uses the runtime's thresholds and shows an unknown balance as unknown", () => {
       expect(tierFor(0)).toContain("Survival tier: critical");
       expect(tierFor(60_000)).toContain("Survival tier: high");
-      const unknown = tierFor(-1, -1);
+      const unknown = tierFor(null, null);
       expect(unknown).toContain("Survival tier: unknown");
       expect(unknown).toContain("Credits: unknown (balance API unreachable)");
-      expect(unknown).not.toContain("$-0.01");
+      expect(unknown).not.toContain("$0.00");
+      // -1 is a real (debt) balance now, not a sentinel.
+      expect(tierFor(-1)).toContain("Credits: $-0.01");
+    });
+
+    it("marks a cached balance with its time", () => {
+      const text = tierFor(3000, 1, { credits: "cached", creditsAsOf: "2026-11-12T08:00:00.000Z" });
+      expect(text).toContain("Credits: $30.00 (cached, as of 2026-11-12T08:00:00.000Z)");
+      expect(text).toContain("Survival tier: high (from cached balance)");
+    });
+
+    it("never shows a cached debt as dead, matching the loop's routing", () => {
+      const cached = tierFor(-20, 1, { credits: "cached" });
+      expect(cached).toContain("Survival tier: critical (from cached balance)");
+      expect(cached).not.toContain("Survival tier: dead");
+      expect(tierFor(-20, 1, { credits: "live" })).toContain("Survival tier: dead");
     });
 
     it("the wakeup prompt shows unknown balances as unknown", () => {
@@ -323,12 +338,11 @@ describe("loop control", () => {
       const text = buildWakeupPrompt({
         identity,
         config: createTestConfig(),
-        financial: { creditsCents: -1, usdcBalance: -1, lastChecked: "" },
+        financial: { creditsCents: null, usdcBalance: null, credits: "unknown", usdc: "unknown", lastChecked: "" },
         db,
       });
-      expect(text).toContain("unknown");
-      expect(text).not.toContain("$-0.01");
-      expect(text).not.toContain("-1.0000");
+      expect(text).toContain("Your credits: unknown (balance API unreachable) | USDC: unknown");
+      expect(text).not.toContain("$0.00");
     });
 
     it("shows a pending restart after a rebuild", () => {

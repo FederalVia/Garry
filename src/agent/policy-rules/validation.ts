@@ -6,11 +6,11 @@
  */
 
 import type { PolicyRule, PolicyRequest, PolicyRuleResult } from "../../types.js";
+import { hasValidEvmChecksum, isValidEvmAddress, isValidSolanaAddress, isZeroAddress, type ChainType } from "../../identity/chain.js";
 
 const PACKAGE_NAME_RE = /^[@a-zA-Z0-9._/-]+$/;
 const SKILL_NAME_RE = /^[a-zA-Z0-9-]+$/;
 const GIT_HASH_RE = /^[a-f0-9]{7,40}$/;
-const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const CRON_PARTS_RE = /^(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)$/;
 
 function deny(rule: string, reasonCode: string, humanMessage: string): PolicyRuleResult {
@@ -169,13 +169,28 @@ function createCronExpressionRule(): PolicyRule {
   };
 }
 
+/** Tools that move credits: the recipient must be on the automaton's own chain. */
+const OWN_CHAIN_ADDRESS_TOOLS = new Set(["transfer_credits", "fund_child"]);
+
+const EVM_FORMAT = "0x followed by 40 hex characters";
+const SOLANA_FORMAT = "a base58 Solana public key (case-sensitive)";
+
+function ownChainType(request: PolicyRequest): ChainType {
+  const chain = request.context?.config?.chainType || request.context?.identity?.chainType;
+  return chain === "solana" ? "solana" : "evm";
+}
+
 /**
- * Validate Ethereum address format.
+ * Validate recipient addresses. Messaging is chain-agnostic, so send_message
+ * takes an EVM or Solana address whatever this automaton's chain. Credit
+ * transfers take only this automaton's own chain format: whether Conway
+ * routes a cross-chain recipient is unverified, and a misrouted transfer
+ * moves money. Addresses are checked as given; base58 is case-sensitive.
  */
 function createAddressFormatRule(): PolicyRule {
   return {
     id: "validate.address_format",
-    description: "Validate Ethereum address format (0x + 40 hex chars)",
+    description: "Validate recipient address format (EVM or Solana; credit transfers on the automaton's own chain)",
     priority: 100,
     appliesTo: {
       by: "name",
@@ -188,11 +203,36 @@ function createAddressFormatRule(): PolicyRule {
         return deny("validate.address_format", "VALIDATION_FAILED", "address must be a string");
       }
 
-      if (!ADDRESS_RE.test(address)) {
+      if (OWN_CHAIN_ADDRESS_TOOLS.has(request.tool.name)) {
+        const chain = ownChainType(request);
+        const valid = chain === "solana" ? isValidSolanaAddress(address) : isValidEvmAddress(address);
+        if (!valid) {
+          return deny(
+            "validate.address_format",
+            "VALIDATION_FAILED",
+            `Invalid address format: "${address}". This automaton is on ${chain === "solana" ? "Solana" : "EVM"}; credit transfers need ${chain === "solana" ? SOLANA_FORMAT : EVM_FORMAT}.`,
+          );
+        }
+        if (chain !== "solana" && !hasValidEvmChecksum(address)) {
+          return deny(
+            "validate.address_format",
+            "VALIDATION_FAILED",
+            `Address "${address}" has a wrong EIP-55 checksum (mixed case that does not match); it is probably mistyped.`,
+          );
+        }
+      } else if (!isValidEvmAddress(address) && !isValidSolanaAddress(address)) {
         return deny(
           "validate.address_format",
           "VALIDATION_FAILED",
-          `Invalid address format: "${address}". Must be 0x followed by 40 hex characters.`,
+          `Invalid address format: "${address}". Must be ${EVM_FORMAT}, or ${SOLANA_FORMAT}.`,
+        );
+      }
+
+      if (isZeroAddress(address)) {
+        return deny(
+          "validate.address_format",
+          "VALIDATION_FAILED",
+          `Refusing the zero/system address "${address}": nothing sent there can be recovered.`,
         );
       }
       return null;

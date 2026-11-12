@@ -12,6 +12,7 @@ import path from "path";
 import os from "os";
 import { claimInboxMessagesFromOneSender, createDatabase, pruneStaleKV, recoverStrandedInboxClaims } from "../state/database.js";
 import type { AutomatonDatabase } from "../types.js";
+import { SCHEMA_VERSION } from "../state/schema.js";
 import { countSlotHoldingChildren } from "../replication/child-status.js";
 
 // Mock erc8004.js to avoid ABI parse error at import time
@@ -834,7 +835,8 @@ describe("Migration 14 (children dedupe, lifecycle status, self-sent colony rows
     try {
       const raw = db.raw;
       const v = raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
-      expect(v.v).toBe(14);
+      // Later migrations run after 14 on the same open.
+      expect(v.v).toBe(SCHEMA_VERSION);
 
       const rows = raw.prepare("SELECT id, address, status, funded_amount_cents AS f FROM children ORDER BY id").all();
       expect(rows).toEqual([

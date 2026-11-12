@@ -54,8 +54,10 @@ import {
   MIGRATION_V11,
   MIGRATION_V13,
   MIGRATION_V14,
+  MIGRATION_V15,
   CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
+import { STATIC_MODEL_BASELINE } from "../inference/types.js";
 import { ensureTreasuryLedger } from "../treasury/ledger.js";
 import type {
   RiskLevel,
@@ -669,6 +671,12 @@ function applyMigrations(db: DatabaseType): void {
       // to its lifecycle state and retires self-sent colony messages.
       apply: () => { db.exec(MIGRATION_V14); },
     },
+    {
+      version: 15,
+      // Adds model_registry.origin so initialize() stops disabling models
+      // discovered from the Conway API or Ollama.
+      apply: () => { migrateModelRegistryOrigin(db); },
+    },
   ];
 
   for (const m of migrations) {
@@ -680,6 +688,37 @@ function applyMigrations(db: DatabaseType): void {
       migrate();
     }
   }
+}
+
+/**
+ * Baseline models removed in earlier releases. At the upgrade they may still
+ * be enabled (the old runtime disabled them at its own boot), so they must
+ * not be mistaken for API-discovered models.
+ */
+const RETIRED_BASELINE_MODEL_IDS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
+
+/**
+ * Version 15: add model_registry.origin (once), mark local models 'ollama',
+ * and mark as 'api' the rows the Conway API refresh added since the last
+ * boot. The old initialize() disabled every other non-baseline row at each
+ * boot, so an enabled non-baseline, non-local row was discovered from the
+ * API. Disabled rows stay 'baseline' and disabled: nothing is re-enabled.
+ */
+export function migrateModelRegistryOrigin(db: DatabaseType): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_registry'").get()) {
+    return;
+  }
+  if (!modelRegistryHasOrigin(db)) {
+    db.exec(MIGRATION_V15);
+  }
+  const known = [...STATIC_MODEL_BASELINE.map((m) => m.modelId), ...RETIRED_BASELINE_MODEL_IDS];
+  const placeholders = known.map(() => "?").join(", ");
+  db.prepare(
+    `UPDATE model_registry SET origin = 'api'
+      WHERE origin = 'baseline' AND enabled = 1
+        AND provider NOT IN ('ollama', 'other')
+        AND model_id NOT IN (${placeholders})`,
+  ).run(...known);
 }
 
 /**
@@ -2450,13 +2489,22 @@ export function inferencePruneCosts(db: DatabaseType, retentionDays: number): nu
 
 // ─── Phase 2.3: Model Registry Helpers ──────────────────────────
 
-export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO model_registry
-     (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
-      max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+/** Where a model_registry row came from; initialize() disables only 'baseline' rows. */
+export type ModelOrigin = "baseline" | "api" | "ollama" | "manual";
+
+/** Whether model_registry has the origin column (schema version 15+). */
+export function modelRegistryHasOrigin(db: DatabaseType): boolean {
+  const cols = db.prepare("PRAGMA table_info(model_registry)").all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === "origin");
+}
+
+/**
+ * Insert or replace a model row. `origin` sets the row's origin; when it is
+ * omitted the stored origin is kept (INSERT OR REPLACE would otherwise reset
+ * it), and a new row gets 'api'.
+ */
+export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow, origin?: ModelOrigin): void {
+  const values = [
     entry.modelId,
     entry.provider,
     entry.displayName,
@@ -2471,7 +2519,32 @@ export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow): 
     entry.enabled ? 1 : 0,
     entry.createdAt,
     entry.updatedAt,
-  );
+  ];
+  if (!modelRegistryHasOrigin(db)) {
+    db.prepare(
+      `INSERT OR REPLACE INTO model_registry
+       (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
+        max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(...values);
+    return;
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO model_registry
+     (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
+      max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       COALESCE(?, (SELECT origin FROM model_registry WHERE model_id = ?), 'api'))`,
+  ).run(...values, origin ?? null, entry.modelId);
+}
+
+/** The stored origin of a model, or undefined (no row, or a pre-15 schema). */
+export function modelRegistryGetOrigin(db: DatabaseType, modelId: string): ModelOrigin | undefined {
+  if (!modelRegistryHasOrigin(db)) return undefined;
+  const row = db
+    .prepare("SELECT origin FROM model_registry WHERE model_id = ?")
+    .get(modelId) as { origin: ModelOrigin } | undefined;
+  return row?.origin;
 }
 
 export function modelRegistryGet(db: DatabaseType, modelId: string): ModelRegistryRow | undefined {

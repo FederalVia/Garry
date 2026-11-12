@@ -17,6 +17,14 @@
     "./state/database.js": {
       "types": "./dist/state/database.d.ts",
       "default": "./dist/state/database.js"
+    },
+    "./operator/fund.js": {
+      "types": "./dist/operator/fund.d.ts",
+      "default": "./dist/operator/fund.js"
+    },
+    "./operator/send.js": {
+      "types": "./dist/operator/send.d.ts",
+      "default": "./dist/operator/send.js"
     }
   },
   "bin": {

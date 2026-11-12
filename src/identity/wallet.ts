@@ -161,6 +161,55 @@ export async function getWallet(chainType?: ChainType): Promise<{
 }
 
 /**
+ * Load the existing wallet as a ChainIdentity, never creating one (unlike
+ * getWallet). Returns null when there is no wallet.json; throws a clear error
+ * when the file is unreadable or holds no key for its chain type.
+ */
+export function loadChainIdentity(): {
+  chainIdentity: ChainIdentity;
+  chainType: ChainType;
+  address: string;
+} | null {
+  if (!fs.existsSync(WALLET_FILE)) {
+    return null;
+  }
+
+  let walletData: WalletData;
+  try {
+    walletData = readWalletData();
+  } catch (err: any) {
+    throw new Error(`Cannot read wallet at ${WALLET_FILE}: ${err?.message || String(err)}`);
+  }
+
+  const chainType: ChainType = walletData.chainType || "evm";
+  if (chainType === "solana") {
+    if (typeof walletData.secretKey !== "string" || !walletData.secretKey) {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has no secretKey`);
+    }
+    let secretKey: Uint8Array;
+    try {
+      secretKey = bs58.decode(walletData.secretKey);
+    } catch {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has a secretKey that is not base58`);
+    }
+    if (secretKey.length !== 64) {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has a secretKey of ${secretKey.length} bytes (expected 64)`);
+    }
+    const chainIdentity = new SolanaChainIdentity(secretKey);
+    return { chainIdentity, chainType, address: chainIdentity.address };
+  }
+
+  if (chainType !== "evm") {
+    throw new Error(`Wallet at ${WALLET_FILE} has unknown chainType "${String(chainType)}"`);
+  }
+  if (typeof walletData.privateKey !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(walletData.privateKey)) {
+    throw new Error(`EVM wallet at ${WALLET_FILE} has no valid privateKey`);
+  }
+  const chainIdentity = new EvmChainIdentity(privateKeyToAccount(walletData.privateKey));
+  return { chainIdentity, chainType, address: chainIdentity.address };
+}
+
+/**
  * Get the wallet address without loading the full account.
  */
 export function getWalletAddress(): string | null {

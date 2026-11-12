@@ -95,4 +95,19 @@ describe("executeFundingStrategies", () => {
     const second = await executeFundingStrategies("dead", identity, config, db, conway);
     expect(second.length).toBe(0);
   });
+
+  it("an unreadable balance is reported as unknown, never as $0.00", async () => {
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+    await executeFundingStrategies("critical", createTestIdentity(), createTestConfig(), db, conway);
+    const notice = db.getKV("funding_notice_critical")!;
+    expect(notice).toContain("an unknown amount remaining");
+    expect(notice).not.toContain("$0.00");
+  });
+
+  it("a readable balance is still shown in dollars", async () => {
+    await executeFundingStrategies("critical", createTestIdentity(), createTestConfig(), db, conway);
+    expect(db.getKV("funding_notice_critical")).toContain("$0.05 remaining");
+  });
 });

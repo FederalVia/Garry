@@ -81,9 +81,11 @@ function tick(overrides: Partial<TickContext> = {}): TickContext {
     startedAt: new Date(),
     creditBalance: 10_000,
     usdcBalance: 0,
+    creditRead: { known: true, value: 10_000, at: new Date().toISOString() },
+    usdcRead: { known: true, value: 0, at: new Date().toISOString() },
     survivalTier: "high",
+    survivalTierKnown: true,
     lowComputeMultiplier: 4,
-    creditBalanceKnown: true,
     config: hbConfig([]),
     db: db.raw,
     ...overrides,
@@ -360,7 +362,8 @@ describe("zero-credit tracking", () => {
     db.setKV("zero_credits_since", minutesAgo(360));
     conway.creditsCents = 500;
     const ctx = await buildTickContext(db.raw, conway, hbConfig([]));
-    expect(ctx.creditBalanceKnown).toBe(true);
+    expect(ctx.creditBalance).toBe(500);
+    expect(ctx.survivalTierKnown).toBe(true);
     expect(db.getKV("zero_credits_since")).toBeUndefined();
   });
 
@@ -371,7 +374,8 @@ describe("zero-credit tracking", () => {
       throw new Error("API down");
     };
     const ctx = await buildTickContext(db.raw, conway, hbConfig([]));
-    expect(ctx.creditBalanceKnown).toBe(false);
+    expect(ctx.creditBalance).toBeNull();
+    expect(ctx.survivalTierKnown).toBe(false);
     const res = await BUILTIN_TASKS.check_credits(ctx, legacy());
     expect(res.shouldWake).toBe(false);
     expect(db.getAgentState()).toBe("sleeping");
@@ -389,5 +393,200 @@ describe("zero-credit tracking", () => {
     const res = await BUILTIN_TASKS.check_credits(ctx, legacy());
     expect(db.getAgentState()).not.toBe("dead");
     expect(res.message ?? "").not.toContain("Dead");
+  });
+});
+
+describe("an unreadable balance after a critical or dead reading", () => {
+  const outage = () => {
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+  };
+
+  it("after a live zero (critical): no distress, no wake, and the zero streak is neither ended nor restarted", async () => {
+    db.setAgentState("sleeping");
+    conway.creditsCents = 0;
+    const live = await buildTickContext(db.raw, conway, hbConfig([]));
+    expect(live.survivalTier).toBe("critical");
+    await BUILTIN_TASKS.check_credits(live, legacy());
+    const since = db.getKV("zero_credits_since");
+    expect(typeof since).toBe("string");
+
+    outage();
+    const ctx = await buildTickContext(db.raw, conway, hbConfig([]));
+    expect(ctx.creditBalance).toBeNull();
+    expect(ctx.survivalTier).toBe("critical");
+    const ping = await BUILTIN_TASKS.heartbeat_ping(ctx, legacy());
+    expect(ping.shouldWake).toBe(false);
+    expect(db.getKV("last_distress")).toBeUndefined();
+    await BUILTIN_TASKS.check_credits(ctx, legacy());
+    expect(db.getKV("zero_credits_since")).toBe(since);
+    expect(db.getAgentState()).toBe("sleeping");
+  });
+
+  it("after a live 5c reading (critical): no distress and no streak starts", async () => {
+    conway.creditsCents = 5;
+    await buildTickContext(db.raw, conway, hbConfig([]));
+    outage();
+    const ctx = await buildTickContext(db.raw, conway, hbConfig([]));
+    expect(ctx.survivalTier).toBe("critical");
+    const ping = await BUILTIN_TASKS.heartbeat_ping(ctx, legacy());
+    expect(ping.shouldWake).toBe(false);
+    expect(db.getKV("last_distress")).toBeUndefined();
+    await BUILTIN_TASKS.check_credits(ctx, legacy());
+    expect(db.getKV("zero_credits_since")).toBeUndefined();
+  });
+
+  it("after a live negative reading (dead): no distress and no wake", async () => {
+    conway.creditsCents = -50;
+    const live = await buildTickContext(db.raw, conway, hbConfig([]));
+    expect(live.survivalTier).toBe("dead");
+    outage();
+    const ctx = await buildTickContext(db.raw, conway, hbConfig([]));
+    expect(ctx.creditBalance).toBeNull();
+    const ping = await BUILTIN_TASKS.heartbeat_ping(ctx, legacy());
+    expect(ping.shouldWake).toBe(false);
+    expect(db.getKV("last_distress")).toBeUndefined();
+  });
+});
+
+describe("an unreadable credit balance over an hour (F143)", () => {
+  const realFetch = globalThis.fetch;
+  const savedRpc = process.env.AUTOMATON_RPC_URL;
+  let payRequests: string[];
+  let balanceRequests: number;
+
+  /** Balance endpoint answers `balance()`; the USDC RPC says 100 USDC; /pay is recorded. */
+  function stubNetwork(balance: () => Response): void {
+    payRequests = [];
+    balanceRequests = 0;
+    process.env.AUTOMATON_RPC_URL = "https://rpc.stub.invalid";
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input?.url ?? String(input);
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes('"jsonrpc"')) {
+        const req = JSON.parse(body);
+        const result = "0x" + (100n * 1_000_000n).toString(16).padStart(64, "0");
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("/pay/")) {
+        payRequests.push(url);
+        return new Response("{}", { status: 402 });
+      }
+      if (url.endsWith("/v1/credits/balance")) {
+        balanceRequests++;
+        return balance();
+      }
+      throw new Error(`no network in this test: ${url}`);
+    }) as typeof fetch;
+  }
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (savedRpc === undefined) delete process.env.AUTOMATON_RPC_URL;
+    else process.env.AUTOMATON_RPC_URL = savedRpc;
+    vi.useRealTimers();
+  });
+
+  async function runHour(balance: () => Response, firstLive?: number) {
+    const { createConwayClient } = await import("../conway/client.js");
+    const { ResilientHttpClient } = await import("../conway/http-client.js");
+    const { getMetrics } = await import("../observability/metrics.js");
+    // Skip retry backoff sleeps; the retry counts are unchanged.
+    const proto = ResilientHttpClient.prototype as unknown as { backoff: (attempt: number) => Promise<void> };
+    vi.spyOn(proto, "backoff").mockResolvedValue(undefined);
+    getMetrics().reset();
+
+    const { generatePrivateKey, privateKeyToAccount } = await import("viem/accounts");
+    const account = privateKeyToAccount(generatePrivateKey());
+    const identity = { ...createTestIdentity(), account, address: account.address };
+    const real = createConwayClient({ apiUrl: "https://api.conway.tech", apiKey: "k", sandboxId: "sb", treasury: () => undefined });
+    const ctxFor = (): HeartbeatLegacyContext => ({ identity, config: createTestConfig(), db, conway: real });
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let now = Date.parse("2030-01-01T00:00:00.000Z");
+    db.setAgentState("sleeping");
+    const wakes: string[] = [];
+    const tiers: string[] = [];
+
+    if (firstLive !== undefined) {
+      stubNetwork(() => new Response(JSON.stringify({ balance_cents: firstLive }), { status: 200, headers: { "content-type": "application/json" } }));
+      vi.setSystemTime(now);
+      const ctx = await buildTickContext(db.raw, real, hbConfig([]), identity.address);
+      await BUILTIN_TASKS.report_metrics(ctx, ctxFor());
+      now += 5 * 60_000;
+    }
+
+    stubNetwork(balance);
+    for (let i = 0; i < 13; i++) {
+      vi.setSystemTime(now);
+      const ctx = await buildTickContext(db.raw, real, hbConfig([]), identity.address);
+      tiers.push(ctx.survivalTier);
+      for (const task of ["check_usdc_balance", "check_credits", "heartbeat_ping", "report_metrics"] as const) {
+        const r = await BUILTIN_TASKS[task](ctx, ctxFor());
+        if (r.shouldWake) wakes.push(`${task}: ${r.message}`);
+      }
+      now += 5 * 60_000;
+    }
+    return { wakes, tiers };
+  }
+
+  function expectNothingSpentOrEscalated(r: { wakes: string[]; tiers: string[] }) {
+    expect(payRequests).toEqual([]);
+    expect(topupStub.calls).toBe(0);
+    expect(r.tiers.every((t) => t !== "critical" && t !== "dead")).toBe(true);
+    expect(db.getKV("last_distress")).toBeUndefined();
+    expect(db.getKV("zero_credits_since")).toBeUndefined();
+    expect(db.getAgentState()).not.toBe("dead");
+    expect(r.wakes).toEqual([]);
+    const ping = JSON.parse(db.getKV("last_heartbeat_ping")!);
+    expect(ping).toMatchObject({ creditsCents: null, balanceKnown: false });
+    expect(typeof db.getKV("balance_unknown_since")).toBe("string");
+  }
+
+  it("a 503 balance endpoint for 65 minutes buys nothing, wakes nothing and never kills", async () => {
+    const r = await runHour(() => new Response("upstream down", { status: 503 }));
+    expect(balanceRequests).toBeGreaterThan(0);
+    expectNothingSpentOrEscalated(r);
+    expect(r.tiers.every((t) => t === "low_compute")).toBe(true);
+  });
+
+  it("a malformed 200 balance body is unknown too, not a known zero", async () => {
+    const r = await runHour(
+      () => new Response(JSON.stringify({ balance: 8000 }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    expectNothingSpentOrEscalated(r);
+  });
+
+  it("an HTML proxy page is unknown", async () => {
+    const r = await runHour(
+      () => new Response("<html>proxy error</html>", { status: 200, headers: { "content-type": "text/html" } }),
+    );
+    expectNothingSpentOrEscalated(r);
+  });
+
+  it("keeps the last known tier through the outage", async () => {
+    const r = await runHour(() => new Response("upstream down", { status: 503 }), 8000);
+    expect(r.tiers.every((t) => t === "high")).toBe(true);
+    expectNothingSpentOrEscalated(r);
+  });
+
+  it("a stale low balance gauge from before the outage does not keep the reserve alert waking", async () => {
+    // 500c is below the 1000c reserve: the alert fires once on the live read,
+    // then the outage leaves the stale gauge out of evaluation.
+    const r = await runHour(() => new Response("upstream down", { status: 503 }), 500);
+    expect(r.wakes.filter((w) => w.startsWith("report_metrics"))).toEqual([]);
+    const snapshots = db.raw
+      .prepare("SELECT metrics_json, alerts_json FROM metric_snapshots ORDER BY snapshot_at")
+      .all() as Array<{ metrics_json: string; alerts_json: string }>;
+    expect(snapshots.length).toBe(14);
+    expect(JSON.parse(snapshots[0].alerts_json).map((a: any) => a.rule)).toContain("balance_below_reserve");
+    for (const s of snapshots.slice(1)) {
+      expect(JSON.parse(s.alerts_json).map((a: any) => a.rule)).not.toContain("balance_below_reserve");
+      expect(JSON.parse(s.metrics_json).some((m: any) => m.name === "balance_cents")).toBe(false);
+    }
   });
 });

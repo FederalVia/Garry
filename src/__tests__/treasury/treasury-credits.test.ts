@@ -1187,7 +1187,7 @@ describe("upgrade and configuration", () => {
       { maxSingleTransferCents: "5,000" as unknown as number },
       { onWarning: (m) => warnings.push(m) },
     );
-    expect(policy.maxSingleTransferCents).toBe(5000);
+    expect(policy.maxSingleTransferCents).toBe(1000);
     expect(warnings.join("\n")).toMatch(/maxSingleTransferCents/);
   });
 });

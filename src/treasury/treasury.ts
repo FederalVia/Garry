@@ -35,6 +35,7 @@ import {
   autoFundDailyCap,
   budgetFor,
   budgetLimits,
+  canonicalAddress,
   centsFromAtomic,
   isX402HostAllowed,
 } from "./policy.js";
@@ -485,15 +486,12 @@ export class Treasury {
 
     // Survival topups: only when actually needed.
     if (budget === "topup_auto") {
+      // Never spend on an unknown balance: an unreadable balance is not a low one.
       if (prep.balanceCents === null) {
-        const blind = this.scalar(
-          `SELECT COUNT(*) FROM treasury_ledger WHERE budget = 'topup_auto' AND balance_unknown = 1
-             AND ${COUNTED_SQL} AND created_at_ms > ?`,
-          now - DAY_MS,
+        return no(
+          "BALANCE_UNAVAILABLE",
+          "The credit balance could not be read, so an automatic topup is not made",
         );
-        if (blind > 0) {
-          return no("BALANCE_UNKNOWN_LIMIT", "Balance unreadable and the one blind topup per 24h is used");
-        }
       } else if (prep.balanceCents >= policy.survivalTopupThresholdCents) {
         return no(
           "TOPUP_NOT_NEEDED",
@@ -1119,7 +1117,7 @@ function isAutoFundOrigin(origin: TreasuryOrigin): boolean {
 }
 
 function sameAddress(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
+  return canonicalAddress(a) === canonicalAddress(b);
 }
 
 /** A URL path as lenient servers see it: decoded, slashes collapsed, dot segments resolved, lowercased. */

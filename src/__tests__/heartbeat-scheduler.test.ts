@@ -387,7 +387,8 @@ describe("DurableScheduler", () => {
       expect(ctx.tickId).toBeTruthy();
       expect(ctx.startedAt).toBeInstanceOf(Date);
       expect(ctx.creditBalance).toBe(5_000);
-      expect(ctx.creditBalanceKnown).toBe(true);
+      expect(ctx.creditRead).toMatchObject({ known: true, value: 5_000 });
+      expect(ctx.survivalTierKnown).toBe(true);
       expect(ctx.survivalTier).toBe("high");
       expect(ctx.lowComputeMultiplier).toBe(4);
       expect(ctx.config).toBe(DEFAULT_HB_CONFIG);
@@ -406,11 +407,31 @@ describe("DurableScheduler", () => {
         DEFAULT_HB_CONFIG,
       );
 
-      // Should default to 0 credits (critical tier — zero is broke, not dead)
-      expect(ctx.creditBalance).toBe(0);
-      expect(ctx.survivalTier).toBe("critical");
-      // ...but flagged, so tasks do not treat the placeholder 0 as a real balance.
-      expect(ctx.creditBalanceKnown).toBe(false);
+      // Unknown, not zero: no placeholder balance and no critical tier.
+      expect(ctx.creditBalance).toBeNull();
+      expect(ctx.creditRead).toMatchObject({ known: false, reason: "network_error" });
+      expect(ctx.survivalTierKnown).toBe(false);
+      expect(ctx.survivalTier).toBe("low_compute");
+    });
+
+    it("keeps the last known tier while the balance is unknown", async () => {
+      conway.creditsCents = 30; // low_compute
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      conway.creditsCents = 50_000; // high
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      conway.getCreditsBalance = async () => {
+        throw new Error("API unavailable");
+      };
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      expect(ctx.survivalTier).toBe("high");
+      expect(ctx.survivalTierKnown).toBe(false);
+      const since = (rawDb.prepare("SELECT value FROM kv WHERE key = 'balance_unknown_since'").get() as any)?.value;
+      expect(typeof since).toBe("string");
+
+      // A good read ends the outage.
+      conway.getCreditsBalance = async () => 50_000;
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      expect(rawDb.prepare("SELECT value FROM kv WHERE key = 'balance_unknown_since'").get()).toBeUndefined();
     });
   });
 

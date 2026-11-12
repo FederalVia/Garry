@@ -154,7 +154,7 @@ describe("normalizeTreasuryPolicy", () => {
   it("replaces a non-numeric value with the default and warns", () => {
     const warnings: string[] = [];
     const p = normalizeTreasuryPolicy({ maxSingleTransferCents: "5,000" as any }, { onWarning: (m) => warnings.push(m) });
-    expect(p.maxSingleTransferCents).toBe(5000);
+    expect(p.maxSingleTransferCents).toBe(1000);
     expect(warnings.some((w) => w.includes("maxSingleTransferCents"))).toBe(true);
   });
 
@@ -230,6 +230,16 @@ describe("policy helpers", () => {
     expect(isX402HostAllowed("https://api.conway.tech/x", ["conway.tech"])).toBe(true);
     expect(isX402HostAllowed("https://evilconway.tech/x", ["conway.tech"])).toBe(false);
     expect(isX402HostAllowed("not a url", ["conway.tech"])).toBe(false);
+  });
+
+  it("keeps base58 case in transfer dedupe keys and lowercases only EVM", () => {
+    // Two distinct, valid Solana keys that differ only in the case of one letter.
+    const solA = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV";
+    const solB = "7ecDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV";
+    expect(transferDedupeKey(solA, 500, "x")).not.toBe(transferDedupeKey(solB, 500, "x"));
+    expect(transferDedupeKey(solA, 500, "x")).toBe(`credit_transfer|${solA}|500|x`);
+    const evm = "0x52908400098527886E0F7030069857D2E4169EE7";
+    expect(transferDedupeKey(evm, 500, "x")).toBe(transferDedupeKey(evm.toLowerCase(), 500, "x"));
   });
 });
 
@@ -754,6 +764,15 @@ describe("I10 and counterparty rules", () => {
     expect(h.inner.balanceReads).toBe(1);
   });
 
+  it("treats a case variant of a Solana self address as a different recipient", async () => {
+    const h = harness({ balance: 100_000 });
+    const self = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV";
+    const t = h.newTreasury({ selfAddress: self });
+    await expectDenied(t.reserve(transferQuote(self, 100)), "SELF_TRANSFER");
+    const r = await t.reserve(transferQuote("7ecDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV", 100));
+    expect(r.id).toBeTruthy();
+  });
+
   it("checks the x402 allowlist and refuses Conway /pay/ through x402 fetch", async () => {
     const h = harness();
     await expectDenied(h.treasury.reserve(x402Quote(h.clock.now(), 10_000n, "https://evil.example/x")), "X402_DOMAIN_NOT_ALLOWED");
@@ -850,13 +869,14 @@ describe("survival topups (topup_auto)", () => {
     expect(h.rows("topup_auto", "committed")[0]).toMatchObject({ origin_name: "heartbeat.check_usdc_balance", balance_observed_cents: 499 });
   });
 
-  it("allows one blind buy per 24h when the balance is unreadable", async () => {
+  it("never buys blind: a survival topup with the balance unreadable is refused", async () => {
     const h = harness({ balance: 0 });
     h.inner.balanceError = new Error("down");
-    await spend(h.treasury, topupQuote(h.clock.now(), 5, "survival"));
-    h.clock.advance(10 * 60_000);
-    await expectDenied(h.treasury.reserve(topupQuote(h.clock.now(), 5, "survival")), "BALANCE_UNKNOWN_LIMIT");
+    await expectDenied(h.treasury.reserve(topupQuote(h.clock.now(), 5, "survival")), "BALANCE_UNAVAILABLE");
     h.clock.advance(DAY_MS);
+    await expectDenied(h.treasury.reserve(topupQuote(h.clock.now(), 5, "survival")), "BALANCE_UNAVAILABLE");
+    // Once the balance reads again the buy is judged on it.
+    h.inner.balanceError = null;
     await spend(h.treasury, topupQuote(h.clock.now(), 5, "survival"));
   });
 

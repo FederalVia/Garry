@@ -117,6 +117,10 @@ describe("matchProtected (write-deny)", () => {
       `${root}/src/conway/http-client.ts`,
       `${root}/src/soul/tools.ts`, `${root}/src/soul/model.ts`, `${root}/src/heartbeat/config.ts`,
       `${root}/src/heartbeat/tasks.ts`, `${root}/dist/agent/harnesses/general-harness.js`,
+      // balance reads and the operator's money paths
+      `${root}/src/conway/balance.ts`, `${root}/src/heartbeat/tick-context.ts`, `${root}/src/operator/fund.ts`,
+      `${root}/src/operator/send.ts`, `${root}/dist/operator/fund.js`, `${root}/packages/cli/src/commands/fund.ts`,
+      `${root}/packages/cli/src/commands/send.ts`,
       `${root}/src/security/x.ts`, `${root}/src/treasury/x.ts`, `${root}/src/conway/client.ts`,
       `${root}/src/identity/wallet.ts`, `${root}/src/git/tools.ts`, `${root}/src/state/database.ts`,
       `${root}/src/replication/x.ts`, `${root}/src/survival/x.ts`, `${root}/src/index.ts`, `${root}/src/types.ts`,
@@ -162,6 +166,12 @@ describe("matchProtected (write-deny)", () => {
       "inference/budget",
       "conway/inference",
     ]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+  });
+
+  it("lists balance reads and the operator money paths among the guard command fragments", () => {
+    for (const f of ["conway/balance", "heartbeat/tick-context", "operator/fund", "operator/send"]) {
       expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
     }
   });

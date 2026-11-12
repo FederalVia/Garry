@@ -13,7 +13,6 @@
 import {
   createPublicClient,
   http,
-  parseUnits,
   type Address,
   type PrivateKeyAccount,
 } from "viem";
@@ -21,6 +20,7 @@ import { base, baseSepolia } from "viem/chains";
 import { ResilientHttpClient } from "./http-client.js";
 import type { ChainType } from "../identity/chain.js";
 import { createLogger } from "../observability/logger.js";
+import { BalanceUnavailableError } from "./balance.js";
 import {
   TreasuryDeniedError,
   X402_MAX_VALIDITY_SECONDS,
@@ -71,6 +71,19 @@ const CHAINS: Record<string, any> = {
 };
 type NetworkId = keyof typeof USDC_ADDRESSES;
 
+/**
+ * EIP-712 domains of the canonical USDC contracts. Only these contracts are
+ * paid, so the table is authoritative; a server's extra.name/version that
+ * differs is logged and ignored (it could only make the signature fail).
+ */
+const USDC_DOMAINS: Record<string, { name: string; version: string }> = {
+  "eip155:8453": { name: "USD Coin", version: "2" }, // Base mainnet FiatToken
+  "eip155:84532": { name: "USDC", version: "2" }, // Base Sepolia
+};
+
+/** Largest digit string accepted as an atomic amount (far above any real payment). */
+const ATOMIC_AMOUNT_RE = /^[0-9]{1,30}$/;
+
 /** The only network payments are signed on unless a caller pins another. */
 export const X402_DEFAULT_NETWORK = "eip155:8453";
 
@@ -100,7 +113,15 @@ const BALANCE_OF_ABI = [
 interface PaymentRequirement {
   scheme: string;
   network: NetworkId;
-  maxAmountRequired: string;
+  /** The exact network string the server sent ("base", "eip155:8453"...), echoed in the payment. */
+  rawNetwork: string;
+  /** The server's amount field as sent: `amount` (spec v2), else `maxAmountRequired`. Atomic units. */
+  amountRaw: string | number;
+  /** Both fields were present and they disagree. */
+  amountConflict: boolean;
+  /** extra.name / extra.version as the server sent them (diagnostics only). */
+  extraName?: string;
+  extraVersion?: string;
   payToAddress: Address;
   requiredDeadlineSeconds: number;
   /** True when the server sent requiredDeadlineSeconds (a minimum), not just maxTimeoutSeconds. */
@@ -188,12 +209,15 @@ function normalizePaymentRequirement(raw: unknown): PaymentRequirement | null {
   if (!network) return null;
 
   const scheme = typeof value.scheme === "string" ? value.scheme : null;
-  const maxAmountRequired = typeof value.maxAmountRequired === "string"
-    ? value.maxAmountRequired
-    : typeof value.maxAmountRequired === "number" &&
-        Number.isFinite(value.maxAmountRequired)
-      ? String(value.maxAmountRequired)
-      : null;
+  // The field name does not follow the version: Conway's /pay answers
+  // x402Version 2 with maxAmountRequired. Either way the value is atomic.
+  const amountField = (v: unknown): string | number | null =>
+    typeof v === "string" || typeof v === "number" ? v : null;
+  const v2Amount = amountField(value.amount);
+  const v1Amount = amountField(value.maxAmountRequired);
+  const amountRaw = v2Amount ?? v1Amount;
+  const amountConflict = v2Amount !== null && v1Amount !== null && String(v2Amount).trim() !== String(v1Amount).trim();
+  const extra = typeof value.extra === "object" && value.extra !== null ? (value.extra as Record<string, unknown>) : {};
   const payToAddress = typeof value.payToAddress === "string"
     ? value.payToAddress
     : typeof value.payTo === "string"
@@ -210,14 +234,18 @@ function normalizePaymentRequirement(raw: unknown): PaymentRequirement | null {
     parsePositiveInt(value.maxTimeoutSeconds) ??
     300;
 
-  if (!scheme || !maxAmountRequired || !payToAddress || !usdcAddress) {
+  if (!scheme || amountRaw === null || !payToAddress || !usdcAddress) {
     return null;
   }
 
   return {
     scheme,
     network,
-    maxAmountRequired,
+    rawNetwork: (value.network as string).trim(),
+    amountRaw,
+    amountConflict,
+    ...(typeof extra.name === "string" ? { extraName: extra.name } : {}),
+    ...(typeof extra.version === "string" ? { extraVersion: extra.version } : {}),
     payToAddress: payToAddress as Address,
     requiredDeadlineSeconds,
     deadlineRequired: explicitDeadline !== null,
@@ -239,19 +267,19 @@ function normalizePaymentRequired(raw: unknown): PaymentRequiredResponse | null 
   return { x402Version, accepts };
 }
 
-function parseMaxAmountRequired(maxAmountRequired: string, x402Version: number): bigint {
-  const amount = maxAmountRequired.trim();
-  if (!/^\d+(\.\d+)?$/.test(amount)) {
-    throw new Error(`Invalid maxAmountRequired: ${maxAmountRequired}`);
+/**
+ * An x402 amount in atomic USDC units (6 decimals), in every protocol
+ * version: a digit string or a safe JSON integer. Decimals, exponents and
+ * signs are refused: the unit is never guessed from the string's shape.
+ */
+export function parseAtomicAmount(raw: unknown): bigint {
+  if (typeof raw === "number") {
+    if (Number.isSafeInteger(raw) && raw >= 0) return BigInt(raw);
+  } else if (typeof raw === "string") {
+    const amount = raw.trim();
+    if (ATOMIC_AMOUNT_RE.test(amount)) return BigInt(amount);
   }
-
-  if (amount.includes(".")) {
-    return parseUnits(amount, 6);
-  }
-  if (x402Version >= 2 || amount.length > 6) {
-    return BigInt(amount);
-  }
-  return parseUnits(amount, 6);
+  throw new Error(`amount must be an integer in atomic units, got ${JSON.stringify(raw)}`);
 }
 
 function selectRequirement(
@@ -292,6 +320,11 @@ export async function getUsdcBalance(
     return getSolanaUsdcBalance(address);
   }
   const result = await getUsdcBalanceDetailed(address as Address, network);
+  // A failed RPC read is not an empty wallet.
+  if (!result.ok) {
+    const reason = !CHAINS[network] || !USDC_ADDRESSES[network] ? "unsupported_network" : "rpc_error";
+    throw new BalanceUnavailableError(reason, result.error ?? `USDC balance read failed on ${network}`);
+  }
   return result.balance;
 }
 
@@ -327,7 +360,7 @@ async function getSolanaUsdcBalance(address: string): Promise<number> {
 
     return totalBalance;
   } catch (err: any) {
-    throw new Error(`Solana USDC balance check failed: ${err?.message || String(err)}`);
+    throw new BalanceUnavailableError("rpc_error", `Solana USDC balance check failed: ${err?.message || String(err)}`);
   }
 }
 
@@ -500,6 +533,15 @@ export async function x402Fetch(
   }
 
   if (initialResp.status !== 402) {
+    // A topup that was never paid bought nothing, whatever the status says.
+    if (payment.purpose === "topup") {
+      return {
+        success: false,
+        error: `Topup endpoint did not ask for payment (HTTP ${initialResp.status}); nothing was paid`,
+        status: initialResp.status,
+        settlement: "none",
+      };
+    }
     return {
       success: initialResp.ok,
       response: initialBody.data,
@@ -529,14 +571,25 @@ export async function x402Fetch(
     );
   }
 
+  if (requirement.amountConflict) {
+    return refuse("INVALID_QUOTE", "Payment requirement has both amount and maxAmountRequired, and they differ");
+  }
   let atomic: bigint;
   try {
-    atomic = parseMaxAmountRequired(requirement.maxAmountRequired, parsed.x402Version);
-  } catch (err: any) {
-    return { success: false, error: err?.message || String(err), status: 402, settlement: "none" };
+    atomic = parseAtomicAmount(requirement.amountRaw);
+  } catch (err) {
+    return refuse("INVALID_QUOTE", errMessage(err));
   }
   if (atomic <= 0n) {
     return refuse("INVALID_AMOUNT", "Payment requirement asks for a zero amount");
+  }
+  // A topup must quote exactly the tier: less would sign an underpayment
+  // that leaves the topup unconfirmed, more would overpay.
+  if (payment.purpose === "topup" && payment.maxAtomic !== undefined && atomic !== payment.maxAtomic) {
+    return refuse(
+      "X402_AMOUNT_MISMATCH",
+      `Topup asks for ${atomic} atomic USDC; the tier is exactly ${payment.maxAtomic}`,
+    );
   }
   if (payment.maxAtomic !== undefined && atomic > payment.maxAtomic) {
     return refuse(
@@ -545,14 +598,13 @@ export async function x402Fetch(
     );
   }
 
-  // Check amount against maxPaymentCents BEFORE signing
+  // Check amount against maxPaymentCents BEFORE signing, rounding up like the gate.
   if (maxPaymentCents !== undefined) {
-    // Convert atomic units (6 decimals) to cents (2 decimals)
-    const amountCents = Number(atomic) / 10_000;
+    const amountCents = centsFromAtomic(atomic);
     if (amountCents > maxPaymentCents) {
       return {
         success: false,
-        error: `Payment of ${amountCents.toFixed(2)} cents exceeds max allowed ${maxPaymentCents} cents`,
+        error: `Payment of ${amountCents} cents (${atomic} atomic USDC) exceeds max allowed ${maxPaymentCents} cents`,
         status: 402,
         settlement: "none",
       };
@@ -902,10 +954,24 @@ async function signPayment(
     throw new Error(`Unsupported network: ${requirement.network}`);
   }
 
+  const known = USDC_DOMAINS[requirement.network];
+  if (!known) {
+    throw new Error(`No USDC EIP-712 domain known for ${requirement.network}`);
+  }
+  if (
+    (requirement.extraName !== undefined && requirement.extraName !== known.name) ||
+    (requirement.extraVersion !== undefined && requirement.extraVersion !== known.version)
+  ) {
+    logger.warn(
+      `x402 server sent USDC domain ${requirement.extraName ?? "?"}/${requirement.extraVersion ?? "?"} ` +
+        `for ${requirement.network}; signing with ${known.name}/${known.version}`,
+    );
+  }
+
   // EIP-712 typed data for TransferWithAuthorization
   const domain = {
-    name: "USD Coin",
-    version: "2",
+    name: known.name,
+    version: known.version,
     chainId: chain.id,
     verifyingContract: requirement.usdcAddress,
   } as const;
@@ -940,7 +1006,8 @@ async function signPayment(
   return {
     x402Version,
     scheme: requirement.scheme,
-    network: requirement.network,
+    // The server matches this against its own requirement string.
+    network: requirement.rawNetwork,
     payload: {
       signature,
       authorization: {

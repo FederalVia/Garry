@@ -234,7 +234,10 @@ function tickContext(u: Usdc, overrides: Partial<TickContext> = {}): TickContext
     startedAt: new Date(),
     creditBalance: 0,
     usdcBalance: 10,
+    creditRead: { known: true, value: 0, at: new Date().toISOString() },
+    usdcRead: { known: true, value: 10, at: new Date().toISOString() },
     survivalTier: "critical",
+    survivalTierKnown: true,
     lowComputeMultiplier: 4,
     config: { entries: [], defaultIntervalMs: 60_000, lowComputeMultiplier: 4 },
     db: u.h.raw,
@@ -820,15 +823,15 @@ describe("automatic survival topups are bounded (H1-001, F143, F193, F229)", () 
     expect(paywall.payments).toHaveLength(0);
   });
 
-  it("U11 (F143): with the balance unreadable, one blind buy per day", async () => {
+  it("U11 (F143): with the balance unreadable, no survival buy is made at all", async () => {
     const u = setup({ balance: 0 });
     u.h.inner.balanceError = new Error("Conway API error: GET /v1/credits/balance -> 503");
-    expect((await buy(u))?.success).toBe(true);
+    expect((await buy(u))?.denied?.code).toBe("BALANCE_UNAVAILABLE");
     u.h.clock.advance(6 * MIN);
-    expect((await buy(u))?.denied?.code).toBe("BALANCE_UNKNOWN_LIMIT");
+    expect((await buy(u))?.denied?.code).toBe("BALANCE_UNAVAILABLE");
     u.h.clock.advance(DAY_MS);
-    expect((await buy(u))?.success).toBe(true);
-    expect(paywall.payments).toHaveLength(2);
+    expect((await buy(u))?.denied?.code).toBe("BALANCE_UNAVAILABLE");
+    expect(paywall.payments).toHaveLength(0);
   });
 
   it("U12: exhausted x402, topup and transfer budgets do not starve the survival topup", async () => {
@@ -999,7 +1002,7 @@ describe("heartbeat check_usdc_balance", () => {
     expect(u.rows("topup_auto", "denied")[0]).toMatchObject({ deny_code: "TOPUP_NOT_NEEDED" });
   });
 
-  it("F143: an hour of failed balance reads buys once, not every 5 minutes", async () => {
+  it("F143: an hour of failed gate balance reads buys nothing and never wakes", async () => {
     const u = setup({ balance: 0 });
     u.h.inner.balanceError = new Error("Conway API error: GET /v1/credits/balance -> 503");
     const wakes: boolean[] = [];
@@ -1011,9 +1014,9 @@ describe("heartbeat check_usdc_balance", () => {
       wakes.push(r.shouldWake);
       u.h.clock.advance(5 * MIN);
     }
-    expect(paywall.payments).toHaveLength(1);
-    expect(wakes[0]).toBe(true); // the one buy is reported
-    expect(wakes.slice(1).every((w) => w === false)).toBe(true);
+    // BALANCE_UNAVAILABLE is a routine refusal: nothing paid, no wake.
+    expect(paywall.payments).toHaveLength(0);
+    expect(wakes.every((w) => w === false)).toBe(true);
   });
 
   it("F143: credits that never post use the survival cap and then wake once a day, not every tick", async () => {

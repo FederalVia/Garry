@@ -30,7 +30,10 @@ function createMockTickContext(db: AutomatonDatabase, overrides?: Partial<TickCo
     startedAt: new Date(),
     creditBalance: 10_000,
     usdcBalance: 1.5,
+    creditRead: { known: true, value: 10_000, at: new Date().toISOString() },
+    usdcRead: { known: true, value: 1.5, at: new Date().toISOString() },
     survivalTier: "normal",
+    survivalTierKnown: true,
     lowComputeMultiplier: 4,
     config: {
       entries: [],

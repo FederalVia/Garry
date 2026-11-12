@@ -40,8 +40,9 @@ export interface PlannedTask {
 }
 
 export interface PlannerContext {
-  creditsCents: number;
-  usdcBalance: number;
+  /** null: the balance could not be read. */
+  creditsCents: number | null;
+  usdcBalance: number | null;
   survivalTier: string;
   availableRoles: string[];
   customRoles: string[];
@@ -254,8 +255,9 @@ export function buildPlannerPrompt(context: PlannerContext): string {
   const marketIntel = context.marketIntel.trim().length > 0 ? context.marketIntel.trim() : "none";
   const modelHints = MODEL_TIERS.map((tier) => `tier:${tier}`).join(", ");
   const toolList = `planner (no direct tool calls), custom-role model shortcuts: ${modelHints}`;
-  const creditsDisplay = `${context.creditsCents} cents`;
-  const usdcDisplay = Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "0";
+  const creditsDisplay = context.creditsCents === null ? "unknown" : `${context.creditsCents} cents`;
+  const usdcDisplay =
+    typeof context.usdcBalance === "number" && Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "unknown";
 
   return `# Planner Agent
 
@@ -335,7 +337,7 @@ RECEIVE -> ANALYZE -> DECOMPOSE -> VALIDATE -> OUTPUT
 <context>
 You have access to (injected at runtime):
 - Current financial state: ${creditsDisplay} credits, ${usdcDisplay} USDC
-- Survival tier: ${context.survivalTier} (dead/critical/low_compute/normal/high)
+- Survival tier: ${context.survivalTier} (dead/critical/low_compute/normal/high; unknown when the balance could not be read)
 - Available predefined roles: ${roleList} (26 roles across 7 departments)
 - Previously created custom roles: ${customRoleList}
 - Active goals and their progress: ${activeGoals}

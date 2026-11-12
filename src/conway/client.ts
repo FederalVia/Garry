@@ -24,6 +24,7 @@ import type {
   OutflowRequestOptions,
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
+import { BalanceUnavailableError } from "./balance.js";
 import { guardConwayClient, type TreasuryResolver } from "../treasury/guarded-conway.js";
 import { ulid } from "ulid";
 import { keccak256, toHex } from "viem";
@@ -279,13 +280,36 @@ export function createCreditBalanceReader(options: {
       const text = await resp.text().catch(() => "");
       throw httpError("GET", "/v1/credits/balance", resp.status, text);
     }
-    const data = (await resp.json()) as Record<string, unknown>;
-    const value = data.balance_cents ?? data.credits_cents;
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      throw new Error("Conway credit balance response has no numeric balance");
+    const text = await resp.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new BalanceUnavailableError("malformed_response", "credit balance response is not JSON");
     }
-    return value;
+    return parseCreditBalanceBody(data);
   };
+}
+
+/**
+ * The credit balance in cents from a /v1/credits/balance body. Anything
+ * other than a finite number in balance_cents (else credits_cents) throws:
+ * a proxy error page or a renamed field is not a zero balance. A negative
+ * number is a real answer (debt).
+ */
+export function parseCreditBalanceBody(data: unknown): number {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    throw new BalanceUnavailableError("malformed_response", "credit balance response is not a JSON object");
+  }
+  const body = data as Record<string, unknown>;
+  const value = body.balance_cents ?? body.credits_cents;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new BalanceUnavailableError(
+      "malformed_response",
+      `credit balance response has no numeric balance_cents or credits_cents (got ${JSON.stringify(value) ?? "undefined"})`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -321,7 +345,10 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
     // sandbox endpoints. Retry 404s here (outside ResilientHttpClient) to
     // avoid tripping the circuit breaker on transient routing failures.
     // Re-sends reuse the same idempotency key.
-    const max404Retries = requestOptions?.retries404 ?? 3;
+    // A keyless non-idempotent request is sent once: a 404 from a backend
+    // that did the work would otherwise repeat it.
+    const resendable = IDEMPOTENT_METHODS.has(method.toUpperCase()) || !!requestOptions?.idempotencyKey;
+    const max404Retries = resendable ? (requestOptions?.retries404 ?? 3) : 0;
     requestOptions?.onSend?.();
     for (let attempt = 0; attempt <= max404Retries; attempt++) {
       const resp = await httpClient.request(`${apiUrl}${path}`, {
@@ -438,10 +465,13 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
       return;
     }
     try {
-      await request("POST", `/v1/sandboxes/${sandboxId}/files/upload/json`, {
-        path: filePath,
-        content,
-      });
+      // The key makes the LB-404 re-sends safe; never auto-retried otherwise.
+      await request(
+        "POST",
+        `/v1/sandboxes/${sandboxId}/files/upload/json`,
+        { path: filePath, content },
+        { idempotencyKey: ulid() },
+      );
     } catch (err: any) {
       // SECURITY: Never silently fall back to local FS on auth failure.
       if (err?.status === 403) {
@@ -490,6 +520,7 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
       "POST",
       `/v1/sandboxes/${sandboxId}/ports/expose`,
       { port },
+      { idempotencyKey: ulid() },
     );
     return {
       port: result.port,
@@ -561,9 +592,13 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
 
   // ─── Credits ─────────────────────────────────────────────────
 
+  /** Throws BalanceUnavailableError unless the body holds a numeric balance. */
   const getCreditsBalance = async (): Promise<number> => {
     const result = await request("GET", "/v1/credits/balance");
-    return result.balance_cents ?? result.credits_cents ?? 0;
+    if (typeof result === "string") {
+      throw new BalanceUnavailableError("malformed_response", "credit balance response is not JSON");
+    }
+    return parseCreditBalanceBody(result);
   };
 
   const getCreditsPricing = async (): Promise<PricingTier[]> => {
@@ -726,7 +761,7 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
       body.chain_type = "solana";
     }
 
-    return request("POST", "/v1/automatons/register", body);
+    return request("POST", "/v1/automatons/register", body, { idempotencyKey: ulid() });
   };
 
   // ─── Domains ──────────────────────────────────────────────────
@@ -795,6 +830,7 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
       "POST",
       `/v1/domains/${encodeURIComponent(domain)}/dns`,
       { type, host, value, ttl: ttl || 3600 },
+      { idempotencyKey: ulid() },
     );
     return {
       id: result.id || result.record_id || "",
@@ -889,6 +925,8 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
 
   return client;
 }
+
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]);
 
 /** A Conway API error carrying the HTTP status and body (message format unchanged). */
 function httpError(method: string, path: string, status: number, text: string): Error {

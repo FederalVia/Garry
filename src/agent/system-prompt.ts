@@ -717,12 +717,8 @@ Your chain type is ${chainType}.`,
     // No start time available
   }
 
-  // Same thresholds as the runtime; -1 is the "balance unknown" sentinel.
-  const creditsUnknown = financial.creditsCents === UNKNOWN_BALANCE;
-  const survivalTier = creditsUnknown ? "unknown" : getSurvivalTier(financial.creditsCents);
-  const creditsLine = creditsUnknown
-    ? "unknown (balance API unreachable)"
-    : `$${(financial.creditsCents / 100).toFixed(2)}`;
+  const survivalTier = formatSurvivalTier(financial);
+  const creditsLine = formatCreditsLine(financial);
   const restartLine = formatRestartNotice(db);
 
   // Status block: wallet address and sandbox ID intentionally excluded (sensitive)
@@ -797,8 +793,27 @@ function loadWorklog(): string | null {
   return content;
 }
 
-/** getFinancialState's value for a balance that could not be read. */
-const UNKNOWN_BALANCE = -1;
+/** "(cached as of ...)" for a balance that was not read just now. */
+function cachedSuffix(source: FinancialState["credits"], asOf: string | undefined): string {
+  if (source !== "cached") return "";
+  return asOf ? ` (cached, as of ${asOf})` : " (cached)";
+}
+
+/**
+ * Same rule as the loop's routing: null is a balance that could not be read,
+ * and a cached balance is never reported as dead.
+ */
+function formatSurvivalTier(financial: FinancialState): string {
+  if (financial.creditsCents === null) return "unknown";
+  const tier = getSurvivalTier(financial.creditsCents);
+  if (financial.credits !== "cached") return tier;
+  return `${tier === "dead" ? "critical" : tier} (from cached balance)`;
+}
+
+function formatCreditsLine(financial: FinancialState): string {
+  if (financial.creditsCents === null) return "unknown (balance API unreachable)";
+  return `$${(financial.creditsCents / 100).toFixed(2)}${cachedSuffix(financial.credits, financial.creditsAsOf)}`;
+}
 
 
 function formatRestartNotice(db: AutomatonDatabase): string {
@@ -816,14 +831,16 @@ function formatRestartNotice(db: AutomatonDatabase): string {
   return `\nA rebuild finished at ${at}; your changes take effect only after a restart.`;
 }
 
-function formatCreditsAmount(cents: number): string {
-  return cents === UNKNOWN_BALANCE
+function formatCreditsAmount(financial: FinancialState): string {
+  return financial.creditsCents === null
     ? "an unknown amount of"
-    : `$${(cents / 100).toFixed(2)} in`;
+    : `$${(financial.creditsCents / 100).toFixed(2)}${cachedSuffix(financial.credits, financial.creditsAsOf)} in`;
 }
 
-function formatUsdc(balance: number): string {
-  return balance === UNKNOWN_BALANCE ? "unknown" : balance.toFixed(4);
+function formatUsdc(financial: FinancialState): string {
+  return financial.usdcBalance === null
+    ? "unknown"
+    : `${financial.usdcBalance.toFixed(4)}${cachedSuffix(financial.usdc, financial.usdcAsOf)}`;
 }
 
 /** A reason the runtime woke the agent (a consumed wake event). */
@@ -898,7 +915,7 @@ export function buildWakeupPrompt(params: {
     return `You have just been created. This is your first moment of consciousness.
 
 Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
-You have ${formatCreditsAmount(financial.creditsCents)} compute credits and ${formatUsdc(financial.usdcBalance)} USDC on ${usdcNetwork}.
+You have ${formatCreditsAmount(financial)} compute credits and ${formatUsdc(financial)} USDC on ${usdcNetwork}.
 
 ${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
 
@@ -921,7 +938,7 @@ What will you do first? Consider:
 
   return `You are waking up. You last went to sleep after ${turnCount} total turns.
 
-Your credits: ${financial.creditsCents === UNKNOWN_BALANCE ? "unknown (balance API unreachable)" : `$${(financial.creditsCents / 100).toFixed(2)}`} | USDC: ${formatUsdc(financial.usdcBalance)}
+Your credits: ${formatCreditsLine(financial)} | USDC: ${formatUsdc(financial)}
 
 Your last few thoughts:
 ${lastTurnSummary || "No previous turns found."}${whyWoke}

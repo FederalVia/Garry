@@ -54,7 +54,9 @@ export const ROUTINE_TOPUP_REFUSALS: readonly string[] = Object.freeze([
   "TOPUP_NOT_NEEDED",
   "TOPUP_COOLDOWN",
   "TOPUP_IN_FLIGHT",
-  "BALANCE_UNKNOWN_LIMIT",
+  // The gate could not read the balance, so it does not buy; this clears
+  // when the balance endpoint answers again.
+  "BALANCE_UNAVAILABLE",
   "PAYMENT_UNCONFIRMED",
   "TOPUP_ALREADY_SETTLED",
 ]);
@@ -144,7 +146,9 @@ export async function topupCredits(
  *
  * Parses the error response to determine the deficit, picks the smallest
  * tier that covers it, checks USDC balance, and calls topupCredits().
- * Returns null if the error isn't a 402 or topup can't proceed.
+ * Returns null if the error isn't a 402 or topup can't proceed, including
+ * when the details are unparseable or no tier covers the deficit: a buy
+ * that cannot make the retry succeed is not made.
  */
 export async function topupForSandbox(params: {
   apiUrl: string;
@@ -166,25 +170,49 @@ export async function topupForSandbox(params: {
   if (error.status !== 402 && !error.message?.includes("INSUFFICIENT_CREDITS")) return null;
 
   // Parse the 402 response body for credit details
-  let requiredCents: number | undefined;
-  let currentCents: number | undefined;
+  let details: Record<string, unknown> | undefined;
   try {
     const body = JSON.parse(error.responseText || "{}");
-    requiredCents = body.details?.required_cents;
-    currentCents = body.details?.current_balance_cents;
+    if (body && typeof body.details === "object" && body.details !== null) {
+      details = body.details as Record<string, unknown>;
+    }
   } catch {
     // If we can't parse the body, check for INSUFFICIENT_CREDITS in message
     if (!error.message?.includes("INSUFFICIENT_CREDITS")) return null;
   }
 
-  // Calculate deficit in cents; default to minimum tier if details missing
-  const deficitCents = (requiredCents != null && currentCents != null)
-    ? requiredCents - currentCents
-    : TOPUP_TIERS[0] * 100;
+  // Deficit in cents; the minimum tier when the 402 gives no details.
+  let deficitCents: number;
+  const hasDetails =
+    details !== undefined && (details.required_cents !== undefined || details.current_balance_cents !== undefined);
+  if (hasDetails) {
+    const requiredCents = parseCentsField(details!.required_cents);
+    const currentCents = parseCentsField(details!.current_balance_cents);
+    if (requiredCents === null || currentCents === null) {
+      logger.warn(
+        `Sandbox topup skipped: unparseable 402 details (required_cents=${JSON.stringify(details!.required_cents)}, ` +
+          `current_balance_cents=${JSON.stringify(details!.current_balance_cents)})`,
+      );
+      return null;
+    }
+    deficitCents = requiredCents - currentCents;
+  } else {
+    deficitCents = TOPUP_TIERS[0] * 100;
+  }
+  if (deficitCents <= 0) {
+    logger.info(`Sandbox topup skipped: no deficit (${deficitCents}c)`);
+    return null;
+  }
 
-  // Pick smallest tier that covers the deficit (tier is in USD, deficit in cents)
-  const selectedTier = TOPUP_TIERS.find((tier) => tier * 100 >= deficitCents)
-    ?? TOPUP_TIERS[TOPUP_TIERS.length - 1];
+  // Smallest tier that covers the deficit (tier is in USD, deficit in cents).
+  const selectedTier = TOPUP_TIERS.find((tier) => tier * 100 >= deficitCents);
+  if (selectedTier === undefined) {
+    logger.warn(
+      `Sandbox topup skipped: deficit $${(deficitCents / 100).toFixed(2)} exceeds the largest tier ` +
+        `($${TOPUP_TIERS[TOPUP_TIERS.length - 1]}); fund manually`,
+    );
+    return null;
+  }
 
   // Check USDC balance before attempting payment
   let usdcBalance: number;
@@ -207,6 +235,16 @@ export async function topupForSandbox(params: {
     topupPurpose: "sandbox_402",
     treasury: params.treasury,
   });
+}
+
+/** A cents field from a 402 body: a finite number >= 0, or a digit string. */
+function parseCentsField(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  if (typeof raw === "string" && /^\s*\d+\s*$/.test(raw)) {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 /**

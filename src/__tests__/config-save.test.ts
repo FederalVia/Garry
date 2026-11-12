@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AutomatonConfig, AutomatonDatabase, ToolContext } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
 
 const savedHome = process.env.HOME;
 let home: string;
@@ -150,7 +151,7 @@ describe("loadConfig", () => {
   it("replaces a malformed treasury value with the default number", () => {
     writeConfig({ ...BASE, treasuryPolicy: { maxSingleTransferCents: "5,000", maxHourlyTransferCents: "10,000" } });
     const config = cfg.loadConfig()!;
-    expect(config.treasuryPolicy?.maxSingleTransferCents).toBe(5000);
+    expect(config.treasuryPolicy?.maxSingleTransferCents).toBe(DEFAULT_TREASURY_POLICY.maxSingleTransferCents);
     expect(typeof config.treasuryPolicy?.maxHourlyTransferCents).toBe("number");
   });
 

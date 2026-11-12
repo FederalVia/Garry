@@ -354,7 +354,7 @@ for each turn:
 - **Idle detection:** Tracks turns without mutations (defined by `MUTATING_TOOLS` blocklist). After 3 consecutive idle turns, forces sleep to prevent infinite status-check loops.
 - **Loop detection:** Tracks tool call patterns. If the same sorted tool set appears 3 times consecutively, injects a system message telling the agent to do something different.
 - **Wake event draining:** On loop entry, consumes all stale wake events so they don't immediately re-wake the agent after its first sleep.
-- **Balance caching:** Caches last known balances in KV store. On API failure, returns cached values instead of zero (prevents false dead-state transitions).
+- **Balance caching:** Caches last known balances in KV (`last_known_balance`). On a failed read the loop uses the cached value marked `cached` (the prompt says so, and its tier line is never `dead`), or else `null` (shown as unknown). A cached or unknown balance only steers model routing: it never buys credits and never marks the agent dead.
 
 ---
 
@@ -401,10 +401,10 @@ The policy engine is a rule-based system that evaluates every tool call before e
 
 1. **Authority rules** — blocks dangerous/forbidden tools from external input sources; implements authority hierarchy (creator > self > peer > external)
 2. **Command safety rules** — forbidden command patterns (self-destruction, DB drops, process kills); rate limits on self-modification
-3. **Financial rules** — enforces TreasuryPolicy: per-payment caps, hourly/daily transfer limits, minimum reserve, x402 domain allowlist, inference daily budget
+3. **Financial rules** — enforces TreasuryPolicy: per-payment caps, hourly/daily transfer limits, minimum reserve, x402 domain allowlist, inference daily budget. A transfer above `requireConfirmationAboveCents` gets `quarantine`, which `executeTool` treats as a refusal (no approval flow exists); the default `maxSingleTransferCents` equals that threshold, and a larger configured value logs a startup warning
 4. **Path protection rules** — blocks writes to protected files (constitution, wallet, DB, config); blocks reads of sensitive files (private key, API keys)
-5. **Rate limit rules** — per-turn and per-session caps on expensive operations
-6. **Validation rules** — input format validation (package names, URLs, domains, git hashes)
+5. **Rate limit rules** — caps on spawns (3/day), own-code edits (10/hour) and genesis prompt changes (1/day), counted from effects (children rows, sandbox creations with an unknown outcome, `modifications` rows), never from logged `allow` decisions
+6. **Validation rules** — input format validation (package names, URLs, domains, git hashes, recipient addresses: `transfer_credits`/`fund_child` on the automaton's own chain, `send_message` EVM or Solana, zero/system addresses refused)
 
 Every decision is persisted to the `policy_decisions` table with full context for audit.
 
@@ -508,7 +508,7 @@ Every tick (default 60s):
 |---|---|---|
 | `heartbeat_ping` | `*/15 * * * *` | Ping Conway, distress on critical/dead |
 | `check_credits` | `0 */6 * * *` | Monitor tier, manage 1hr dead grace period |
-| `check_usdc_balance` | `*/5 * * * *` | Wake agent if USDC available for topup |
+| `check_usdc_balance` | `*/5 * * * *` | $5 survival topup when credits are critical and USDC >= $5 (EVM only); wake on success, failures deduplicated per 6 h |
 | `check_for_updates` | `0 */4 * * *` | Git upstream monitoring (dedup: only new commits) |
 | `health_check` | `*/30 * * * *` | Sandbox liveness (dedup: only first failure) |
 | `check_child_health` | `*/10 * * * *` | Probe live children, apply starting/healthy/unhealthy/failed (no children: no probes) |
@@ -520,7 +520,7 @@ Every tick (default 60s):
 
 **Wake events:** Tasks that detect actionable conditions insert atomic wake events into the `wake_events` table. The scheduler is their only writer. The main run loop checks this table every 30 seconds during sleep, and the reasons (sanitized; inbox wakes as a generic sentence) are shown in the first prompt of the wake.
 
-**Balance-driven tasks:** `TickContext.creditBalanceKnown` is false when the balance read failed; `check_credits`, `check_usdc_balance` and the `heartbeat_ping` distress then do nothing. Any successful read above 0 clears `zero_credits_since`.
+**Balance-driven tasks:** a failed or malformed balance read is unknown, never 0. `TickContext.creditBalance` (and `usdcBalance`) is then `null`, `creditRead`/`usdcRead` say why (`{ known: false, reason, detail }`), and `survivalTierKnown` is false. The tier is the last known tier (`last_known_tier` KV) or else `low_compute`, never `critical` or `dead` from a failed read. `check_credits`, `check_usdc_balance` and the `heartbeat_ping` distress do nothing on an unknown balance: no topup, no distress, and the zero-credit streak (`zero_credits_since`) is neither started, extended nor ended. The outage start is kept in `balance_unknown_since` and a warning is logged at most once an hour; it never wakes the agent. Any successful read clears `balance_unknown_since` and records the tier; a read above 0 clears `zero_credits_since`. In the agent loop a cached balance (`last_known_balance`) can steer model routing but never buys credits and never marks the agent dead: only a live read can.
 
 ---
 
@@ -529,7 +529,9 @@ Every tick (default 60s):
 The automaton's survival depends on two balances:
 
 1. **Conway credits** (cents) — prepaid compute credits for sandboxes, inference, domains
-2. **USDC** (on-chain) — fungible stablecoin on Base mainnet
+2. **USDC** (on-chain) — on Base mainnet for an EVM automaton, on Solana mainnet for a Solana automaton (read only: x402 payments and topups need an EVM wallet and are refused on Solana)
+
+**Balance reads** (`src/conway/balance.ts`): `getCreditsBalance` and `getUsdcBalance` throw `BalanceUnavailableError` (or the HTTP error) on anything they cannot trust: HTTP/RPC errors, timeouts, an open circuit, a response without a finite numeric balance. `readCredits`/`readUsdc` wrap them in `{ known: true, value } | { known: false, reason, detail }`, so every caller must handle "could not read" separately from 0.
 
 **Survival tiers** (`src/conway/credits.ts`):
 
@@ -541,9 +543,9 @@ The automaton's survival depends on two balances:
 | `critical` | >= $0.00 | Zero credits, alive. Distress signals, accept funding. |
 | `dead` | < $0.00 | Only reachable via 1-hour heartbeat grace period at zero credits |
 
-**Credit topup** (`src/conway/topup.ts`): The agent buys credits from USDC via the x402 payment protocol. On startup, `bootstrapTopup()` buys the minimum $5 tier. At runtime, the agent uses `topup_credits` tool to choose larger tiers ($5/$25/$100/$500/$1000/$2500). Every purchase is a Treasury outflow: the signed amount may not exceed the requested tier, the credits must be for this automaton, and the purpose picks the budget (`manual`, `sandbox_402`, or `survival` for the automatic $5 buys, which the gate allows only when its own balance read is low).
+**Credit topup** (`src/conway/topup.ts`): The agent buys credits from USDC via the x402 payment protocol. On startup, `bootstrapTopup()` buys the minimum $5 tier when credits are below $5 and USDC is at least $5 (skipped when either balance cannot be read). At runtime, the agent uses `topup_credits` tool to choose larger tiers ($5/$25/$100/$500/$1000/$2500). Every purchase is a Treasury outflow: the signed amount may not exceed the requested tier, the credits must be for this automaton, and the purpose picks the budget (`manual`, `sandbox_402`, or `survival` for the automatic $5 buys, which the gate allows only when its own balance read is low). `x402Fetch` with purpose `topup` requires a 402 from `/pay/`: any other answer to the unpaid request is a failed topup with nothing paid, never a purchase. A sandbox 402 buys only the smallest tier that covers the stated deficit, and nothing when the deficit is unparseable or larger than every tier.
 
-**x402 protocol** (`src/conway/x402.ts`): HTTP 402 payment flow. Server returns payment requirements; the client checks them (exact USDC on Base, amount, deadline), reserves the payment with the Treasury with its nonce and `validBefore` (at most 600s ahead), then signs a USDC `TransferWithAuthorization` (EIP-3009) and retries with the `X-Payment` header. A 2xx commits the ledger row; a refused connection releases it; any other failure after sending leaves it `unknown` until `authorizationState` on chain says whether it was used.
+**x402 protocol** (`src/conway/x402.ts`): HTTP 402 payment flow. Server returns payment requirements; the client checks them (exact USDC on Base, amount, deadline), reserves the payment with the Treasury with its nonce and `validBefore` (at most 600s ahead), then signs a USDC `TransferWithAuthorization` (EIP-3009) and sends the request once more with the `X-Payment` header. A 2xx commits the ledger row; a refused connection releases it; any other failure after sending leaves it `unknown` until `authorizationState` on chain says whether it was used. Amounts are atomic USDC units (6 decimals) in every protocol version, parsed by `parseAtomicAmount` (digit string or safe integer; decimals, exponents and signs refused; `amount` and `maxAmountRequired` must agree); cents limits round up (`centsFromAtomic`), and a topup must quote exactly its tier. The EIP-712 domain comes from the network's canonical USDC contract (`USD Coin`/`USDC`, version 2) and the payload echoes the server's network string. The probe and the paid request use `redirect: "manual"` and the paid request `retries: 0`, so `X-Payment` never reaches a host other than the one the Treasury checked and a signed payment is never re-sent. Topups use their own HTTP client, so a failing third-party x402 host cannot open the topup circuit.
 
 **Treasury** (`src/treasury/`): One gate every outflow passes through. The five value-moving primitives (Conway `transferCredits`, `createSandbox`, `registerDomain`, and the signed payment in `x402Fetch`, which topups use) are wrapped, so tools, workers, the orchestrator, the health monitor, the heartbeat and startup are all gated the same way. The gate is resolved at call time; with none installed the call is refused and nothing is sent or signed.
 
@@ -564,9 +566,9 @@ Limits are per budget (transfer, x402, topup, topup_auto, infra) over rolling wi
 
 **Files:** `src/identity/`
 
-Each automaton has a unique Ethereum identity:
+Each automaton has a unique EVM or Solana identity (`chainType` in the config):
 
-- **Wallet** (`wallet.ts`): Generated via `viem` on first run. Stored at `~/.automaton/wallet.json` (mode 0600). The private key is never exposed to the agent via tools (blocked by path protection rules).
+- **Wallet** (`wallet.ts`): Generated on first run (secp256k1 via `viem`, or an Ed25519 keypair for Solana). Stored at `~/.automaton/wallet.json` (mode 0600). The private key is never exposed to the agent via tools (blocked by path protection rules).
 - **Provisioning** (`provision.ts`): Signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway API. Receives an API key stored at `~/.automaton/api-key`.
 - **On-chain identity** (`registry/erc8004.ts`): Optional ERC-8004 agent registration on Base. Publishes a JSON-LD agent card with capabilities, services, and contact info.
 
@@ -590,7 +592,7 @@ The `ConwayClient` interface provides all Conway API operations:
 
 **Remote exec:** the HTTP timeout is the command timeout plus 15 s, with no client retry: a re-sent POST could run the command twice. Only 404 routing errors are re-sent (same idempotency key).
 
-**Resilient HTTP** (`http-client.ts`): All API calls go through `ResilientHttpClient` with configurable retries (default 3 on 429/5xx), jittered exponential backoff, circuit breaker (5 failures -> 60s open), and idempotency key support for mutating operations.
+**Resilient HTTP** (`http-client.ts`): All API calls go through `ResilientHttpClient`. Only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) are retried automatically (default 3 on 429/5xx, jittered exponential backoff); a POST or PATCH is sent once unless the caller passes `retryUnsafe` because the server deduplicates it by its `Idempotency-Key`. Redirects are not followed: a 3xx is returned to the caller, unless it opts in with `followRedirects` (at most 3 hops, GET/HEAD only, same origin, HTTPS, never with an `X-Payment` header); anything else throws `RedirectRefusedError`. The circuit breaker (5 failures -> 60s open) is per origin, so one failing host does not block the others. The Conway client re-sends a 404 (load-balancer routing bug) only for idempotent methods or requests that carry an `Idempotency-Key`, reusing the key. Value-moving calls (`transferCredits`, `createSandbox`, `registerDomain`) carry a ulid key and are sent with `retries: 0` and `redirect: "manual"`; a timeout, 5xx or redirect is an unknown outcome for the Treasury, never a silent re-send. A credit transfer is re-sent only by the Treasury, with the original key.
 
 ---
 

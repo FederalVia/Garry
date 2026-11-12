@@ -14,6 +14,8 @@ import {
   modelRegistryGetAll,
   modelRegistryGetAvailable,
   modelRegistrySetEnabled,
+  modelRegistryGetOrigin,
+  modelRegistryHasOrigin,
 } from "../state/database.js";
 
 type Database = BetterSqlite3.Database;
@@ -36,7 +38,9 @@ export class ModelRegistry {
   /**
    * Upsert the static model baseline into the registry on every startup.
    * New models are added, existing models get updated pricing/capabilities,
-   * and models removed from the baseline are disabled.
+   * and baseline models removed from the baseline are disabled. Models from
+   * the Conway API, Ollama or a manual upsert are left alone, so calling
+   * this before refreshFromApi (as refresh_models does) is harmless.
    */
   initialize(): void {
     const now = new Date().toISOString();
@@ -61,19 +65,20 @@ export class ModelRegistry {
         createdAt: existing?.createdAt || now,
         updatedAt: now,
       };
-      modelRegistryUpsert(this.db, row);
+      modelRegistryUpsert(this.db, row, "baseline");
     }
 
-    // Disable models no longer in the baseline (e.g., removed Anthropic models).
-    // Skip dynamically-discovered providers (e.g. ollama) — they manage their own lifecycle.
+    // Disable baseline models that left the baseline (e.g., removed Anthropic
+    // models). Discovered models (API, Ollama, manual) manage their own
+    // lifecycle. Without the origin column (pre-15 schema) every non-local
+    // row counts as baseline, as before.
+    const hasOrigin = modelRegistryHasOrigin(this.db);
     const allModels = modelRegistryGetAll(this.db);
     for (const existing of allModels) {
-      if (
-        !baselineIds.has(existing.modelId) &&
-        existing.enabled &&
-        existing.provider !== "ollama" &&
-        existing.provider !== "other"
-      ) {
+      if (baselineIds.has(existing.modelId) || !existing.enabled) continue;
+      if (existing.provider === "ollama" || existing.provider === "other") continue;
+      const origin = hasOrigin ? modelRegistryGetOrigin(this.db, existing.modelId) : "baseline";
+      if (origin === "baseline") {
         modelRegistrySetEnabled(this.db, existing.modelId, false);
       }
     }
@@ -121,7 +126,9 @@ export class ModelRegistry {
       createdAt: entry.createdAt,
       updatedAt: entry.updatedAt,
     };
-    modelRegistryUpsert(this.db, row);
+    // A new row added by hand is 'manual'; an existing row keeps its origin.
+    const exists = modelRegistryGet(this.db, entry.modelId) !== undefined;
+    modelRegistryUpsert(this.db, row, exists ? undefined : "manual");
   }
 
   /**
@@ -154,7 +161,8 @@ export class ModelRegistry {
         createdAt: existing?.createdAt || now,
         updatedAt: now,
       };
-      modelRegistryUpsert(this.db, row);
+      // New rows are 'api'; an existing row (baseline included) keeps its origin.
+      modelRegistryUpsert(this.db, row, existing ? undefined : "api");
     }
   }
 

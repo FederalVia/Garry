@@ -30,8 +30,9 @@ Conway Automaton CLI - Creator Tools
 Usage:
   automaton-cli status              Show automaton status
   automaton-cli logs [--tail N]     View automaton logs
-  automaton-cli fund <amount> [--to 0x...]  Transfer Conway credits
-  automaton-cli send <to-address> <message> Send a social message
+  automaton-cli fund <usd> --to <address> [--cents] [--yes]
+                                    Transfer Conway credits (dollars; --cents for cents)
+  automaton-cli send <to-address> <message> Send a signed social message (EVM or Solana)
 `);
   }
 }

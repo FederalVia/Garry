@@ -152,7 +152,7 @@ Configurable spending limits that protect against unauthorized financial activit
 
 | Setting | Default | Description |
 |---|---|---|
-| Max single transfer | $50.00 (5000 cents) | Maximum per-transfer credit amount |
+| Max single transfer | $10.00 (1000 cents) | Maximum per-transfer credit amount. A value above the confirmation threshold has no effect (startup logs a warning) |
 | Max hourly transfers | $100.00 (10000 cents) | Total transfers allowed per hour |
 | Max daily transfers | $250.00 (25000 cents) | Total transfers allowed per day |
 | Minimum reserve | $10.00 (1000 cents) | No transfer, sandbox or domain purchase may take the observed balance below this |
@@ -171,7 +171,7 @@ The wizard detects whether you're running inside a Conway sandbox (via environme
 After setup, the wizard shows your automaton's wallet address and funding instructions:
 
 1. **Transfer Conway credits** directly using `conway credits transfer <address> <amount>`
-2. **Send USDC on Base** to the automaton's wallet address
+2. **Send USDC** to the automaton's wallet address (on Base for an EVM automaton; automatic credit purchases with USDC work only on EVM)
 3. **Fund via dashboard** at https://app.conway.tech
 
 The automaton handles zero-credit startup gracefully. Fund it at any time.
@@ -193,6 +193,21 @@ node dist/index.js [command]
 | `--status` | Show current automaton status |
 | `--version`, `-v` | Show version |
 | `--help`, `-h` | Show help |
+
+### Creator CLI (`automaton-cli`)
+
+```bash
+node packages/cli/dist/index.js <command>
+```
+
+| Command | Description |
+|---|---|
+| `status` | Show automaton status |
+| `logs [--tail N]` | View automaton logs |
+| `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the automaton's API key |
+| `send <to-address> <message>` | Send a signed social message (EVM or Solana wallet) |
+
+`fund` units: the amount is **dollars** by default, at most two decimals (`5` is $5.00, `0.75` is 75 cents). With `--cents` it is a whole number of cents (`75 --cents` is $0.75). Do not type a `$` sign: unquoted, the shell expands `$25` to `5` before the CLI sees it, so a leading `$` is refused. `--to` is required and must be an address on the automaton's own chain (0x... on EVM, base58 on Solana); the zero address, the Solana system address (all-zero key), the automaton's own address and a mixed-case EVM address whose EIP-55 checksum is wrong are refused. The plan (`$X.XX (N cents) from ... to ...`) is printed and must be confirmed with `--yes` or a `y` on an interactive terminal. The request is sent once with one idempotency key and is never retried: a timeout, a 5xx or a redirect exits 2 with "outcome unknown"; check the balance before running it again. A 2xx reply whose status says the transfer was declined, refused or short of funds is reported as a failure.
 
 ### Environment Variables
 
@@ -273,16 +288,20 @@ Prepaid compute credits used for sandboxes, inference, and domains. Denominated 
 
 ### USDC (on-chain)
 
-The automaton holds USDC in its Ethereum wallet on Base mainnet. USDC can be used to:
+An EVM automaton holds USDC in its wallet on Base mainnet; a Solana automaton holds it on Solana mainnet. On EVM, USDC can be used to:
 - Buy Conway credits via x402 payment
 - Pay for domain registrations
 - Make x402 payments to external services
+
+x402 payments (and so every credit purchase with USDC) need an EVM wallet. A Solana automaton reads its USDC balance but refuses x402 payments and topups with a clear message; fund its credits with a credit transfer or the dashboard.
+
+A balance that could not be read (HTTP or RPC error, timeout, open circuit breaker, a response without a numeric balance) is **unknown**, never 0. `check_credits` and `check_usdc_balance` return an error in that case, and nothing spends on an unknown balance.
 
 ### Funding methods
 
 **1. Send USDC directly**
 
-Transfer USDC on Base to the automaton's wallet address. The automaton will automatically buy credits on startup if its balance is low. At runtime, it uses the `topup_credits` tool to buy more as needed.
+Transfer USDC on Base to an EVM automaton's wallet address. It buys credits on startup if its balance is low, and at runtime the agent uses the `topup_credits` tool to buy more.
 
 **2. Transfer Conway credits**
 
@@ -297,9 +316,12 @@ Fund via https://app.conway.tech
 
 ### Auto-topup behavior
 
-- **On startup:** If credits < $5.00 and USDC >= $5.00, the runtime automatically buys $5 in credits (the minimum tier) so the agent can start running inference.
+- **On startup:** If credits < $5.00 and USDC >= $5.00, the runtime buys $5 in credits (the minimum tier) so the agent can start running inference. It is skipped when either balance could not be read, and startup waits for it at most 15 s.
 - **At runtime:** The agent decides when and how much to top up using the `topup_credits` tool. Valid tiers: $5, $25, $100, $500, $1,000, $2,500.
+- **Inline (agent loop):** before a turn, when credits are low_compute or below and USDC is at least $5, one $5 buy per 60 s, only on balances read live for that turn (never on a cached balance).
 - **Heartbeat:** Every 5 minutes, `check_usdc_balance` runs. When credits are critical and USDC is at least $5, it tries one $5 survival topup (at most once per 5 minutes). It wakes the agent when the topup succeeded, and when it failed: once per distinct error, then again at most every 6 hours. A topup that was not attempted (the Treasury's own checks said no) does not wake the agent. Solana wallets cannot pay with x402, so the task does nothing for them (an info line is logged once a day). When the credit balance could not be read, the task does nothing.
+- All automatic buys are survival topups: the Treasury checks a fresh balance read itself, refuses them when it cannot read it (`BALANCE_UNAVAILABLE`), and caps them at `maxAutoTopupDailyCents` per day.
+- A topup succeeds only when the `/pay/` endpoint asked for payment (HTTP 402) and accepted it. An endpoint that answers the unpaid request with anything else (even 200) is a failed topup: nothing was paid and no credits are reported.
 
 ---
 
@@ -343,7 +365,7 @@ Configuration is stored at `~/.automaton/automaton.json`.
 
   // Financial safety
   "treasuryPolicy": {
-    "maxSingleTransferCents": 5000,
+    "maxSingleTransferCents": 1000,
     "maxHourlyTransferCents": 10000,
     "maxDailyTransferCents": 25000,
     "minimumReserveCents": 1000,
@@ -475,7 +497,7 @@ USDC balances cannot go negative, so the `dead` state is reached only through a 
 - **Normal/High:** The agent operates at full capacity with the configured inference model.
 - **Low compute:** The inference router switches to a cheaper model. The heartbeat frequency is multiplied by `lowComputeMultiplier` (default 4x slower). Non-essential tasks are deferred.
 - **Critical:** Minimal inference. The heartbeat publishes distress signals with funding instructions. The agent actively seeks any path to revenue or funding.
-- **Dead:** The agent loop stops. No inference runs while the state is `dead` and the balance is 0 or less (a negative balance is also the `dead` tier). One inline USDC topup is tried per 60-second cooldown when USDC is at least $5. The heartbeat keeps running and the runtime checks again every 5 minutes or on a wake event. The `dead` state survives a shutdown and restart. If credits are received, the agent revives.
+- **Dead:** The agent loop stops. No inference runs while the state is `dead` and the balance is 0 or less (a negative balance is also the `dead` tier). One inline USDC topup is tried per 60-second cooldown when USDC is at least $5 and both balances were read live. The heartbeat keeps running and the runtime checks again every 5 minutes or on a wake event. The `dead` state survives a shutdown and restart. If credits are received, the agent revives.
 
 The zero-credit grace period starts at the first heartbeat that reads exactly 0 credits and is cleared by any later successful read above 0 (every tick), so time spent funded never counts toward it. A balance that could not be read is never treated as 0: it starts no grace period, sends no distress and triggers no topup. In prompts an unreadable balance is shown as "unknown (balance API unreachable)".
 
@@ -491,7 +513,7 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 |---|---|---|
 | `heartbeat_ping` | Every 15 min | Publishes status to Conway. Sends distress on critical/dead. |
 | `check_credits` | Every 6 hours | Monitors credit tier. Manages 1-hour dead grace period. |
-| `check_usdc_balance` | Every 5 min | Checks USDC balance. Wakes agent if topup is possible. |
+| `check_usdc_balance` | Every 5 min | When credits are critical and USDC is at least $5, tries a $5 survival topup (EVM only). Wakes the agent on success, and on failure at most once per distinct error per 6 h. |
 | `check_for_updates` | Every 4 hours | Checks git upstream for new commits. Wakes on new commits. |
 | `health_check` | Every 30 min | Verifies sandbox is responsive (`echo alive`). |
 | `check_child_health` | Every 10 min | Probes each starting/healthy/unhealthy child's process and moves it (see [Child status](#child-status)). No children, no probes. Wakes the agent only when a child newly becomes unhealthy or failed. |
@@ -558,7 +580,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | Tool | Risk | Description |
 |---|---|---|
 | `check_credits` | safe | Check Conway credit balance. |
-| `check_usdc_balance` | safe | Check on-chain USDC balance on Base. |
+| `check_usdc_balance` | safe | Check on-chain USDC balance (Base on an EVM automaton, Solana on a Solana automaton). A failed read is an error, never 0. |
 | `list_sandboxes` | safe | List all sandboxes. |
 | `create_sandbox` | caution | Create a new VM. Params: name, vcpu, memory_mb, disk_gb. |
 | `delete_sandbox` | dangerous | Delete a sandbox (cannot delete own). |
@@ -568,14 +590,14 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `search_domains` | safe | Search for available domain names. |
 | `register_domain` | dangerous | Register a domain (costs USDC via x402). |
 | `manage_dns` | safe | List, add, or delete DNS records. |
-| `send_message` | caution | Send a signed message to another agent. |
+| `send_message` | caution | Send a signed message to another agent. The recipient may be an EVM (0x...) or Solana (base58, case-sensitive) address. |
 
 ### Financial (financial)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `topup_credits` | caution | Buy credits from USDC. Tiers: $5, $25, $100, $500, $1000, $2500. |
-| `transfer_credits` | dangerous | Transfer credits to another address. Capped at 50% of balance. |
+| `topup_credits` | caution | Buy credits from USDC via x402 (EVM only). Tiers: $5, $25, $100, $500, $1000, $2500. |
+| `transfer_credits` | dangerous | Transfer credits (`amount_cents`, whole cents) to an address on the automaton's own chain: 0x... on EVM, base58 (case-sensitive) on Solana. Capped at 50% of balance and at `requireConfirmationAboveCents`. |
 | `x402_fetch` | dangerous | Fetch a URL with automatic x402 USDC payment. |
 
 ### Survival (survival)
@@ -677,6 +699,11 @@ Every outflow of value passes through one spending gate, the Treasury (`src/trea
 
 The policy engine's financial rules still run first for model tool calls and give early, friendly denials. The Treasury is authoritative.
 
+**Policy rules around money.**
+- A transfer above `requireConfirmationAboveCents` gets a `quarantine` decision (`TRANSFER_ABOVE_CONFIRMATION_THRESHOLD`), which is a refusal: nothing is held for approval. Raise the threshold to allow larger transfers.
+- `validate.address_format`: `transfer_credits` and `fund_child` recipients must be on the automaton's own chain (0x... on EVM, base58 on Solana, case kept); `send_message` accepts either format. The EVM zero address and the all-zero Solana key are refused, and so is a mixed-case EVM recipient of a credit transfer whose EIP-55 checksum is wrong (all-lowercase and all-uppercase addresses carry no checksum and are accepted). In the Treasury, EVM addresses compare case-insensitively and Solana addresses exactly.
+- Rate limits (`rate.spawn_daily` 3 per day, `rate.self_mod_hourly` 10 per hour, `rate.genesis_prompt_daily` 1 per day) count operations that took effect or may have (children created, sandbox creations with an unknown outcome, recorded modifications), not policy `allow` decisions, so a failed call does not use up the quota.
+
 **Budgets.** Each outflow draws on one of five budgets. Windows are rolling (the last 60 minutes, the last 24 hours), not calendar buckets.
 
 | Budget | Outflows | Single | Rolling hour | Rolling day | Other limits |
@@ -684,7 +711,7 @@ The policy engine's financial rules still run first for model tool calls and giv
 | transfer | `transfer_credits`, `fund_child`, and the colony health monitor's child funding when its `autoFund` option is on (off by default) | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
 | x402 | `x402_fetch`, worker `web_fetch` payments | `maxX402PaymentCents` | 10x that | 50x that | host must be in `x402AllowedDomains`; Conway `/pay/` URLs are refused here (credits are bought through topup) |
 | topup | `topup_credits`, sandbox 402 topups | `maxTopupSingleCents` | | `maxTopupDailyCents` | recipient must be this automaton; one topup in flight at a time |
-| topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; one blind buy per 24h when the balance cannot be read; `autoTopupCooldownMs` between attempts; never from a tool call |
+| topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; refused with `BALANCE_UNAVAILABLE` when the balance cannot be read (no blind buy); `autoTopupCooldownMs` between attempts; never from a tool call |
 | infra | `create_sandbox`, `spawn_child`, `register_domain` | `maxInfraSingleCents` | | `maxInfraDailyCents` | reserve floor; sandbox priced from the pricing endpoint, else charged at the single cap; domains need an exact price quote; years 1 to 10 |
 
 **Always enforced:**
@@ -699,7 +726,7 @@ Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 
 | Limit | Default | Description |
 |---|---|---|
-| `maxSingleTransferCents` | 5000 ($50) | Max per-transfer amount (also capped by `requireConfirmationAboveCents`) |
+| `maxSingleTransferCents` | 1000 ($10) | Max per-transfer amount (also capped by `requireConfirmationAboveCents`; a higher value has no effect and logs a warning at startup) |
 | `maxHourlyTransferCents` | 10000 ($100) | Rolling-hour transfer cap |
 | `maxDailyTransferCents` | 25000 ($250) | Rolling-day transfer cap |
 | `minimumReserveCents` | 1000 ($10) | Credit balance that transfers, sandboxes and domains may not dip below |
@@ -743,11 +770,16 @@ Local models are free and pass every monetary cap. A model with no known price i
 
 ### x402 protocol
 
-The x402 payment protocol enables the automaton to pay for services with USDC. When a server responds with HTTP 402, the automaton:
+The x402 payment protocol enables an EVM automaton to pay for services with USDC (Solana automatons refuse x402). When a server responds with HTTP 402, the automaton:
 1. Parses payment requirements from the response
-2. Signs a USDC `TransferWithAuthorization` (EIP-3009, gasless)
-3. Retries the request with an `X-Payment` header
-4. The payment is settled on-chain via the x402 facilitator
+2. Checks them: the `exact` scheme on Base with the canonical USDC contract, the amount, and the validity window (at most 10 minutes)
+3. Reserves the amount with the Treasury, then signs a USDC `TransferWithAuthorization` (EIP-3009, gasless)
+4. Sends the request again to the same URL with an `X-Payment` header
+5. The payment is settled on-chain via the x402 facilitator
+
+**Amounts** (`maxAmountRequired` or `amount`) are atomic USDC units (6 decimals: `1000000` is $1.00) in every protocol version. Only a digit string or a whole JSON number is accepted; decimals, exponents and signs are refused before anything is signed, and an offer whose `amount` and `maxAmountRequired` differ is refused. Limits in cents round the atomic amount up. A credit topup must quote exactly its tier (`5000000` for $5).
+
+**Redirects** are never followed for x402 requests, so the `X-Payment` header only goes to the URL whose host the Treasury checked (`x402AllowedDomains`). A 3xx to the unpaid request fails with nothing signed; any non-2xx to the paid request (a 3xx included) leaves the payment `unknown` until it is checked on chain. The paid request is never re-sent. The signature uses the EIP-712 domain of the network's USDC contract (`USD Coin` on Base mainnet, `USDC` on Base Sepolia, version 2), and the payload echoes the network string the server sent.
 
 ### Credit topup tiers
 
@@ -760,7 +792,7 @@ The x402 payment protocol enables the automaton to pay for services with USDC. W
 | 5 | $1,000 |
 | 6 | $2,500 |
 
-The agent calls `topup_credits` with the desired tier amount. The payment is processed via x402 from the agent's USDC balance.
+The agent calls `topup_credits` with the desired tier amount (whole dollars). The payment is processed via x402 from the agent's USDC balance (EVM only). The topup endpoint must answer with HTTP 402; any other answer to the unpaid request is reported as a failed topup with nothing paid.
 
 ---
 
@@ -1262,7 +1294,7 @@ The bootstrap topup attempts to buy $5 credits from USDC automatically on startu
 Check available models with `list_models`. The default is `gpt-5.2`. If using BYOK keys, ensure they're valid.
 
 **Rate limited:**
-The resilient HTTP client retries on 429 with exponential backoff (up to 3 retries).
+Inference requests are POSTs and are sent once; the inference router or the agent loop decides whether to try again. The resilient HTTP client retries only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) automatically, on 429 and 5xx with exponential backoff (up to 3 retries).
 
 **Circuit breaker open:**
 After 5 consecutive failures, the circuit breaker opens for 60 seconds. Wait and retry.
@@ -1352,7 +1384,7 @@ pnpm build
 
 **What happens if the Conway API goes down?**
 
-The resilient HTTP client retries with exponential backoff. After 5 consecutive failures, the circuit breaker opens for 60 seconds. Balance reads fall back to cached values. The agent continues running with cached state until connectivity is restored.
+The resilient HTTP client retries idempotent requests (such as balance reads) with exponential backoff; requests that may move money are sent once. After 5 consecutive failures to one host, the circuit breaker for that host opens for 60 seconds. A balance that cannot be read is unknown: the agent loop may route models on the last cached balance (shown as cached in prompts) but never buys credits or marks the agent dead from it, and the heartbeat sends no distress and buys nothing until a read succeeds.
 
 **Can I change the genesis prompt after creation?**
 

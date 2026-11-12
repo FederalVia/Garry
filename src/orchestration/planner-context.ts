@@ -44,7 +44,8 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
   return {
     creditsCents,
     usdcBalance,
-    survivalTier: getSurvivalTier(creditsCents),
+    // An unread balance is unknown to the planner, never a phantom zero.
+    survivalTier: creditsCents === null ? "unknown" : getSurvivalTier(creditsCents),
     availableRoles: normalizeStringList(options.availableRoles, [...DEFAULT_PLANNER_AVAILABLE_ROLES]),
     customRoles: normalizeStringList(options.customRoles, []),
     activeGoals: getActiveGoals(options.db).map((goal) => ({
@@ -167,7 +168,7 @@ function readCachedBalance(db: Database): { creditsCents?: number; usdcBalance?:
  * else the last cached balance. Never the child-funding ledger, which only
  * knows what was sent to children.
  */
-function resolveCreditsCents(options: PlannerContextOptions, cachedCreditsCents?: number): number {
+function resolveCreditsCents(options: PlannerContextOptions, cachedCreditsCents?: number): number | null {
   if (typeof options.creditsCents === "number" && Number.isFinite(options.creditsCents)) {
     return Math.max(0, Math.floor(options.creditsCents));
   }
@@ -181,17 +182,17 @@ function resolveCreditsCents(options: PlannerContextOptions, cachedCreditsCents?
     // Fall back to the cache.
   }
 
-  return Math.max(0, Math.floor(cachedCreditsCents ?? 0));
+  return cachedCreditsCents === undefined ? null : Math.max(0, Math.floor(cachedCreditsCents));
 }
 
-function resolveUsdcBalance(options: PlannerContextOptions, cachedUsdcBalance?: number): number {
+function resolveUsdcBalance(options: PlannerContextOptions, cachedUsdcBalance?: number): number | null {
   if (typeof options.usdcBalance === "number" && Number.isFinite(options.usdcBalance)) {
     return options.usdcBalance;
   }
 
   return typeof cachedUsdcBalance === "number" && Number.isFinite(cachedUsdcBalance)
     ? cachedUsdcBalance
-    : 0;
+    : null;
 }
 
 function listWorkspaceFiles(workspace?: Pick<AgentWorkspace, "basePath" | "listOutputs">): string[] {

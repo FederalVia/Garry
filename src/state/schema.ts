@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -887,4 +887,17 @@ export const MIGRATION_V14 = `
 /** One row per child address (failed spawns keep an empty address). */
 export const CHILDREN_ADDRESS_INDEX = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_children_address ON children(address) WHERE address <> '';
+`;
+
+// === Model registry origin ===
+// Applied by the version 15 entry of applyMigrations (database.ts), which
+// adds the column only when it is missing and then marks models discovered
+// from the Conway API before the upgrade. initialize() disables only
+// 'baseline' rows that left the static baseline.
+
+export const MIGRATION_V15 = `
+  -- Schema version: 15
+  ALTER TABLE model_registry ADD COLUMN origin TEXT NOT NULL DEFAULT 'baseline'
+    CHECK(origin IN ('baseline','api','ollama','manual'));
+  UPDATE model_registry SET origin = 'ollama' WHERE provider IN ('ollama','other');
 `;

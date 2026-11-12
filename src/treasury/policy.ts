@@ -11,6 +11,7 @@ import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { TreasuryPolicy, ResolvedTreasuryPolicy } from "../types.js";
 import type { BudgetId, OutflowKind, TopupPurpose } from "./types.js";
 import { createLogger } from "../observability/logger.js";
+import { detectChainType, normalizeAddress } from "../identity/chain.js";
 
 const logger = createLogger("treasury.policy");
 
@@ -209,8 +210,14 @@ export function isX402HostAllowed(url: string, allowedDomains: readonly string[]
 
 // ─── Dedupe keys ───────────────────────────────────────────────
 
+/** EVM addresses compare case-insensitively; base58 (Solana) case is part of the key. */
+export function canonicalAddress(address: string): string {
+  const a = address.trim();
+  return normalizeAddress(a, detectChainType(a) ?? "evm");
+}
+
 export function transferDedupeKey(to: string, amountCents: number, originName?: string): string {
-  return `credit_transfer|${to.toLowerCase()}|${amountCents}|${originName ?? ""}`;
+  return `credit_transfer|${canonicalAddress(to)}|${amountCents}|${originName ?? ""}`;
 }
 
 /** Method, full URL and body hash, so one ambiguous call blocks only that exact call. */

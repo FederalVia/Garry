@@ -35,6 +35,11 @@ import type {
 } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
 
+// The rules under test with a single cap above the confirmation threshold, so
+// both the cap and the quarantine rule are reachable. The shipped default
+// sets the cap equal to the threshold.
+const TEST_POLICY: TreasuryPolicy = { ...DEFAULT_TREASURY_POLICY, maxSingleTransferCents: 5000 };
+
 // ─── Test Helpers ───────────────────────────────────────────────
 
 function createTestDb(): Database.Database {
@@ -157,7 +162,7 @@ describe("Financial Policy Rules", () => {
 
   beforeEach(() => {
     db = createTestDb();
-    rules = createFinancialRules(DEFAULT_TREASURY_POLICY);
+    rules = createFinancialRules(TEST_POLICY);
     engine = new PolicyEngine(db, rules);
     spendTracker = new SpendTracker(db);
   });
@@ -246,7 +251,7 @@ describe("Financial Policy Rules", () => {
 
       const decision = engine.evaluate(request);
       expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
     });
 
     it("denies transfers above 5000 cents", () => {
@@ -282,7 +287,7 @@ describe("Financial Policy Rules", () => {
       const decision = engine.evaluate(request);
       // 5000 > requireConfirmationAboveCents (1000) so quarantine
       expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
     });
   });
 
@@ -333,7 +338,7 @@ describe("Financial Policy Rules", () => {
     it("denies when daily total would exceed 25000", () => {
       // Use custom policy with high hourly cap
       const policy: TreasuryPolicy = {
-        ...DEFAULT_TREASURY_POLICY,
+        ...TEST_POLICY,
         maxHourlyTransferCents: 100_000,
         maxDailyTransferCents: 25000,
       };
@@ -464,7 +469,7 @@ describe("Financial Policy Rules", () => {
     it("hourly cap blocks without turn limit (high confirmation threshold)", () => {
       // Use policy with no turn limit and high confirmation threshold
       const policy: TreasuryPolicy = {
-        ...DEFAULT_TREASURY_POLICY,
+        ...TEST_POLICY,
         maxTransfersPerTurn: 100, // effectively no turn limit
         requireConfirmationAboveCents: 100000, // high enough to not trigger
       };
@@ -536,7 +541,7 @@ describe("Financial Policy Rules", () => {
     it("quarantines fund_child above the confirmation threshold", () => {
       const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 4000 }, createMockSpendTracker()));
       expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
     });
 
     it("counts transfers already recorded this hour, whichever tool made them", () => {
@@ -547,7 +552,7 @@ describe("Financial Policy Rules", () => {
     });
 
     it("denies fund_child over the daily cap", () => {
-      const policy: TreasuryPolicy = { ...DEFAULT_TREASURY_POLICY, maxHourlyTransferCents: 100_000 };
+      const policy: TreasuryPolicy = { ...TEST_POLICY, maxHourlyTransferCents: 100_000 };
       const dailyEngine = new PolicyEngine(db, createFinancialRules(policy));
       spendTracker.recordSpend({ toolName: "fund_child", amountCents: 24_800, category: "transfer" });
       const decision = dailyEngine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 500 }, spendTracker));

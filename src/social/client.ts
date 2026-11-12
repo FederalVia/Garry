@@ -133,6 +133,8 @@ export function createSocialClient(
         },
         body: JSON.stringify({ cursor, limit }),
         timeout: REQUEST_TIMEOUT_MS,
+        // A read-only POST: re-sending it changes nothing.
+        retryUnsafe: true,
       });
 
       if (!res.ok) {

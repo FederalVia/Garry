@@ -228,10 +228,24 @@ export interface HeartbeatPingPayload {
 
 // ─── Financial ───────────────────────────────────────────────────
 
+/** Where a balance came from: read now, the last good read, or nothing. */
+export type BalanceSource = "live" | "cached" | "unknown";
+
+/**
+ * Balances as the agent sees them. null means unknown (never read, or the
+ * read failed with nothing cached). Spending and the dead decision need a
+ * "live" source; an absent source is treated as not live.
+ */
 export interface FinancialState {
-  creditsCents: number;
-  usdcBalance: number;
+  creditsCents: number | null;
+  usdcBalance: number | null;
+  credits?: BalanceSource;
+  usdc?: BalanceSource;
   lastChecked: string;
+  /** When a cached creditsCents was read. */
+  creditsAsOf?: string;
+  /** When a cached usdcBalance was read. */
+  usdcAsOf?: string;
 }
 
 export type SurvivalTier = "dead" | "critical" | "low_compute" | "normal" | "high";
@@ -650,7 +664,7 @@ export type ResolvedTreasuryPolicy = Required<Omit<TreasuryPolicy, "topupPayTo">
   Pick<TreasuryPolicy, "topupPayTo">;
 
 export const DEFAULT_TREASURY_POLICY: Required<Omit<TreasuryPolicy, "topupPayTo">> = {
-  maxSingleTransferCents: 5000,
+  maxSingleTransferCents: 1000,
   maxHourlyTransferCents: 10000,
   maxDailyTransferCents: 25000,
   minimumReserveCents: 1000,
@@ -965,12 +979,17 @@ export const DEFAULT_TOKEN_BUDGET: TokenBudget = {
 export interface TickContext {
   tickId: string;                    // ULID, unique per tick
   startedAt: Date;
-  creditBalance: number;             // fetched once per tick (cents)
-  usdcBalance: number;               // fetched once per tick
+  /** Cents, read once per tick; null when it could not be read. */
+  creditBalance: number | null;
+  /** USDC, read once per tick; null when it could not be read (or no wallet). */
+  usdcBalance: number | null;
+  creditRead: import("./conway/balance.js").BalanceRead;
+  usdcRead: import("./conway/balance.js").BalanceRead;
+  /** From a known balance; when unknown, the last known tier, else low_compute. */
   survivalTier: SurvivalTier;
+  /** False when survivalTier was not derived from this tick's balance. */
+  survivalTierKnown: boolean;
   lowComputeMultiplier: number;      // from config
-  /** False when the credit balance could not be read; creditBalance is then a placeholder 0. */
-  creditBalanceKnown?: boolean;
   config: HeartbeatConfig;
   db: import("better-sqlite3").Database;
 }

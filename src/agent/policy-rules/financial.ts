@@ -16,6 +16,9 @@ import type {
   PolicyRuleResult,
   TreasuryPolicy,
 } from "../../types.js";
+import { createLogger } from "../../observability/logger.js";
+
+const logger = createLogger("policy.financial");
 
 /** Tools that move Conway credits to another address; they share one transfer budget. */
 export const CREDIT_TRANSFER_TOOLS = ["transfer_credits", "fund_child"] as const;
@@ -272,26 +275,28 @@ function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 }
 
 /**
- * Return 'quarantine' for transfer amounts above requireConfirmationAboveCents.
- * No confirmation flow exists, so quarantine is a refusal; the treasury also
- * caps every transfer at this threshold.
+ * Refuse transfers above requireConfirmationAboveCents. No confirmation flow
+ * exists, so this is a hard cap (the treasury caps every transfer at the same
+ * threshold); the action stays 'quarantine' so the decision log keeps the
+ * distinction, and the message says plainly that nothing will confirm it.
  */
 function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
+  const threshold = policy.requireConfirmationAboveCents;
   return {
     id: "financial.require_confirmation",
-    description: `Quarantine transfers above ${policy.requireConfirmationAboveCents} cents for confirmation`,
+    description: `Refuse transfers above ${threshold} cents (no confirmation flow exists)`,
     priority: 500,
     appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
       const amount = request.args.amount_cents;
       if (typeof amount !== "number") return null;
 
-      if (amount > policy.requireConfirmationAboveCents) {
+      if (amount > threshold) {
         return {
           rule: "financial.require_confirmation",
           action: "quarantine",
-          reasonCode: "CONFIRMATION_REQUIRED",
-          humanMessage: `Transfer of ${amount} cents ($${(amount / 100).toFixed(2)}) exceeds confirmation threshold of ${policy.requireConfirmationAboveCents} cents ($${(policy.requireConfirmationAboveCents / 100).toFixed(2)})`,
+          reasonCode: "TRANSFER_ABOVE_CONFIRMATION_THRESHOLD",
+          humanMessage: `Transfer of ${amount} cents (${usd(amount)}) refused: transfers above ${usd(threshold)} are refused because no confirmation flow exists. The operator can raise treasuryPolicy.requireConfirmationAboveCents.`,
         };
       }
 
@@ -300,12 +305,29 @@ function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
   };
 }
 
+function usd(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/**
+ * The warning createFinancialRules logs when maxSingleTransferCents is above
+ * the confirmation threshold (which then caps every transfer), else null.
+ */
+export function transferCapWarning(policy: TreasuryPolicy): string | null {
+  if (policy.maxSingleTransferCents > policy.requireConfirmationAboveCents) {
+    return `treasuryPolicy.maxSingleTransferCents (${policy.maxSingleTransferCents}c) has no effect above requireConfirmationAboveCents (${policy.requireConfirmationAboveCents}c): transfers above ${usd(policy.requireConfirmationAboveCents)} are refused because no confirmation flow exists.`;
+  }
+  return null;
+}
+
 /**
  * Create all financial policy rules.
  */
 export function createFinancialRules(
   treasuryPolicy: TreasuryPolicy,
 ): PolicyRule[] {
+  const warning = transferCapWarning(treasuryPolicy);
+  if (warning) logger.warn(warning);
   // Same priority: the first deny in this order wins, so the amount shape is
   // checked before any rule compares the amount.
   return [

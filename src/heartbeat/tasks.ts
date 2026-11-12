@@ -67,6 +67,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       address: taskCtx.identity.address,
       state,
       creditsCents: credits,
+      balanceKnown: credits !== null,
       uptimeSeconds: Math.floor(uptimeMs / 1000),
       version: taskCtx.config.version,
       sandboxId: taskCtx.identity.sandboxId,
@@ -76,8 +77,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
     taskCtx.db.setKV("last_heartbeat_ping", JSON.stringify(payload));
 
-    // An unread balance is not a low one: no distress on a placeholder 0.
-    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
+    // An unread balance is not a low one: no distress without a reading.
+    if (credits === null) return { shouldWake: false };
 
     // If critical or dead, record a distress signal
     if (tier === "critical" || tier === "dead") {
@@ -103,7 +104,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
   check_credits: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     // A failed balance read must not start, extend or end a zero-credit streak.
-    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
+    if (ctx.creditBalance === null) return { shouldWake: false };
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
     const tier = ctx.survivalTier;
@@ -169,7 +170,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       }
       return { shouldWake: false };
     }
-    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
+    // Spend only on balances read this tick.
+    if (ctx.creditBalance === null || ctx.usdcBalance === null) return { shouldWake: false };
 
     // Use ctx.usdcBalance instead of calling getUsdcBalance()
     const balance = ctx.usdcBalance;
@@ -204,8 +206,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       });
 
       // The gate refused for a reason that needs nothing from the agent
-      // (credits not actually low, a buy in flight or just made, the blind
-      // buy used, an unconfirmed payment). Waking would only cost a turn.
+      // (credits not actually low, a buy in flight or just made, the gate's
+      // balance read failed, an unconfirmed payment). Waking would only cost a turn.
       if (result?.denied && ROUTINE_TOPUP_REFUSALS.includes(result.denied.code)) {
         logger.info(`Auto-topup not attempted: ${result.denied.code} — ${result.denied.message}`);
         return { shouldWake: false };
@@ -532,18 +534,34 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       const metrics = getMetrics();
       const alerts = getAlertEngine();
 
-      // Update gauges from tick context
-      metrics.gauge("balance_cents", ctx.creditBalance);
-      metrics.gauge("survival_tier", tierToInt(ctx.survivalTier));
+      // Balance gauges only from a balance read this tick. The collector
+      // cannot drop a gauge, so on an unknown read the stale balance gauges
+      // are left out of alert evaluation and of the snapshot: a low value
+      // from before the outage must not keep the critical alert waking.
+      const balanceKnown = ctx.creditBalance !== null;
+      metrics.gauge("balance_known", balanceKnown ? 1 : 0);
+      if (balanceKnown) {
+        metrics.gauge("balance_cents", ctx.creditBalance as number);
+        metrics.gauge("survival_tier", tierToInt(ctx.survivalTier));
+      }
 
       // Evaluate alerts
-      const firedAlerts = alerts.evaluate(metrics);
+      let firedAlerts;
+      let entries = metrics.getAll();
+      if (balanceKnown) {
+        firedAlerts = alerts.evaluate(metrics);
+      } else {
+        const snapshot = metrics.getSnapshot();
+        for (const name of BALANCE_GAUGES) snapshot.gauges.delete(name);
+        firedAlerts = alerts.evaluate(snapshot);
+        entries = entries.filter((e) => !(e.type === "gauge" && BALANCE_GAUGES.includes(e.name)));
+      }
 
       // Save snapshot to DB
       metricsInsertSnapshot(taskCtx.db.raw, {
         id: ulid(),
         snapshotAt: new Date().toISOString(),
-        metricsJson: JSON.stringify(metrics.getAll()),
+        metricsJson: JSON.stringify(entries),
         alertsJson: JSON.stringify(firedAlerts),
         createdAt: new Date().toISOString(),
       });
@@ -833,6 +851,9 @@ function pendingOutflows(taskCtx: HeartbeatLegacyContext): { cents: number; rows
     return { cents: 0, rows: [] };
   }
 }
+
+/** Gauges that only mean something when this tick's balance was read. */
+const BALANCE_GAUGES: readonly string[] = ["balance_cents", "survival_tier"];
 
 function tierToInt(tier: SurvivalTier): number {
   const map: Record<SurvivalTier, number> = {

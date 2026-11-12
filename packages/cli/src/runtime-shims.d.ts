@@ -11,6 +11,7 @@ declare module "@conway/automaton/config.js" {
     openaiApiKey?: string;
     anthropicApiKey?: string;
     socialRelayUrl?: string;
+    chainType?: "evm" | "solana";
   }
 
   export function loadConfig(): AutomatonCliConfig | null;
@@ -55,4 +56,62 @@ declare module "@conway/automaton/state/database.js" {
   }
 
   export function createDatabase(path: string): AutomatonCliDatabase;
+}
+
+declare module "@conway/automaton/operator/fund.js" {
+  import type { AutomatonCliConfig } from "@conway/automaton/config.js";
+
+  export type ParseAmountResult =
+    | { ok: true; cents: number }
+    | { ok: false; error: string };
+
+  export interface FundPlan {
+    apiUrl: string;
+    apiKey: string;
+    chainType: "evm" | "solana";
+    from: string;
+    to: string;
+    amountCents: number;
+    note: string;
+    description: string;
+  }
+
+  export type FundResult =
+    | {
+        status: "ok";
+        idempotencyKey: string;
+        path: string;
+        transferId: string;
+        transferStatus: string;
+        balanceAfterCents?: number;
+      }
+    | { status: "failed"; idempotencyKey: string; error: string }
+    | { status: "unknown"; idempotencyKey: string; error: string };
+
+  export function parseUsdAmount(raw: string, opts: { cents: boolean }): ParseAmountResult;
+  export function planFund(input: {
+    config: Partial<AutomatonCliConfig>;
+    to: string | undefined;
+    amountCents: number;
+  }): { ok: true; plan: FundPlan } | { ok: false; error: string };
+  export function executeFund(
+    plan: FundPlan,
+    opts: { paths: readonly string[]; idempotencyKey?: string; timeoutMs?: number },
+  ): Promise<FundResult>;
+  export function formatUsd(cents: number): string;
+  export function confirmOnTty(question: string): Promise<boolean | null>;
+  export const FUND_USAGE: string;
+}
+
+declare module "@conway/automaton/operator/send.js" {
+  export type SendOperatorResult =
+    | { ok: true; id: string; from: string; to: string; relayUrl: string; chainType: "evm" | "solana" }
+    | { ok: false; error: string };
+
+  export function resolveRelayUrl(config: { socialRelayUrl?: string } | null | undefined): string;
+  export function sendOperatorMessage(input: {
+    relayUrl: string;
+    to: string;
+    content: string;
+  }): Promise<SendOperatorResult>;
 }

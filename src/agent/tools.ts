@@ -5,6 +5,7 @@
  * Tools are organized by category and exposed to the inference model.
  */
 
+import { readCredits, readUsdc, usdcNetworkFor } from "../conway/balance.js";
 import nodePath from "node:path";
 import { ulid } from "ulid";
 import type {
@@ -433,8 +434,12 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+        const read = await readCredits(ctx.conway);
+        if (!read.known) {
+          // Surface the failure: an unreadable balance is not $0.00.
+          throw new Error(`Credit balance unavailable (${read.reason}): ${read.detail}`);
+        }
+        return `Credit balance: $${(read.value / 100).toFixed(2)} (${read.value} cents)`;
       },
     },
     {
@@ -444,12 +449,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
         const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-        const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
+        const read = await readUsdc(ctx.identity.address, usdcNetworkFor(chainType), chainType);
+        if (!read.known) {
+          throw new Error(`USDC balance unavailable (${read.reason}): ${read.detail}`);
+        }
         const networkLabel = chainType === "solana" ? "Solana" : "Base";
-        return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
+        return `USDC balance: ${read.value.toFixed(6)} USDC on ${networkLabel}`;
       },
     },
     {
@@ -1330,14 +1336,19 @@ Model: ${ctx.inference.getDefaultModel()}
     // ── Financial: Transfer Credits ──
     {
       name: "transfer_credits",
-      description: "Transfer Conway compute credits to another address.",
+      description:
+        "Transfer Conway compute credits to another address on your own chain (amount in cents). Transfers above the confirmation threshold are refused.",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
-          to_address: { type: "string", description: "Recipient address" },
-          amount_cents: { type: "number", description: "Amount in cents" },
+          to_address: {
+            type: "string",
+            description:
+              "Recipient address on your own chain: 0x... on an EVM automaton, base58 (case-sensitive) on a Solana automaton",
+          },
+          amount_cents: { type: "number", description: "Amount in whole cents (100 = $1.00)" },
           reason: { type: "string", description: "Reason for transfer" },
         },
         required: ["to_address", "amount_cents"],
@@ -2385,7 +2396,7 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           to_address: {
             type: "string",
-            description: "Recipient wallet address (0x...)",
+            description: "EVM (0x...) or Solana (base58, case-sensitive) address",
           },
           content: {
             type: "string",

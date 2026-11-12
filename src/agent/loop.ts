@@ -45,7 +45,7 @@ import {
 } from "./tools.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
-import { getUsdcBalance } from "../conway/x402.js";
+import { readCredits, readUsdc, usdcNetworkFor } from "../conway/balance.js";
 import {
   claimInboxMessagesFromOneSender,
   getInboxTurnsFromSender,
@@ -259,21 +259,28 @@ export async function runAgentLoop(
     canServe: inference.canServe ? (m) => inference.canServe!(m) : undefined,
   });
 
-  /** Tier to route at: an unknown balance is low_compute (or the last known tier), never dead. */
+  /**
+   * Tier to route at. A live balance decides it; a cached one may lower it
+   * but never to dead; an unknown balance is the last known tier, else
+   * low_compute.
+   */
   const routeTier = (): SurvivalTier => {
-    if (financial.creditsCents !== -1) return getSurvivalTier(financial.creditsCents);
+    if (financial.creditsCents !== null) return routingTier(financial);
     const last = inferenceGate.survival().tier;
     return last === "unknown" ? "low_compute" : last;
   };
-  /** Feed the live survival tier to the gate, which orchestration routing follows. */
+  /** Feed the survival tier to the gate, which orchestration routing follows. */
   const updateGateSurvival = (): void => {
-    if (financial.creditsCents === -1) {
+    if (financial.creditsCents === null) {
       inferenceGate.setSurvival({ tier: inferenceGate.survival().tier, creditsCents: null });
-    } else {
+    } else if (financial.credits === "live") {
       inferenceGate.setSurvival({
         tier: getSurvivalTier(financial.creditsCents),
         creditsCents: financial.creditsCents,
       });
+    } else {
+      // A cached balance routes, but is not reported as a reading.
+      inferenceGate.setSurvival({ tier: routingTier(financial), creditsCents: null });
     }
   };
 
@@ -422,10 +429,12 @@ export async function runAgentLoop(
   /**
    * Buy credits from USDC before inference when credits are low (or in
    * debt) and USDC is available, so the agent does not die mid-loop waiting
-   * for the heartbeat. One attempt per cooldown.
+   * for the heartbeat. One attempt per cooldown, and only on balances read
+   * just now: a cached balance never pays.
    */
   const maybeInlineTopup = async (current: FinancialState): Promise<FinancialState> => {
-    if (current.creditsCents === -1 || current.usdcBalance < 5) return current;
+    if (current.credits !== "live" || current.usdc !== "live") return current;
+    if (current.creditsCents === null || current.usdcBalance === null || current.usdcBalance < 5) return current;
     const tier = getSurvivalTier(current.creditsCents);
     if (tier !== "critical" && tier !== "low_compute" && tier !== "dead") return current;
     const lastInlineTopup = db.getKV("last_inline_topup_attempt");
@@ -443,8 +452,14 @@ export async function runAgentLoop(
       });
       if (topupResult?.success) {
         log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
-        // Re-fetch so the rest of the turn sees the new balance.
-        return await getFinancialState(conway, identity.address, db, chainType);
+        // Re-fetch so the rest of the turn sees the new balance. A re-read
+        // that is not live does not include the purchase, so it is kept
+        // as cached and cannot trigger another buy.
+        const after = await getFinancialState(conway, identity.address, db, chainType);
+        if (after.credits !== "live") {
+          return { ...after, creditsCents: current.creditsCents, credits: "cached", creditsAsOf: current.lastChecked };
+        }
+        return after;
       }
     } catch (err: any) {
       logger.warn(`Inline auto-topup failed: ${err.message}`);
@@ -455,13 +470,14 @@ export async function runAgentLoop(
   // Get financial state
   let financial = await getFinancialState(conway, identity.address, db, chainType);
 
-  // Dead (marked by the heartbeat) and still unfunded: no inference, and the
-  // state is left as it is so the runtime keeps waiting for funding.
+  // Dead (marked by the heartbeat) and not shown funded by a live read: no
+  // inference, and the state is left as it is so the runtime keeps waiting
+  // for funding. A cached or unknown balance never revives a dead agent.
   if (db.getAgentState() === "dead") {
     financial = await maybeInlineTopup(financial);
-    if (isUnfunded(financial)) {
+    if (!isLiveFunded(financial)) {
       updateGateSurvival();
-      log(config, "[DEAD] Waiting for funding; no inference while the balance is zero or below.");
+      log(config, "[DEAD] Waiting for funding; no inference until a live balance read shows credits.");
       return;
     }
   }
@@ -487,7 +503,7 @@ export async function runAgentLoop(
   db.setAgentState("running");
   onStateChange?.("running");
 
-  log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
+  log(config, `[WAKE UP] ${config.name} is alive. Credits: ${describeCredits(financial)}`);
 
   // ─── The Loop ──────────────────────────────────────────────
 
@@ -696,17 +712,26 @@ export async function runAgentLoop(
       financial = await getFinancialState(conway, identity.address, db, chainType);
       financial = await maybeInlineTopup(financial);
 
-      // Check survival tier
-      // api_unreachable: creditsCents === -1 means API failed with no cache.
+      // Check survival tier.
+      // Marked dead by the heartbeat meanwhile: only a live funded read
+      // lets inference continue.
+      if (db.getAgentState() === "dead" && !isLiveFunded(financial)) {
+        inference.setLowComputeMode(true);
+        updateGateSurvival();
+        log(config, "[DEAD] Waiting for funding; no inference until a live balance read shows credits.");
+        running = false;
+        break;
+      }
+      // api_unreachable: no live read and nothing cached.
       // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
+      if (financial.creditsCents === null) {
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
-        const effectiveTier = getSurvivalTier(financial.creditsCents);
+        const effectiveTier = routingTier(financial);
 
-        // Checked before the tier branch, which would overwrite 'dead': in
-        // debt, or marked dead by the heartbeat and still unfunded.
+        // Checked before the tier branch, which would overwrite 'dead'. Only
+        // a live read in debt (or at zero after the heartbeat's grace) kills.
         if (effectiveTier === "dead" || (db.getAgentState() === "dead" && isUnfunded(financial))) {
           if (db.getAgentState() !== "dead") {
             db.setAgentState("dead");
@@ -1563,9 +1588,27 @@ function toolPattern(calls: ToolCallResult[]): string {
     .join(",");
 }
 
-/** Known balance at or below zero; -1 is the unknown sentinel. */
+/** A live read at or below zero. Cached and unknown balances never count. */
 function isUnfunded(financial: FinancialState): boolean {
-  return financial.creditsCents !== -1 && financial.creditsCents <= 0;
+  return financial.credits === "live" && financial.creditsCents !== null && financial.creditsCents <= 0;
+}
+
+/** A live read above zero: the only thing that lets a dead agent run again. */
+function isLiveFunded(financial: FinancialState): boolean {
+  return financial.credits === "live" && financial.creditsCents !== null && financial.creditsCents > 0;
+}
+
+/** The tier of a known balance; a non-live one is never dead (that needs a live read). */
+function routingTier(financial: FinancialState): SurvivalTier {
+  if (financial.creditsCents === null) return "low_compute";
+  const tier = getSurvivalTier(financial.creditsCents);
+  return tier === "dead" && financial.credits !== "live" ? "critical" : tier;
+}
+
+function describeCredits(financial: FinancialState): string {
+  if (financial.creditsCents === null) return "unknown (balance API unreachable)";
+  const amount = `$${(financial.creditsCents / 100).toFixed(2)}`;
+  return financial.credits === "live" ? amount : `${amount} (cached${financial.creditsAsOf ? ` as of ${financial.creditsAsOf}` : ""})`;
 }
 
 function toWakeReason(ev: WakeEventRow): WakeReason {
@@ -1635,76 +1678,97 @@ function parseToolArguments(raw: unknown): Record<string, unknown> {
   }
 }
 
-// Cache last known good balances so transient API failures don't
-// cause the automaton to believe it has $0 and kill itself.
-let _lastKnownCredits = 0;
-let _lastKnownUsdc = 0;
+interface CachedBalance {
+  creditsCents?: number;
+  usdcBalance?: number;
+  creditsAt?: string;
+  usdcAt?: string;
+}
 
+function readCachedBalance(db?: AutomatonDatabase): CachedBalance {
+  if (!db) return {};
+  try {
+    const raw = db.getKV("last_known_balance");
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+    const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+    return {
+      creditsCents: num(parsed.creditsCents),
+      usdcBalance: num(parsed.usdcBalance),
+      creditsAt: str(parsed.creditsAt),
+      usdcAt: str(parsed.usdcAt),
+    };
+  } catch (error) {
+    logger.error("Failed to parse cached balance", error instanceof Error ? error : undefined);
+    return {};
+  }
+}
+
+/**
+ * Both balances, each marked live (read now), cached (the last live read,
+ * with its time) or unknown (null). Only live reads are written to the
+ * cache, so a failure never overwrites a good value.
+ */
 async function getFinancialState(
   conway: ConwayClient,
   address: string,
   db?: AutomatonDatabase,
   chainType?: string,
 ): Promise<FinancialState> {
-  let creditsCents = _lastKnownCredits;
-  let usdcBalance = _lastKnownUsdc;
+  const now = new Date().toISOString();
+  const creditRead = await readCredits(conway);
+  const usdcRead = await readUsdc(address, usdcNetworkFor(chainType), chainType as any);
+  const cached = readCachedBalance(db);
 
-  try {
-    creditsCents = await conway.getCreditsBalance();
-    if (creditsCents > 0) _lastKnownCredits = creditsCents;
-  } catch (error) {
-    logger.error("Credits balance fetch failed", error instanceof Error ? error : undefined);
-    // Use last known balance from KV, not zero
-    if (db) {
-      const cached = db.getKV("last_known_balance");
-      if (cached) {
-        try {
-          const parsed = JSON.parse(cached);
-          logger.warn("Balance API failed, using cached balance");
-          return {
-            creditsCents: parsed.creditsCents ?? 0,
-            usdcBalance: parsed.usdcBalance ?? 0,
-            lastChecked: new Date().toISOString(),
-          };
-        } catch (parseError) {
-          logger.error("Failed to parse cached balance", parseError instanceof Error ? parseError : undefined);
-        }
-      }
+  const state: FinancialState = {
+    creditsCents: null,
+    usdcBalance: null,
+    credits: "unknown",
+    usdc: "unknown",
+    lastChecked: now,
+  };
+
+  if (creditRead.known) {
+    state.creditsCents = creditRead.value;
+    state.credits = "live";
+  } else {
+    logger.warn(`Credit balance unavailable (${creditRead.reason}): ${creditRead.detail}`);
+    if (cached.creditsCents !== undefined) {
+      state.creditsCents = cached.creditsCents;
+      state.credits = "cached";
+      if (cached.creditsAt) state.creditsAsOf = cached.creditsAt;
     }
-    // No cache available -- return conservative non-zero sentinel
-    logger.error("Balance API failed, no cache available");
-    return {
-      creditsCents: -1,
-      usdcBalance: -1,
-      lastChecked: new Date().toISOString(),
+  }
+
+  if (usdcRead.known) {
+    state.usdcBalance = usdcRead.value;
+    state.usdc = "live";
+  } else {
+    logger.warn(`USDC balance unavailable (${usdcRead.reason}): ${usdcRead.detail}`);
+    if (cached.usdcBalance !== undefined) {
+      state.usdcBalance = cached.usdcBalance;
+      state.usdc = "cached";
+      if (cached.usdcAt) state.usdcAsOf = cached.usdcAt;
+    }
+  }
+
+  if (db && (creditRead.known || usdcRead.known)) {
+    const next: CachedBalance = {
+      creditsCents: creditRead.known ? creditRead.value : cached.creditsCents,
+      usdcBalance: usdcRead.known ? usdcRead.value : cached.usdcBalance,
+      creditsAt: creditRead.known ? creditRead.at : cached.creditsAt,
+      usdcAt: usdcRead.known ? usdcRead.at : cached.usdcAt,
     };
-  }
-
-  try {
-    const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-    usdcBalance = await getUsdcBalance(address, network, chainType as any);
-    if (usdcBalance > 0) _lastKnownUsdc = usdcBalance;
-  } catch (error) {
-    logger.error("USDC balance fetch failed", error instanceof Error ? error : undefined);
-  }
-
-  // Cache successful balance reads
-  if (db) {
     try {
-      db.setKV(
-        "last_known_balance",
-        JSON.stringify({ creditsCents, usdcBalance }),
-      );
+      db.setKV("last_known_balance", JSON.stringify(next));
     } catch (error) {
       logger.error("Failed to cache balance", error instanceof Error ? error : undefined);
     }
   }
 
-  return {
-    creditsCents,
-    usdcBalance,
-    lastChecked: new Date().toISOString(),
-  };
+  return state;
 }
 
 function log(_config: AutomatonConfig, message: string): void {

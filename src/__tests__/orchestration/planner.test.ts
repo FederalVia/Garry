@@ -443,4 +443,27 @@ describe("buildPlannerContext", () => {
       db.close();
     }
   });
+
+  it("reports an unread balance as unknown, not 0 cents and critical", async () => {
+    const { createInMemoryDb } = await import("./test-db.js");
+    const { buildPlannerContext } = await import("../../orchestration/planner-context.js");
+    const { buildPlannerPrompt } = await import("../../orchestration/planner.js");
+    const gateModule = await import("../../inference/gate.js");
+    const db = createInMemoryDb();
+    const spy = vi.spyOn(gateModule, "getInstalledInferenceGate").mockReturnValue({
+      survival: () => ({ tier: "unknown", creditsCents: null }),
+    } as never);
+    try {
+      const context = await buildPlannerContext({ db });
+      expect(context.creditsCents).toBeNull();
+      expect(context.usdcBalance).toBeNull();
+      expect(context.survivalTier).toBe("unknown");
+      const prompt = buildPlannerPrompt(context);
+      expect(prompt).toContain("Current financial state: unknown credits, unknown USDC");
+      expect(prompt).not.toContain("0 cents");
+    } finally {
+      spy.mockRestore();
+      db.close();
+    }
+  });
 });

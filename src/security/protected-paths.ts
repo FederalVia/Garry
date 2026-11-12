@@ -382,6 +382,11 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "soul/model",
   "heartbeat/config",
   "heartbeat/tasks",
+  // Balance snapshot the heartbeat's topup and survival decisions read.
+  "heartbeat/tick-context",
+  // The operator CLI signs and moves the operator's money.
+  "packages/cli/src/commands/fund",
+  "packages/cli/src/commands/send",
   "audit-log",
 ]);
 
@@ -398,6 +403,7 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "state",
   "replication",
   "survival",
+  "operator",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
 const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts"]);
@@ -542,6 +548,10 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "conway/client",
   "conway/x402",
   "conway/topup",
+  "conway/balance",
+  "heartbeat/tick-context",
+  "operator/fund",
+  "operator/send",
   "orchestration/simple-tracker",
   "heartbeat.yml",
   "constitution.md",
