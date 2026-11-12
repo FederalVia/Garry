@@ -21,21 +21,82 @@ import type {
   DomainRegistration,
   DnsRecord,
   ModelInfo,
+  OutflowRequestOptions,
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
+import { guardConwayClient, type TreasuryResolver } from "../treasury/guarded-conway.js";
 import { ulid } from "ulid";
 import { keccak256, toHex } from "viem";
 import type { Address, PrivateKeyAccount } from "viem";
 import { randomUUID } from "crypto";
 import type { ChainType, ChainIdentity } from "../identity/chain.js";
 
-interface ConwayClientOptions {
+export interface ConwayClientOptions {
   apiUrl: string;
   apiKey: string;
   sandboxId: string;
 }
 
-export function createConwayClient(options: ConwayClientOptions): ConwayClient {
+/**
+ * The Conway client the rest of the agent uses. Its value-moving calls
+ * (transferCredits, createSandbox, registerDomain) go through the Treasury,
+ * resolved at call time: the explicit resolver, else the installed one, else
+ * the call is refused and nothing is sent. Scoped clients are guarded too.
+ */
+export function createConwayClient(
+  options: ConwayClientOptions & { treasury?: TreasuryResolver },
+): ConwayClient {
+  const { treasury, ...rawOptions } = options;
+  return guardConwayClient(createRawConwayClient(rawOptions), treasury);
+}
+
+/**
+ * A balance reader for the Treasury with its own HTTP client, so failures of
+ * other Conway calls (which can open the shared circuit breaker) never make
+ * the gate's balance reads fail. Throws when the balance is missing.
+ */
+export function createCreditBalanceReader(options: {
+  apiUrl: string;
+  apiKey: string;
+  /** Base delay between 404 retries (attempt n waits n times this). Default 1000ms. */
+  notFoundRetryDelayMs?: number;
+}): () => Promise<number> {
+  const httpClient = new ResilientHttpClient();
+  const delayMs = options.notFoundRetryDelayMs ?? 1000;
+  return async () => {
+    // Conway's load balancer intermittently answers 404 for valid endpoints;
+    // retry those like the main client does, outside the circuit breaker.
+    const max404Retries = 3;
+    let resp: Response;
+    for (let attempt = 0; ; attempt++) {
+      resp = await httpClient.request(`${options.apiUrl}/v1/credits/balance`, {
+        method: "GET",
+        headers: { Authorization: options.apiKey },
+        retries: 1,
+      });
+      if (resp.status !== 404 || attempt >= max404Retries) break;
+      await resp.body?.cancel().catch(() => {});
+      await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+    }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw httpError("GET", "/v1/credits/balance", resp.status, text);
+    }
+    const data = (await resp.json()) as Record<string, unknown>;
+    const value = data.balance_cents ?? data.credits_cents;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error("Conway credit balance response has no numeric balance");
+    }
+    return value;
+  };
+}
+
+/**
+ * The unguarded client. Module-private: only createConwayClient (which wraps
+ * it) and its own scoped clients use it, so no caller can move value without
+ * a treasury ledger row.
+ */
+function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
   const { apiUrl, apiKey } = options;
   // Normalize sandbox ID defensively so values like whitespace/"undefined"/"null"
   // never produce malformed API paths such as /v1/sandboxes//exec.
@@ -46,12 +107,23 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     method: string,
     path: string,
     body?: unknown,
-    requestOptions?: { idempotencyKey?: string; retries404?: number },
+    requestOptions?: {
+      idempotencyKey?: string;
+      retries404?: number;
+      /** Passed to the HTTP client; 0 for value-moving calls. */
+      retries?: number;
+      /** Runs once, before the first attempt; 404 re-sends do not call it again. */
+      onSend?: () => void;
+      /** "manual" for value-moving calls: a redirect is an answer, never followed. */
+      redirect?: RequestRedirect;
+    },
   ): Promise<any> {
     // Conway LB has an intermittent routing bug that returns 404 for valid
     // sandbox endpoints. Retry 404s here (outside ResilientHttpClient) to
     // avoid tripping the circuit breaker on transient routing failures.
+    // Re-sends reuse the same idempotency key.
     const max404Retries = requestOptions?.retries404 ?? 3;
+    requestOptions?.onSend?.();
     for (let attempt = 0; attempt <= max404Retries; attempt++) {
       const resp = await httpClient.request(`${apiUrl}${path}`, {
         method,
@@ -61,6 +133,8 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         },
         body: body ? JSON.stringify(body) : undefined,
         idempotencyKey: requestOptions?.idempotencyKey,
+        retries: requestOptions?.retries,
+        ...(requestOptions?.redirect ? { redirect: requestOptions.redirect } : {}),
       });
 
       if (resp.status === 404 && attempt < max404Retries) {
@@ -70,14 +144,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
       if (!resp.ok) {
         const text = await resp.text();
-        const err: any = new Error(
-          `Conway API error: ${method} ${path} -> ${resp.status}: ${text}`,
-        );
-        err.status = resp.status;
-        err.responseText = text;
-        err.method = method;
-        err.path = path;
-        throw err;
+        throw httpError(method, path, resp.status, text);
       }
 
       return resp.headers.get("content-type")?.includes("application/json")
@@ -252,13 +319,25 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   const createSandbox = async (
     options: CreateSandboxOptions,
   ): Promise<SandboxInfo> => {
-    const result = await request("POST", "/v1/sandboxes", {
-      name: options.name,
-      vcpu: options.vcpu || 1,
-      memory_mb: options.memoryMb || 512,
-      disk_gb: options.diskGb || 5,
-      region: options.region,
-    });
+    // Sandboxes are prepaid and non-refundable: never auto-retry, and send
+    // an idempotency key so a server that honours it creates at most one.
+    const result = await request(
+      "POST",
+      "/v1/sandboxes",
+      {
+        name: options.name,
+        vcpu: options.vcpu || 1,
+        memory_mb: options.memoryMb || 512,
+        disk_gb: options.diskGb || 5,
+        region: options.region,
+      },
+      {
+        idempotencyKey: options.idempotencyKey ?? ulid(),
+        onSend: options.onSend,
+        retries: 0,
+        redirect: "manual",
+      },
+    );
     return {
       id: result.id || result.sandbox_id,
       status: result.status || "running",
@@ -314,6 +393,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     toAddress: string,
     amountCents: number,
     note?: string,
+    opts?: OutflowRequestOptions,
   ): Promise<CreditTransferResult> => {
     const payload = {
       to_address: toAddress,
@@ -321,10 +401,13 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       note,
     };
 
-    const idempotencyKey = ulid();
+    // One key for both endpoint shapes, and the caller's key when given, so
+    // a retried logical transfer is recognisable by the server.
+    const idempotencyKey = opts?.idempotencyKey ?? ulid();
     const paths = ["/v1/credits/transfer", "/v1/credits/transfers"];
 
-    let lastError = "Unknown transfer error";
+    let last404: { path: string; text: string } | undefined;
+    opts?.onSend?.();
 
     for (const path of paths) {
       const resp = await httpClient.request(`${apiUrl}${path}`, {
@@ -336,14 +419,19 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         body: JSON.stringify(payload),
         idempotencyKey,
         retries: 0, // Mutating: do not auto-retry transfers
+        // A redirect is not followed: it would re-send the transfer elsewhere,
+        // and a failure on the second hop would look like nothing was sent.
+        redirect: "manual",
       });
 
       if (!resp.ok) {
         const text = await resp.text();
-        lastError = `${resp.status}: ${text}`;
         // Try next known endpoint shape before failing.
-        if (resp.status === 404) continue;
-        throw new Error(`Conway API error: POST ${path} -> ${lastError}`);
+        if (resp.status === 404) {
+          last404 = { path, text };
+          continue;
+        }
+        throw httpError("POST", path, resp.status, text);
       }
 
       const data = await resp.json().catch(() => ({}) as any);
@@ -357,9 +445,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       };
     }
 
-    throw new Error(
-      `Conway API error: POST /v1/credits/transfer -> ${lastError}`,
-    );
+    throw httpError("POST", "/v1/credits/transfer", 404, last404?.text ?? "Unknown transfer error");
   };
 
   const registerAutomaton = async (params: {
@@ -476,11 +562,15 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   const registerDomain = async (
     domain: string,
     years: number = 1,
+    opts?: OutflowRequestOptions,
   ): Promise<DomainRegistration> => {
-    const result = await request("POST", "/v1/domains/register", {
-      domain,
-      years,
-    });
+    // Paid and not refundable: never auto-retry, always send a key.
+    const result = await request(
+      "POST",
+      "/v1/domains/register",
+      { domain, years },
+      { idempotencyKey: opts?.idempotencyKey ?? ulid(), onSend: opts?.onSend, retries: 0, redirect: "manual" },
+    );
     return {
       domain: result.domain || domain,
       status: result.status || "registered",
@@ -575,8 +665,10 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     return [];
   };
 
+  // Raw on purpose: the guarded wrapper re-guards scoped clients, so each
+  // outflow is gated exactly once.
   const createScopedClient = (targetSandboxId: string): ConwayClient => {
-    return createConwayClient({ apiUrl, apiKey, sandboxId: targetSandboxId });
+    return createRawConwayClient({ apiUrl, apiKey, sandboxId: targetSandboxId });
   };
 
   const client: ConwayClient = {
@@ -607,6 +699,16 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   // that any code with a client reference could access.
 
   return client;
+}
+
+/** A Conway API error carrying the HTTP status and body (message format unchanged). */
+function httpError(method: string, path: string, status: number, text: string): Error {
+  const err: any = new Error(`Conway API error: ${method} ${path} -> ${status}: ${text}`);
+  err.status = status;
+  err.responseText = text;
+  err.method = method;
+  err.path = path;
+  return err;
 }
 
 function normalizeSandboxId(value: string | null | undefined): string {

@@ -18,6 +18,9 @@ import {
   noToolResponse,
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
+import { PolicyEngine } from "../agent/policy-engine.js";
+import { createDefaultRules } from "../agent/policy-rules/index.js";
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -221,6 +224,35 @@ describe("Agent Loop", () => {
     const execTurn = turns.find((t) => t.toolCalls.length > 0);
     expect(execTurn).toBeDefined();
     expect(execTurn!.toolCalls.length).toBeLessThanOrEqual(10);
+  });
+
+  it("fund_child calls count toward the per-turn transfer limit", async () => {
+    const policy = { ...DEFAULT_TREASURY_POLICY, maxTransfersPerTurn: 2 };
+    const policyEngine = new PolicyEngine(db.raw, createDefaultRules(policy));
+    const to = "0x1111111111111111111111111111111111111111";
+    const inference = new MockInferenceClient([
+      toolCallResponse([
+        { name: "fund_child", arguments: { child_id: "missing-1", amount_cents: 100 } },
+        { name: "fund_child", arguments: { child_id: "missing-2", amount_cents: 100 } },
+        { name: "transfer_credits", arguments: { to_address: to, amount_cents: 100 } },
+      ]),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+
+    await runAgentLoop({
+      identity,
+      config: createTestConfig({ treasuryPolicy: policy }),
+      db,
+      conway,
+      inference,
+      policyEngine,
+      onTurnComplete: (turn) => turns.push(turn),
+    });
+
+    const turn = turns.find((t) => t.toolCalls.some((tc) => tc.name === "transfer_credits"));
+    const transfer = turn!.toolCalls.find((tc) => tc.name === "transfer_credits");
+    expect(transfer!.error).toContain("TURN_TRANSFER_LIMIT");
   });
 
   it("consecutive errors trigger sleep", async () => {

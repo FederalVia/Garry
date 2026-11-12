@@ -13,7 +13,7 @@ import { getWallet, getAutomatonDir } from "./identity/wallet.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
 import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
-import { createConwayClient } from "./conway/client.js";
+import { createConwayClient, createCreditBalanceReader } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
@@ -30,10 +30,11 @@ import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
 import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
-import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
-import { bootstrapTopup } from "./conway/topup.js";
+import { startupBootstrapTopup } from "./conway/topup.js";
+import { readUsdcAuthorizationState } from "./conway/x402.js";
+import { Treasury, installTreasury, normalizeTreasuryPolicy } from "./treasury/index.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -238,12 +239,40 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
+  // Create Conway client. Its value-moving calls resolve the installed
+  // Treasury at call time, so the Treasury is installed right below, before
+  // anything can spend.
   const conway = createConwayClient({
     apiUrl: config.conwayApiUrl,
     apiKey,
     sandboxId: config.sandboxId,
   });
+
+  // Treasury: the one spending gate. The normalized policy is shared by the
+  // policy rules and the gate, so both enforce the same numbers.
+  const treasuryPolicy = normalizeTreasuryPolicy(config.treasuryPolicy);
+  const spendTracker = new SpendTracker(db.raw);
+  // The gate's balance reads use their own client, so a circuit breaker
+  // opened by unrelated failures (sandbox exec) does not refuse every outflow.
+  // It also throws on a missing balance instead of reading it as zero.
+  const readCreditBalance = createCreditBalanceReader({ apiUrl: config.conwayApiUrl, apiKey });
+  const treasury = new Treasury({
+    db: db.raw,
+    policy: treasuryPolicy,
+    selfAddress: chainIdentity.address,
+    readCreditBalance,
+    readAuthorizationState: readUsdcAuthorizationState,
+    spendTracker,
+    conwayApiUrl: config.conwayApiUrl,
+  });
+  installTreasury(treasury);
+  // Resolve payments a previous run left without an answer.
+  void treasury
+    .reconcileX402({ limit: 20 })
+    .then((n) => {
+      if (n > 0) logger.info(`[${new Date().toISOString()}] Reconciled ${n} pending x402 payment(s).`);
+    })
+    .catch((err: any) => logger.warn(`x402 reconcile at startup failed: ${err?.message || String(err)}`));
 
   // Register automaton identity (one-time, immutable)
   const registrationState = db.getIdentity("conwayRegistrationStatus");
@@ -307,11 +336,9 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
 
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4)
-  const treasuryPolicy = config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
+  // Initialize PolicyEngine (Phase 1.4) with the same normalized policy.
   const rules = createDefaultRules(treasuryPolicy);
   const policyEngine = new PolicyEngine(db.raw, rules);
-  const spendTracker = new SpendTracker(db.raw);
 
   // Load and sync heartbeat config
   const heartbeatConfigPath = resolvePath(config.heartbeatConfigPath);
@@ -338,31 +365,27 @@ async function run(): Promise<void> {
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
+  // A failed balance read skips the buy; it is not a zero balance.
   try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+    const outcome = await startupBootstrapTopup({
+      apiUrl: config.conwayApiUrl,
+      account,
+      readCreditBalance: () => conway.getCreditsBalance(),
+      chainType: resolvedChainType,
+      timeoutMs: 15_000,
     });
-    try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-            chainType: resolvedChainType,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
+    if (outcome.status === "done" && outcome.result?.success) {
+      logger.info(
+        `[${new Date().toISOString()}] Bootstrap topup: +$${outcome.result.amountUsd} credits from USDC`,
+      );
+    } else if (outcome.status === "skipped") {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${outcome.reason}`);
+    } else if (outcome.status === "timed_out") {
+      logger.warn(
+        `[${new Date().toISOString()}] Bootstrap topup still pending after 15s; continuing (the payment stays in the ledger).`,
+      );
+    } else if (outcome.result && !outcome.result.success) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup not made: ${outcome.result.error}`);
     }
   } catch (err: any) {
     logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);

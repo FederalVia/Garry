@@ -153,12 +153,12 @@ Configurable spending limits that protect against unauthorized financial activit
 | Max single transfer | $50.00 (5000 cents) | Maximum per-transfer credit amount |
 | Max hourly transfers | $100.00 (10000 cents) | Total transfers allowed per hour |
 | Max daily transfers | $250.00 (25000 cents) | Total transfers allowed per day |
-| Minimum reserve | $10.00 (1000 cents) | Credits that cannot be transferred away |
+| Minimum reserve | $10.00 (1000 cents) | No transfer, sandbox or domain purchase may take the observed balance below this |
 | Max x402 payment | $1.00 (100 cents) | Maximum single x402 payment |
 | Max daily inference | $500.00 (50000 cents) | Maximum daily inference spend |
-| Confirmation threshold | $10.00 (1000 cents) | Require confirmation above this amount |
+| Confirmation threshold | $10.00 (1000 cents) | Transfers above this are refused. There is no approval flow, so this acts as the effective single-transfer cap |
 
-Press Enter to accept defaults for each setting.
+Press Enter to accept defaults for each setting. The wizard does not ask for the topup, survival and infrastructure limits; they take the defaults listed under [Treasury policy](#treasury-policy) and can be changed in `automaton.json`.
 
 ### Step 5: Environment Detection
 
@@ -311,7 +311,15 @@ Configuration is stored at `~/.automaton/automaton.json`.
     "transferCooldownMs": 0,
     "maxTransfersPerTurn": 2,
     "maxInferenceDailyCents": 50000,
-    "requireConfirmationAboveCents": 1000
+    "requireConfirmationAboveCents": 1000,
+    // Optional; defaults shown
+    "maxTopupSingleCents": 2500,
+    "maxTopupDailyCents": 10000,
+    "maxAutoTopupDailyCents": 2000,
+    "autoTopupCooldownMs": 300000,
+    "survivalTopupThresholdCents": 500,
+    "maxInfraSingleCents": 2500,
+    "maxInfraDailyCents": 5000
   },
 
   // Advanced (optional)
@@ -596,19 +604,53 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 
 ### Treasury policy
 
-The treasury policy enforces spending limits at the policy engine level. Every financial tool call is checked against these limits before execution.
+Every outflow of value passes through one spending gate, the Treasury (`src/treasury/`). Five primitives move value: Conway `transferCredits`, `createSandbox` and `registerDomain`, and the signed payment inside `x402Fetch` (which every credit topup also uses). Each is wrapped so it reserves its amount in the `treasury_ledger` table before anything is sent or signed, whoever calls it: a tool, a worker, the orchestrator, the health monitor, the heartbeat or startup. If no Treasury is installed, these calls are refused and nothing is sent.
+
+The policy engine's financial rules still run first for model tool calls and give early, friendly denials. The Treasury is authoritative.
+
+**Budgets.** Each outflow draws on one of five budgets. Windows are rolling (the last 60 minutes, the last 24 hours), not calendar buckets.
+
+| Budget | Outflows | Single | Rolling hour | Rolling day | Other limits |
+|---|---|---|---|---|---|
+| transfer | `transfer_credits`, `fund_child`, orchestrator and health-monitor child funding | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
+| x402 | `x402_fetch`, worker `web_fetch` payments | `maxX402PaymentCents` | 10x that | 50x that | host must be in `x402AllowedDomains`; Conway `/pay/` URLs are refused here (credits are bought through topup) |
+| topup | `topup_credits`, sandbox 402 topups | `maxTopupSingleCents` | | `maxTopupDailyCents` | recipient must be this automaton; one topup in flight at a time |
+| topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; one blind buy per 24h when the balance cannot be read; `autoTopupCooldownMs` between attempts; never from a tool call |
+| infra | `create_sandbox`, `spawn_child`, `register_domain` | `maxInfraSingleCents` | | `maxInfraDailyCents` | reserve floor; sandbox priced from the pricing endpoint, else charged at the single cap; domains need an exact price quote; years 1 to 10 |
+
+**Always enforced:**
+- `minimumReserveCents`: a transfer, sandbox or domain purchase is refused if the observed balance, minus every credit outflow still in flight, would fall below the reserve. When the balance cannot be read, these outflows are refused.
+- `transferCooldownMs`: minimum time between credit transfers (0 turns it off).
+- Outflows started from an untrusted input source (inbox and any other source the runtime does not set) are refused.
+- Every amount must be a positive whole number of cents.
+
+**Ambiguous outcomes.** A request that was sent but got no reliable answer (timeout, connection reset, 5xx) is recorded as `unknown` and keeps counting against its limits for its windows. An identical credit transfer may be retried twice with the same Idempotency-Key, each retry counted again; after that it is refused for 24 hours. Identical sandbox and domain requests are refused for 24 hours. An unconfirmed x402 payment is checked on chain (EIP-3009 `authorizationState`); x402 authorizations are signed for at most 10 minutes, so an unused one is released shortly after it expires.
+
+Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 
 | Limit | Default | Description |
 |---|---|---|
-| `maxSingleTransferCents` | 5000 ($50) | Max per-transfer amount |
-| `maxHourlyTransferCents` | 10000 ($100) | Hourly transfer cap |
-| `maxDailyTransferCents` | 25000 ($250) | Daily transfer cap |
-| `minimumReserveCents` | 1000 ($10) | Reserve that cannot be transferred |
-| `maxX402PaymentCents` | 100 ($1) | Max single x402 payment |
-| `x402AllowedDomains` | `["conway.tech"]` | Domains allowed for x402 |
-| `maxTransfersPerTurn` | 2 | Max transfers per agent turn |
-| `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget |
-| `requireConfirmationAboveCents` | 1000 ($10) | Extra logging for large amounts |
+| `maxSingleTransferCents` | 5000 ($50) | Max per-transfer amount (also capped by `requireConfirmationAboveCents`) |
+| `maxHourlyTransferCents` | 10000 ($100) | Rolling-hour transfer cap |
+| `maxDailyTransferCents` | 25000 ($250) | Rolling-day transfer cap |
+| `minimumReserveCents` | 1000 ($10) | Credit balance that transfers, sandboxes and domains may not dip below |
+| `maxX402PaymentCents` | 100 ($1) | Max single x402 payment; hourly 10x, daily 50x |
+| `x402AllowedDomains` | `["conway.tech"]` | Domains allowed for x402 (subdomains included) |
+| `transferCooldownMs` | 0 | Minimum time between transfers (0 = off) |
+| `maxTransfersPerTurn` | 2 | Max transfers per agent turn (policy rule) |
+| `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget (policy rule) |
+| `requireConfirmationAboveCents` | 1000 ($10) | Transfers above this are refused; no approval flow exists |
+| `maxTopupSingleCents` | 2500 ($25) | Largest topup bought by a tool or a sandbox 402 handler |
+| `maxTopupDailyCents` | 10000 ($100) | Rolling-day cap on those topups |
+| `maxAutoTopupDailyCents` | 2000 ($20) | Rolling-day cap on survival topups |
+| `autoTopupCooldownMs` | 300000 (5 min) | Minimum time between survival topup attempts |
+| `survivalTopupThresholdCents` | 500 ($5) | Survival topups run only below this balance |
+| `maxInfraSingleCents` | 2500 ($25) | Largest single sandbox or domain purchase |
+| `maxInfraDailyCents` | 5000 ($50) | Rolling-day cap on sandboxes and domains |
+
+Advanced (rarely changed): `minSandboxEstimateCents` (500, floor for a sandbox price estimate), `unknownInflightMs` (3600000, how long an ambiguous credit outflow is treated as possibly still landing), `balanceLagMs` (60000, how long a committed debit may take to show in the balance), `autoFundCounterpartyCooldownMs` (1800000, automatic child funding per address), `topupPayTo` (address every credit topup must pay, survival buys included; when unset, the address of the last committed manual or sandbox topup is trusted for those topups, survival buys are not pinned, and a changed address is refused until you set `topupPayTo` to it).
+
+Invalid values (negative, non-numeric, not finite) fall back to their defaults with a warning.
 
 ### x402 protocol
 

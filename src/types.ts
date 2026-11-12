@@ -253,7 +253,8 @@ export type TransactionType =
   | "tool_use"
   | "transfer_in"
   | "transfer_out"
-  | "funding_request";
+  | "funding_request"
+  | "x402_payment";
 
 // ─── Self-Modification ───────────────────────────────────────────
 
@@ -370,6 +371,7 @@ export interface ConwayClient {
     toAddress: string,
     amountCents: number,
     note?: string,
+    opts?: OutflowRequestOptions,
   ): Promise<CreditTransferResult>;
   registerAutomaton(params: {
     automatonId: string;
@@ -385,7 +387,11 @@ export interface ConwayClient {
   }): Promise<{ automaton: Record<string, unknown> }>;
   // Domain operations
   searchDomains(query: string, tlds?: string): Promise<DomainSearchResult[]>;
-  registerDomain(domain: string, years?: number): Promise<DomainRegistration>;
+  registerDomain(
+    domain: string,
+    years?: number,
+    opts?: OutflowRequestOptions,
+  ): Promise<DomainRegistration>;
   listDnsRecords(domain: string): Promise<DnsRecord[]>;
   addDnsRecord(
     domain: string,
@@ -413,7 +419,18 @@ export interface PortInfo {
   sandboxId: string;
 }
 
-export interface CreateSandboxOptions {
+/**
+ * Options the treasury passes to a value-moving Conway call. The key is sent
+ * as the Idempotency-Key header on every attempt. onSend runs exactly once,
+ * synchronously, before the first byte of the first attempt leaves the
+ * process; retries of the same call reuse the key and do not call it again.
+ */
+export interface OutflowRequestOptions {
+  idempotencyKey?: string;
+  onSend?: () => void;
+}
+
+export interface CreateSandboxOptions extends OutflowRequestOptions {
   name?: string;
   vcpu?: number;
   memoryMb?: number;
@@ -584,10 +601,44 @@ export interface TreasuryPolicy {
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
+  /** Transfers above this are refused (no approval flow exists). */
   requireConfirmationAboveCents: number;
+  /** Largest single credit topup bought by a tool or a sandbox 402 handler. */
+  maxTopupSingleCents?: number;
+  /** Rolling 24h cap on those topups. */
+  maxTopupDailyCents?: number;
+  /** Rolling 24h cap on automatic survival topups. */
+  maxAutoTopupDailyCents?: number;
+  /** Minimum time between automatic survival topup attempts. */
+  autoTopupCooldownMs?: number;
+  /** Survival topups run only when a fresh balance read is below this. */
+  survivalTopupThresholdCents?: number;
+  /** Largest single sandbox or domain purchase. */
+  maxInfraSingleCents?: number;
+  /** Rolling 24h cap on sandbox and domain purchases. */
+  maxInfraDailyCents?: number;
+  /** Floor for a sandbox price estimate, whatever the pricing endpoint says. */
+  minSandboxEstimateCents?: number;
+  /** Ambiguous credit outflows count as possibly in flight for this long. */
+  unknownInflightMs?: number;
+  /** How long a committed debit may take to show up in the balance endpoint. */
+  balanceLagMs?: number;
+  /** Automatic child funding: at most one transfer per address per this window. */
+  autoFundCounterpartyCooldownMs?: number;
+  /**
+   * Address every credit topup must pay (survival buys included). When unset,
+   * the payTo of the last committed manual or sandbox topup is trusted for
+   * those topups; survival buys are not pinned, so an address change cannot
+   * starve them. Set this to accept a new address.
+   */
+  topupPayTo?: string;
 }
 
-export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
+/** A treasury policy with every numeric field filled in. */
+export type ResolvedTreasuryPolicy = Required<Omit<TreasuryPolicy, "topupPayTo">> &
+  Pick<TreasuryPolicy, "topupPayTo">;
+
+export const DEFAULT_TREASURY_POLICY: Required<Omit<TreasuryPolicy, "topupPayTo">> = {
   maxSingleTransferCents: 5000,
   maxHourlyTransferCents: 10000,
   maxDailyTransferCents: 25000,
@@ -598,6 +649,17 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
   requireConfirmationAboveCents: 1000,
+  maxTopupSingleCents: 2500,
+  maxTopupDailyCents: 10000,
+  maxAutoTopupDailyCents: 2000,
+  autoTopupCooldownMs: 300_000,
+  survivalTopupThresholdCents: 500,
+  maxInfraSingleCents: 2500,
+  maxInfraDailyCents: 5000,
+  minSandboxEstimateCents: 500,
+  unknownInflightMs: 3_600_000,
+  balanceLagMs: 60_000,
+  autoFundCounterpartyCooldownMs: 1_800_000,
 };
 
 // ─── Phase 1: Inbox Message Status ──────────────────────────────

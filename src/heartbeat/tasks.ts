@@ -7,6 +7,9 @@
  * Phase 1.1: All tasks accept TickContext as first parameter.
  * Credit balance is fetched once per tick and shared via ctx.creditBalance.
  * This eliminates 4x redundant getCreditsBalance() calls per tick.
+ *
+ * Every task runs with the Treasury origin "heartbeat.<task>", so an outflow
+ * a task starts is attributed to it (and is never mistaken for a tool call).
  */
 
 import type {
@@ -22,6 +25,7 @@ import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
 const logger = createLogger("heartbeat.tasks");
@@ -43,7 +47,7 @@ export const COLONY_TASK_INTERVALS_MS = {
   dead_agent_cleanup: 3_600_000,
 } as const;
 
-export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
+const TASKS: Record<string, HeartbeatTaskFn> = {
   heartbeat_ping: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
@@ -168,13 +172,45 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
       taskCtx.db.setKV("last_auto_topup_attempt", new Date().toISOString());
 
-      const { bootstrapTopup } = await import("../conway/topup.js");
+      const { bootstrapTopup, ROUTINE_TOPUP_REFUSALS, DAILY_NOTICE_TOPUP_REFUSALS } = await import(
+        "../conway/topup.js"
+      );
       const result = await bootstrapTopup({
         apiUrl: taskCtx.config.conwayApiUrl,
         account: taskCtx.identity.account,
         creditsCents: credits,
         chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
       });
+
+      // The gate refused for a reason that needs nothing from the agent
+      // (credits not actually low, a buy in flight or just made, the blind
+      // buy used, an unconfirmed payment). Waking would only cost a turn.
+      if (result?.denied && ROUTINE_TOPUP_REFUSALS.includes(result.denied.code)) {
+        logger.info(`Auto-topup not attempted: ${result.denied.code} — ${result.denied.message}`);
+        return { shouldWake: false };
+      }
+
+      // The survival daily cap or an untrusted payTo: retrying, or a manual
+      // topup, does not fix either. Tell the agent once a day, not every tick.
+      if (result?.denied && DAILY_NOTICE_TOPUP_REFUSALS.includes(result.denied.code)) {
+        logger.warn(`Auto-topup refused: ${result.denied.code} — ${result.denied.message}`);
+        const key = `auto_topup_notice:${result.denied.code}`;
+        const last = taskCtx.db.getKV(key);
+        const lastMs = last ? new Date(last).getTime() : NaN;
+        const nowMs = Date.now();
+        const sinceMs = nowMs - lastMs;
+        if (Number.isFinite(sinceMs) && sinceMs >= 0 && sinceMs < 24 * 60 * 60 * 1000) {
+          return { shouldWake: false };
+        }
+        taskCtx.db.setKV(key, new Date(nowMs).toISOString());
+        return {
+          shouldWake: true,
+          message:
+            `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}), ` +
+            `but automatic topups are refused: ${result.denied.code} — ${result.denied.message}. ` +
+            `They resume on their own when the limit allows; this notice repeats at most once a day.`,
+        };
+      }
 
       if (result?.success) {
         logger.info(
@@ -529,10 +565,13 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
           || tx.type === "tool_use"
           || tx.type === "transfer_out"
           || tx.type === "funding_request"
+          || tx.type === "x402_payment"
         ) {
           expenseCents += amount;
         }
       }
+
+      const pending = pendingOutflows(taskCtx);
 
       const childFunding = taskCtx.db.raw
         .prepare("SELECT COALESCE(SUM(funded_amount_cents), 0) AS total FROM children")
@@ -553,6 +592,8 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         netCents: revenueCents - expenseCents,
         fundedToChildrenCents: childFunding.total,
         taskExecutionCostCents: taskCosts.total,
+        pendingOutflowCents: pending.cents,
+        pendingOutflows: pending.rows,
         activeAgents: taskCtx.db.getChildren().filter(
           (child) => child.status !== "dead" && child.status !== "cleaned_up",
         ).length,
@@ -706,6 +747,63 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 };
 
+/** The heartbeat tasks, each run with its own Treasury origin. */
+export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = withTreasuryOrigins(TASKS);
+
+function withTreasuryOrigins(tasks: Record<string, HeartbeatTaskFn>): Record<string, HeartbeatTaskFn> {
+  const wrapped: Record<string, HeartbeatTaskFn> = {};
+  for (const [name, fn] of Object.entries(tasks)) {
+    wrapped[name] = (ctx, taskCtx) =>
+      runWithTreasuryOrigin({ type: "auto", name: `heartbeat.${name}` }, () => fn(ctx, taskCtx));
+  }
+  return wrapped;
+}
+
+interface PendingOutflow {
+  id: string;
+  kind: string;
+  amountCents: number;
+  counterparty: string;
+  createdAt: string;
+}
+
+/**
+ * Outflows that were sent without a reliable answer ('unknown' ledger rows).
+ * They may still settle, so the report lists them as pending.
+ */
+function pendingOutflows(taskCtx: HeartbeatLegacyContext): { cents: number; rows: PendingOutflow[] } {
+  try {
+    const exists = taskCtx.db.raw
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'treasury_ledger'")
+      .get();
+    if (!exists) return { cents: 0, rows: [] };
+    const rows = taskCtx.db.raw
+      .prepare(
+        `SELECT id, kind, amount_cents, counterparty, created_at_ms FROM treasury_ledger
+         WHERE status = 'unknown' ORDER BY created_at_ms DESC LIMIT 50`,
+      )
+      .all() as Array<{ id: string; kind: string; amount_cents: number; counterparty: string; created_at_ms: number }>;
+    const total = taskCtx.db.raw
+      .prepare("SELECT COALESCE(SUM(amount_cents), 0) AS total FROM treasury_ledger WHERE status = 'unknown'")
+      .get() as { total: number };
+    return {
+      cents: total.total,
+      rows: rows.map((r) => ({
+        id: r.id,
+        kind: r.kind,
+        amountCents: r.amount_cents,
+        counterparty: r.counterparty,
+        createdAt: new Date(r.created_at_ms).toISOString(),
+      })),
+    };
+  } catch (error) {
+    logger.warn("Could not read pending treasury outflows", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { cents: 0, rows: [] };
+  }
+}
+
 function tierToInt(tier: SurvivalTier): number {
   const map: Record<SurvivalTier, number> = {
     dead: 0,
@@ -743,7 +841,9 @@ async function createHealthMonitor(taskCtx: HeartbeatLegacyContext): Promise<Col
   const { HealthMonitor } = await import("../orchestration/health-monitor.js");
 
   const tracker = new SimpleAgentTracker(taskCtx.db);
-  const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db);
+  // The fourth argument names the Treasury origin of the monitor's funding
+  // transfers, which share the automatic child-funding sub-cap and cooldown.
+  const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db, "health.fund_child");
   const transport = new LocalDBTransport(taskCtx.db);
   const messaging = new ColonyMessaging(transport, taskCtx.db);
 

@@ -1,14 +1,16 @@
 /**
  * Financial Policy Rules Tests
  *
- * Tests for all financial limit rules:
- * - x402_max_single denies payments > 100 cents
+ * Tests for all financial limit rules (the treasury gate re-checks these and
+ * more for every outflow; the rules give early, friendly denials):
+ * - x402_envelope denies x402 fetches once the x402 hourly/daily envelope is used up
  * - x402_domain_allowlist denies non-conway.tech domains
+ * - amount_integer denies amounts that are not positive whole cents
  * - transfer_max_single denies transfers > 5000 cents
  * - transfer_hourly_cap denies when hourly total > 10000
  * - transfer_daily_cap denies when daily total > 25000
- * - minimum_reserve denies when balance would drop below 1000
  * - turn_transfer_limit denies > 2 transfers per turn
+ * - the transfer rules cover fund_child as well as transfer_credits
  * - Iterative drain scenario: 10 successive transfers blocked by hourly cap
  */
 
@@ -505,9 +507,98 @@ describe("Financial Policy Rules", () => {
     });
   });
 
+  describe("financial.amount_integer", () => {
+    for (const amount of ["5,000", 10.5, Number.NaN, -1, 0, Number.MAX_SAFE_INTEGER + 2, undefined]) {
+      it(`denies amount_cents ${String(amount)} for transfer_credits and fund_child`, () => {
+        for (const tool of [mockTransferTool(), mockFundChildTool()]) {
+          const decision = engine.evaluate(
+            createRequest(tool, { amount_cents: amount, to_address: "0x1234567890abcdef1234567890abcdef12345678" }, createMockSpendTracker()),
+          );
+          expect(decision.action).toBe("deny");
+          expect(decision.reasonCode).toBe("INVALID_AMOUNT");
+        }
+      });
+    }
+
+    it("allows a positive whole amount", () => {
+      const decision = engine.evaluate(createRequest(mockFundChildTool(), { amount_cents: 1, child_id: "c" }, createMockSpendTracker()));
+      expect(decision.action).toBe("allow");
+    });
+  });
+
+  describe("fund_child shares the transfer rules", () => {
+    it("denies fund_child above the single transfer max", () => {
+      const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 6000 }, createMockSpendTracker()));
+      expect(decision.action).toBe("deny");
+      expect(decision.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
+    });
+
+    it("quarantines fund_child above the confirmation threshold", () => {
+      const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 4000 }, createMockSpendTracker()));
+      expect(decision.action).toBe("quarantine");
+      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+    });
+
+    it("counts transfers already recorded this hour, whichever tool made them", () => {
+      spendTracker.recordSpend({ toolName: "transfer_credits", amountCents: 9500, category: "transfer" });
+      const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 600 }, spendTracker));
+      expect(decision.action).toBe("deny");
+      expect(decision.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
+    });
+
+    it("denies fund_child over the daily cap", () => {
+      const policy: TreasuryPolicy = { ...DEFAULT_TREASURY_POLICY, maxHourlyTransferCents: 100_000 };
+      const dailyEngine = new PolicyEngine(db, createFinancialRules(policy));
+      spendTracker.recordSpend({ toolName: "fund_child", amountCents: 24_800, category: "transfer" });
+      const decision = dailyEngine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 500 }, spendTracker));
+      expect(decision.action).toBe("deny");
+      expect(decision.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
+    });
+
+    it("applies the per-turn limit to fund_child", () => {
+      const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 100 }, createMockSpendTracker(), 2));
+      expect(decision.action).toBe("deny");
+      expect(decision.reasonCode).toBe("TURN_TRANSFER_LIMIT");
+    });
+  });
+
+  describe("financial.x402_envelope", () => {
+    it("allows x402 fetches while the envelope has room", () => {
+      spendTracker.recordSpend({ toolName: "x402_fetch", amountCents: 999, domain: "api.conway.tech", category: "x402" });
+      const decision = engine.evaluate(createRequest(mockX402Tool(), { url: "https://api.conway.tech/v1/x" }, spendTracker));
+      expect(decision.action).toBe("allow");
+    });
+
+    it("denies once the hourly envelope (10x the per-payment max) is used up", () => {
+      spendTracker.recordSpend({ toolName: "x402_fetch", amountCents: 1000, domain: "api.conway.tech", category: "x402" });
+      const decision = engine.evaluate(createRequest(mockX402Tool(), { url: "https://api.conway.tech/v1/x" }, spendTracker));
+      expect(decision.action).toBe("deny");
+      expect(decision.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
+    });
+
+    it("does not apply to transfers", () => {
+      spendTracker.recordSpend({ toolName: "x402_fetch", amountCents: 5000, category: "x402" });
+      const decision = engine.evaluate(
+        createRequest(mockTransferTool(), { amount_cents: 100, to_address: "0x1234567890abcdef1234567890abcdef12345678" }, spendTracker),
+      );
+      expect(decision.action).toBe("allow");
+    });
+  });
+
   describe("Rules are registered", () => {
     it("creates 9 financial rules (7 Phase 0 + 2 Phase 1)", () => {
       expect(rules.length).toBe(9);
+      expect(rules.map((r) => r.id)).toEqual([
+        "financial.x402_envelope",
+        "financial.x402_domain_allowlist",
+        "financial.amount_integer",
+        "financial.transfer_max_single",
+        "financial.transfer_hourly_cap",
+        "financial.transfer_daily_cap",
+        "financial.turn_transfer_limit",
+        "financial.inference_daily_cap",
+        "financial.require_confirmation",
+      ]);
     });
 
     it("all rules have priority 500", () => {

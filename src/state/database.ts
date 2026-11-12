@@ -53,6 +53,7 @@ import {
   MIGRATION_V10,
   MIGRATION_V11,
 } from "./schema.js";
+import { ensureTreasuryLedger } from "../treasury/ledger.js";
 import type {
   RiskLevel,
   PolicyAction,
@@ -636,6 +637,13 @@ function applyMigrations(db: DatabaseType): void {
       apply: () => {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
+    },
+    {
+      version: 12,
+      // Creates treasury_ledger (MIGRATION_V12) and, only when the table is
+      // new, copies the last day of legacy spend so the upgrade keeps today's
+      // usage against the caps.
+      apply: () => { ensureTreasuryLedger(db, Date.now()); },
     },
   ];
 

@@ -9,6 +9,7 @@ import { sanitizeToolResult } from "../injection-defense.js";
 import { executeTool } from "../tools.js";
 import { getForbiddenCommandMatch, isForbiddenCommand } from "../policy-rules/command-safety.js";
 import { isSensitiveFile } from "../policy-rules/path-protection.js";
+import { CREDIT_TRANSFER_TOOLS } from "../policy-rules/financial.js";
 
 const MAX_EXEC_TIMEOUT_MS = 30_000;
 const MAX_READ_SIZE = 10_000;
@@ -43,6 +44,8 @@ const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "forget",
   "x402_fetch",
 ]);
+// Every credit transfer tool counts toward the per-turn transfer limit.
+const CREDIT_TRANSFER_NAMES: ReadonlySet<string> = new Set(CREDIT_TRANSFER_TOOLS);
 const GENERAL_SPEC_ALIAS_TARGETS = {
   web_fetch: "x402_fetch",
 } as const;
@@ -265,7 +268,7 @@ When calling task_done, provide:
             sessionSpend: this.context.spendTracker ?? NOOP_SPEND_TRACKER,
           },
         );
-        if (tool.name === "transfer_credits") {
+        if (CREDIT_TRANSFER_NAMES.has(tool.name)) {
           this.transferToolCallCount += 1;
         }
 

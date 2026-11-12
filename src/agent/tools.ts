@@ -21,6 +21,14 @@ import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
 import { INSTALL_AND_BUILD, INSTALL_AND_BUILD_NO_SCRIPTS } from "../self-mod/install.js";
+import {
+  OutcomeUnknownError,
+  TransferRejectedError,
+  TreasuryDeniedError,
+  runWithTreasuryOrigin,
+  type TreasuryResultFields,
+} from "../treasury/index.js";
+import { isRejectedTransferStatus } from "../treasury/guarded-conway.js";
 
 const logger = createLogger("tools");
 
@@ -311,26 +319,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
         }
 
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
+        const result: Awaited<ReturnType<typeof topupCredits>> & TreasuryResultFields =
+          await topupCredits(ctx.config.conwayApiUrl, ctx.identity.account, amountUsd);
 
+        // The treasury writes the credit_purchase row when the payment commits.
+        if (result.denied) {
+          throw new TreasuryDeniedError(result.denied.code, result.denied.message);
+        }
+        if (result.settlement === "unknown") {
+          return unknownOutcomeText("topup_credits", result.reservationId);
+        }
         if (!result.success) {
           return `Credit topup failed: ${result.error}`;
         }
-
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
 
         return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
       },
@@ -357,6 +358,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
       },
       execute: async (args, ctx) => {
+        // Priced, bounded and recorded by the treasury inside createSandbox.
         const info = await ctx.conway.createSandbox({
           name: args.name as string,
           vcpu: args.vcpu as number,
@@ -1020,22 +1022,16 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
         }
 
+        // The treasury checks every limit before sending and writes the
+        // transfer_out row when the transfer commits.
         const transfer = await ctx.conway.transferCredits(
           args.to_address as string,
           amount,
           args.reason as string | undefined,
         );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Transfer to ${args.to_address}: ${args.reason || ""}`,
-          timestamp: new Date().toISOString(),
-        });
+        if (isRejectedTransferStatus(transfer.status)) {
+          throw new TransferRejectedError(transfer.status);
+        }
 
         return `Credit transfer submitted: $${(amount / 100).toFixed(2)} to ${transfer.toAddress} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
       },
@@ -1758,22 +1754,17 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
         }
 
+        // Same gated transfer and shared budget as transfer_credits. A
+        // rejected or ambiguous transfer throws, so the child is only marked
+        // funded after a committed transfer.
         const transfer = await ctx.conway.transferCredits(
           child.address,
           amount,
           `fund child ${child.id}`,
         );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Fund child ${child.name} (${child.id})`,
-          timestamp: new Date().toISOString(),
-        });
+        if (isRejectedTransferStatus(transfer.status)) {
+          throw new TransferRejectedError(transfer.status);
+        }
 
         // Update funded amount
         ctx.db.raw
@@ -2227,9 +2218,10 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["domain"],
       },
       execute: async (args, ctx) => {
+        // The treasury quotes the price, checks the infra limits and records it.
         const reg = await ctx.conway.registerDomain(
           args.domain as string,
-          (args.years as number) || 1,
+          args.years === undefined || args.years === null ? 1 : (args.years as number),
         );
         return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
       },
@@ -2769,15 +2761,15 @@ Model: ${ctx.inference.getDefaultModel()}
         const maxPayment =
           ctx.config.treasuryPolicy?.maxX402PaymentCents ??
           DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
+        const result: Awaited<ReturnType<typeof x402Fetch>> & TreasuryResultFields =
+          await x402Fetch(url, ctx.identity.account, method, body, extraHeaders, maxPayment);
 
+        if (result.denied) {
+          throw new TreasuryDeniedError(result.denied.code, result.denied.message);
+        }
+        if (result.settlement === "unknown") {
+          return unknownOutcomeText("x402_fetch", result.reservationId);
+        }
         if (!result.success) {
           return `x402 fetch failed: ${result.error || "Unknown error"}`;
         }
@@ -3335,55 +3327,17 @@ export async function executeTool(
   }
 
   try {
-    let result = await tool.execute(args, context);
+    // Every outflow the tool makes is attributed to it, with the turn's input
+    // source, so the treasury can refuse spending driven by untrusted input.
+    // The treasury records spend when an outflow commits.
+    let result = await runWithTreasuryOrigin(
+      { type: "tool", name: toolName, inputSource: turnContext?.inputSource },
+      () => tool.execute(args, context),
+    );
 
     // Sanitize results from external source tools
     if (EXTERNAL_SOURCE_TOOLS.has(toolName)) {
       result = sanitizeToolResult(result);
-    }
-
-    // Record spend for financial operations
-    if (turnContext && !result.startsWith("Blocked:")) {
-      if (toolName === "transfer_credits") {
-        const amount = args.amount_cents as number | undefined;
-        if (amount && amount > 0) {
-          try {
-            turnContext.sessionSpend.recordSpend({
-              toolName: "transfer_credits",
-              amountCents: amount,
-              recipient: args.to_address as string | undefined,
-              category: "transfer",
-            });
-          } catch (error) {
-            logger.error(
-              "Spend tracking failed for transfer_credits",
-              error instanceof Error ? error : undefined,
-            );
-          }
-        }
-      } else if (toolName === "x402_fetch") {
-        // x402 payment amounts are determined by the server response,
-        // but we record a nominal entry for tracking purposes
-        try {
-          turnContext.sessionSpend.recordSpend({
-            toolName: "x402_fetch",
-            amountCents: 0, // Actual amount is inside the x402 protocol
-            domain: (() => {
-              try {
-                return new URL(args.url as string).hostname;
-              } catch {
-                return undefined;
-              }
-            })(),
-            category: "x402",
-          });
-        } catch (error) {
-          logger.error(
-            "Spend tracking failed for x402_fetch",
-            error instanceof Error ? error : undefined,
-          );
-        }
-      }
     }
 
     return {
@@ -3400,9 +3354,58 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: Date.now() - startTime,
-      error: err.message || String(err),
+      error: describeToolError(toolName, err),
     };
   }
+}
+
+/** Tool error text; treasury outcomes get wording the model can act on. */
+function describeToolError(toolName: string, err: unknown): string {
+  if (isTreasuryDenied(err)) {
+    return `Policy denied: ${err.code} — ${err.message}`;
+  }
+  if (err instanceof TransferRejectedError || (err as { name?: unknown })?.name === "TransferRejectedError") {
+    return `Transfer rejected (status ${(err as TransferRejectedError).status}); nothing recorded as spent.`;
+  }
+  if (err instanceof OutcomeUnknownError || (err as { name?: unknown })?.name === "OutcomeUnknownError") {
+    return unknownOutcomeText(toolName, (err as OutcomeUnknownError).reservationId);
+  }
+  const e = err as { message?: unknown } | null | undefined;
+  return (typeof e?.message === "string" && e.message) || String(err);
+}
+
+function isTreasuryDenied(err: unknown): err is TreasuryDeniedError {
+  if (err instanceof TreasuryDeniedError) return true;
+  const e = err as { name?: unknown; code?: unknown } | null | undefined;
+  return (
+    (e?.name === "TreasuryDeniedError" || e?.name === "TreasuryNotInstalledError") &&
+    typeof e.code === "string"
+  );
+}
+
+const TRANSFER_TOOLS = new Set(["transfer_credits", "fund_child"]);
+const INFRA_TOOLS = new Set(["create_sandbox", "register_domain", "spawn_child"]);
+const USDC_TOOLS = new Set(["x402_fetch", "topup_credits"]);
+
+/** Text for an outflow that was sent but got no reliable answer. */
+function unknownOutcomeText(toolName: string, reservationId: string | undefined): string {
+  let retry: string;
+  if (TRANSFER_TOOLS.has(toolName)) {
+    retry =
+      "Retrying the identical transfer re-sends it with the same idempotency key and is charged against your limits again; after 2 retries identical transfers are refused for 24h.";
+  } else if (INFRA_TOOLS.has(toolName)) {
+    retry =
+      "Identical requests are refused for 24h; check list_sandboxes or the domain before trying anything else.";
+  } else if (toolName === "topup_credits") {
+    retry =
+      "The signed payment may still settle. An identical topup is refused while the payment is unconfirmed; once it is confirmed on chain the topup counts as done and the next identical topup is refused once (TOPUP_ALREADY_SETTLED). If its authorization expires unused, an identical topup buys again. Check check_credits before buying more.";
+  } else if (USDC_TOOLS.has(toolName)) {
+    retry =
+      "The signed payment may still settle. An identical request is refused while the payment is unconfirmed; once it is confirmed on chain or its authorization expires unused, an identical request pays again.";
+  } else {
+    retry = "Check whether it took effect before trying again.";
+  }
+  return `Outcome unknown (ledger ${reservationId ?? "n/a"}): the request was sent but no reliable answer came back. It counts against your limits. ${retry}`;
 }
 
 /** Escape a string for safe shell interpolation. */

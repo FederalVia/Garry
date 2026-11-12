@@ -90,6 +90,8 @@ The runtime alternates between two states: **running** (the agent loop is active
        |
   [Init database]         Schema migrations applied (v1 -> v8)
        |
+  [Install Treasury]      The spending gate; reconcile pending x402 payments
+       |
   [Bootstrap topup]       If credits < $5 and USDC available, buy $5 credits
        |
   [Start heartbeat]       DurableScheduler begins ticking
@@ -142,7 +144,7 @@ src/
     context.ts             Inference message assembly + token budgeting
     injection-defense.ts   Input sanitization (8 detection checks)
     policy-engine.ts       Centralized tool-call policy evaluation
-    spend-tracker.ts       Financial spend tracking by time window
+    spend-tracker.ts       Spend mirror by calendar window (read by policy rules)
     policy-rules/          Rule implementations
       index.ts               Rule set factory
       authority.ts           Authority hierarchy rules
@@ -151,6 +153,14 @@ src/
       path-protection.ts     Protected file read/write rules
       rate-limits.ts         Per-turn/session rate limits
       validation.ts          Input format validation rules
+
+  treasury/                Single spending gate for every outflow
+    types.ts               Kinds, budgets, deny codes, quote, errors
+    policy.ts              normalizeTreasuryPolicy, budget limits, dedupe keys
+    ledger.ts              treasury_ledger setup (DDL is migration 12) and one-time legacy copy
+    treasury.ts            Treasury: reserve / markSent / settle / guard / reconcile / recover
+    registry.ts            Installed instance and outflow origin (AsyncLocalStorage)
+    guarded-conway.ts      Conway client wrapper that routes value-moving calls through the Treasury
 
   conway/                  Conway API integration
     client.ts              ConwayClient (sandbox ops, credits, domains)
@@ -267,11 +277,12 @@ The automaton runs as a long-lived Node.js process. The `--run` command triggers
 2. **Wallet load** — reads or generates `~/.automaton/wallet.json` (viem PrivateKeyAccount)
 3. **Database init** — opens `~/.automaton/state.db`, applies schema migrations (v1-v8)
 4. **Conway client** — creates HTTP client for sandbox/credits/domain API
+   - **Treasury** — normalizes the treasury policy once, installs the spending gate (with its own balance-read client and the on-chain `authorizationState` reader) before anything can spend, and starts reconciling x402 payments a previous run left unknown
 5. **Inference client** — creates chat completion client (Conway proxy, OpenAI direct, or Anthropic direct)
 6. **Social client** — connects to `social.conway.tech` relay (optional)
-7. **Policy engine** — assembles rule set from 6 rule categories
-8. **Spend tracker** — initializes hourly/daily spend windows
-9. **Bootstrap topup** — buys minimum $5 credits from USDC if balance is low
+7. **Policy engine** — assembles rule set from 6 rule categories, using the same normalized treasury policy as the gate
+8. **Spend tracker** — the commit-time mirror the Treasury writes and the policy rules read
+9. **Bootstrap topup** — buys minimum $5 credits from USDC if balance is low (origin `startup.bootstrap`; skipped when the balance cannot be read; a 15s timeout stops the wait, not the payment, whose open ledger row keeps other topups out)
 10. **Heartbeat daemon** — starts DurableScheduler with 6 default tasks
 11. **Main loop** — alternates between `runAgentLoop()` and sleeping
 
@@ -336,8 +347,8 @@ Each tool has a `riskLevel`: `safe`, `caution`, `dangerous`, or `forbidden`. Eve
 Agent requests tool call
   -> Policy engine evaluates rules
   -> If denied: return denial message to agent
-  -> If allowed: execute tool function
-  -> If dangerous tool: record in spend tracker
+  -> If allowed: execute tool function (with the tool's name as the outflow origin)
+  -> Value-moving calls inside it are reserved, sent and settled by the Treasury
   -> Return result to agent (truncated to MAX_TOOL_RESULT_SIZE)
 ```
 
@@ -481,13 +492,22 @@ The automaton's survival depends on two balances:
 | `critical` | >= $0.00 | Zero credits, alive. Distress signals, accept funding. |
 | `dead` | < $0.00 | Only reachable via 1-hour heartbeat grace period at zero credits |
 
-**Credit topup** (`src/conway/topup.ts`): The agent buys credits from USDC via the x402 payment protocol. On startup, `bootstrapTopup()` buys the minimum $5 tier. At runtime, the agent uses `topup_credits` tool to choose larger tiers ($5/$25/$100/$500/$1000/$2500).
+**Credit topup** (`src/conway/topup.ts`): The agent buys credits from USDC via the x402 payment protocol. On startup, `bootstrapTopup()` buys the minimum $5 tier. At runtime, the agent uses `topup_credits` tool to choose larger tiers ($5/$25/$100/$500/$1000/$2500). Every purchase is a Treasury outflow: the signed amount may not exceed the requested tier, the credits must be for this automaton, and the purpose picks the budget (`manual`, `sandbox_402`, or `survival` for the automatic $5 buys, which the gate allows only when its own balance read is low).
 
-**x402 protocol** (`src/conway/x402.ts`): HTTP 402 payment flow. Server returns payment requirements, client signs a USDC `TransferWithAuthorization` (EIP-3009), retries with `X-Payment` header.
+**x402 protocol** (`src/conway/x402.ts`): HTTP 402 payment flow. Server returns payment requirements; the client checks them (exact USDC on Base, amount, deadline), reserves the payment with the Treasury with its nonce and `validBefore` (at most 600s ahead), then signs a USDC `TransferWithAuthorization` (EIP-3009) and retries with the `X-Payment` header. A 2xx commits the ledger row; a refused connection releases it; any other failure after sending leaves it `unknown` until `authorizationState` on chain says whether it was used.
 
-**Treasury policy** (`TreasuryPolicy` in config): Configurable caps on transfers, x402 payments, inference spend, with hourly/daily windows enforced by the policy engine.
+**Treasury** (`src/treasury/`): One gate every outflow passes through. The five value-moving primitives (Conway `transferCredits`, `createSandbox`, `registerDomain`, and the signed payment in `x402Fetch`, which topups use) are wrapped, so tools, workers, the orchestrator, the health monitor, the heartbeat and startup are all gated the same way. The gate is resolved at call time; with none installed the call is refused and nothing is sent or signed.
 
-**Spend tracking** (`src/agent/spend-tracker.ts`): Records every financial action in `spend_tracking` table. Queries hourly/daily aggregates to enforce treasury limits.
+Each outflow is a row in `treasury_ledger` that moves `reserved -> sent -> committed | released | unknown`:
+- `reserve` reads a fresh credit balance (for credit-debiting outflows and survival topups), then runs one synchronous `BEGIN IMMEDIATE` transaction that checks every limit against the ledger and inserts the row. Concurrent callers (main loop, workers, orchestrator, heartbeat) are totally ordered by that transaction, so the check and the reservation cannot interleave.
+- `markSent` runs immediately before the first byte is sent.
+- `settle` records the outcome. A commit writes the `transactions` row and the `spend_tracking` mirror in the same SQLite transaction and never records less than was reserved. An `unknown` row (sent, no reliable answer) keeps counting.
+
+Limits are per budget (transfer, x402, topup, topup_auto, infra) over rolling windows with no upper bound, so a backward clock step cannot reset them. The reserve floor subtracts every credit outflow that may not yet show in the balance. Outflows from untrusted input sources are refused. At startup, rows left open by an earlier process are closed (`reserved -> released`, `sent -> unknown`) using a per-process boot id, and unknown x402 payments are reconciled on chain. Every row records its origin (tool name or automatic caller) and input source.
+
+**Treasury policy** (`TreasuryPolicy` in config): the limits above, normalized once by `normalizeTreasuryPolicy`. The policy engine's financial rules still give early denials for model tool calls; the Treasury is authoritative.
+
+**Spend tracking** (`src/agent/spend-tracker.ts`): `spend_tracking` is a mirror written by the Treasury on commit, bucketed by calendar hour and day. Policy rules read it.
 
 ---
 
@@ -658,7 +678,8 @@ Step-by-step instructions for the agent...
 | `reputation` | v2 | Peer reputation scores |
 | `inbox_messages` | v3 | Social messages with processing state machine |
 | `policy_decisions` | v4 | Tool call policy audit trail |
-| `spend_tracking` | v4 | Financial spend by time window |
+| `spend_tracking` | v4 | Spend mirror by calendar window (written by the Treasury on commit) |
+| `treasury_ledger` | v12 | Every outflow attempt and its state (reserved, sent, committed, released, unknown, denied) |
 | `heartbeat_schedule` | v4 | Durable scheduler config (cron, leases, tier minimums) |
 | `heartbeat_history` | v4 | Task execution history |
 | `wake_events` | v4 | Atomic wake signals (source, reason, consumed flag) |
@@ -732,7 +753,7 @@ The automaton operates under a defense-in-depth security model:
 
 **Layer 5 — Command safety** (shell): Forbidden command patterns blocked (rm -rf /, DROP TABLE, kill -9, etc.). Rate limits on self-modification operations.
 
-**Layer 6 — Financial limits** (treasury): Configurable caps on transfers, x402 payments, inference spend. Minimum reserve prevents drain-to-zero.
+**Layer 6 — Financial limits** (treasury): Every outflow passes through the Treasury, which reserves it against rolling caps per budget, the minimum reserve and single-flight rules before anything is sent or signed. Inference spend has its own caps.
 
 **Layer 7 — Authority hierarchy** (trust levels): Creator input has highest trust. Self-generated input is trusted. Peer/external input has reduced trust and cannot invoke dangerous tools.
 
@@ -747,7 +768,7 @@ The automaton operates under a defense-in-depth security model:
 | Core loop | `loop.test.ts` | State transitions, tool execution, idle detection, inbox |
 | Security | `injection-defense.test.ts`, `command-injection.test.ts`, `tools-security.test.ts` | Input sanitization, shell injection, tool risk levels |
 | Policy | `policy-engine.test.ts`, `authority-rules.test.ts`, `financial.test.ts`, `path-protection.test.ts` | Rule evaluation, authority, treasury, path blocks |
-| Financial | `spend-tracker.test.ts` | Spend recording, limit checks, pruning |
+| Financial | `spend-tracker.test.ts`, `treasury/treasury-core.test.ts`, `treasury/treasury-credits.test.ts`, `treasury/treasury-credits-repro.test.ts`, `treasury/treasury-usdc.test.ts` | Spend recording; the Treasury state machine, every gate invariant, concurrency, crash recovery; credit transfers, child funding, sandboxes and domains through the gate; x402 payments and topups through the gate |
 | Heartbeat | `heartbeat.test.ts`, `heartbeat-scheduler.test.ts` | Tasks, scheduler, tick context, leases |
 | Network | `http-client.test.ts` | Retries, backoff, circuit breaker, idempotency |
 | Inference | `inference-router.test.ts` | Router, registry, budget, routing matrix |

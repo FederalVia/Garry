@@ -6,6 +6,7 @@ import type {
   ConwayClient,
 } from "../types.js";
 import type { AgentTracker, FundingProtocol } from "./types.js";
+import { runWithTreasuryOrigin } from "../treasury/registry.js";
 
 const IDLE_STATUSES = new Set<ChildStatus>(["running", "healthy"]);
 
@@ -79,10 +80,16 @@ export class SimpleAgentTracker implements AgentTracker {
 }
 
 export class SimpleFundingProtocol implements FundingProtocol {
+  /**
+   * @param originName who funds through this protocol ("orchestrator.fund_child"
+   *   or "health.fund_child"). The treasury applies the shared transfer budget
+   *   plus the automatic-funding sub-cap and per-child cooldown to it.
+   */
   constructor(
     private readonly conway: ConwayClient,
     private readonly identity: AutomatonIdentity,
     private readonly db: AutomatonDatabase,
+    private readonly originName: string = "orchestrator.fund_child",
   ) {}
 
   async fundChild(childAddress: string, amountCents: number): Promise<{ success: boolean }> {
@@ -92,10 +99,16 @@ export class SimpleFundingProtocol implements FundingProtocol {
     }
 
     try {
-      const result = await this.conway.transferCredits(
-        childAddress,
-        transferAmount,
-        "Task funding from orchestrator",
+      // A treasury denial, a rejected status or an unknown outcome all throw
+      // and become { success: false }; nothing is added to the child ledger.
+      const result = await runWithTreasuryOrigin(
+        { type: "auto", name: this.originName },
+        () =>
+          this.conway.transferCredits(
+            childAddress,
+            transferAmount,
+            "Task funding from orchestrator",
+          ),
       );
 
       const success = isTransferSuccessful(result.status);
@@ -119,6 +132,9 @@ export class SimpleFundingProtocol implements FundingProtocol {
       return { success: true, amountCents: 0 };
     }
 
+    // This is a transfer from the parent to itself (nothing leaves the child).
+    // The treasury refuses self-transfers, so this returns { success: false }
+    // and the child ledger is left alone instead of being zeroed.
     try {
       const result = await this.conway.transferCredits(
         this.identity.address,

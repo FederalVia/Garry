@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -678,4 +678,56 @@ export const MIGRATION_V10 = `
 
   CREATE INDEX idx_knowledge_category ON knowledge_store(category);
   CREATE INDEX idx_knowledge_key ON knowledge_store(key);
+`;
+
+// === Treasury: spending gate ledger ===
+// Applied through ensureTreasuryLedger, which also copies the last day of
+// transfer and x402 spend from spend_tracking when it first creates the table.
+
+export const MIGRATION_V12 = `
+  -- Schema version: 12
+  -- Tables: treasury_ledger
+
+  CREATE TABLE IF NOT EXISTS treasury_ledger (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    replay_of TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('credit_transfer','x402_payment','credit_topup','sandbox_create','domain_register','legacy')),
+    budget TEXT NOT NULL CHECK(budget IN ('transfer','x402','topup','topup_auto','infra')),
+    status TEXT NOT NULL CHECK(status IN ('denied','reserved','sent','committed','released','unknown')),
+    amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0 AND typeof(amount_cents) = 'integer'),
+    committed_cents INTEGER CHECK(committed_cents IS NULL OR (committed_cents >= 0 AND typeof(committed_cents) = 'integer')),
+    amount_atomic INTEGER CHECK(amount_atomic IS NULL OR (amount_atomic >= 0 AND typeof(amount_atomic) = 'integer')),
+    amount_basis TEXT NOT NULL DEFAULT 'exact' CHECK(amount_basis IN ('exact','quote','estimate','ceiling')),
+    debits_credits INTEGER NOT NULL CHECK(debits_credits IN (0,1)),
+    counterparty TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    origin_type TEXT NOT NULL,
+    origin_name TEXT,
+    input_source TEXT,
+    boot_id TEXT,
+    topup_purpose TEXT,
+    url TEXT,
+    description TEXT,
+    deny_code TEXT,
+    deny_count INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    external_ref TEXT,
+    x402_nonce TEXT,
+    x402_valid_before INTEGER,
+    x402_from TEXT,
+    x402_network TEXT,
+    x402_asset TEXT,
+    balance_observed_cents INTEGER,
+    balance_read_started_ms INTEGER,
+    balance_unknown INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    sent_at_ms INTEGER,
+    settled_at_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_treasury_budget_time ON treasury_ledger(budget, created_at_ms);
+  CREATE INDEX IF NOT EXISTS idx_treasury_open ON treasury_ledger(status, debits_credits);
+  CREATE INDEX IF NOT EXISTS idx_treasury_dedupe ON treasury_ledger(dedupe_key, status);
+  CREATE INDEX IF NOT EXISTS idx_treasury_replay ON treasury_ledger(replay_of);
 `;
