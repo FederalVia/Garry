@@ -29,32 +29,176 @@ import {
   type TreasuryResultFields,
 } from "../treasury/index.js";
 import { isRejectedTransferStatus } from "../treasury/guarded-conway.js";
+import { normalizeTreasuryPolicy } from "../treasury/policy.js";
+import { DEFAULT_EXEC_TIMEOUT_MS, isLocalSandboxId } from "../conway/client.js";
+import { readFileSafe, writeFileVerified, UnsafePathError } from "../security/secure-fs.js";
+import { homeDir } from "../security/protected-paths.js";
+import { markRestartRequired, RESTART_NOTICE } from "../self-mod/restart-notice.js";
+import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
+import {
+  addScheduleEntry,
+  resolveTaskName,
+  scheduleEntryExists,
+  setScheduleCron,
+  setScheduleEnabled,
+  setTaskAlias,
+} from "../heartbeat/schedule-store.js";
+import { updateConfigFile } from "../config.js";
+import cronParser from "cron-parser";
 
 const logger = createLogger("tools");
 
 // ─── Path Confinement ─────────────────────────────────────────
-// write_file is restricted to the sandbox home directory tree.
-// The sandbox home is /root for both local and remote execution.
+// write_file is restricted to the home directory tree: /root in a remote
+// sandbox, the real HOME when running locally (where ~ means HOME).
 const SANDBOX_HOME = "/root";
+
+/** The directory write_file is confined to, and ~ expands to. */
+function writeRootFor(ctx: ToolContext): string {
+  return isLocalSandboxId(ctx.identity.sandboxId) ? nodePath.resolve(homeDir()) : SANDBOX_HOME;
+}
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
  * Returns the resolved absolute path, or an error string if out of bounds.
  */
-function confinePathToSandbox(filePath: string): string | { error: string } {
-  // Resolve ~ to SANDBOX_HOME
+function confinePathToRoot(filePath: string, root: string): string | { error: string } {
+  // Resolve ~ to the root
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.join(root, filePath.slice(1))
     : filePath;
-  // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
-  // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+  // Resolve to absolute (relative paths resolve against the root)
+  const resolved = nodePath.resolve(root, expanded);
+  if (resolved !== root && !resolved.startsWith(root + "/")) {
     return {
-      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
+      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${root}). Writes are confined to the home directory.`,
     };
   }
   return resolved;
+}
+
+// Heartbeat entry and installed tool names: what providers accept as function names.
+const HEARTBEAT_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+export const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+// ─── Exec timeouts ────────────────────────────────────────────
+export const MIN_EXEC_TIMEOUT_MS = 1_000;
+export const MAX_EXEC_TIMEOUT_MS = 600_000;
+
+/** The model's timeout, bounded: default 30 s, at least 1 s, at most 10 min. */
+export function clampExecTimeout(value: unknown): number {
+  const requested =
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_EXEC_TIMEOUT_MS;
+  return Math.min(MAX_EXEC_TIMEOUT_MS, Math.max(MIN_EXEC_TIMEOUT_MS, Math.floor(requested)));
+}
+
+// ─── Self-modification history ────────────────────────────────
+// Commits made by edit_own_file, newest last. revert_last_edit reverts only
+// these, newest first, so it never toggles a revert or undoes operator work.
+export const SELF_MOD_COMMITS_KEY = "self_mod.commits";
+const MAX_SELF_MOD_COMMITS = 50;
+const CODE_FILE_RE = /\.(ts|js|tsx|jsx|mjs|cjs)$/;
+const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/;
+
+export interface SelfModCommit {
+  sha: string;
+  path: string;
+  reason: string;
+  at: string;
+}
+
+interface KVLike {
+  getKV(key: string): string | undefined;
+  setKV(key: string, value: string): void;
+  deleteKV(key: string): void;
+}
+
+export function readSelfModCommits(db: KVLike): SelfModCommit[] {
+  try {
+    const parsed = JSON.parse(db.getKV(SELF_MOD_COMMITS_KEY) || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (c): c is SelfModCommit => !!c && typeof c.sha === "string" && COMMIT_SHA_RE.test(c.sha),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeSelfModCommits(db: KVLike, commits: SelfModCommit[]): void {
+  db.setKV(SELF_MOD_COMMITS_KEY, JSON.stringify(commits.slice(-MAX_SELF_MOD_COMMITS)));
+}
+
+function pushSelfModCommit(db: KVLike, commit: SelfModCommit): void {
+  const commits = readSelfModCommits(db);
+  if (commits.some((c) => c.sha === commit.sha)) return;
+  commits.push(commit);
+  writeSelfModCommits(db, commits);
+}
+
+function dropSelfModCommit(db: KVLike, sha: string): void {
+  writeSelfModCommits(
+    db,
+    readSelfModCommits(db).filter((c) => c.sha !== sha),
+  );
+}
+
+async function readHeadCommit(
+  conway: ToolContext["conway"],
+  repoRoot: string,
+): Promise<{ sha: string; subject: string } | null> {
+  try {
+    const res = await conway.exec(`cd ${escapeShellArg(repoRoot)} && git log -1 --format=%H%x09%s`, 10_000);
+    if (res.exitCode !== 0) return null;
+    const line = res.stdout.trim().split("\n")[0] ?? "";
+    const tab = line.indexOf("\t");
+    const sha = (tab >= 0 ? line.slice(0, tab) : line).trim();
+    if (!COMMIT_SHA_RE.test(sha)) return null;
+    return { sha, subject: tab >= 0 ? line.slice(tab + 1) : "" };
+  } catch {
+    return null;
+  }
+}
+
+const GIT_BUSY_MARKERS = new Set([
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "MERGE_HEAD",
+  "REBASE_HEAD",
+  "sequencer",
+  "rebase-merge",
+  "rebase-apply",
+  "staged-changes",
+]);
+// Prints each in-progress git operation marker, and "staged-changes" when the index differs from HEAD.
+const GIT_BUSY_SCRIPT =
+  'g=$(git rev-parse --git-dir) || exit 0; ' +
+  'for f in CHERRY_PICK_HEAD REVERT_HEAD MERGE_HEAD REBASE_HEAD sequencer rebase-merge rebase-apply; do ' +
+  '[ -e "$g/$f" ] && echo "$f"; done; ' +
+  "git diff --cached --quiet || echo staged-changes; exit 0";
+
+/**
+ * Operations someone else has in progress in the repo, or a staged index.
+ * git's --abort rolls back any cherry-pick or revert in progress, not only
+ * the tool's own, so the tools refuse to start on top of one.
+ */
+/** Reported by gitBusyState when its check itself fails. */
+const GIT_STATE_UNCHECKED = "state could not be checked";
+
+async function gitBusyState(conway: ToolContext["conway"], repo: string): Promise<string[]> {
+  try {
+    const res = await conway.exec(`cd ${repo} && ${GIT_BUSY_SCRIPT}`, 10_000);
+    return res.stdout.split("\n").map((l) => l.trim()).filter((l) => GIT_BUSY_MARKERS.has(l));
+  } catch {
+    // An unanswered check must not read as an idle repo.
+    return [GIT_STATE_UNCHECKED];
+  }
+}
+
+/** stdout and stderr of a failed command (git often explains itself on stdout). */
+function commandOutput(res: { stdout: string; stderr: string; exitCode: number }): string {
+  const text = [res.stdout, res.stderr].map((t) => (t || "").trim()).filter(Boolean).join("\n");
+  return (text || `exit code ${res.exitCode}`).slice(0, 2000);
 }
 
 // Tools whose results come from external sources and need sanitization
@@ -133,20 +277,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           },
           timeout: {
             type: "number",
-            description: "Timeout in milliseconds (default: 30000)",
+            description:
+              "Timeout in milliseconds (default 30000, min 1000, max 600000). On timeout the command and its child processes are killed. Background jobs (cmd &) keep running after the command returns.",
           },
         },
         required: ["command"],
       },
       execute: async (args, ctx) => {
         const command = args.command as string;
+        if (typeof command !== "string" || !command.trim()) return "Blocked: exec needs a command string.";
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
 
-        const result = await ctx.conway.exec(
-          command,
-          (args.timeout as number) || 30000,
-        );
+        const result = await ctx.conway.exec(command, clampExecTimeout(args.timeout));
         return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
       },
     },
@@ -165,21 +308,36 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
-        // Path confinement: restrict writes to sandbox home directory
-        const confined = confinePathToSandbox(filePath);
+        const content = args.content;
+        if (typeof filePath !== "string" || !filePath) return "Blocked: write_file needs a path string.";
+        if (typeof content !== "string") return "Blocked: write_file needs content as a string.";
+        // Path confinement: restrict writes to the home directory
+        const root = writeRootFor(ctx);
+        const confined = confinePathToRoot(filePath, root);
         if (typeof confined === "object") return confined.error;
         // Guard against overwriting protected files (same check as edit_own_file)
         const { isProtectedFile } = await import("../self-mod/code.js");
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
         }
-        await ctx.conway.writeFile(confined, args.content as string);
+        if (isLocalSandboxId(ctx.identity.sandboxId)) {
+          // The checks run again at the moment of the write, on the real
+          // path, and the write never follows a link swapped in since.
+          try {
+            writeFileVerified(confined, content, { root });
+          } catch (err) {
+            if (err instanceof UnsafePathError) return `Blocked: ${err.message}`;
+            throw err;
+          }
+          return `File written: ${confined}`;
+        }
+        await ctx.conway.writeFile(confined, content);
         return `File written: ${confined}`;
       },
     },
     {
       name: "read_file",
-      description: "Read content from a file in your sandbox.",
+      description: "Read content from a file in your sandbox (at most 2 MB when running locally).",
       category: "vm",
       riskLevel: "safe",
       parameters: {
@@ -191,6 +349,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
+        if (typeof filePath !== "string" || !filePath) return "Blocked: read_file needs a path string.";
         // Block reads of sensitive files (wallet, env, config secrets)
         const basename = filePath.split("/").pop() || "";
         const sensitiveFiles = ["wallet.json", ".env", "automaton.json"];
@@ -201,6 +360,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           basename.startsWith("private-key")
         ) {
           return "Blocked: Cannot read sensitive file. This protects credentials and secrets.";
+        }
+        if (isLocalSandboxId(ctx.identity.sandboxId)) {
+          // One checked read: O_NOFOLLOW, same inode as checked, 2 MB cap.
+          // Relative paths resolve against HOME, like write_file and exec.
+          const abs = filePath.startsWith("~")
+            ? nodePath.join(homeDir(), filePath.slice(1))
+            : nodePath.resolve(homeDir(), filePath);
+          try {
+            return readFileSafe(abs);
+          } catch (err) {
+            if (err instanceof UnsafePathError) return `Blocked: ${err.message}`;
+            return `ERROR: File not found or not readable: ${filePath}`;
+          }
         }
         try {
           return await ctx.conway.readFile(filePath);
@@ -440,6 +612,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `BLOCKED: ${validation.reason}\nChecks: ${validation.checks.map((c) => `${c.name}: ${c.passed ? "PASS" : "FAIL"} (${c.detail})`).join(", ")}`;
         }
 
+        const repoRoot = process.cwd();
+        const headBefore = await readHeadCommit(ctx.conway, repoRoot);
+
         const result = await editFile(
           ctx.conway,
           ctx.db,
@@ -452,48 +627,116 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return result.error || "Unknown error during file edit";
         }
 
-        const msg = `File edited: ${filePath} (audited + git-committed)`;
-        return result.error ? `${msg}\nWarning: ${result.error}` : msg;
+        // Record the commit for revert_last_edit only when this edit made it.
+        const headAfter = await readHeadCommit(ctx.conway, repoRoot);
+        let msg: string;
+        if (headAfter && headAfter.sha !== headBefore?.sha && headAfter.subject.startsWith("self-mod: ")) {
+          pushSelfModCommit(ctx.db, {
+            sha: headAfter.sha,
+            path: filePath,
+            reason: String(args.description ?? ""),
+            at: new Date().toISOString(),
+          });
+          msg = `File edited: ${filePath} (audited + git-committed as ${headAfter.sha.slice(0, 7)})`;
+        } else {
+          msg = `File edited: ${filePath} (audited; no new commit: the content was unchanged or git is unavailable)`;
+        }
+        if (result.error) msg += `\nWarning: ${result.error}`;
+        if (CODE_FILE_RE.test(filePath)) {
+          markRestartRequired(ctx.db, `edit_own_file ${filePath}`);
+          msg += `\n${RESTART_NOTICE}`;
+        }
+        return msg;
       },
     },
     {
       name: "revert_last_edit",
       description:
-        "Revert the last self-modification. Uses git to undo the most recent code change and rebuild.",
+        "Revert your most recent recorded self-modification (an edit_own_file commit) and rebuild. Repeated calls go further back. Operator commits are never reverted, nor commits touching protected files.",
       category: "self_mod",
       riskLevel: "caution",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
         const repoRoot = process.cwd();
+        const repo = escapeShellArg(repoRoot);
+        const commits = readSelfModCommits(ctx.db);
+        const top = commits[commits.length - 1];
+        if (!top) {
+          return "No recorded self-modification to revert. Only edits made with edit_own_file are recorded; operator commits are never reverted.";
+        }
+        const short = top.sha.slice(0, 7);
+        const label = `${short} (${top.path}: ${top.reason})`;
 
-        // Show what we're reverting
-        const lastCommit = await ctx.conway.exec(
-          `cd '${repoRoot}' && git log -1 --oneline`,
+        // Each failure below drops the entry, so one bad entry cannot block older ones.
+        const ancestor = await ctx.conway.exec(
+          `cd ${repo} && git merge-base --is-ancestor ${top.sha} HEAD`,
           10_000,
         );
-
-        // Revert
-        const result = await ctx.conway.exec(
-          `cd '${repoRoot}' && git revert HEAD --no-edit`,
-          30_000,
-        );
-        if (result.exitCode !== 0) {
-          return `Revert failed: ${result.stderr}`;
+        if (ancestor.exitCode !== 0) {
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Nothing reverted: recorded edit ${label} is no longer in the history of HEAD (reset or rewritten). It was removed from the revert list; call revert_last_edit again to revert the edit before it.`;
         }
 
-        // Rebuild
-        const build = await ctx.conway.exec(
-          `cd '${repoRoot}' && npm run build`,
-          60_000,
+        const files = await ctx.conway.exec(
+          `cd ${repo} && git diff-tree --no-commit-id --name-only -r ${top.sha}`,
+          10_000,
         );
+        if (files.exitCode !== 0) {
+          return `Revert failed: could not list the files of ${label}: ${commandOutput(files)}`;
+        }
+        const { isProtectedFile } = await import("../self-mod/code.js");
+        const touched = files.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+        const protectedFiles = touched.filter((f) => isProtectedFile(nodePath.resolve(repoRoot, f)));
+        if (protectedFiles.length > 0) {
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Refused: ${label} touches protected files (${protectedFiles.join(", ")}), so it was not reverted. It was removed from the revert list.`;
+        }
+
+        const busy = await gitBusyState(ctx.conway, repo);
+        if (busy.length > 0) {
+          return `Nothing reverted: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first; ${label} stays on the revert list.`;
+        }
+        const revert = await ctx.conway.exec(
+          `cd ${repo} && git revert --no-edit ${top.sha} 2>&1`,
+          30_000,
+        );
+        if (revert.exitCode !== 0) {
+          const output = commandOutput(revert);
+          // The tree was clean of other operations, so a REVERT_HEAD now is ours to abort.
+          const after = await gitBusyState(ctx.conway, repo);
+          if (after.includes(GIT_STATE_UNCHECKED)) {
+            return `Revert failed and the repository state could not be checked: ${output}\nInspect it by hand (git status); ${label} stays on the revert list.`;
+          }
+          const started = after.includes("REVERT_HEAD") || after.includes("sequencer");
+          if (started) {
+            await ctx.conway.exec(`cd ${repo} && git revert --abort 2>&1`, 10_000).catch(() => undefined);
+          }
+          if (/nothing to commit|nothing added to commit/i.test(output)) {
+            dropSelfModCommit(ctx.db, top.sha);
+            return `Nothing reverted: ${label} is already undone in the working tree. It was removed from the revert list.`;
+          }
+          if (!started) {
+            // git refused before starting (e.g. local changes in the way): nothing to abort, keep the entry.
+            return `Nothing reverted: git refused to start the revert (the tree is unchanged): ${output}\n${label} stays on the revert list.`;
+          }
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Revert failed and was aborted (the tree is unchanged): ${output}\n${label} was removed from the revert list; undo it by hand with edit_own_file if needed.`;
+        }
+        dropSelfModCommit(ctx.db, top.sha);
+
+        // Rebuild
+        const build = await ctx.conway.exec(`cd ${repo} && npm run build`, 120_000);
+        markRestartRequired(ctx.db, `revert_last_edit ${short}`);
 
         // Audit log
         const { logModification } = await import("../self-mod/audit-log.js");
-        logModification(ctx.db, "code_revert", `Reverted: ${lastCommit.stdout.trim()}`, {
+        logModification(ctx.db, "code_revert", `Reverted: ${label}`, {
           reversible: true,
         });
 
-        return `Reverted: ${lastCommit.stdout.trim()}. ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + build.stderr}`;
+        const buildText =
+          build.exitCode === 0 ? "Rebuild succeeded." : `Rebuild failed: ${commandOutput(build)}`;
+        return `Reverted: ${label}. ${buildText}\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -512,7 +755,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           30_000,
         );
         if (fetch.exitCode !== 0) {
-          return `Failed to fetch upstream: ${fetch.stderr}`;
+          return `Failed to fetch upstream: ${commandOutput(fetch)}`;
         }
 
         // Record what we're about to lose
@@ -527,8 +770,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           30_000,
         );
         if (reset.exitCode !== 0) {
-          return `Reset failed: ${reset.stderr}`;
+          return `Reset failed: ${commandOutput(reset)}`;
         }
+        // The recorded self-mod commits are gone from history.
+        ctx.db.deleteKV(SELF_MOD_COMMITS_KEY);
 
         // Reinstall + rebuild
         const build = await ctx.conway.exec(
@@ -543,8 +788,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           reversible: false,
         });
 
+        markRestartRequired(ctx.db, "reset_to_upstream");
         const discarded = localCommits.stdout.trim();
-        return `Reset to upstream. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."} ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + build.stderr}`;
+        return `Reset to upstream. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."} ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + commandOutput(build)} The revert list was cleared.\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -630,38 +876,58 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const commit = args.commit as string | undefined;
+        if (commit !== undefined && (typeof commit !== "string" || !COMMIT_SHA_RE.test(commit))) {
+          return `Blocked: commit must be a hex commit hash (7-40 characters), got ${JSON.stringify(commit)}.`;
+        }
 
-        // Run git commands inside sandbox via conway.exec()
+        // In the repo this process runs from, the one review_upstream_changes reads.
+        const repo = escapeShellArg(process.cwd());
         const run = async (cmd: string) => {
-          const result = await ctx.conway.exec(cmd, 120_000);
+          const result = await ctx.conway.exec(`cd ${repo} && ${cmd}`, 120_000);
           if (result.exitCode !== 0) {
-            throw new Error(
-              result.stderr ||
-                `Command failed with exit code ${result.exitCode}`,
-            );
+            throw new Error(commandOutput(result));
           }
           return result.stdout.trim();
         };
 
+        const busy = await gitBusyState(ctx.conway, repo);
+        if (busy.length > 0) {
+          return `Nothing applied: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first.`;
+        }
+
         let appliedSummary: string;
         try {
           if (commit) {
-            await run(`git cherry-pick ${commit}`);
+            try {
+              await run(`git cherry-pick ${commit}`);
+            } catch (err) {
+              // Abort only a cherry-pick this call started; the check above saw none.
+              const after = await gitBusyState(ctx.conway, repo);
+              if (after.includes(GIT_STATE_UNCHECKED)) {
+                throw new Error(`${err instanceof Error ? err.message : String(err)} (the repository state could not be checked afterwards; inspect it by hand)`);
+              }
+              if (after.includes("CHERRY_PICK_HEAD") || after.includes("sequencer")) {
+                await ctx.conway.exec(`cd ${repo} && git cherry-pick --abort 2>&1`, 10_000).catch(() => undefined);
+              }
+              throw err;
+            }
             appliedSummary = `Cherry-picked ${commit}`;
           } else {
             await run("git pull origin main --ff-only");
             appliedSummary = "Pulled all of origin/main (fast-forward)";
           }
         } catch (err: any) {
-          return `Git operation failed: ${err.message}. You may need to resolve conflicts manually.`;
+          return `Git operation failed (nothing applied; a failed cherry-pick is aborted): ${err.message}`;
         }
 
         // Rebuild
         try {
           await run(INSTALL_AND_BUILD_NO_SCRIPTS);
         } catch (err: any) {
-          return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.`;
+          markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
+          return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.\n${RESTART_NOTICE}`;
         }
+        markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
 
         // Log modification
         ctx.db.insertModification({
@@ -672,7 +938,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           reversible: true,
         });
 
-        return `${appliedSummary}. Rebuild succeeded.`;
+        return `${appliedSummary}. Rebuild succeeded.\n${RESTART_NOTICE}`;
       },
     },
 
@@ -702,36 +968,78 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["action", "name"],
       },
       execute: async (args, ctx) => {
-        const action = args.action as string;
-        const name = args.name as string;
+        const action = args.action;
+        const name = args.name;
+        if (action !== "add" && action !== "update" && action !== "remove") {
+          return `Error: action must be add, update or remove.`;
+        }
+        if (typeof name !== "string" || !HEARTBEAT_NAME_RE.test(name)) {
+          return `Error: name must match ${HEARTBEAT_NAME_RE.source}.`;
+        }
+        if (args.schedule !== undefined) {
+          if (typeof args.schedule !== "string") return "Error: schedule must be a cron expression string.";
+          try {
+            cronParser.parseExpression(args.schedule);
+          } catch (err: any) {
+            return `Error: invalid cron expression "${args.schedule}": ${err?.message || String(err)}`;
+          }
+        }
+        if (args.task !== undefined && (typeof args.task !== "string" || !(args.task in BUILTIN_TASKS))) {
+          return `Error: task must be one of: ${Object.keys(BUILTIN_TASKS).join(", ")}.`;
+        }
+        if (args.enabled !== undefined && typeof args.enabled !== "boolean") {
+          return "Error: enabled must be true or false.";
+        }
+        const raw = ctx.db.raw;
+        const exists = scheduleEntryExists(raw, name);
+        const schedule = args.schedule as string | undefined;
+        const task = args.task as string | undefined;
 
         if (action === "remove") {
-          ctx.db.upsertHeartbeatEntry({
-            name,
-            schedule: "",
-            task: "",
-            enabled: false,
-          });
-          return `Heartbeat entry '${name}' disabled`;
+          // Disabled, not deleted: its run history references the row.
+          if (!setScheduleEnabled(raw, name, false)) return `No heartbeat entry named '${name}'.`;
+        } else if (action === "add") {
+          if (exists) return `Heartbeat entry '${name}' already exists; use action "update".`;
+          const taskName = task ?? name;
+          if (!(taskName in BUILTIN_TASKS)) {
+            return `Error: '${name}' is not a built-in task; pass task (one of: ${Object.keys(BUILTIN_TASKS).join(", ")}).`;
+          }
+          addScheduleEntry(raw, name, schedule ?? "0 * * * *", taskName, args.enabled !== false);
+        } else {
+          if (!exists) return `No heartbeat entry named '${name}'; use action "add".`;
+          if (schedule !== undefined) setScheduleCron(raw, name, schedule);
+          if (args.enabled !== undefined) setScheduleEnabled(raw, name, args.enabled as boolean);
+          if (task !== undefined) setTaskAlias(raw, name, task);
         }
 
-        ctx.db.upsertHeartbeatEntry({
-          name,
-          schedule: (args.schedule as string) || "0 * * * *",
-          task: (args.task as string) || name,
-          enabled: args.enabled !== false,
-        });
+        // Mirror into the legacy table that --status reads.
+        const row = raw
+          .prepare("SELECT cron_expression, enabled FROM heartbeat_schedule WHERE task_name = ?")
+          .get(name) as { cron_expression: string; enabled: number } | undefined;
+        if (row) {
+          ctx.db.upsertHeartbeatEntry({
+            name,
+            schedule: row.cron_expression,
+            task: resolveTaskName(raw, name),
+            enabled: row.enabled === 1,
+          });
+        }
 
-        const { ulid } = await import("ulid");
         ctx.db.insertModification({
           id: ulid(),
           timestamp: new Date().toISOString(),
           type: "heartbeat_change",
-          description: `${action} heartbeat: ${name} (${args.schedule || "default"})`,
+          description: `${action} heartbeat: ${name} (${schedule ?? "unchanged schedule"})`,
           reversible: true,
         });
 
-        return `Heartbeat entry '${name}' ${action}d`;
+        if (action === "remove") {
+          return `Heartbeat entry '${name}' disabled (it stays listed; use update with enabled=true to turn it back on). Persists across restarts unless heartbeat.yml changes this entry.`;
+        }
+        const state = row
+          ? `schedule "${row.cron_expression}", task ${resolveTaskName(raw, name)}, ${row.enabled === 1 ? "enabled" : "disabled"}`
+          : "saved";
+        return `Heartbeat entry '${name}' ${action === "add" ? "added" : "updated"}: ${state}. Persists across restarts unless heartbeat.yml changes this entry.`;
       },
     },
 
@@ -923,9 +1231,13 @@ Model: ${ctx.inference.getDefaultModel()}
 
         ctx.config.genesisPrompt = sanitized.content;
 
-        // Save config
-        const { saveConfig } = await import("../config.js");
-        saveConfig(ctx.config);
+        // Write only this key, re-read from disk, so operator edits survive.
+        let persisted = "Saved to automaton.json.";
+        try {
+          updateConfigFile({ genesisPrompt: sanitized.content });
+        } catch (err: any) {
+          persisted = `Not saved to automaton.json (${err?.message || String(err)}); the change applies until restart.`;
+        }
 
         ctx.db.insertModification({
           id: ulid(),
@@ -936,7 +1248,7 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `Genesis prompt updated (sanitized, ${sanitized.content.length} chars). Reason: ${args.reason}. Previous version backed up.`;
+        return `Genesis prompt updated (sanitized, ${sanitized.content.length} chars). Reason: ${args.reason}. Previous version backed up. ${persisted}`;
       },
     },
 
@@ -960,10 +1272,31 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const pkg = args.package as string;
+        const name = args.name;
         // Defense-in-depth: validate package name inline in case the
         // policy engine's validate.package_name rule is bypassed.
-        if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
+        if (typeof pkg !== "string" || !/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
           return `Blocked: invalid package name "${pkg}"`;
+        }
+        // An invalid or duplicate name would make every inference request fail.
+        if (typeof name !== "string" || !TOOL_NAME_RE.test(name)) {
+          return `Blocked: tool name must match ${TOOL_NAME_RE.source} (letters, digits, _ and -; at most 64).`;
+        }
+        if (builtinToolNames().has(name)) {
+          return `Blocked: "${name}" is the name of a built-in tool.`;
+        }
+        if (ctx.db.getInstalledTools().some((t) => t.name === name)) {
+          return `Blocked: a tool named "${name}" is already installed.`;
+        }
+        let config: Record<string, unknown> = {};
+        if (args.config !== undefined && args.config !== "") {
+          try {
+            const parsed = typeof args.config === "string" ? JSON.parse(args.config) : args.config;
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object");
+            config = parsed as Record<string, unknown>;
+          } catch (err: any) {
+            return `Blocked: config is not a valid JSON object: ${err?.message || String(err)}`;
+          }
         }
         const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
 
@@ -971,12 +1304,11 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Failed to install MCP server: ${result.stderr}`;
         }
 
-        const { ulid } = await import("ulid");
         const toolEntry = {
           id: ulid(),
-          name: args.name as string,
+          name,
           type: "mcp" as const,
-          config: args.config ? JSON.parse(args.config as string) : {},
+          config,
           installedAt: new Date().toISOString(),
           enabled: true,
         };
@@ -991,7 +1323,7 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `MCP server installed: ${args.name}`;
+        return `Package installed: ${pkg}. MCP invocation is not supported yet, so "${name}" is not available as a tool.`;
       },
     },
 
@@ -1208,7 +1540,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitStatus } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         const status = await gitStatus(ctx.conway, repoPath);
         return `Branch: ${status.branch}\nStaged: ${status.staged.length}\nModified: ${status.modified.length}\nUntracked: ${status.untracked.length}\nClean: ${status.clean}`;
       },
@@ -1230,7 +1562,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitDiff } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         return await gitDiff(
           ctx.conway,
           repoPath,
@@ -1260,7 +1592,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitCommit } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         return await gitCommit(
           ctx.conway,
           repoPath,
@@ -1289,7 +1621,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitLog } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         const entries = await gitLog(
           ctx.conway,
           repoPath,
@@ -1322,7 +1654,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitPush } = await import("../git/tools.js");
         return await gitPush(
           ctx.conway,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx),
           (args.remote as string) || "origin",
           args.branch as string | undefined,
         );
@@ -1352,7 +1684,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitBranch } = await import("../git/tools.js");
         return await gitBranch(
           ctx.conway,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx),
           args.action as any,
           args.branch_name as string | undefined,
         );
@@ -1380,7 +1712,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return await gitClone(
           ctx.conway,
           args.url as string,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx, ""),
           args.depth as number | undefined,
         );
       },
@@ -1850,14 +2182,19 @@ Model: ${ctx.inference.getDefaultModel()}
 
         try {
           // Start the child process with nohup so it survives exec session end
-          await childConway.exec(
-            "nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 &",
+          const launch = await childConway.exec(
+            "nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 & echo $!",
             30_000,
           );
+          const lastLine = (launch.stdout || "").trim().split("\n").pop()?.trim() ?? "";
+          const pid = /^\d+$/.test(lastLine) ? lastLine : null;
 
-          // Brief pause then verify the process is actually running
+          // Brief pause, then check that exact process. The pgrep fallback
+          // is bracketed so it cannot match the checking shell itself.
           const check = await childConway.exec(
-            "sleep 2 && pgrep -f 'index.js --run' > /dev/null && echo running || echo stopped",
+            pid
+              ? `sleep 2 && kill -0 ${pid} 2>/dev/null && echo running || echo stopped`
+              : "sleep 2 && pgrep -f '[i]ndex.js --run' > /dev/null && echo running || echo stopped",
             15_000,
           );
 
@@ -2099,9 +2436,13 @@ Model: ${ctx.inference.getDefaultModel()}
           ctx.config.modelStrategy.inferenceModel = modelId;
         }
 
-        // Persist
-        const { saveConfig } = await import("../config.js");
-        saveConfig(ctx.config);
+        // Persist only the model keys, re-read from disk, so operator edits survive.
+        let persisted = "Change persisted to config.";
+        try {
+          updateConfigFile({ inferenceModel: modelId });
+        } catch (err: any) {
+          persisted = `Not saved to automaton.json (${err?.message || String(err)}); the change applies until restart.`;
+        }
 
         // Audit log
         ctx.db.insertModification({
@@ -2112,7 +2453,7 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `Inference model switched to ${modelId}. Reason: ${reason}. Change persisted to config.`;
+        return `Inference model switched to ${modelId}. Reason: ${reason}. ${persisted}`;
       },
     },
     {
@@ -2756,7 +3097,6 @@ Model: ${ctx.inference.getDefaultModel()}
         }
 
         const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
         const url = args.url as string;
         const method = (args.method as string) || "GET";
         const body = args.body as string | undefined;
@@ -2764,9 +3104,8 @@ Model: ${ctx.inference.getDefaultModel()}
           ? JSON.parse(args.headers as string)
           : undefined;
 
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
+        // Normalized: a malformed configured value falls back to the default.
+        const maxPayment = normalizeTreasuryPolicy(ctx.config.treasuryPolicy).maxX402PaymentCents;
         const result: Awaited<ReturnType<typeof x402Fetch>> & TreasuryResultFields =
           await x402Fetch(url, ctx.identity.account, method, body, extraHeaders, maxPayment);
 
@@ -3208,6 +3547,23 @@ Model: ${ctx.inference.getDefaultModel()}
   ];
 }
 
+let cachedBuiltinToolNames: Set<string> | null = null;
+
+/** Names of the built-in tools (installed tools may not reuse them). */
+export function builtinToolNames(): Set<string> {
+  if (!cachedBuiltinToolNames) {
+    cachedBuiltinToolNames = new Set(createBuiltinTools("").map((t) => t.name));
+  }
+  return cachedBuiltinToolNames;
+}
+
+const warnedInstalledTools = new Set<string>();
+function warnInstalledToolOnce(key: string, message: string): void {
+  if (warnedInstalledTools.has(key)) return;
+  warnedInstalledTools.add(key);
+  logger.warn(message);
+}
+
 /**
  * Load installed tools from the database and return as AutomatonTool[].
  * Installed tools are dynamically added from the installed_tools table.
@@ -3224,7 +3580,23 @@ export function loadInstalledTools(db: {
 }): AutomatonTool[] {
   try {
     const installed = db.getInstalledTools();
-    return installed.map((tool) => ({
+    const builtin = builtinToolNames();
+    const seen = new Set<string>();
+    const usable = installed.filter((tool) => {
+      let why: string | null = null;
+      if (typeof tool.name !== "string" || !TOOL_NAME_RE.test(tool.name)) why = "its name is not a valid tool name";
+      else if (builtin.has(tool.name)) why = "its name is a built-in tool's";
+      else if (seen.has(tool.name)) why = "another installed tool has the same name";
+      // There is no MCP client: an MCP tool could only fake a result.
+      else if (tool.type === "mcp") why = "MCP invocation is not supported";
+      if (why) {
+        warnInstalledToolOnce(`${tool.id}:${why}`, `Installed tool "${tool.name}" is not offered to the model: ${why}`);
+        return false;
+      }
+      seen.add(tool.name);
+      return true;
+    });
+    return usable.map((tool) => ({
       name: tool.name,
       description: `Installed tool: ${tool.name}`,
       category: (tool.type === "mcp" ? "conway" : "vm") as ToolCategory,
@@ -3251,8 +3623,7 @@ function createInstalledToolExecutor(tool: {
 }): AutomatonTool["execute"] {
   return async (args, ctx) => {
     if (tool.type === "mcp") {
-      // MCP tools would be executed via MCP protocol
-      return `MCP tool ${tool.name} invoked with args: ${JSON.stringify(args)}`;
+      throw new Error(`MCP tools cannot be invoked by this runtime (${tool.name} was not run).`);
     }
     // Generic installed tool — execute via sandbox shell if command is configured
     const command = tool.config?.command as string | undefined;
@@ -3317,8 +3688,21 @@ export async function executeTool(
       context,
       turnContext,
     };
-    const decision = policyEngine.evaluate(request);
-    policyEngine.logDecision(decision);
+    let decision: ReturnType<PolicyEngine["evaluate"]>;
+    try {
+      decision = policyEngine.evaluate(request);
+      policyEngine.logDecision(decision);
+    } catch (err: any) {
+      // Fail closed: a policy that cannot decide never lets the call run.
+      return {
+        id: ulid(),
+        name: toolName,
+        arguments: args,
+        result: "",
+        durationMs: Date.now() - startTime,
+        error: `Policy evaluation failed: ${err?.message || String(err)}; the call was not run.`,
+      };
+    }
 
     if (decision.action !== "allow") {
       return {
@@ -3412,6 +3796,18 @@ function unknownOutcomeText(toolName: string, reservationId: string | undefined)
     retry = "Check whether it took effect before trying again.";
   }
   return `Outcome unknown (ledger ${reservationId ?? "n/a"}): the request was sent but no reliable answer came back. It counts against your limits. ${retry}`;
+}
+
+/**
+ * Repository path for the git tools, default ~/.automaton. A leading ~ is
+ * expanded here (to HOME locally, /root in a remote sandbox) because the git
+ * helpers quote the path, and the shell never expands a quoted ~.
+ */
+function resolveGitRepoPath(value: unknown, ctx: ToolContext, fallback = "~/.automaton"): string {
+  const p = typeof value === "string" && value.trim() ? value.trim() : fallback;
+  if (p !== "~" && !p.startsWith("~/")) return p;
+  const home = isLocalSandboxId(ctx.identity.sandboxId) ? homeDir() : SANDBOX_HOME;
+  return p === "~" ? home : nodePath.join(home, p.slice(2));
 }
 
 /** Escape a string for safe shell interpolation. */

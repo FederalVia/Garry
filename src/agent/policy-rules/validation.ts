@@ -30,8 +30,11 @@ function createPackageNameRule(): PolicyRule {
       names: ["install_npm_package", "install_mcp_server"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const pkg = request.args.package as string | undefined;
+      const pkg = request.args.package;
       if (pkg === undefined) return null;
+      if (typeof pkg !== "string") {
+        return deny("validate.package_name", "VALIDATION_FAILED", "package must be a string");
+      }
 
       if (!PACKAGE_NAME_RE.test(pkg)) {
         return deny(
@@ -58,8 +61,11 @@ function createSkillNameRule(): PolicyRule {
       names: ["install_skill", "create_skill", "remove_skill"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const name = request.args.name as string | undefined;
+      const name = request.args.name;
       if (name === undefined) return null;
+      if (typeof name !== "string") {
+        return deny("validate.skill_name", "VALIDATION_FAILED", "name must be a string");
+      }
 
       if (!SKILL_NAME_RE.test(name)) {
         return deny(
@@ -86,8 +92,11 @@ function createGitHashRule(): PolicyRule {
       names: ["pull_upstream"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const commit = request.args.commit as string | undefined;
+      const commit = request.args.commit;
       if (commit === undefined) return null; // commit is optional
+      if (typeof commit !== "string") {
+        return deny("validate.git_hash", "VALIDATION_FAILED", "commit must be a string");
+      }
 
       if (!GIT_HASH_RE.test(commit)) {
         return deny(
@@ -114,10 +123,10 @@ function createPortRangeRule(): PolicyRule {
       names: ["expose_port", "remove_port"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const port = request.args.port as number | undefined;
+      const port = request.args.port;
       if (port === undefined) return null;
 
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
         return deny(
           "validate.port_range",
           "VALIDATION_FAILED",
@@ -142,8 +151,11 @@ function createCronExpressionRule(): PolicyRule {
       names: ["modify_heartbeat"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const schedule = request.args.schedule as string | undefined;
+      const schedule = request.args.schedule;
       if (schedule === undefined) return null;
+      if (typeof schedule !== "string") {
+        return deny("validate.cron_expression", "VALIDATION_FAILED", "schedule must be a string");
+      }
 
       if (!CRON_PARTS_RE.test(schedule.trim())) {
         return deny(
@@ -170,9 +182,11 @@ function createAddressFormatRule(): PolicyRule {
       names: ["transfer_credits", "send_message", "fund_child"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const address = (request.args.to_address as string | undefined)
-        ?? (request.args.agent_address as string | undefined);
+      const address = request.args.to_address ?? request.args.agent_address;
       if (address === undefined) return null;
+      if (typeof address !== "string") {
+        return deny("validate.address_format", "VALIDATION_FAILED", "address must be a string");
+      }
 
       if (!ADDRESS_RE.test(address)) {
         return deny(

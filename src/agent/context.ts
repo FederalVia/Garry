@@ -17,6 +17,7 @@ import type {
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import { createTokenCounter } from "../memory/context-manager.js";
 import { isIsolatedTurn } from "./inbox-isolation.js";
+import { isMutatingTool } from "./idle-only-tools.js";
 
 const MAX_CONTEXT_TURNS = 20;
 const SUMMARY_THRESHOLD = 15;
@@ -204,16 +205,18 @@ export function buildContextMessages(
   }
 
   // ── Anti-Repetition Warning ──
-  // Analyze the last 5 turns for repeated tool usage
+  // Counts the turns (not calls) in the last 5 that used each read-only
+  // tool. Mutating tools are real work, so a build sequence never trips it.
   const analysisWindow = recentTurns.slice(-5);
   if (analysisWindow.length >= 3) {
-    const toolFrequency: Record<string, number> = {};
+    const turnsWithTool: Record<string, number> = {};
     for (const turn of analysisWindow) {
-      for (const tc of turn.toolCalls) {
-        toolFrequency[tc.name] = (toolFrequency[tc.name] || 0) + 1;
+      for (const name of new Set(turn.toolCalls.map((tc) => tc.name))) {
+        if (isMutatingTool(name)) continue;
+        turnsWithTool[name] = (turnsWithTool[name] || 0) + 1;
       }
     }
-    const repeatedTools = Object.entries(toolFrequency)
+    const repeatedTools = Object.entries(turnsWithTool)
       .filter(([, count]) => count >= 3)
       .map(([name]) => name);
     if (repeatedTools.length > 0) {

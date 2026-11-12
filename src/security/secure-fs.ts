@@ -32,6 +32,19 @@ export class UnsafePathError extends Error {
   }
 }
 
+/**
+ * The path the kernel holds for an open fd (Linux /proc), or null where that
+ * is unavailable. O_NOFOLLOW only covers the last component, so a parent
+ * directory swapped for a link after the check is caught here, not at open.
+ */
+function fdPath(fd: number): string | null {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    return null;
+  }
+}
+
 function readOpenFd(fd: number, size: number, position = 0): Buffer {
   const buf = Buffer.alloc(size);
   let offset = 0;
@@ -54,15 +67,21 @@ export function readFileSafe(absPath: string, opts: { root?: string; maxBytes?: 
     throw new UnsafePathError(decision.code ?? "UNRESOLVABLE", decision.reason ?? "read denied");
   }
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_READ_BYTES;
-  const before = fs.lstatSync(decision.real);
-  if (before.isDirectory()) {
-    throw Object.assign(new Error(`EISDIR: ${absPath} is a directory`), { code: "EISDIR" });
+  if (decision.ino === undefined) {
+    // Absent at check time: report it as missing rather than open whatever appeared since.
+    throw Object.assign(new Error(`ENOENT: ${absPath}`), { code: "ENOENT" });
   }
   const fd = fs.openSync(decision.real, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   try {
     const st = fs.fstatSync(fd);
+    if (st.isDirectory()) {
+      throw Object.assign(new Error(`EISDIR: ${absPath} is a directory`), { code: "EISDIR" });
+    }
     if (!st.isFile()) throw new UnsafePathError("NOT_REGULAR", `${absPath} is not a regular file`);
-    if (st.dev !== before.dev || st.ino !== before.ino) {
+    // Bind the open to what checkRead inspected: the same inode, and (where
+    // the kernel reports it) the same real path.
+    const opened = fdPath(fd);
+    if (st.dev !== decision.dev || st.ino !== decision.ino || (opened !== null && opened !== decision.real)) {
       throw new UnsafePathError("UNRESOLVABLE", `${absPath} changed while it was being opened`);
     }
     if (st.nlink > 1 && sameInodeAsSensitive(st)) {
@@ -204,6 +223,18 @@ export function writeFileSafe(
     mode,
   );
   try {
+    // A parent swapped for a link after the realpath check would put the
+    // temp file (and so the rename) in another directory.
+    const opened = fdPath(fd);
+    if (opened !== null && opened !== tmp) {
+      fs.closeSync(fd);
+      try {
+        fs.unlinkSync(opened);
+      } catch {
+        // already gone
+      }
+      throw new UnsafePathError("UNRESOLVABLE", `parent of ${absPath} changed while it was being written`);
+    }
     try {
       const data = typeof content === "string" ? Buffer.from(content, "utf8") : content;
       let offset = 0;
@@ -221,6 +252,84 @@ export function writeFileSafe(
       // already gone
     }
     throw err;
+  }
+  return final;
+}
+
+/**
+ * Write a path the agent chose through one verified file descriptor.
+ *
+ * writeFileSafe's temp-file-and-rename is atomic, but rename looks the
+ * parents up again by path, so a parent directory swapped for a link between
+ * the check and the rename can move the file anywhere. Here the file is
+ * opened without truncating it, the kernel's path for the open fd and its
+ * type and link count are checked against the checked real path, and only
+ * then is it truncated and written through that fd, which no later swap can
+ * redirect. The write is not atomic: a crash can leave it partly written.
+ * Internal state files keep writeFileSafe. Returns the real path written.
+ */
+export function writeFileVerified(
+  absPath: string,
+  content: string | Buffer,
+  opts: WriteFileSafeOptions = {},
+): string {
+  const decision = checkWrite(absPath, opts);
+  if (!decision.ok || !decision.real) {
+    throw new UnsafePathError(decision.code ?? "UNRESOLVABLE", decision.reason ?? "write denied");
+  }
+  const final = decision.real;
+  const parent = path.dirname(final);
+  fs.mkdirSync(parent, { recursive: true });
+  if (fs.realpathSync(parent) !== parent) {
+    throw new UnsafePathError("UNRESOLVABLE", `parent of ${absPath} changed while it was being created`);
+  }
+
+  let mode = opts.mode;
+  if (mode === undefined) {
+    try {
+      const st = fs.lstatSync(final);
+      mode = st.isFile() ? st.mode & 0o7777 : 0o644;
+    } catch {
+      mode = 0o644;
+    }
+  }
+
+  // No O_TRUNC: nothing is changed until the opened file is confirmed. A new
+  // file is created exclusively, so a refused write can remove what it made.
+  let fd: number;
+  let created = false;
+  try {
+    fd = fs.openSync(final, fs.constants.O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    fd = fs.openSync(
+      final,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW | O_NONBLOCK,
+      mode,
+    );
+    created = true;
+  }
+  try {
+    const opened = fdPath(fd);
+    const st = fs.fstatSync(fd);
+    if ((opened !== null && opened !== final) || !st.isFile() || st.nlink > 1) {
+      if (created && opened !== null) {
+        try {
+          fs.unlinkSync(opened);
+        } catch {
+          // already gone
+        }
+      }
+      throw new UnsafePathError("UNRESOLVABLE", `${absPath} changed while it was being written`);
+    }
+    fs.ftruncateSync(fd, 0);
+    const data = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+    let offset = 0;
+    while (offset < data.length) offset += fs.writeSync(fd, data, offset, data.length - offset, offset);
+    fs.fchmodSync(fd, mode);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
   }
   return final;
 }

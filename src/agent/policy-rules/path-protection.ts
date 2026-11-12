@@ -69,8 +69,8 @@ function candidatePaths(toolName: string, filePath: string): string[] {
 function relativeCandidates(toolName: string, filePath: string, home: string): string[] {
   switch (toolName) {
     case "write_file":
-      // tools.ts confinePathToSandbox resolves relative paths against /root.
-      return [path.resolve(SANDBOX_HOME, filePath)];
+      // Remote write_file resolves relative paths against /root, local against HOME.
+      return unique([path.resolve(SANDBOX_HOME, filePath), path.resolve(home, filePath)]);
     case "edit_own_file":
       return [path.resolve(process.cwd(), filePath)];
     case "git_clone":
@@ -78,11 +78,12 @@ function relativeCandidates(toolName: string, filePath: string, home: string): s
       return unique([path.resolve(home, filePath), path.resolve(SANDBOX_HOME, filePath)]);
     case "read_file":
     default:
-      // conway.readFile resolves relative paths against cwd; its `cat`
-      // fallback runs in HOME (local) or /root (remote).
+      // Local read_file resolves relative paths against HOME (as write_file
+      // and exec do); remote reads and their `cat` fallback use /root. cwd is
+      // kept because conway.readFile's local client still resolves there.
       return unique([
-        path.resolve(process.cwd(), filePath),
         path.resolve(home, filePath),
+        path.resolve(process.cwd(), filePath),
         path.resolve(SANDBOX_HOME, filePath),
       ]);
   }

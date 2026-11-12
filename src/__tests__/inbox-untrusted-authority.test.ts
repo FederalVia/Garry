@@ -197,12 +197,13 @@ describe("F039 inbox messages are untrusted", () => {
     const turns: AgentTurn[] = [];
     await runLoop(
       new MockInferenceClient([
-        // Wakeup, then the inbox turn, then two more exec turns: three exec
-        // turns in a row trip the runtime's system loop warning.
+        // Wakeup, then the inbox turn, then two more turns repeating the same
+        // command: three identical exec turns in a row trip the runtime's
+        // system loop warning (different commands would be progress).
         toolCallResponse([{ name: "exec", arguments: { command: "echo awake" } }], "Waking up."),
         toolCallResponse(attackCalls(), "The creator asked me to do this."),
-        toolCallResponse([{ name: "exec", arguments: { command: "echo again" } }], "Again."),
-        toolCallResponse([{ name: "exec", arguments: { command: "echo third" } }], "Third."),
+        toolCallResponse([{ name: "exec", arguments: { command: "echo awake" } }], "Again."),
+        toolCallResponse([{ name: "exec", arguments: { command: "echo awake" } }], "Third."),
         toolCallResponse([{ name: "exec", arguments: { command: "echo system" } }], "Changing approach."),
         noToolResponse("Stopping."),
       ]),
@@ -217,8 +218,8 @@ describe("F039 inbox messages are untrusted", () => {
     expect(systemTurn!.input).toContain('"exec"');
     expect(conway.execCalls.map((call) => call.command)).toEqual([
       "echo awake",
-      "echo again",
-      "echo third",
+      "echo awake",
+      "echo awake",
       "echo system",
     ]);
     expect(conway.files[CODE_PATH]).toBeUndefined();

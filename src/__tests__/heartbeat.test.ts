@@ -5,7 +5,15 @@
  * Phase 1.1: Updated to pass TickContext + HeartbeatLegacyContext.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// bootstrapTopup is stubbed: the real one reads the on-chain USDC balance.
+const topupStub = vi.hoisted(() => ({ result: null as unknown }));
+vi.mock("../conway/topup.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../conway/topup.js")>();
+  return { ...actual, bootstrapTopup: async () => topupStub.result };
+});
+
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import {
   MockConwayClient,
@@ -363,7 +371,8 @@ describe("Heartbeat Tasks", () => {
       expect(result.shouldWake).toBe(false);
     });
 
-    it("wakes when has USDC but critically low credits", async () => {
+    it("wakes when has USDC but critically low credits and the topup fails", async () => {
+      topupStub.result = { success: false, amountUsd: 5, error: "payment rejected" };
       const tickCtx = createMockTickContext(db, {
         creditBalance: 0, // critical tier
         usdcBalance: 10.0, // > 5
@@ -380,6 +389,7 @@ describe("Heartbeat Tasks", () => {
 
       expect(result.shouldWake).toBe(true);
       expect(result.message).toContain("USDC");
+      expect(result.message).toContain("payment rejected");
     });
 
     it("does not wake when USDC below threshold", async () => {

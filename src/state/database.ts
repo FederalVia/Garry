@@ -111,6 +111,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   // Apply migrations
   applyMigrations(db);
+  repairPreV4InboxStatus(db);
 
   // Ensure version is recorded
   const versionRow = db
@@ -601,7 +602,14 @@ function applyMigrations(db: DatabaseType): void {
         db.exec(MIGRATION_V4);
         try { db.exec(MIGRATION_V4_ALTER); } catch { logger.debug("V4 ALTER (to_address) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER2); } catch { logger.debug("V4 ALTER (raw_content) skipped — column likely exists"); }
-        try { db.exec(MIGRATION_V4_ALTER_INBOX_STATUS); } catch { logger.debug("V4 ALTER (inbox status) skipped — column likely exists"); }
+        try {
+          db.exec(MIGRATION_V4_ALTER_INBOX_STATUS);
+          // The column is new, so every existing row just got 'received'.
+          // Rows the v3 runtime already handled carry processed_at; keep them
+          // out of the queue. Only here: after V4, processed_at is also set
+          // on unhandled social rows, so it is no proof of handling.
+          db.exec(INBOX_V4_BACKFILL_SQL);
+        } catch { logger.debug("V4 ALTER (inbox status) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_RETRY); } catch { logger.debug("V4 ALTER (inbox retry_count) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_MAX_RETRIES); } catch { logger.debug("V4 ALTER (inbox max_retries) skipped — column likely exists"); }
       },
@@ -663,6 +671,36 @@ function applyMigrations(db: DatabaseType): void {
       migrate();
     }
   }
+}
+
+const INBOX_V4_BACKFILL_SQL =
+  "UPDATE inbox_messages SET status = 'processed' WHERE processed_at IS NOT NULL";
+
+/** KV marker: the pre-V4 inbox repair below has run on this database. */
+const INBOX_REPAIR_KEY = "schema.inbox_v4_status_repair";
+
+/**
+ * Databases upgraded by the earlier V4 migration got status 'received' on
+ * every row, including messages the v3 runtime had already handled. Mark as
+ * processed only rows handled before the V4 upgrade time; later processed_at
+ * values come from unhandled social rows and mean nothing. Runs once.
+ */
+export function repairPreV4InboxStatus(db: DatabaseType): number {
+  return db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM kv WHERE key = ?").get(INBOX_REPAIR_KEY)) return 0;
+    const info = db.prepare(
+      `UPDATE inbox_messages SET status = 'processed'
+       WHERE status = 'received' AND processed_at IS NOT NULL
+         AND processed_at < (SELECT applied_at FROM schema_version WHERE version = 4)`,
+    ).run();
+    db.prepare(
+      "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+    ).run(INBOX_REPAIR_KEY, JSON.stringify({ repaired: info.changes }));
+    if (info.changes > 0) {
+      logger.info(`Marked ${info.changes} inbox message(s) handled before the V4 upgrade as processed`);
+    }
+    return info.changes;
+  })();
 }
 
 // ─── Exported Helpers ───────────────────────────────────────────
@@ -1327,7 +1365,7 @@ export function acquireTaskLease(db: DatabaseType, taskName: string, owner: stri
     `UPDATE heartbeat_schedule
      SET lease_owner = ?, lease_expires_at = ?, updated_at = datetime('now')
      WHERE task_name = ?
-       AND (lease_owner IS NULL OR lease_expires_at < datetime('now'))`,
+       AND (lease_owner IS NULL OR julianday(lease_expires_at) < julianday('now'))`,
   ).run(owner, expiresAt, taskName);
   return result.changes > 0;
 }
@@ -1344,7 +1382,7 @@ export function clearExpiredLeases(db: DatabaseType): number {
   const result = db.prepare(
     `UPDATE heartbeat_schedule
      SET lease_owner = NULL, lease_expires_at = NULL, updated_at = datetime('now')
-     WHERE lease_expires_at IS NOT NULL AND lease_expires_at < datetime('now')`,
+     WHERE lease_expires_at IS NOT NULL AND julianday(lease_expires_at) < julianday('now')`,
   ).run();
   return result.changes;
 }
@@ -1572,9 +1610,65 @@ export function unclaimInboxMessages(db: DatabaseType, ids: string[]): void {
 export function resetInboxToReceived(db: DatabaseType, ids: string[]): void {
   if (ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
+  // Only a live claim goes back; a processed or failed row stays as it is.
   db.prepare(
-    `UPDATE inbox_messages SET status = 'received' WHERE id IN (${placeholders})`,
+    `UPDATE inbox_messages SET status = 'received' WHERE status = 'in_progress' AND id IN (${placeholders})`,
   ).run(...ids);
+}
+
+/**
+ * KV: ids of the inbox batch whose tools have started. Set before the first
+ * tool of an inbox turn runs and cleared when the turn is saved, so startup
+ * recovery can tell a batch that may already have been answered.
+ */
+export const INBOX_TOOLS_STARTED_KEY = "inbox.tools_started";
+
+/**
+ * Claims left in_progress by a crash or a forced exit. A batch whose tools
+ * had started is marked processed (its reply may have gone out); the rest go
+ * back to 'received' while retries remain, else to 'failed' (the claim
+ * already counted the retry). Safe only while no other process holds claims,
+ * so it runs at startup under the instance lock.
+ */
+export function recoverStrandedInboxClaims(
+  db: DatabaseType,
+): { requeued: number; failed: number; processed: number } {
+  return db.transaction(() => {
+    let processed = 0;
+    const marker = db.prepare("SELECT value FROM kv WHERE key = ?").get(INBOX_TOOLS_STARTED_KEY) as
+      | { value: string }
+      | undefined;
+    if (marker) {
+      let ids: string[] = [];
+      try {
+        const parsed = JSON.parse(marker.value);
+        if (Array.isArray(parsed?.ids)) ids = parsed.ids.filter((id: unknown) => typeof id === "string");
+      } catch {
+        // A corrupt marker is dropped; its rows are treated like any other.
+      }
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => "?").join(",");
+        processed = db.prepare(
+          `UPDATE inbox_messages SET status = 'processed', processed_at = datetime('now')
+           WHERE status = 'in_progress' AND id IN (${placeholders})`,
+        ).run(...ids).changes;
+      }
+      db.prepare("DELETE FROM kv WHERE key = ?").run(INBOX_TOOLS_STARTED_KEY);
+    }
+    const requeued = db.prepare(
+      `UPDATE inbox_messages SET status = 'received'
+       WHERE status = 'in_progress' AND retry_count < max_retries`,
+    ).run().changes;
+    const failed = db.prepare(
+      "UPDATE inbox_messages SET status = 'failed' WHERE status = 'in_progress'",
+    ).run().changes;
+    return { requeued, failed, processed };
+  })();
+}
+
+/** Rewrite a saved turn's tool-call list (the copy context is rebuilt from). */
+export function updateTurnToolCalls(db: DatabaseType, turnId: string, toolCalls: ToolCallResult[]): void {
+  db.prepare("UPDATE turns SET tool_calls = ? WHERE id = ?").run(JSON.stringify(toolCalls), turnId);
 }
 
 export function getUnprocessedInboxCount(db: DatabaseType): number {

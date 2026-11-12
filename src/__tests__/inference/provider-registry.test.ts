@@ -409,6 +409,33 @@ describe("ProviderRegistry", () => {
     expect(isLocalProvider(resolved.provider)).toBe(true);
   });
 
+  it("takes keys from an explicit map, without touching process.env", () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.OPENAI_BASE_URL;
+    const before = { ...process.env };
+    const registry = ProviderRegistry.fromConfig(makeMissingPath(), {
+      keys: { OPENAI_API_KEY: "cnwy_k_from_map" },
+    });
+    registry.overrideBaseUrl("openai", "https://api.conway.tech/v1");
+
+    const resolved = registry.resolveModel("reasoning");
+    expect(resolved.provider.id).toBe("openai");
+    expect(resolved.provider.baseUrl).toBe("https://api.conway.tech/v1");
+    const options = openAiCtor.mock.calls.at(-1)![0] as { apiKey: string; baseURL: string };
+    expect(options.apiKey).toBe("cnwy_k_from_map");
+    expect(options.baseURL).toBe("https://api.conway.tech/v1");
+    expect(process.env).toEqual(before);
+    expect(process.env.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  it("without a key in the map or the environment, the provider is skipped", () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    const registry = ProviderRegistry.fromConfig(makeMissingPath(), { keys: {} });
+    expect(() => registry.resolveModel("reasoning")).toThrow(/No provider\/model/);
+  });
+
   it("isLocalProvider is true only for the local provider on loopback", () => {
     expect(isLocalProvider({ id: "local", baseUrl: "http://localhost:11434/v1" })).toBe(true);
     expect(isLocalProvider({ id: "local", baseUrl: "https://ollama.example.com/v1" })).toBe(false);

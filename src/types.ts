@@ -962,6 +962,8 @@ export interface TickContext {
   usdcBalance: number;               // fetched once per tick
   survivalTier: SurvivalTier;
   lowComputeMultiplier: number;      // from config
+  /** False when the credit balance could not be read; creditBalance is then a placeholder 0. */
+  creditBalanceKnown?: boolean;
   config: HeartbeatConfig;
   db: import("better-sqlite3").Database;
 }

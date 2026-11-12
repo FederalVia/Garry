@@ -663,3 +663,43 @@ describe("package install inline validation", () => {
     expect(conway.execCalls.length).toBe(1);
   });
 });
+
+// ─── Policy evaluation fails closed ─────────────────────────────
+
+describe("executeTool policy errors", () => {
+  it("returns an error and does not run the tool when evaluate throws", async () => {
+    const db = createTestDb();
+    const execute = vi.fn(async () => "ran");
+    const tool: AutomatonTool = {
+      name: "side_effect",
+      description: "test",
+      category: "vm",
+      riskLevel: "caution",
+      parameters: { type: "object", properties: {} },
+      execute,
+    };
+    const ctx: ToolContext = {
+      identity: createTestIdentity(),
+      config: createTestConfig(),
+      db,
+      conway: new MockConwayClient(),
+      inference: new MockInferenceClient(),
+    };
+    const engine = {
+      evaluate: () => {
+        throw new TypeError("schedule.trim is not a function");
+      },
+      logDecision: () => {},
+    } as unknown as Parameters<typeof executeTool>[4];
+    const result = await executeTool("side_effect", {}, [tool], ctx, engine, {
+      inputSource: "agent",
+      turnToolCallCount: 0,
+      sessionSpend: {} as any,
+    });
+    db.close();
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.error).toBe(
+      "Policy evaluation failed: schedule.trim is not a function; the call was not run.",
+    );
+  });
+});

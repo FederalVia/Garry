@@ -84,11 +84,15 @@ The runtime alternates between two states: **running** (the agent loop is active
 ```
      START
        |
-  [Load config]
+  [Load config]           Corrupt file: exit 1. Missing: genesis.json bootstrap,
+       |                  else the wizard (TTY only), else exit 1
+  [Load wallet]
        |
-  [Load wallet]           First run: interactive setup wizard
+  [Instance lock]         <dbPath>.lock; a live holder: exit 1
        |
-  [Init database]         Schema migrations applied (v1 -> v8)
+  [Init database]         Schema migrations; stranded inbox claims recovered
+       |
+  [Preload modules]       Every lazily imported module, so one code version runs
        |
   [Install Treasury]      The spending gate; reconcile pending x402 payments
        |
@@ -125,7 +129,13 @@ The runtime alternates between two states: **running** (the agent loop is active
 - `setup` -> `waking` -> `running` -> `sleeping` -> `waking` (cycle)
 - `running` -> `low_compute` (credits below threshold)
 - `running` -> `critical` (zero credits)
-- `critical` -> `dead` (zero credits for 1 hour, via heartbeat grace period)
+- `critical` -> `dead` (zero credits for 1 hour, via heartbeat grace period; or a negative balance). While `dead` with a balance of 0 or less the loop runs no inference and leaves the state unchanged; one inline topup is tried per cooldown.
+
+**Single instance.** `src/state/instance-lock.ts` takes an exclusive SQLite lock (a kernel advisory lock) on `<dbPath>.lock` (mode 0600) before the database is opened, and records `{pid, startedAt, argv}` in it. A holder makes `--run` exit 1 naming its pid and the lock path. The OS drops the lock when the holder exits or is killed, so it cannot go stale and there is no takeover race; the file is never deleted. Startup recovery of stranded inbox claims relies on this: claims of a batch whose tools had started (KV `inbox.tools_started`) are marked processed, the rest are re-queued or failed by retry count.
+
+**Shutdown.** `src/runtime/shutdown.ts` gives the main loop a stop flag and interruptible sleeps. The first SIGTERM/SIGINT requests a stop and arms a forced exit after `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). The agent loop checks the flag at the top of each iteration, before claiming inbox messages, between tool calls of a main turn (the remaining calls are recorded as skipped and the turn is saved) and after saving. The in-flight tool or inference call is not cancelled, and an inbox turn always runs to the end. Then `heartbeat.stop()` (no new task starts), `heartbeat.drain()` (the running tick and any task past its timeout are awaited), `shutdownWorkerPools()` (workers aborted and awaited), state `sleeping` (a `dead` state is kept), lock released, database closed, exit 0. A second signal or the deadline does the last steps best-effort and exits 1.
+
+**Restart after rebuild.** Tools that rebuild `dist/` set KV `restart_required` (`src/self-mod/restart-notice.ts`); the runtime shows it in the system prompt and logs it until the next start, which deletes it. Lazy modules are preloaded at startup (`src/runtime/preload.ts`), so a rebuild never mixes new modules into the running process.
 
 ---
 
@@ -135,7 +145,17 @@ The runtime alternates between two states: **running** (the agent loop is active
 src/
   index.ts                 Entry point, CLI, main run loop
   types.ts                 All shared interfaces (~1400 lines)
-  config.ts                Config load/save/merge
+  config.ts                Config load (throws ConfigError on a corrupt file), save, runtime patch (updateConfigFile)
+
+  runtime/                 Process lifecycle
+    shutdown.ts            Stop flag, interruptible sleep, deadline helper
+    preload.ts             LAZY_MODULES + preloadLazyModules() (one code version per process)
+
+  security/                Guard code shared by tools, workers and loaders
+    protected-paths.ts     Protected (write) and sensitive (read) path rules; checkRead / checkWrite on real paths
+    secure-fs.ts           readFileSafe (O_NOFOLLOW, inode check, 2 MB cap), writeFileSafe (temp file + rename)
+    secret-redaction.ts    Registered secrets redacted from inference requests and logs
+    child-env.ts           Environment for commands: credential-shaped variables removed
 
   agent/                   Core agent intelligence
     loop.ts                ReAct loop (think -> act -> observe -> persist)
@@ -171,8 +191,9 @@ src/
     x402.ts                x402 payment protocol + USDC balance
 
   heartbeat/               Background daemon
-    daemon.ts              Daemon lifecycle (start/stop/forceRun)
-    scheduler.ts           DurableScheduler (DB-backed, leased, cron)
+    daemon.ts              Daemon lifecycle (start/stop/drain/forceRun)
+    scheduler.ts           DurableScheduler (DB-backed, leased, cron, low-compute stretch, late results)
+    schedule-store.ts      heartbeat.yml seeding that keeps run state, runtime changes, task aliases, leases
     tasks.ts               11 built-in heartbeat tasks
     config.ts              heartbeat.yml load/save/merge
     tick-context.ts        Per-tick shared context builder
@@ -182,6 +203,8 @@ src/
     provision.ts           SIWE API key provisioning
 
   inference/               Model strategy
+    gate.ts                Inference spend gate: reserve / settle every call against all caps
+    policy.ts              resolveInferencePolicy (caps from modelStrategy + treasuryPolicy)
     router.ts              InferenceRouter (tier + task -> model selection)
     registry.ts            ModelRegistry (DB-backed model catalog)
     budget.ts              InferenceBudgetTracker (hourly/daily caps)
@@ -205,8 +228,9 @@ src/
     alerts.ts              AlertEngine (rule evaluation, cooldowns)
 
   state/                   Persistence
-    schema.ts              SQLite schema + migrations (v1-v8)
+    schema.ts              SQLite schema + migrations
     database.ts            60+ DB helper functions + AutomatonDatabase
+    instance-lock.ts       One --run per state database (<dbPath>.lock)
 
   soul/                    Agent identity evolution
     model.ts               SOUL.md parser/writer (soul/v1 format)
@@ -237,6 +261,7 @@ src/
 
   self-mod/                Self-modification
     code.ts                Safe file editing with protection checks
+    restart-notice.ts      KV restart_required + the notice rebuild tools return
     upstream.ts            Git upstream monitoring + cherry-pick
     tools-manager.ts       Dynamic tool/MCP server installation
     audit-log.ts           Modification audit trail
@@ -246,7 +271,8 @@ src/
     tools.ts               Git tool implementations
 
   setup/                   First-run wizard
-    wizard.ts              Interactive prompts + config creation
+    wizard.ts              Interactive prompts + config creation (TTY only)
+    genesis-bootstrap.ts   Non-interactive config from genesis.json (children)
     prompts.ts             Question definitions
     defaults.ts            Default value generators
     environment.ts         Environment detection
@@ -273,7 +299,8 @@ src/
 
 The automaton runs as a long-lived Node.js process. The `--run` command triggers the full bootstrap sequence:
 
-1. **Config load** — reads `~/.automaton/automaton.json`; triggers setup wizard on first run
+1. **Config load** — reads `~/.automaton/automaton.json`; a corrupt file exits 1; a missing one is built from `genesis.json` when present, else the setup wizard runs only on a terminal, else exit 1
+   - **Instance lock** — `<dbPath>.lock`, before the database opens
 2. **Wallet load** — reads or generates `~/.automaton/wallet.json` (viem PrivateKeyAccount)
 3. **Database init** — opens `~/.automaton/state.db`, applies schema migrations (v1-v8)
 4. **Conway client** — creates HTTP client for sandbox/credits/domain API
@@ -283,10 +310,10 @@ The automaton runs as a long-lived Node.js process. The `--run` command triggers
 7. **Policy engine** — assembles rule set from 6 rule categories, using the same normalized treasury policy as the gate
 8. **Spend tracker** — the commit-time mirror the Treasury writes and the policy rules read
 9. **Bootstrap topup** — buys minimum $5 credits from USDC if balance is low (origin `startup.bootstrap`; skipped when the balance cannot be read; a 15s timeout stops the wait, not the payment, whose open ledger row keeps other topups out)
-10. **Heartbeat daemon** — starts DurableScheduler with 6 default tasks
+10. **Heartbeat daemon** — seeds the schedule and starts DurableScheduler with 6 default tasks (lazy modules are preloaded first)
 11. **Main loop** — alternates between `runAgentLoop()` and sleeping
 
-The main loop is infinite: when the agent loop exits (sleep or dead), the outer loop waits and restarts when conditions change.
+The main loop runs until a stop is requested: when the agent loop exits (sleep or dead), the outer loop waits (interruptibly) and restarts when conditions change. See Runtime Lifecycle for shutdown.
 
 ---
 
@@ -313,7 +340,7 @@ for each turn:
 **Key behaviors:**
 
 - **Financial guard:** On each turn, checks credit balance. Below threshold triggers `low_compute` mode (model downgrade). Zero credits = `critical` (still runs, but distress signals).
-- **Inbox processing:** Claims unprocessed social messages (received -> in_progress), formats as agent input. Failed messages reset for retry (max 3).
+- **Inbox processing:** Claims one sender's batch (received -> in_progress) and runs it as an isolated reply-only turn. A batch whose tools ran is marked processed even if saving the turn failed, so its side effects are never replayed; a batch that failed before any tool ran is reset for retry (max 3).
 - **Idle detection:** Tracks turns without mutations (defined by `MUTATING_TOOLS` blocklist). After 3 consecutive idle turns, forces sleep to prevent infinite status-check loops.
 - **Loop detection:** Tracks tool call patterns. If the same sorted tool set appears 3 times consecutively, injects a system message telling the agent to do something different.
 - **Wake event draining:** On loop entry, consumes all stale wake events so they don't immediately re-wake the agent after its first sleep.
@@ -397,6 +424,8 @@ InferenceRouter.route(request)
 
 **Budget tracker:** Enforces hourly, daily, and per-call cost ceilings. Prevents runaway inference spend.
 
+**Inference gate** (`src/inference/gate.ts`): the one process-wide enforcement point. Every HTTP attempt, from the main loop's router and from the unified client used by the planner, the orchestrator and workers, first reserves its worst-case cost (prompt tokens plus `maxTokensPerTurn` at the model's price, or the most expensive baseline price for an unpriced model) in the `inference_ledger` table, in one immediate transaction that checks the daily cap (`treasuryPolicy.maxInferenceDailyCents`), the hourly cap, the session and per-call caps, per-task caps and the orchestration share. It settles afterwards: committed at actual usage, released when the provider provably did not bill, held at the reserved amount when unknown. A refused call is never sent and raises `InferenceRefusedError` with a code and `retryAfterMs`; the main loop then persists nothing, runs at most one survival turn from the survival allowance, or sleeps until the refusal clears (doubling 10..60 min backoff when it never clears by itself). Caps come from `resolveInferencePolicy` (`src/inference/policy.ts`).
+
 ---
 
 ## Memory System
@@ -445,15 +474,23 @@ The heartbeat runs continuously in the background via `setTimeout` (no `setInter
 ```
 Every tick (default 60s):
   1. Build TickContext (fetch credit balance + USDC balance ONCE)
-  2. Get due tasks (cron expression evaluation)
-  3. For each due task:
+  2. Get due tasks (cron expression evaluation; low_compute and below
+     stretch non-essential tasks by lowComputeMultiplier)
+  3. For each due task (stop() ends the loop between tasks):
      a. Check survival tier minimum
-     b. Acquire lease (60s TTL, prevents double-execution)
-     c. Execute task function
-     d. Record result in heartbeat_history
-     e. Release lease
-  4. If task returns shouldWake=true: insert wake event
+     b. Resolve the task function (entry name, else its alias)
+     c. Acquire lease (60s TTL, prevents double-execution)
+     d. Execute task function, racing its timeout
+     e. Record result in heartbeat_history; schedule a retry while
+        consecutive failures <= maxRetries
+     f. Release lease, unless the task timed out: then the lease is held
+        and the task is not restarted until it settles (given up on
+        after max(10 min, 10 x timeout))
+  4. If task returns shouldWake=true (also late, after a timeout):
+     insert wake event {taskName}, then notify onWakeRequest
 ```
+
+**Schedule store** (`schedule-store.ts`): `heartbeat.yml` seeds `heartbeat_schedule` at startup without touching run state. A YAML value replaces a row's cron/enabled/task only when it differs from the snapshot of the previous seed (KV `heartbeat.seed.<name>`), i.e. when the operator edited the file; otherwise runtime changes made with `modify_heartbeat` are kept. Entries whose task differs from their name store the mapping in KV `heartbeat.task.<name>`. A last run in the future (clock stepped back) is cleared. Lease expiry compares with `julianday()`, so ISO timestamps and SQLite times compare correctly. The legacy `heartbeat_entries` table only mirrors the schedule for `--status`.
 
 **Built-in tasks (11):**
 
@@ -471,7 +508,9 @@ Every tick (default 60s):
 | `prune_dead_children` | configurable | Cleanup dead child records/sandboxes |
 | `report_metrics` | configurable | Metrics snapshot + alert evaluation |
 
-**Wake events:** Tasks that detect actionable conditions insert atomic wake events into the `wake_events` table. The main run loop checks this table every 30 seconds during sleep.
+**Wake events:** Tasks that detect actionable conditions insert atomic wake events into the `wake_events` table. The scheduler is their only writer. The main run loop checks this table every 30 seconds during sleep, and the reasons (sanitized; inbox wakes as a generic sentence) are shown in the first prompt of the wake.
+
+**Balance-driven tasks:** `TickContext.creditBalanceKnown` is false when the balance read failed; `check_credits`, `check_usdc_balance` and the `heartbeat_ping` distress then do nothing. Any successful read above 0 clears `zero_credits_since`.
 
 ---
 
@@ -535,7 +574,11 @@ The `ConwayClient` interface provides all Conway API operations:
 - **Domains:** `searchDomains`, `registerDomain`, `listDnsRecords`, `addDnsRecord`, `deleteDnsRecord`
 - **Models:** `listModels`
 
-**Auto-routing:** When `sandboxId` is empty, all operations execute locally (shell exec, filesystem I/O). When set, routes through Conway API. On 403 errors (mismatched API key), falls back to local execution.
+**Auto-routing:** When `sandboxId` is empty, all operations execute locally (shell exec, filesystem I/O). When set, routes through Conway API. A 403 (mismatched or revoked API key) is an error; the operation is never run locally instead.
+
+**Local exec** (`execLocalCommand`): async `spawn("/bin/sh", ["-c", cmd])` in HOME, in its own process group (`detached`), with `childProcessEnv()`. Output is collected up to 10 MB per stream. When the shell exits, the result is returned within 200 ms even if a background job still holds the pipes (they are drained and unref'd, so the job keeps running). On timeout the group gets SIGTERM, then SIGKILL after 2 s, and the result is exit code 124. Groups still running when the process exits are killed. The `exec` tool clamps the timeout to 1 s .. 10 min (default 30 s).
+
+**Remote exec:** the HTTP timeout is the command timeout plus 15 s, with no client retry: a re-sent POST could run the command twice. Only 404 routing errors are re-sent (same idempotency key).
 
 **Resilient HTTP** (`http-client.ts`): All API calls go through `ResilientHttpClient` with configurable retries (default 3 on 429/5xx), jittered exponential backoff, circuit breaker (5 failures -> 60s open), and idempotency key support for mutating operations.
 
@@ -547,12 +590,14 @@ The `ConwayClient` interface provides all Conway API operations:
 
 The automaton can modify its own code:
 
-- **File editing** (`code.ts`): `edit_own_file` tool applies diffs to source files. Protected files (constitution, wallet, DB, config) are blocked by path protection rules. All edits are logged to the `modifications` table.
-- **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` shows commit diffs. `pull_upstream` cherry-picks individual commits. The automaton is not obligated to accept all upstream changes.
-- **Tool installation** (`tools-manager.ts`): `install_npm_package` and `install_mcp_server` add new capabilities at runtime.
+- **File editing** (`code.ts`): `edit_own_file` tool applies diffs to source files. Protected files (constitution, wallet, DB, config) are blocked by path protection rules. All edits are logged to the `modifications` table. Each edit commits only its file; the tool records the new `self-mod:` commit's sha in KV `self_mod.commits` (only when this edit created it).
+- **Revert** (`tools.ts`): `revert_last_edit` reverts the newest recorded sha (`git revert --no-edit <sha>`) after checking it is an ancestor of HEAD and touches no protected file. Failed, stale or refused entries are dropped with a message, so a bad entry never blocks older ones. Operator commits are never reverted. `reset_to_upstream` clears the list.
+- **Restart notice** (`restart-notice.ts`): every tool that rebuilds says the running process keeps the old code and sets KV `restart_required`.
+- **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` shows commit diffs. `pull_upstream` cherry-picks individual commits (hex hashes only), running every command with `cd` into the runtime's repo (`process.cwd()`), and aborts a failed cherry-pick. The automaton is not obligated to accept all upstream changes.
+- **Tool installation** (`agent/tools.ts`; `tools-manager.ts` holds older helpers no tool calls): `install_npm_package` adds packages. `install_mcp_server` validates the tool name (`^[a-zA-Z0-9_-]{1,64}$`, not a builtin, not installed) and installs the package, but MCP tools are not offered to the model: there is no MCP client. `loadInstalledTools` skips invalid, duplicate, builtin-colliding and MCP entries.
 - **Audit log** (`audit-log.ts`): Every modification is recorded with timestamp, type, diff, and hash for creator review.
 
-The `~/.automaton/` directory is a git repository. Every state change is versioned.
+The `~/.automaton/` directory is a git repository. Every state change is versioned. The git tools default to it, expanding `~` before the path is quoted, and treat a failing git command as an error.
 
 ---
 
@@ -735,7 +780,11 @@ AutomatonConfig
   modelStrategy           Model routing config
 ```
 
-**Deep-merged fields:** `treasuryPolicy`, `modelStrategy`, and `soulConfig` are merged with defaults so partial overrides work correctly.
+**Deep-merged fields:** `modelStrategy` and `soulConfig` are merged with defaults so partial overrides work correctly. `treasuryPolicy` goes through `normalizeTreasuryPolicy`: any field that is not a finite number >= 0 (whatever its type) takes its default, with a warning.
+
+**Loading:** `loadConfig()` returns null only when the file is missing and throws `ConfigError` when it cannot be read or parsed.
+
+**Saving:** `saveConfig()` writes the whole file atomically (temp file + rename) and is used by the wizard, `--configure` and `--pick-model`. The running agent never writes its startup snapshot back: `updateConfigFile({ genesisPrompt?, inferenceModel? })` re-reads the file, changes only those keys (and `modelStrategy.inferenceModel` when present), and writes atomically; on a missing or corrupt file it throws and writes nothing.
 
 ---
 
@@ -749,11 +798,15 @@ The automaton operates under a defense-in-depth security model:
 
 **Layer 3 — Injection defense** (input sanitization): 8 detection checks on all external input: instruction patterns, authority claims, boundary manipulation, ChatML markers, encoding evasion, multi-language injection, financial manipulation, self-harm instructions.
 
-**Layer 4 — Path protection** (filesystem): Protected files cannot be written (constitution, wallet, DB, config, SOUL.md). Sensitive files cannot be read (private key, API keys, .env).
+**Layer 4 — Path protection** (filesystem, `src/security/protected-paths.ts`): Protected paths cannot be written (state directory outside its writable entries, secrets, shell startup files, system directories, guard code). Sensitive paths cannot be read (secret files and directories, system secrets, the state directory outside its readable allowlist). Rules are checked on the lexical and the real path; links in the final component are refused. The policy rules check before the call, and `secure-fs.ts` checks again at the moment of I/O for local `read_file`/`write_file`, `edit_own_file`, worker file tools and the runtime's state writers.
 
-**Layer 5 — Command safety** (shell): Forbidden command patterns blocked (rm -rf /, DROP TABLE, kill -9, etc.). Rate limits on self-modification operations.
+**Layer 5 — Command safety** (shell): the exec tripwire denies commands that name secrets, reach into the state directory, glob hidden home paths, dump the environment, kill the runtime or write guard files. It is a tripwire, not a boundary: exec runs as the wallet's OS user. Rate limits on self-modification operations.
 
-**Layer 6 — Financial limits** (treasury): Every outflow passes through the Treasury, which reserves it against rolling caps per budget, the minimum reserve and single-flight rules before anything is sent or signed. Inference spend has its own caps.
+**Layer 5b — Secrets out of reach:** API keys are not copied into `process.env`; every command (agent and workers) gets `childProcessEnv()`, without credential-shaped variables (operator tokens such as `GITHUB_TOKEN` included). Registered secrets are redacted from inference requests and logs (`secret-redaction.ts`).
+
+**Layer 6 — Financial limits** (treasury): Every outflow passes through the Treasury, which reserves it against rolling caps per budget, the minimum reserve and single-flight rules before anything is sent or signed. Inference spend has its own caps, enforced by the inference gate.
+
+**Fail closed:** a policy rule that throws denies the call (`POLICY_RULE_ERROR`), `executeTool` turns a failing policy evaluation into an error result without running the tool, and a tool exception is recorded as that call's error, so a bad argument never discards a turn whose earlier tools already ran.
 
 **Layer 7 — Authority hierarchy** (trust levels): Creator input has highest trust. Self-generated input is trusted. Peer/external input has reduced trust and cannot invoke dangerous tools.
 

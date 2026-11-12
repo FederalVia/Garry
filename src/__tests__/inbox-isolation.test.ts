@@ -728,6 +728,28 @@ describe("inbox turn isolation", () => {
     expect(waiting.c).toBe(27);
   });
 
+  for (const [label, wakeReply] of [
+    ["a text-only reply", () => noToolResponse("Noted. The inbox turn will handle it.")],
+    ["the sleep tool", () => toolCallResponse([{ name: "sleep", arguments: { duration_seconds: 60, reason: "nothing to do" } }])],
+  ] as const) {
+    it(`a waiting message is handled in the same cycle when the wakeup turn ends it with ${label}`, async () => {
+      const sender = addr(0xd0);
+      insertMessage(sender, "please reply");
+      const inference = new ScriptedInference(
+        (_n, call) => toolCallResponse([{ name: "send_message", arguments: { to_address: senderOf(call), content: "ack" } }]),
+        wakeReply,
+      );
+      await run(inference);
+
+      expect(inference.privilegedCalls).toHaveLength(1);
+      expect(inference.inboxCalls).toHaveLength(1);
+      expect(social.sentMessages).toHaveLength(1);
+      const row = db.raw.prepare("SELECT status FROM inbox_messages").get() as { status: string };
+      expect(row.status).toBe("processed");
+      expect(db.getAgentState()).toBe("sleeping");
+    });
+  }
+
   it("a failing orchestrator tick does not handle a batch twice", async () => {
     const sender = addr(0xd1);
     insertMessage(sender, "hello");

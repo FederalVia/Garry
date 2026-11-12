@@ -10,7 +10,7 @@
 
 import readline from "readline";
 import chalk from "chalk";
-import { loadConfig, saveConfig, resolvePath } from "../config.js";
+import { loadConfig, saveConfig, resolvePath, ConfigError } from "../config.js";
 import { DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { AutomatonConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
 import { closePrompts } from "./prompts.js";
@@ -322,7 +322,15 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
 // ─── Entry point ──────────────────────────────────────────────────
 
 export async function runConfigure(): Promise<void> {
-  const config = loadConfig();
+  let config: AutomatonConfig | null;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    console.log(chalk.red(`  automaton.json cannot be read: ${err.message}\n  Fix or restore it, then try again.\n`));
+    process.exitCode = 1;
+    return;
+  }
   if (!config) {
     console.log(chalk.red("  Automaton is not configured. Run: automaton --setup\n"));
     return;

@@ -49,10 +49,25 @@ export async function buildTickContext(
 
   // Fetch balances ONCE
   let creditBalance = 0;
+  let creditBalanceKnown = false;
   try {
-    creditBalance = await conway.getCreditsBalance();
+    const value = await conway.getCreditsBalance();
+    if (typeof value === "number" && Number.isFinite(value)) {
+      creditBalance = value;
+      creditBalanceKnown = true;
+    }
   } catch (err: any) {
     logger.error("Failed to fetch credit balance", err instanceof Error ? err : undefined);
+  }
+
+  // Any trustworthy non-zero reading ends a zero-credit streak, so the dead
+  // grace period is never measured across a funded stretch.
+  if (creditBalanceKnown && creditBalance > 0) {
+    try {
+      db.prepare("DELETE FROM kv WHERE key = 'zero_credits_since'").run();
+    } catch (err: any) {
+      logger.warn(`Could not clear zero_credits_since: ${err?.message || String(err)}`);
+    }
   }
 
   let usdcBalance = 0;
@@ -75,6 +90,7 @@ export async function buildTickContext(
     usdcBalance,
     survivalTier,
     lowComputeMultiplier,
+    creditBalanceKnown,
     config,
     db,
   };

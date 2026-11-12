@@ -23,7 +23,7 @@ import {
   matchSensitive,
   resolveReal,
 } from "../../security/protected-paths.js";
-import { listDirSafe, readFileSafe, UnsafePathError, writeFileSafe } from "../../security/secure-fs.js";
+import { listDirSafe, readFileSafe, UnsafePathError, writeFileVerified } from "../../security/secure-fs.js";
 
 const MAX_EXEC_OUTPUT = 16_000;
 const MAX_EXEC_BUFFER = 1024 * 1024;
@@ -127,7 +127,7 @@ async function readContent(ctx: WorkerFsContext, abs: string): Promise<string> {
 
 async function writeContent(ctx: WorkerFsContext, abs: string, content: string): Promise<void> {
   if (ctx.localMode) {
-    writeFileSafe(abs, content, { root: ctx.root });
+    writeFileVerified(abs, content, { root: ctx.root });
     return;
   }
   await ctx.conway.writeFile(abs, content);

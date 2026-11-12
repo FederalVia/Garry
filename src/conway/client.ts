@@ -6,7 +6,7 @@
  * Adapted from @aiws/sdk patterns.
  */
 
-import { execSync } from "child_process";
+import { spawn } from "child_process";
 import fs from "fs";
 import nodePath from "path";
 import type {
@@ -30,6 +30,203 @@ import { keccak256, toHex } from "viem";
 import type { Address, PrivateKeyAccount } from "viem";
 import { randomUUID } from "crypto";
 import type { ChainType, ChainIdentity } from "../identity/chain.js";
+import { childProcessEnv } from "../security/child-env.js";
+
+/** Default command timeout when the caller gives none. */
+export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+/** Remote exec: the HTTP call may outlive the command by this much (queueing, upload of output). */
+export const REMOTE_EXEC_HTTP_MARGIN_MS = 15_000;
+const MAX_EXEC_OUTPUT_BYTES = 10 * 1024 * 1024;
+const KILL_GRACE_MS = 2_000;
+/** After the shell exits, how long to wait for its pipes to close before detaching them. */
+const PIPE_CLOSE_GRACE_MS = 200;
+
+// Process groups of commands still running in the foreground. A runtime
+// that exits mid-command must not leave them behind.
+const activeExecGroups = new Set<number>();
+let execExitHookInstalled = false;
+
+function installExecExitHook(): void {
+  if (execExitHookInstalled) return;
+  execExitHookInstalled = true;
+  process.on("exit", () => {
+    for (const pid of activeExecGroups) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+}
+
+function groupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * Run a shell command on this machine without blocking the event loop. The
+ * command gets its own process group, the scrubbed child environment and
+ * HOME as cwd. On timeout the whole group is killed (SIGTERM, then SIGKILL
+ * after 2 s) and the result has exit code 124. Background jobs (`cmd &`)
+ * keep running after the shell exits; their output is discarded.
+ */
+export function execLocalCommand(
+  command: string,
+  timeoutMs?: number,
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<ExecResult> {
+  const timeout = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_EXEC_TIMEOUT_MS;
+  installExecExitHook();
+
+  return new Promise<ExecResult>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("/bin/sh", ["-c", command], {
+        cwd: opts.cwd ?? (process.env.HOME || "/root"),
+        env: opts.env ?? childProcessEnv(),
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err: any) {
+      resolve({ stdout: "", stderr: err?.message || String(err), exitCode: 1 });
+      return;
+    }
+
+    const pid = child.pid;
+    const out: Buffer[] = [];
+    const errOut: Buffer[] = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let collecting = true;
+    let settled = false;
+    let timedOut = false;
+    let overflow = false;
+    let shellExited = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+
+    if (pid !== undefined) activeExecGroups.add(pid);
+
+    const detachPipes = () => {
+      collecting = false;
+      // Keep draining so a background job never dies of SIGPIPE, but never
+      // let its pipes keep this process alive.
+      for (const stream of [child.stdout, child.stderr]) {
+        if (!stream) continue;
+        stream.removeAllListeners("data");
+        stream.on("data", () => {});
+        stream.on("error", () => {});
+        stream.resume();
+        (stream as unknown as { unref?: () => void }).unref?.();
+      }
+      child.unref();
+    };
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (closeTimer) clearTimeout(closeTimer);
+      if (pid !== undefined) activeExecGroups.delete(pid);
+      detachPipes();
+      const stdout = Buffer.concat(out).toString("utf8");
+      let stderr = Buffer.concat(errOut).toString("utf8");
+      if (overflow) {
+        resolve({
+          stdout,
+          stderr: `${stderr}${stderr ? "\n" : ""}Command output exceeded 10 MB; its process group was killed.`,
+          exitCode: 1,
+        });
+        return;
+      }
+      if (timedOut) {
+        resolve({
+          stdout,
+          stderr: `${stderr}${stderr ? "\n" : ""}Command timed out after ${timeout} ms; its process group was killed.`,
+          exitCode: 124,
+        });
+        return;
+      }
+      if (exitCode === null && exitSignal) {
+        stderr = `${stderr}${stderr ? "\n" : ""}Command terminated by ${exitSignal}`;
+      }
+      resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
+    };
+
+    const stopGroup = (reason: "timeout" | "overflow") => {
+      if (settled) return;
+      if (reason === "timeout") timedOut = true;
+      else overflow = true;
+      collecting = false;
+      if (pid === undefined) {
+        finish();
+        return;
+      }
+      killGroup(pid, reason === "overflow" ? "SIGKILL" : "SIGTERM");
+      if (killTimer) return;
+      killTimer = setTimeout(() => {
+        if (groupAlive(pid)) killGroup(pid, "SIGKILL");
+        finish();
+      }, reason === "overflow" ? 0 : KILL_GRACE_MS);
+    };
+
+    const collect = (chunks: Buffer[], which: "out" | "err") => (chunk: Buffer) => {
+      if (!collecting) return;
+      if (which === "out") outBytes += chunk.length;
+      else errBytes += chunk.length;
+      if (outBytes > MAX_EXEC_OUTPUT_BYTES || errBytes > MAX_EXEC_OUTPUT_BYTES) {
+        stopGroup("overflow");
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout?.on("data", collect(out, "out"));
+    child.stderr?.on("data", collect(errOut, "err"));
+
+    const timer = setTimeout(() => stopGroup("timeout"), timeout);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      errOut.push(Buffer.from(err.message));
+      exitCode = 1;
+      finish();
+    });
+
+    child.on("exit", (code, signal) => {
+      shellExited = true;
+      exitCode = code;
+      exitSignal = signal;
+      if (timedOut || overflow) {
+        // Finish as soon as the whole group is gone; else the kill timer does.
+        if (pid === undefined || !groupAlive(pid)) finish();
+        return;
+      }
+      if (pid !== undefined) activeExecGroups.delete(pid);
+      closeTimer = setTimeout(finish, PIPE_CLOSE_GRACE_MS);
+    });
+
+    child.on("close", () => {
+      if (shellExited && !timedOut && !overflow) finish();
+    });
+  });
+}
 
 export interface ConwayClientOptions {
   apiUrl: string;
@@ -116,6 +313,8 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
       onSend?: () => void;
       /** "manual" for value-moving calls: a redirect is an answer, never followed. */
       redirect?: RequestRedirect;
+      /** Per-attempt HTTP timeout in ms (default: the client's base timeout). */
+      timeout?: number;
     },
   ): Promise<any> {
     // Conway LB has an intermittent routing bug that returns 404 for valid
@@ -134,6 +333,7 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
         body: body ? JSON.stringify(body) : undefined,
         idempotencyKey: requestOptions?.idempotencyKey,
         retries: requestOptions?.retries,
+        ...(requestOptions?.timeout !== undefined ? { timeout: requestOptions.timeout } : {}),
         ...(requestOptions?.redirect ? { redirect: requestOptions.redirect } : {}),
       });
 
@@ -175,40 +375,29 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
 
   const isLocal = !sandboxId;
 
-  const execLocal = (command: string, timeout?: number): ExecResult => {
-    try {
-      const stdout = execSync(command, {
-        timeout: timeout || 30_000,
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024,
-        cwd: process.env.HOME || "/root",
-      });
-      return { stdout: stdout || "", stderr: "", exitCode: 0 };
-    } catch (err: any) {
-      return {
-        stdout: err.stdout || "",
-        stderr: err.stderr || err.message || "",
-        exitCode: err.status ?? 1,
-      };
-    }
-  };
-
   const exec = async (
     command: string,
     timeout?: number,
   ): Promise<ExecResult> => {
-    if (isLocal) return execLocal(command, timeout);
+    if (isLocal) return execLocalCommand(command, timeout);
 
     // Remote sandboxes default to / as cwd. Wrap commands to run from /root
     // (matching local exec behavior) unless the command already sets a directory.
     const wrappedCommand = `cd /root && ${command}`;
+    const commandTimeout = timeout && timeout > 0 ? timeout : DEFAULT_EXEC_TIMEOUT_MS;
 
     try {
+      // The HTTP call lasts as long as the command plus a margin, and is
+      // never re-sent after a client-side abort: the command may be running.
       const result = await request(
         "POST",
         `/v1/sandboxes/${sandboxId}/exec`,
-        { command: wrappedCommand, timeout },
-        { idempotencyKey: ulid() },
+        { command: wrappedCommand, timeout: commandTimeout },
+        {
+          idempotencyKey: ulid(),
+          timeout: commandTimeout + REMOTE_EXEC_HTTP_MARGIN_MS,
+          retries: 0,
+        },
       );
       return {
         stdout: result.stdout || "",
@@ -709,6 +898,11 @@ function httpError(method: string, path: string, status: number, text: string): 
   err.method = method;
   err.path = path;
   return err;
+}
+
+/** True when this sandbox id means "run on this machine" (empty, whitespace, "undefined", "null"). */
+export function isLocalSandboxId(value: string | null | undefined): boolean {
+  return normalizeSandboxId(value) === "";
 }
 
 function normalizeSandboxId(value: string | null | undefined): string {

@@ -6,6 +6,8 @@
  */
 
 import path from "node:path";
+import { createHash } from "node:crypto";
+import type Database from "better-sqlite3";
 import type {
   AutomatonIdentity,
   AutomatonConfig,
@@ -28,10 +30,12 @@ import type {
   InferenceResult,
   SurvivalTier,
   ChatMessage,
+  WakeEventRow,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { buildSystemPrompt, buildWakeupPrompt } from "./system-prompt.js";
+import type { WakeReason } from "./system-prompt.js";
 import { buildContextMessages, trimContext } from "./context.js";
 import {
   createBuiltinTools,
@@ -50,6 +54,8 @@ import {
   resetInboxToReceived,
   unclaimInboxMessages,
   consumeNextWakeEvent,
+  updateTurnToolCalls,
+  INBOX_TOOLS_STARTED_KEY,
 } from "../state/database.js";
 import type { InboxMessageRow } from "../state/database.js";
 import { ulid } from "ulid";
@@ -78,7 +84,7 @@ import { HarnessRegistry } from "./harness-registry.js";
 import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
-import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { isIdleOnlyTool, isMutatingTool } from "./idle-only-tools.js";
 import {
   INBOX_ALLOWED_TOOLS,
   INBOX_HISTORY_LIMIT,
@@ -111,6 +117,16 @@ const REFUSAL_SLEEP_MIN_MS = 60_000;
 const REFUSAL_SLEEP_MAX_MS = 6 * 60 * 60_000;
 /** Refusals the survival allowance does not apply to. */
 const NO_SURVIVAL_CODES = new Set(["TASK_CAP", "SURVIVAL_TIER"]);
+
+/** Stored as the error of calls not run because the runtime is stopping. */
+export const SHUTDOWN_SKIP_ERROR = "Skipped: the runtime is shutting down.";
+/** Saved for a call before it runs; replaced by its result when it returns. */
+export const INTERRUPTED_TOOL_ERROR =
+  "Interrupted: the runtime exited while this call was running; its effects are unknown.";
+/** KV: why the last cycle was force-slept, shown to the next real turn. */
+const LOOP_ENFORCEMENT_KEY = "loop.enforcement_note";
+const LOOP_ENFORCEMENT_SLEEP_MS = 5 * 60_000;
+const INLINE_TOPUP_COOLDOWN_MS = 60_000;
 
 const SURVIVAL_TURN_NOTE =
   "Your inference budget is exhausted; this is a limited survival turn. " +
@@ -151,6 +167,39 @@ export interface AgentLoopOptions {
   onStateChange?: (state: AgentState) => void;
   onTurnComplete?: (turn: AgentTurn) => void;
   ollamaBaseUrl?: string;
+  /**
+   * Polled at the top of each iteration, before claiming inbox rows, before
+   * each tool call of a privileged turn and after each save. When it returns
+   * true the loop saves what ran and returns without changing the state.
+   */
+  shouldStop?: () => boolean;
+  /** Wake events the runtime consumed while sleeping; shown as wake reasons. */
+  wakeEvents?: WakeEventRow[];
+}
+
+// One worker pool per database (in practice, per process): workers outlive
+// the wake cycle that spawned them, so liveness checks must see them all.
+const sharedWorkerPools = new Map<Database.Database, LocalWorkerPool>();
+
+/** The worker pool shared by every cycle on this database, once created. */
+export function getSharedWorkerPool(db: AutomatonDatabase): LocalWorkerPool | undefined {
+  return sharedWorkerPools.get(db.raw);
+}
+
+/** Abort every worker and wait for them to settle, for at most timeoutMs. */
+export async function shutdownWorkerPools(timeoutMs: number): Promise<void> {
+  const pools = [...sharedWorkerPools.values()];
+  sharedWorkerPools.clear();
+  if (pools.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, timeoutMs));
+    timer.unref?.();
+  });
+  // shutdown() aborts synchronously, then waits for each worker to settle.
+  const settled = Promise.allSettled(pools.map((pool) => pool.shutdown())).then(() => undefined);
+  await Promise.race([settled, deadline]);
+  if (timer) clearTimeout(timer);
 }
 
 /**
@@ -162,6 +211,14 @@ export async function runAgentLoop(
 ): Promise<void> {
   const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
     options;
+  const shouldStop = (): boolean => {
+    try {
+      return options.shouldStop?.() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (shouldStop()) return;
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
@@ -256,40 +313,17 @@ export async function runAgentLoop(
     try {
       planModeController = new PlanModeController(db.raw);
 
-      // Bridge automaton config API keys to env vars for the provider registry.
-      // The registry reads keys from process.env; the automaton config may have
-      // them from config.json or Conway provisioning.
-      if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
-        process.env.OPENAI_API_KEY = config.openaiApiKey;
-      }
-      if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
-        process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
-      }
-      // Conway Compute API is OpenAI-compatible. Use it as fallback when no
-      // direct OpenAI key is available. The conwayApiKey is always present
-      // (required for sandbox operations), so this ensures the orchestrator
-      // can always make inference calls.
-      if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
-        process.env.CONWAY_API_KEY = config.conwayApiKey;
-      }
-      // If no OpenAI key is set but Conway key is available, use Conway as
-      // the OpenAI provider (Conway Compute is OpenAI API-compatible).
-      if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
-        process.env.OPENAI_API_KEY = config.conwayApiKey;
-        process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
-      }
-
+      // Keys go to the registry directly, never into process.env, where
+      // every child process would inherit them.
+      const providerKeys = resolveProviderKeys(config);
       const providersPath = path.join(
         process.env.HOME || process.cwd(),
         ".automaton",
         "inference-providers.json",
       );
-      const registry = ProviderRegistry.fromConfig(providersPath);
-
-      // If OPENAI_BASE_URL was set (Conway fallback), update the default
-      // provider's baseUrl so the OpenAI client points to Conway Compute.
-      if (process.env.OPENAI_BASE_URL) {
-        registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
+      const registry = ProviderRegistry.fromConfig(providersPath, { keys: providerKeys.keys });
+      if (providerKeys.openaiBaseUrl) {
+        registry.overrideBaseUrl("openai", providerKeys.openaiBaseUrl);
       }
 
       const unifiedInference = new UnifiedInferenceClient(registry);
@@ -306,21 +340,26 @@ export async function runAgentLoop(
       // harnesses can preserve tier + responseFormat contracts.
       const workerInference = createWorkerInferenceBridge(unifiedInference);
 
-      // Local worker pool: runs inference-driven agents in-process
-      // as async tasks. Falls back from Conway sandbox spawning.
-      const initializedWorkerPool = new LocalWorkerPool({
-        db: db.raw,
-        inference: workerInference,
-        conway,
-        harnessRegistry,
-        identity,
-        config,
-        allowedEditRoot: process.cwd(),
-        tools,
-        toolContext,
-        policyEngine,
-        spendTracker,
-      });
+      // Local worker pool: runs inference-driven agents in-process as async
+      // tasks. Falls back from Conway sandbox spawning. Created on the first
+      // cycle and reused, so it keeps that cycle's tool list.
+      let sharedPool = sharedWorkerPools.get(db.raw);
+      if (!sharedPool) {
+        sharedPool = new LocalWorkerPool({
+          db: db.raw,
+          inference: workerInference,
+          conway,
+          harnessRegistry,
+          identity,
+          config,
+          tools,
+          toolContext,
+          policyEngine,
+          spendTracker,
+        });
+        sharedWorkerPools.set(db.raw, sharedPool);
+      }
+      const initializedWorkerPool = sharedPool;
       workerPool = initializedWorkerPool;
 
       orchestrator = new Orchestrator({
@@ -467,21 +506,70 @@ export async function runAgentLoop(
   let idleToolTurns = 0;
   // blockedGoalTurns removed — replaced by immediate sleep + exponential backoff
 
-  // Drain any stale wake events from before this loop started,
-  // so they don't re-wake the agent after its first sleep.
-  let drained = 0;
-  while (consumeNextWakeEvent(db.raw)) drained++;
+  // Wake reasons: events the runtime consumed while sleeping, plus any still
+  // queued. Draining them also keeps them from re-waking the agent after its
+  // first sleep.
+  const wakeReasons: WakeReason[] = (options.wakeEvents ?? []).map(toWakeReason);
+  for (let ev = consumeNextWakeEvent(db.raw); ev; ev = consumeNextWakeEvent(db.raw)) {
+    wakeReasons.push(toWakeReason(ev));
+  }
 
   // Clear any stale sleep_until from a previous session so the agent
   // doesn't immediately go back to sleep on startup.
   db.deleteKV("sleep_until");
 
+  const chainType = config.chainType || identity.chainType || "evm";
+
+  /**
+   * Buy credits from USDC before inference when credits are low (or in
+   * debt) and USDC is available, so the agent does not die mid-loop waiting
+   * for the heartbeat. One attempt per cooldown.
+   */
+  const maybeInlineTopup = async (current: FinancialState): Promise<FinancialState> => {
+    if (current.creditsCents === -1 || current.usdcBalance < 5) return current;
+    const tier = getSurvivalTier(current.creditsCents);
+    if (tier !== "critical" && tier !== "low_compute" && tier !== "dead") return current;
+    const lastInlineTopup = db.getKV("last_inline_topup_attempt");
+    const cooldownExpired = !lastInlineTopup ||
+      Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
+    if (!cooldownExpired) return current;
+    db.setKV("last_inline_topup_attempt", new Date().toISOString());
+    try {
+      const { bootstrapTopup } = await import("../conway/topup.js");
+      const topupResult = await bootstrapTopup({
+        apiUrl: config.conwayApiUrl,
+        account: identity.account,
+        creditsCents: current.creditsCents,
+        chainType,
+      });
+      if (topupResult?.success) {
+        log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
+        // Re-fetch so the rest of the turn sees the new balance.
+        return await getFinancialState(conway, identity.address, db, chainType);
+      }
+    } catch (err: any) {
+      logger.warn(`Inline auto-topup failed: ${err.message}`);
+    }
+    return current;
+  };
+
+  // Get financial state
+  let financial = await getFinancialState(conway, identity.address, db, chainType);
+
+  // Dead (marked by the heartbeat) and still unfunded: no inference, and the
+  // state is left as it is so the runtime keeps waiting for funding.
+  if (db.getAgentState() === "dead") {
+    financial = await maybeInlineTopup(financial);
+    if (isUnfunded(financial)) {
+      updateGateSurvival();
+      log(config, "[DEAD] Waiting for funding; no inference while the balance is zero or below.");
+      return;
+    }
+  }
+
   // Transition to waking state
   db.setAgentState("waking");
   onStateChange?.("waking");
-
-  // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
   updateGateSurvival();
 
   // Check if this is the first run
@@ -493,6 +581,7 @@ export async function runAgentLoop(
     config,
     financial,
     db,
+    wakeReasons,
   });
 
   // Transition to running
@@ -522,6 +611,13 @@ export async function runAgentLoop(
   // Claimed inbox rows not yet acknowledged. The catch block returns them to
   // the queue; it is cleared as soon as the acknowledging transaction commits.
   let claimedMessages: InboxMessageRow[] = [];
+  // Set once a tool of the current inbox batch has started: from then on the
+  // batch is never returned to the queue (a reply may already have gone out).
+  let claimToolsStarted = false;
+
+  const markClaimToolsStarted = (): void => {
+    claimToolsStarted = true;
+  };
 
   /**
    * Handle one sender's batch in an isolated turn. The model sees only the
@@ -599,10 +695,13 @@ export async function runAgentLoop(
     };
 
     const calls = (routerResult.toolCalls as any[] | undefined) ?? [];
+    // An inbox turn is not cut short by a stop request: it can send at most
+    // one reply, and skipping it would drop the message unanswered.
+    const recorder = new TurnRecorder(db, turn, messageIds, markClaimToolsStarted);
     let sendCount = 0;
     for (const tc of calls.slice(0, MAX_TOOL_CALLS_PER_TURN)) {
       const args = parseToolArguments(tc.function.arguments);
-      const name = tc.function.name as string;
+      const name = String(tc.function?.name ?? "");
       // Enforced here as well as in the policy engine, which is optional.
       const refusal = checkInboxToolCall(name, args, {
         sender,
@@ -613,7 +712,7 @@ export async function runAgentLoop(
       let result: ToolCallResult;
       if (refusal) {
         result = {
-          id: tc.id,
+          id: ulid(),
           name,
           arguments: args,
           result: "",
@@ -630,23 +729,18 @@ export async function runAgentLoop(
           inboxMessageIds: messageIds,
           inboxSendCount: sendCount - 1,
         };
-        result = await executeTool(name, args, tools, toolContext, policyEngine, turnContext);
-        result.id = tc.id;
+        recorder.started(toolNames.has(name) ? name : UNKNOWN_TOOL_NAME, args);
+        result = await safeExecuteTool(name, args, tools, toolContext, policyEngine, turnContext);
       }
       if (!toolNames.has(result.name)) result.name = UNKNOWN_TOOL_NAME;
-      turn.toolCalls.push(result);
+      recorder.record(result);
       log(config, `[INBOX TOOL] ${result.name}: ${result.error ? "refused or failed" : "ok"}`);
     }
 
-    db.runTransaction(() => {
-      db.insertTurn(turn);
-      for (const tc of turn.toolCalls) {
-        db.insertToolCall(turn.id, tc);
-      }
-      markInboxProcessed(db.raw, messageIds);
-    });
+    recorder.finish();
     claimedMessages = [];
-    onTurnComplete?.(turn);
+    claimToolsStarted = false;
+    notifyTurnComplete(onTurnComplete, turn);
 
     try {
       const sessionId = db.getKV("session_id") || "default";
@@ -659,8 +753,33 @@ export async function runAgentLoop(
     return {};
   };
 
+  /**
+   * Before a voluntary sleep, handle inbox batches still waiting. The claim
+   * at the top of the loop only runs between privileged turns, so a turn
+   * that ends the cycle (text only, sleep, idle) would otherwise leave them
+   * for a later wake, which ends the same way.
+   */
+  const drainInboxBeforeSleep = async (): Promise<{ refusal?: InferenceRefusal }> => {
+    while (!shouldStop() && inboxTurnsThisCycle < MAX_INBOX_TURNS_PER_CYCLE) {
+      const batch = claimInboxMessagesFromOneSender(db.raw, INBOX_BATCH_LIMIT);
+      if (batch.length === 0) break;
+      claimedMessages = batch;
+      claimToolsStarted = false;
+      inboxTurnsThisCycle++;
+      const outcome = await runInboxTurn(batch);
+      if (outcome.refusal) return outcome;
+    }
+    return {};
+  };
+
   while (running) {
     claimedMessages = [];
+    claimToolsStarted = false;
+
+    if (shouldStop()) {
+      log(config, "[STOP] Stop requested; leaving the loop.");
+      break;
+    }
 
     try {
       // Check if we should be sleeping
@@ -675,7 +794,8 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getFinancialState(conway, identity.address, db, chainType);
+      financial = await maybeInlineTopup(financial);
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
@@ -684,42 +804,21 @@ export async function runAgentLoop(
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
-        const tier = getSurvivalTier(financial.creditsCents);
-
-        // Inline auto-topup: if credits are critically low and USDC is
-        // available, buy credits NOW — before attempting inference.
-        // This prevents the agent from dying mid-loop while waiting for
-        // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
-          const INLINE_TOPUP_COOLDOWN_MS = 60_000;
-          const lastInlineTopup = db.getKV("last_inline_topup_attempt");
-          const cooldownExpired = !lastInlineTopup ||
-            Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
-
-          if (cooldownExpired) {
-            db.setKV("last_inline_topup_attempt", new Date().toISOString());
-            try {
-              const { bootstrapTopup } = await import("../conway/topup.js");
-              const topupResult = await bootstrapTopup({
-                apiUrl: config.conwayApiUrl,
-                account: identity.account,
-                creditsCents: financial.creditsCents,
-                chainType: config.chainType || identity.chainType || "evm",
-              });
-              if (topupResult?.success) {
-                log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
-                // Re-fetch financial state after topup so the rest of
-                // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
-              }
-            } catch (err: any) {
-              logger.warn(`Inline auto-topup failed: ${err.message}`);
-            }
-          }
-        }
-
-        // Re-evaluate tier after potential topup
         const effectiveTier = getSurvivalTier(financial.creditsCents);
+
+        // Checked before the tier branch, which would overwrite 'dead': in
+        // debt, or marked dead by the heartbeat and still unfunded.
+        if (effectiveTier === "dead" || (db.getAgentState() === "dead" && isUnfunded(financial))) {
+          if (db.getAgentState() !== "dead") {
+            db.setAgentState("dead");
+            onStateChange?.("dead");
+          }
+          inference.setLowComputeMode(true);
+          updateGateSurvival();
+          log(config, "[DEAD] Balance is zero or below; no inference until the agent is funded.");
+          running = false;
+          break;
+        }
 
         if (effectiveTier === "critical") {
           log(config, "[CRITICAL] Credits critically low. Limited operation.");
@@ -785,6 +884,11 @@ export async function runAgentLoop(
         }
       }
 
+      if (shouldStop()) {
+        log(config, "[STOP] Stop requested; leaving the loop.");
+        break;
+      }
+
       // Inbox: claim one sender's batch only when no runtime input is queued,
       // the previous turn was not an inbox turn, and the cycle cap allows it.
       // State machine: received -> in_progress (claim) -> processed on success,
@@ -814,15 +918,15 @@ export async function runAgentLoop(
       // filter and its fallback, so neither can bring one back. Then filter
       // out purely idle turns (only status checks) to prevent the model from
       // continuing a status-check pattern.
+      // The last two turns are always kept (they hold what the agent just
+      // asked and learned); older idle-only turns without input are dropped.
       const allTurns = db.getRecentTurns(20, { excludeIsolated: true });
-      const meaningfulTurns = allTurns.filter((t) => {
+      const olderTurns = allTurns.slice(0, Math.max(0, allTurns.length - 2)).filter((t) => {
         if (t.toolCalls.length === 0) return true; // text-only turns are meaningful
+        if (t.input && t.inputSource !== "wakeup") return true;
         return t.toolCalls.some((tc) => !isIdleOnlyTool(tc.name));
       });
-      // Keep at least the last 2 turns for continuity, even if idle
-      const recentTurns = trimContext(
-        meaningfulTurns.length > 0 ? meaningfulTurns : allTurns.slice(-2),
-      );
+      const recentTurns = trimContext([...olderTurns, ...allTurns.slice(-2)]);
       const systemPrompt = buildSystemPrompt({
         identity,
         config,
@@ -890,6 +994,10 @@ export async function runAgentLoop(
           role: "system",
           content: `Note: your inference budget was exhausted (${lastRefusal.code}) until ${lastRefusal.until}, so you slept.`,
         });
+      }
+      const enforcementNote = db.getKV(LOOP_ENFORCEMENT_KEY);
+      if (enforcementNote) {
+        messages.splice(1, 0, { role: "system", content: enforcementNote });
       }
 
       // ── Inference Call (via router when available) ──
@@ -971,17 +1079,38 @@ export async function runAgentLoop(
       };
 
       // ── Execute Tool Calls ──
+      // The turn is saved as it runs (see TurnRecorder), so a crash or a
+      // forced exit keeps every call that already ran.
+      const recorder = new TurnRecorder(db, turn, [], markClaimToolsStarted);
+      let stoppedMidTurn = false;
       if (response.toolCalls && response.toolCalls.length > 0) {
-        const toolCallMessages: any[] = [];
-        let callCount = 0;
+        if (response.toolCalls.length > MAX_TOOL_CALLS_PER_TURN) {
+          log(config, `[TOOLS] Max tool calls per turn reached (${MAX_TOOL_CALLS_PER_TURN})`);
+        }
+        const calls = response.toolCalls.slice(0, MAX_TOOL_CALLS_PER_TURN);
 
-        for (const tc of response.toolCalls) {
-          if (callCount >= MAX_TOOL_CALLS_PER_TURN) {
-            log(config, `[TOOLS] Max tool calls per turn reached (${MAX_TOOL_CALLS_PER_TURN})`);
+        for (let i = 0; i < calls.length; i++) {
+          const tc = calls[i];
+          const args = parseToolArguments(tc.function.arguments);
+
+          // Stop between calls: the call in flight finished; the rest are
+          // recorded as skipped, so the next run knows they did not happen.
+          if (shouldStop()) {
+            for (const rest of calls.slice(i)) {
+              const restName = String(rest.function?.name ?? "");
+              recorder.record({
+                id: ulid(),
+                name: toolNames.has(restName) ? restName : UNKNOWN_TOOL_NAME,
+                arguments: parseToolArguments(rest.function?.arguments),
+                result: "",
+                durationMs: 0,
+                error: SHUTDOWN_SKIP_ERROR,
+              });
+            }
+            stoppedMidTurn = true;
+            log(config, `[STOP] Stop requested; ${calls.length - i} remaining tool call(s) skipped.`);
             break;
           }
-
-          const args = parseToolArguments(tc.function.arguments);
 
           log(config, `[TOOL] ${tc.function.name}(${JSON.stringify(args).slice(0, 100)})`);
 
@@ -993,60 +1122,52 @@ export async function runAgentLoop(
             : null;
           // A turn context is always passed so the policy engine runs
           // whenever one is configured, with or without a spend tracker.
-          const result: ToolCallResult = refusal
-            ? {
-                id: tc.id,
-                name: tc.function.name,
-                arguments: args,
-                result: "",
-                durationMs: 0,
-                error: `Refused: ${refusal.code}: ${refusal.message}`,
-              }
-            : await executeTool(
-                tc.function.name,
-                args,
-                tools,
-                toolContext,
-                policyEngine,
-                {
-                  inputSource: currentSource,
-                  turnToolCallCount: turn.toolCalls.filter(t => CREDIT_TRANSFER_NAMES.has(t.name)).length,
-                  sessionSpend,
-                },
-              );
+          // Stored ids are our own ULIDs: provider ids can repeat or be empty.
+          let result: ToolCallResult;
+          if (refusal) {
+            result = {
+              id: ulid(),
+              name: tc.function.name,
+              arguments: args,
+              result: "",
+              durationMs: 0,
+              error: `Refused: ${refusal.code}: ${refusal.message}`,
+            };
+          } else {
+            recorder.started(toolNames.has(tc.function.name) ? tc.function.name : UNKNOWN_TOOL_NAME, args);
+            result = await safeExecuteTool(
+              tc.function.name,
+              args,
+              tools,
+              toolContext,
+              policyEngine,
+              {
+                inputSource: currentSource,
+                turnToolCallCount: turn.toolCalls.filter(t => CREDIT_TRANSFER_NAMES.has(t.name)).length,
+                sessionSpend,
+              },
+            );
+          }
 
-          // Override the ID to match the inference call's ID
-          result.id = tc.id;
           // A name the model invented is not stored: stored names reach loop
           // prompts, episodic memory and the soul's capabilities line.
           if (!toolNames.has(result.name)) result.name = UNKNOWN_TOOL_NAME;
-          turn.toolCalls.push(result);
+          recorder.record(result);
 
           log(
             config,
             `[TOOL RESULT] ${tc.function.name}: ${result.error ? `ERROR: ${result.error}` : result.result.slice(0, 200)}`,
           );
-
-          callCount++;
         }
       }
 
-      // ── Persist Turn (atomic: turn + tool calls + inbox ack) ──
-      const claimedIds = claimedMessages.map((m) => m.id);
-      db.runTransaction(() => {
-        db.insertTurn(turn);
-        for (const tc of turn.toolCalls) {
-          db.insertToolCall(turn.id, tc);
-        }
-        // Mark claimed inbox messages as processed (atomic with turn persistence)
-        if (claimedIds.length > 0) {
-          markInboxProcessed(db.raw, claimedIds);
-        }
-      });
+      // ── Persist Turn ──
+      recorder.finish();
       claimedMessages = [];
-      onTurnComplete?.(turn);
+      notifyTurnComplete(onTurnComplete, turn);
       if (lastRefusal) db.deleteKV(LAST_REFUSAL_KEY);
       db.deleteKV(REFUSAL_BACKOFF_KEY);
+      if (enforcementNote) db.deleteKV(LOOP_ENFORCEMENT_KEY);
 
       // Phase 2.2: Post-turn memory ingestion (non-blocking)
       try {
@@ -1058,12 +1179,21 @@ export async function runAgentLoop(
         // Memory failure must not block the agent loop
       }
 
+      if (stoppedMidTurn || shouldStop()) {
+        log(config, "[STOP] Turn saved; leaving the loop.");
+        break;
+      }
+
       // ── create_goal BLOCKED fast-break ──
       // When a goal is already active, the parent loop has nothing useful to do.
       // Force sleep immediately on first BLOCKED (not second) with exponential
       // backoff so the agent doesn't wake every 2 minutes just to get BLOCKED again.
+      // A duplicate-goal rejection is the same no-progress state.
       const blockedGoalCall = turn.toolCalls.find(
-        (tc) => tc.name === "create_goal" && tc.result?.includes("BLOCKED"),
+        (tc) =>
+          tc.name === "create_goal" &&
+          !tc.error &&
+          (tc.result?.startsWith("BLOCKED:") || tc.result?.startsWith("Duplicate goal rejected")),
       );
       if (blockedGoalCall) {
         // Exponential backoff: 2min → 4min → 8min → cap at 10min
@@ -1079,14 +1209,19 @@ export async function runAgentLoop(
         onStateChange?.("sleeping");
         running = false;
         break;
-      } else if (turn.toolCalls.some((tc) => tc.name === "create_goal" && !tc.error)) {
+      } else if (
+        turn.toolCalls.some(
+          (tc) => tc.name === "create_goal" && !tc.error && tc.result?.startsWith("Goal created:"),
+        )
+      ) {
         // Goal was successfully created — reset backoff
         db.deleteKV("blocked_goal_backoff");
       }
 
       // ── Loop Detection ──
       if (turn.toolCalls.length > 0) {
-        const currentPattern = turn.toolCalls
+        const currentPattern = toolPattern(turn.toolCalls);
+        const patternNames = turn.toolCalls
           .map((tc) => tc.name)
           .sort()
           .join(",");
@@ -1111,12 +1246,14 @@ export async function runAgentLoop(
           lastToolPatterns.every((p) => p === currentPattern)
         ) {
           log(config, `[LOOP] Enforcement: agent ignored loop warning, forcing sleep.`);
-          pendingInput = {
-            content:
-              `LOOP ENFORCEMENT: You were warned about repeating "${currentPattern}" but continued. ` +
-              `Forcing sleep to prevent credit waste. On next wake, try a DIFFERENT approach.`,
-            source: "system",
-          };
+          // Kept in KV: the next cycle's first real turn is told why it slept.
+          db.setKV(
+            LOOP_ENFORCEMENT_KEY,
+            `LOOP ENFORCEMENT: You were warned about repeating "${patternNames}" but continued, ` +
+              `so the runtime forced a ${LOOP_ENFORCEMENT_SLEEP_MS / 60_000}-minute sleep to prevent credit waste. ` +
+              `Try a DIFFERENT approach now.`,
+          );
+          db.setKV("sleep_until", new Date(Date.now() + LOOP_ENFORCEMENT_SLEEP_MS).toISOString());
           loopWarningPattern = null;
           lastToolPatterns = [];
           db.setAgentState("sleeping");
@@ -1133,7 +1270,7 @@ export async function runAgentLoop(
           log(config, `[LOOP] Repetitive pattern detected: ${currentPattern}`);
           pendingInput = {
             content:
-              `LOOP DETECTED: You have called "${currentPattern}" ${MAX_REPETITIVE_TURNS} times in a row with similar results. ` +
+              `LOOP DETECTED: You have called "${patternNames}" ${MAX_REPETITIVE_TURNS} times in a row with similar results. ` +
               `STOP repeating yourself. You already know your status. DO SOMETHING DIFFERENT NOW. ` +
               `Pick ONE concrete task from your genesis prompt and execute it.`,
             source: "system",
@@ -1172,6 +1309,12 @@ export async function runAgentLoop(
       // ── Check for sleep command ──
       const sleepTool = turn.toolCalls.find((tc) => tc.name === "sleep");
       if (sleepTool && !sleepTool.error) {
+        const drained = await drainInboxBeforeSleep();
+        if (drained.refusal) {
+          sleepForRefusal(drained.refusal);
+          running = false;
+          break;
+        }
         log(config, "[SLEEP] Agent chose to sleep.");
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
@@ -1183,26 +1326,17 @@ export async function runAgentLoop(
       // If this turn had no pending input and didn't do any real work
       // (no mutations — only read/check/list/info tools), count as idle.
       // Use a blocklist of mutating tools rather than an allowlist of safe ones.
-      const MUTATING_TOOLS = new Set([
-        "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
-        "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
-        "install_npm_package", "install_mcp_server", "install_skill",
-        "create_skill", "remove_skill", "install_skill_from_git",
-        "install_skill_from_url", "pull_upstream", "git_commit", "git_push",
-        "git_branch", "git_clone", "send_message", "message_child",
-        "register_domain", "register_erc8004", "give_feedback",
-        "update_genesis_prompt", "update_agent_card", "modify_heartbeat",
-        "expose_port", "remove_port", "x402_fetch", "manage_dns",
-        "distress_signal", "prune_dead_children", "sleep",
-        "update_soul", "remember_fact", "set_goal", "complete_goal",
-        "save_procedure", "note_about_agent", "forget",
-        "enter_low_compute", "switch_model", "review_upstream_changes",
-      ]);
-      const didMutate = turn.toolCalls.some((tc) => MUTATING_TOOLS.has(tc.name));
+      const didMutate = turn.toolCalls.some((tc) => isMutatingTool(tc.name));
 
       if (!currentInput && !didMutate) {
         idleTurnCount++;
         if (idleTurnCount >= MAX_IDLE_TURNS) {
+          const drained = await drainInboxBeforeSleep();
+          if (drained.refusal) {
+            sleepForRefusal(drained.refusal);
+            running = false;
+            break;
+          }
           log(config, `[IDLE] ${idleTurnCount} consecutive idle turns with no work. Entering sleep.`);
           db.setKV("sleep_until", new Date(Date.now() + 60_000).toISOString());
           db.setAgentState("sleeping");
@@ -1235,6 +1369,12 @@ export async function runAgentLoop(
       ) {
         // Agent produced text without tool calls.
         // This is a natural pause point -- no work queued, sleep briefly.
+        const drained = await drainInboxBeforeSleep();
+        if (drained.refusal) {
+          sleepForRefusal(drained.refusal);
+          running = false;
+          break;
+        }
         log(config, "[IDLE] No pending inputs. Entering brief sleep.");
         db.setKV(
           "sleep_until",
@@ -1253,7 +1393,17 @@ export async function runAgentLoop(
       // Handle inbox message state on turn failure:
       // Messages that have retries remaining go back to 'received';
       // messages that have exhausted retries move to 'failed'.
-      if (claimedMessages.length > 0) {
+      if (claimedMessages.length > 0 && claimToolsStarted) {
+        // Its tools ran: a replay would repeat them, so it is never re-queued.
+        try {
+          markInboxProcessed(db.raw, claimedMessages.map((m) => m.id));
+          db.deleteKV(INBOX_TOOLS_STARTED_KEY);
+        } catch (markErr) {
+          logger.error("Could not mark an attempted inbox batch processed", markErr instanceof Error ? markErr : undefined);
+        }
+        log(config, `[INBOX] ${claimedMessages.length} message(s) marked processed (tools had run)`);
+        claimedMessages = [];
+      } else if (claimedMessages.length > 0) {
         const exhausted = claimedMessages.filter((m) => m.retryCount >= m.maxRetries);
         const retryable = claimedMessages.filter((m) => m.retryCount < m.maxRetries);
 
@@ -1288,6 +1438,265 @@ export async function runAgentLoop(
 }
 
 // ─── Helpers ───────────────────────────────────────────────────
+
+/**
+ * Saves a turn while it runs. begin() writes the turn row (and, for an inbox
+ * batch, a marker) before the first tool executes; started() saves the call
+ * about to run as interrupted, so a forced exit mid-call leaves a record that
+ * it may have partly happened; record() replaces that with the result right
+ * after it returns; finish() writes the final list and acknowledges the
+ * batch. If a write fails, finish() falls back to best-effort writes, and a
+ * batch whose tools ran is marked processed, never returned to the queue.
+ * No method throws.
+ */
+class TurnRecorder {
+  private begun = false;
+  private healthy = true;
+  private readonly saved = new Set<string>();
+  // Id of the interrupted placeholder for the call now running, and of every
+  // row that started as one (record() overwrites those rather than inserting).
+  private pendingId: string | null = null;
+  private readonly placeholders = new Set<string>();
+
+  constructor(
+    private readonly db: AutomatonDatabase,
+    private readonly turn: AgentTurn,
+    private readonly claimedIds: string[],
+    private readonly onToolsStarted: () => void,
+  ) {}
+
+  /** Called before each tool executes; only the first call writes. */
+  begin(): void {
+    if (this.begun) return;
+    this.begun = true;
+    if (this.claimedIds.length > 0) this.onToolsStarted();
+    try {
+      this.db.runTransaction(() => {
+        this.db.insertTurn({ ...this.turn, toolCalls: [...this.turn.toolCalls] });
+        for (const tc of this.turn.toolCalls) {
+          this.db.insertToolCall(this.turn.id, tc);
+          this.saved.add(tc.id);
+        }
+        if (this.claimedIds.length > 0) {
+          this.db.setKV(INBOX_TOOLS_STARTED_KEY, JSON.stringify({ turnId: this.turn.id, ids: this.claimedIds }));
+        }
+      });
+    } catch (err) {
+      this.saved.clear();
+      this.healthy = false;
+      logger.error("Could not save the turn before its tools ran", err instanceof Error ? err : undefined);
+    }
+  }
+
+  /** Called right before a tool executes. */
+  started(name: string, args: Record<string, unknown>): void {
+    this.begin();
+    this.pendingId = null;
+    if (!this.healthy) return;
+    const placeholder: ToolCallResult = {
+      id: ulid(),
+      name,
+      arguments: args,
+      result: "",
+      durationMs: 0,
+      error: INTERRUPTED_TOOL_ERROR,
+    };
+    try {
+      this.db.runTransaction(() => {
+        this.db.insertToolCall(this.turn.id, placeholder);
+        updateTurnToolCalls(this.db.raw, this.turn.id, [...this.turn.toolCalls, placeholder]);
+      });
+      this.pendingId = placeholder.id;
+      this.saved.add(placeholder.id);
+    } catch (err) {
+      this.healthy = false;
+      logger.error(`Could not save tool call ${name} before it ran`, err instanceof Error ? err : undefined);
+    }
+  }
+
+  record(result: ToolCallResult): void {
+    // The result takes the placeholder's id and row.
+    if (this.pendingId) {
+      result.id = this.pendingId;
+      this.placeholders.add(this.pendingId);
+      this.pendingId = null;
+    }
+    this.turn.toolCalls.push(result);
+    if (!this.begun || !this.healthy) return;
+    try {
+      this.db.runTransaction(() => {
+        this.writeToolCall(result);
+        updateTurnToolCalls(this.db.raw, this.turn.id, this.turn.toolCalls);
+      });
+      this.saved.add(result.id);
+      this.placeholders.delete(result.id);
+    } catch (err) {
+      this.healthy = false;
+      logger.error(`Could not save tool call ${result.name}`, err instanceof Error ? err : undefined);
+    }
+  }
+
+  finish(): void {
+    const ids = this.claimedIds;
+    try {
+      this.db.runTransaction(() => {
+        if (!this.begun) {
+          this.db.insertTurn(this.turn);
+          for (const tc of this.turn.toolCalls) this.db.insertToolCall(this.turn.id, tc);
+        } else {
+          if (!this.healthy) throw new Error("an earlier write of this turn failed");
+          updateTurnToolCalls(this.db.raw, this.turn.id, this.turn.toolCalls);
+        }
+        if (ids.length > 0) {
+          markInboxProcessed(this.db.raw, ids);
+          this.db.deleteKV(INBOX_TOOLS_STARTED_KEY);
+        }
+      });
+      return;
+    } catch (err) {
+      logger.error(
+        `Turn ${this.turn.id} could not be saved in one transaction; saving what can be saved`,
+        err instanceof Error ? err : undefined,
+      );
+    }
+    this.bestEffort();
+  }
+
+  private bestEffort(): void {
+    const attempt = (label: string, fn: () => void): boolean => {
+      try {
+        fn();
+        return true;
+      } catch (err) {
+        logger.error(`Best-effort save failed (${label})`, err instanceof Error ? err : undefined);
+        return false;
+      }
+    };
+    const turnSaved = this.begun && this.healthyTurnRow();
+    if (!turnSaved) attempt("turn", () => this.db.insertTurn(this.turn));
+    attempt("tool list", () => updateTurnToolCalls(this.db.raw, this.turn.id, this.turn.toolCalls));
+    for (const tc of this.turn.toolCalls) {
+      if (this.saved.has(tc.id) && !this.placeholders.has(tc.id)) continue;
+      if (attempt(`tool call ${tc.name}`, () => this.writeToolCall(tc))) {
+        this.saved.add(tc.id);
+        this.placeholders.delete(tc.id);
+      }
+    }
+    const ids = this.claimedIds;
+    if (ids.length > 0) {
+      // Once inference returned, the batch is never returned to the queue.
+      if (!attempt("inbox ack", () => markInboxProcessed(this.db.raw, ids))) {
+        attempt("inbox fail", () => markInboxFailed(this.db.raw, ids));
+      }
+      attempt("inbox marker", () => this.db.deleteKV(INBOX_TOOLS_STARTED_KEY));
+    }
+  }
+
+  private writeToolCall(tc: ToolCallResult): void {
+    if (this.placeholders.has(tc.id)) {
+      this.db.raw.prepare("DELETE FROM tool_calls WHERE id = ?").run(tc.id);
+    }
+    this.db.insertToolCall(this.turn.id, tc);
+  }
+
+  /** True when begin() wrote the turn row. */
+  private healthyTurnRow(): boolean {
+    try {
+      return this.db.getTurnById(this.turn.id) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** executeTool, with any throw turned into an error result. */
+async function safeExecuteTool(
+  name: string,
+  args: Record<string, unknown>,
+  tools: AutomatonTool[],
+  context: ToolContext,
+  policyEngine: PolicyEngine | undefined,
+  turnContext: PolicyRequest["turnContext"],
+): Promise<ToolCallResult> {
+  try {
+    return await executeTool(name, args, tools, context, policyEngine, turnContext);
+  } catch (err) {
+    return {
+      id: ulid(),
+      name,
+      arguments: args,
+      result: "",
+      durationMs: 0,
+      error: `Tool failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/** A failing callback must not fail a turn that is already saved. */
+function notifyTurnComplete(cb: ((turn: AgentTurn) => void) | undefined, turn: AgentTurn): void {
+  if (!cb) return;
+  try {
+    cb(turn);
+  } catch (err) {
+    logger.warn(`onTurnComplete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Loop-detection key for a turn: mutating tools count with a hash of their
+ * arguments (different build steps are progress), read-only tools by name
+ * (re-reading with new arguments is still a loop).
+ */
+function toolPattern(calls: ToolCallResult[]): string {
+  return calls
+    .map((tc) => {
+      if (!isMutatingTool(tc.name)) return tc.name;
+      let argsText: string;
+      try {
+        argsText = JSON.stringify(tc.arguments) ?? "";
+      } catch {
+        argsText = String(tc.arguments);
+      }
+      return `${tc.name}:${createHash("sha256").update(argsText).digest("hex").slice(0, 12)}`;
+    })
+    .sort()
+    .join(",");
+}
+
+/** Known balance at or below zero; -1 is the unknown sentinel. */
+function isUnfunded(financial: FinancialState): boolean {
+  return financial.creditsCents !== -1 && financial.creditsCents <= 0;
+}
+
+function toWakeReason(ev: WakeEventRow): WakeReason {
+  let taskName: string | undefined;
+  try {
+    const payload = JSON.parse(ev.payload || "{}");
+    if (typeof payload?.taskName === "string") taskName = payload.taskName;
+  } catch {
+    // A malformed payload just has no task name.
+  }
+  return { source: String(ev.source ?? ""), reason: String(ev.reason ?? ""), taskName };
+}
+
+/**
+ * Inference keys for the provider registry. Conway Compute is
+ * OpenAI-compatible and is the fallback when no OpenAI key exists; its key
+ * then only ever goes to the Conway base URL.
+ */
+function resolveProviderKeys(config: AutomatonConfig): {
+  keys: Record<string, string | undefined>;
+  openaiBaseUrl?: string;
+} {
+  const openaiKey = config.openaiApiKey || process.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    return { keys: { OPENAI_API_KEY: openaiKey }, openaiBaseUrl: process.env.OPENAI_BASE_URL || undefined };
+  }
+  if (config.conwayApiKey) {
+    return { keys: { OPENAI_API_KEY: config.conwayApiKey }, openaiBaseUrl: `${config.conwayApiUrl}/v1` };
+  }
+  return { keys: {} };
+}
 
 /** The installed gate when it uses this database, else a new one installed for it. */
 function ensureInferenceGate(db: AutomatonDatabase, config: AutomatonConfig): InferenceGate {

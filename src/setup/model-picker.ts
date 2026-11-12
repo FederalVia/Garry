@@ -8,7 +8,7 @@
  */
 
 import chalk from "chalk";
-import { loadConfig, saveConfig, resolvePath } from "../config.js";
+import { loadConfig, saveConfig, resolvePath, ConfigError } from "../config.js";
 import { createDatabase } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
 import { discoverOllamaModels } from "../ollama/discover.js";
@@ -24,7 +24,15 @@ const PROVIDER_LABEL: Record<string, string> = {
 };
 
 export async function runModelPicker(): Promise<void> {
-  const config = loadConfig();
+  let config;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    console.log(chalk.red(`  automaton.json cannot be read: ${err.message}\n  Fix or restore it, then try again.`));
+    process.exitCode = 1;
+    return;
+  }
   if (!config) {
     console.log(chalk.red("  Automaton is not configured. Run: automaton --setup"));
     return;

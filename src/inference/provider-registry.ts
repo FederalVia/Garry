@@ -310,15 +310,23 @@ export function isLocalProvider(provider: Pick<ProviderConfig, "id" | "baseUrl">
   }
 }
 
+/** Keys by env var name, handed in so the runtime never copies them into process.env. */
+export interface ProviderRegistryOptions {
+  keys?: Record<string, string | undefined>;
+}
+
 export class ProviderRegistry {
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
+  private readonly keys: Record<string, string | undefined>;
 
   constructor(
     providers: ProviderConfig[],
     tierDefaults: Record<ModelTier, TierDefault> = DEFAULT_TIER_DEFAULTS,
+    options: ProviderRegistryOptions = {},
   ) {
+    this.keys = { ...(options.keys ?? {}) };
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
       .sort((a, b) => a.priority - b.priority);
@@ -336,7 +344,7 @@ export class ProviderRegistry {
     }
   }
 
-  static fromConfig(configPath: string): ProviderRegistry {
+  static fromConfig(configPath: string, options: ProviderRegistryOptions = {}): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
 
@@ -346,7 +354,7 @@ export class ProviderRegistry {
       maxBytes: MAX_PROVIDER_CONFIG_BYTES,
     });
     if (text === null) {
-      return new ProviderRegistry(providers, tierDefaults);
+      return new ProviderRegistry(providers, tierDefaults, options);
     }
 
     try {
@@ -373,7 +381,7 @@ export class ProviderRegistry {
       // Keep defaults if config is invalid.
     }
 
-    return new ProviderRegistry(providers, tierDefaults);
+    return new ProviderRegistry(providers, tierDefaults, options);
   }
 
   /** `downgrade` steps the tier down once (reasoning to fast, fast to cheap). */
@@ -530,9 +538,10 @@ export class ProviderRegistry {
   }
 
   private resolveApiKey(provider: ProviderConfig): string | null {
-    const configured = process.env[provider.apiKeyEnvVar];
-    if (typeof configured === "string" && configured.trim().length > 0) {
-      return configured;
+    for (const configured of [this.keys[provider.apiKeyEnvVar], process.env[provider.apiKeyEnvVar]]) {
+      if (typeof configured === "string" && configured.trim().length > 0) {
+        return configured;
+      }
     }
 
     // Local servers usually need no key; "local" must still be enabled explicitly.

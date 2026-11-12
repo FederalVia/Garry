@@ -432,7 +432,8 @@ describe("buildSystemPrompt status block", () => {
     const statusEnd = prompt.indexOf("--- END STATUS ---");
     const statusBlock = prompt.slice(statusStart, statusEnd);
 
-    expect(statusBlock).toContain("Survival tier: normal");
+    // The prompt uses the runtime's getSurvivalTier: above 500 cents is high.
+    expect(statusBlock).toContain("Survival tier: high");
   });
 
   it("computes correct survival tiers", () => {
@@ -463,11 +464,23 @@ describe("buildSystemPrompt status block", () => {
     });
     expect(prompt).toContain("Survival tier: critical");
 
-    // Dead tier (credits = 0)
+    // Zero credits is critical, as in getSurvivalTier; only debt is dead.
     prompt = buildSystemPrompt({
       identity,
       config,
       financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: critical");
+
+    // Dead tier (credits below zero)
+    prompt = buildSystemPrompt({
+      identity,
+      config,
+      financial: { creditsCents: -20, usdcBalance: 0, lastChecked: new Date().toISOString() },
       state: "running",
       db,
       tools: [],

@@ -21,12 +21,16 @@ import {
   getHeartbeatSchedule,
   updateHeartbeatSchedule,
   insertHeartbeatHistory,
-  acquireTaskLease,
-  releaseTaskLease,
-  clearExpiredLeases,
   pruneExpiredDedupKeys,
   insertWakeEvent,
 } from "../state/database.js";
+import {
+  acquireScheduleLease,
+  clearExpiredScheduleLeases,
+  extendScheduleLease,
+  getTaskAlias,
+  releaseScheduleLease,
+} from "./schedule-store.js";
 import { createLogger } from "../observability/logger.js";
 
 type DatabaseType = BetterSqlite3.Database;
@@ -34,7 +38,22 @@ const logger = createLogger("heartbeat.scheduler");
 
 const DEFAULT_TASK_TIMEOUT_MS = 30_000;
 const LEASE_TTL_MS = 60_000;
+/**
+ * A task still running this long after it started is given up on: its lease
+ * is released and it may start again. Its late result is still handled.
+ */
+const ABANDON_AFTER_MIN_MS = 10 * 60_000;
+const ABANDON_AFTER_TIMEOUTS = 10;
+/** A last run this far in the future means the clock stepped back. */
+const CLOCK_SKEW_TOLERANCE_MS = 60_000;
 const HISTORY_ID_COUNTER = { value: 0 };
+
+/** Never slowed by the low-compute multiplier: survival depends on them. */
+export const ESSENTIAL_HEARTBEAT_TASKS: ReadonlySet<string> = new Set([
+  "heartbeat_ping",
+  "check_credits",
+  "check_usdc_balance",
+]);
 
 function generateId(): string {
   const timestamp = Date.now().toString(36);
@@ -43,10 +62,10 @@ function generateId(): string {
   return `${timestamp}-${random}-${HISTORY_ID_COUNTER.value.toString(36)}`;
 }
 
-function timeoutPromise(ms: number): { promise: Promise<never>; clear: () => void } {
+function timeoutSignal(ms: number): { promise: Promise<"timeout">; clear: () => void } {
   let timerId: ReturnType<typeof setTimeout>;
-  const promise = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`Task timed out after ${ms}ms`)), ms);
+  const promise = new Promise<"timeout">((resolve) => {
+    timerId = setTimeout(() => resolve("timeout"), ms);
   });
   return { promise, clear: () => clearTimeout(timerId!) };
 }
@@ -64,9 +83,25 @@ function tierMeetsMinimum(currentTier: string, minimumTier: string): boolean {
   return (TIER_ORDER[currentTier] ?? 0) >= (TIER_ORDER[minimumTier] ?? 0);
 }
 
+type TaskResult = { shouldWake: boolean; message?: string };
+
+interface InFlightTask {
+  /** Resolves once the task settled and its outcome was handled. */
+  done: Promise<void>;
+  startedMs: number;
+  abandonAt: number;
+  settled: boolean;
+  timedOut: boolean;
+  abandoned: boolean;
+}
+
 export class DurableScheduler {
   private tickInProgress = false;
+  private currentTick: Promise<void> | null = null;
+  private stopped = false;
   private readonly ownerId: string;
+  private readonly inFlight = new Map<string, InFlightTask>();
+  private readonly warnedMissing = new Set<string>();
 
   constructor(
     private readonly db: DatabaseType,
@@ -82,12 +117,22 @@ export class DurableScheduler {
    * Called on interval -- guards against overlap.
    */
   async tick(): Promise<void> {
-    if (this.tickInProgress) return;
+    if (this.tickInProgress || this.stopped) return;
     this.tickInProgress = true;
+    const run = this.runTick();
+    this.currentTick = run;
+    try {
+      await run;
+    } finally {
+      this.tickInProgress = false;
+      this.currentTick = null;
+    }
+  }
 
+  private async runTick(): Promise<void> {
     try {
       // Clear any expired leases first
-      clearExpiredLeases(this.db);
+      clearExpiredScheduleLeases(this.db);
 
       // Build shared context (single API call for balance)
       const context = await buildTickContext(
@@ -102,6 +147,7 @@ export class DurableScheduler {
       const dueTasks = this.getDueTasks(context);
 
       for (const task of dueTasks) {
+        if (this.stopped) break;
         await this.executeTask(task.taskName, context);
       }
 
@@ -109,9 +155,55 @@ export class DurableScheduler {
       pruneExpiredDedupKeys(this.db);
     } catch (err: any) {
       logger.error("Tick failed", err instanceof Error ? err : undefined);
-    } finally {
-      this.tickInProgress = false;
     }
+  }
+
+  /** No new task starts after this; a running task is not interrupted. */
+  stop(): void {
+    this.stopped = true;
+  }
+
+  resume(): void {
+    this.stopped = false;
+  }
+
+  /**
+   * Wait for the current tick and every task still running (including ones
+   * past their timeout), at most timeoutMs.
+   */
+  async drain(timeoutMs: number): Promise<void> {
+    const pending: Promise<unknown>[] = [];
+    if (this.currentTick) pending.push(this.currentTick);
+    for (const flight of this.inFlight.values()) pending.push(flight.done);
+    if (pending.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, timeoutMs));
+    });
+    try {
+      await Promise.race([Promise.allSettled(pending).then(() => undefined), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Names of entries whose task is still running. */
+  getInFlightTasks(): string[] {
+    return [...this.inFlight.keys()];
+  }
+
+  /** The task function an entry runs: its own name, else its alias. */
+  private resolveTask(entryName: string): { fn?: HeartbeatTaskFn; taskName: string } {
+    const own = this.tasks.get(entryName);
+    if (own) return { fn: own, taskName: entryName };
+    let alias: string | undefined;
+    try {
+      alias = getTaskAlias(this.db, entryName);
+    } catch {
+      alias = undefined;
+    }
+    if (alias) return { fn: this.tasks.get(alias), taskName: alias };
+    return { taskName: entryName };
   }
 
   /**
@@ -120,6 +212,13 @@ export class DurableScheduler {
   getDueTasks(context: TickContext): HeartbeatScheduleRow[] {
     const schedule = getHeartbeatSchedule(this.db);
     const now = new Date();
+    const nowMs = now.getTime();
+    const multiplier = context.lowComputeMultiplier;
+    const slowed =
+      (TIER_ORDER[context.survivalTier] ?? 0) <= TIER_ORDER.low_compute &&
+      typeof multiplier === "number" &&
+      Number.isFinite(multiplier) &&
+      multiplier > 1;
 
     return schedule.filter((row) => {
       // Skip disabled tasks
@@ -135,23 +234,38 @@ export class DurableScheduler {
         }
       }
 
+      const lastRunMs = row.lastRunAt ? Date.parse(row.lastRunAt) : NaN;
+      // A last run in the future means the clock stepped back: run now
+      // instead of waiting for the clock to catch up.
+      if (Number.isFinite(lastRunMs) && lastRunMs > nowMs + CLOCK_SKEW_TOLERANCE_MS) {
+        return true;
+      }
+
       // Check if a retry was explicitly scheduled via nextRunAt
       if (row.nextRunAt && new Date(row.nextRunAt) <= now) {
         return true;
       }
 
+      // Low compute stretches the period of every non-essential task.
+      const stretch =
+        slowed && Number.isFinite(lastRunMs) && !ESSENTIAL_HEARTBEAT_TASKS.has(this.resolveTask(row.taskName).taskName);
+
       // Check if task is due based on cron expression
       if (row.cronExpression) {
         try {
-          const currentDate = row.lastRunAt
-            ? new Date(row.lastRunAt)
-            : new Date(Date.now() - 86400000); // If never run, assume due
+          const currentDate = Number.isFinite(lastRunMs)
+            ? new Date(lastRunMs)
+            : new Date(nowMs - 86400000); // If never run, assume due
 
           const interval = cronParser.parseExpression(row.cronExpression, {
             currentDate,
           });
           const nextRun = interval.next().toDate();
-          return nextRun <= now;
+          if (nextRun > now) return false;
+          if (!stretch) return true;
+          const following = interval.next().toDate();
+          const periodMs = Math.max(following.getTime() - nextRun.getTime(), 0);
+          return nowMs >= lastRunMs + periodMs * multiplier;
         } catch {
           return false;
         }
@@ -159,9 +273,9 @@ export class DurableScheduler {
 
       // Check if task is due based on intervalMs
       if (row.intervalMs) {
-        if (!row.lastRunAt) return true;
-        const elapsed = now.getTime() - new Date(row.lastRunAt).getTime();
-        return elapsed >= row.intervalMs;
+        if (!Number.isFinite(lastRunMs)) return true;
+        const elapsed = nowMs - lastRunMs;
+        return elapsed >= row.intervalMs * (stretch ? multiplier : 1);
       }
 
       return false;
@@ -170,59 +284,147 @@ export class DurableScheduler {
 
   /**
    * Execute a single task with timeout and lease.
+   *
+   * On timeout the timeout is recorded, but the task cannot be cancelled:
+   * the lease stays held and no second copy starts until it settles. Its
+   * late result is then handled (a wake is still delivered). A task that
+   * never settles is given up on after max(10 x timeout, 10 min).
    */
   async executeTask(taskName: string, ctx: TickContext): Promise<void> {
-    const taskFn = this.tasks.get(taskName);
-    if (!taskFn) return;
-
+    const entryName = taskName;
     const schedule = getHeartbeatSchedule(this.db).find(
-      (r) => r.taskName === taskName,
+      (r) => r.taskName === entryName,
     );
+    const { fn: taskFn, taskName: resolvedTask } = this.resolveTask(entryName);
+    if (!taskFn) {
+      if (!this.warnedMissing.has(entryName)) {
+        this.warnedMissing.add(entryName);
+        logger.warn(`No task function for heartbeat entry '${entryName}'`);
+      }
+      if (schedule) {
+        this.recordFailure(entryName, new Error(`no task function for '${entryName}'`), 0, new Date().toISOString());
+      }
+      return;
+    }
     const timeoutMs = schedule?.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 
+    const running = this.inFlight.get(entryName);
+    if (running) {
+      if (Date.now() < running.abandonAt) return;
+      running.abandoned = true;
+      this.inFlight.delete(entryName);
+      this.releaseLease(entryName);
+      logger.warn(
+        `Task '${entryName}' has not settled ${Math.round((Date.now() - running.startedMs) / 1000)}s after it started; starting it again`,
+      );
+    }
+
     // Acquire lease
-    if (!this.acquireLease(taskName)) return;
+    if (!this.acquireLease(entryName)) return;
 
     const startedAt = new Date().toISOString();
     const startMs = Date.now();
-    const timeout = timeoutPromise(timeoutMs);
+    const flight: InFlightTask = {
+      done: Promise.resolve(),
+      startedMs: startMs,
+      abandonAt: startMs + Math.max(ABANDON_AFTER_MIN_MS, timeoutMs * ABANDON_AFTER_TIMEOUTS),
+      settled: false,
+      timedOut: false,
+      abandoned: false,
+    };
+    const run = Promise.resolve().then(() => taskFn(ctx, this.legacyContext));
+    flight.done = run.then(
+      (result) => this.onTaskSettled(entryName, resolvedTask, flight, startedAt, { ok: true, result }),
+      (error) => this.onTaskSettled(entryName, resolvedTask, flight, startedAt, { ok: false, error }),
+    );
+    this.inFlight.set(entryName, flight);
 
-    try {
-      const result = await Promise.race([
-        taskFn(ctx, this.legacyContext),
-        timeout.promise,
-      ]);
-
-      const durationMs = Date.now() - startMs;
-      this.recordSuccess(taskName, durationMs, startedAt);
-
-      // If the task says we should wake, fire the callback
-      if (result.shouldWake && this.onWakeRequest) {
-        const reason = result.message || `Heartbeat task '${taskName}' requested wake`;
-        this.onWakeRequest(reason);
-        insertWakeEvent(this.db, 'heartbeat', reason, { taskName });
+    const timeout = timeoutSignal(timeoutMs);
+    const first = await Promise.race([flight.done.then(() => "settled" as const), timeout.promise]);
+    timeout.clear();
+    if (first === "timeout" && !flight.settled) {
+      flight.timedOut = true;
+      try {
+        this.recordFailure(
+          entryName,
+          new Error(`Task timed out after ${timeoutMs}ms`),
+          Date.now() - startMs,
+          startedAt,
+          "timeout",
+        );
+        this.scheduleRetryIfAllowed(entryName, schedule);
+        // Keep the lease until the task settles (or is given up on).
+        extendScheduleLease(this.db, entryName, this.ownerId, Math.max(flight.abandonAt - Date.now(), LEASE_TTL_MS));
+      } catch (err) {
+        logger.error(`Recording timeout of '${entryName}' failed`, err instanceof Error ? err : undefined);
       }
-    } catch (err: any) {
-      const durationMs = Date.now() - startMs;
-      const isTimeout = err.message?.includes("timed out");
-      this.recordFailure(
-        taskName,
-        err,
-        durationMs,
-        startedAt,
-        isTimeout ? "timeout" : "failure",
-      );
+    }
+  }
 
-      // Check if we should retry
-      if (schedule && schedule.maxRetries > 0) {
-        const history = this.getRecentFailures(taskName);
-        if (history < schedule.maxRetries) {
-          this.scheduleRetry(taskName);
+  private onTaskSettled(
+    entryName: string,
+    resolvedTask: string,
+    flight: InFlightTask,
+    startedAt: string,
+    outcome: { ok: true; result: TaskResult } | { ok: false; error: unknown },
+  ): void {
+    flight.settled = true;
+    if (this.inFlight.get(entryName) === flight) this.inFlight.delete(entryName);
+    const late = flight.timedOut || flight.abandoned;
+    try {
+      if (!late) {
+        if (outcome.ok) {
+          this.recordSuccess(entryName, Date.now() - flight.startedMs, startedAt);
+        } else {
+          const err = outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
+          this.recordFailure(entryName, err, Date.now() - flight.startedMs, startedAt, "failure");
+          const schedule = getHeartbeatSchedule(this.db).find((r) => r.taskName === entryName);
+          this.scheduleRetryIfAllowed(entryName, schedule);
+        }
+      } else if (outcome.ok) {
+        logger.info(`Task '${entryName}' finished after its timeout`);
+      } else {
+        const msg = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+        logger.warn(`Task '${entryName}' failed after its timeout: ${msg}`);
+      }
+
+      if (outcome.ok && outcome.result?.shouldWake) {
+        const reason = outcome.result.message || `Heartbeat task '${entryName}' requested wake`;
+        this.deliverWake(reason, entryName, resolvedTask);
+      }
+    } catch (err) {
+      logger.error(`Handling the result of '${entryName}' failed`, err instanceof Error ? err : undefined);
+    } finally {
+      if (!flight.abandoned) {
+        try {
+          this.releaseLease(entryName);
+        } catch {
+          // database closed
         }
       }
-    } finally {
-      timeout.clear();
-      this.releaseLease(taskName);
+    }
+  }
+
+  /** The scheduler is the only writer of heartbeat wake events; the callback only notifies. */
+  private deliverWake(reason: string, entryName: string, resolvedTask: string): void {
+    const payload: Record<string, string> = { taskName: resolvedTask };
+    if (entryName !== resolvedTask) payload.entryName = entryName;
+    insertWakeEvent(this.db, "heartbeat", reason, payload);
+    try {
+      this.onWakeRequest?.(reason);
+    } catch (err) {
+      logger.error("onWakeRequest callback failed", err instanceof Error ? err : undefined);
+    }
+  }
+
+  /**
+   * Retry while the consecutive failures, the current one included, are at
+   * most maxRetries.
+   */
+  private scheduleRetryIfAllowed(taskName: string, schedule: HeartbeatScheduleRow | undefined): void {
+    if (!schedule || schedule.maxRetries <= 0) return;
+    if (this.getRecentFailures(taskName) <= schedule.maxRetries) {
+      this.scheduleRetry(taskName);
     }
   }
 
@@ -230,14 +432,14 @@ export class DurableScheduler {
    * Acquire a lease for a task.
    */
   acquireLease(taskName: string): boolean {
-    return acquireTaskLease(this.db, taskName, this.ownerId, LEASE_TTL_MS);
+    return acquireScheduleLease(this.db, taskName, this.ownerId, LEASE_TTL_MS);
   }
 
   /**
    * Release a lease for a task.
    */
   releaseLease(taskName: string): void {
-    releaseTaskLease(this.db, taskName, this.ownerId);
+    releaseScheduleLease(this.db, taskName, this.ownerId);
   }
 
   /**
@@ -290,8 +492,10 @@ export class DurableScheduler {
       idempotencyKey: null,
     });
 
+    // A spent retry time must not keep the task due; a new retry is set after this.
     updateHeartbeatSchedule(this.db, taskName, {
       lastRunAt: now,
+      nextRunAt: null,
       lastResult: result,
       lastError: errorMessage,
       failCount: (this.getFailCount(taskName) ?? 0) + 1,

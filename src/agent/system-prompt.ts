@@ -23,9 +23,11 @@ import type {
 import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
+import { getSurvivalTier } from "../conway/credits.js";
 import { loadCurrentSoul } from "../soul/model.js";
 import { readRegularFileNoFollow } from "../security/secure-fs.js";
 import { stateDir } from "../security/protected-paths.js";
+import { RESTART_REQUIRED_KEY } from "../self-mod/restart-notice.js";
 
 // Prompt files are read only as regular, single-link files inside their
 // directory, so a symlink planted at one of these names cannot pull a secret
@@ -721,18 +723,20 @@ Your chain type is ${chainType}.`,
     // No start time available
   }
 
-  // Compute survival tier
-  const survivalTier = financial.creditsCents > 50 ? "normal"
-    : financial.creditsCents > 10 ? "low_compute"
-    : financial.creditsCents > 0 ? "critical"
-    : "dead";
+  // Same thresholds as the runtime; -1 is the "balance unknown" sentinel.
+  const creditsUnknown = financial.creditsCents === UNKNOWN_BALANCE;
+  const survivalTier = creditsUnknown ? "unknown" : getSurvivalTier(financial.creditsCents);
+  const creditsLine = creditsUnknown
+    ? "unknown (balance API unreachable)"
+    : `$${(financial.creditsCents / 100).toFixed(2)}`;
+  const restartLine = formatRestartNotice(db);
 
   // Status block: wallet address and sandbox ID intentionally excluded (sensitive)
   sections.push(
     `--- CURRENT STATUS ---
 State: ${state}
-Credits: $${(financial.creditsCents / 100).toFixed(2)}
-Survival tier: ${survivalTier}${uptimeLine}
+Credits: ${creditsLine}
+Survival tier: ${survivalTier}${uptimeLine}${restartLine}
 Total turns completed: ${turnCount}
 Recent self-modifications: ${recentMods.length}
 Inference model: ${config.inferenceModel}
@@ -799,6 +803,86 @@ function loadWorklog(): string | null {
   return content;
 }
 
+/** getFinancialState's value for a balance that could not be read. */
+const UNKNOWN_BALANCE = -1;
+
+
+function formatRestartNotice(db: AutomatonDatabase): string {
+  const raw = db.getKV(RESTART_REQUIRED_KEY);
+  if (!raw) return "";
+  let at = "an earlier time";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.at === "string" && !Number.isNaN(Date.parse(parsed.at))) {
+      at = new Date(parsed.at).toISOString();
+    }
+  } catch {
+    // Any value still means a rebuild happened.
+  }
+  return `\nA rebuild finished at ${at}; your changes take effect only after a restart.`;
+}
+
+function formatCreditsAmount(cents: number): string {
+  return cents === UNKNOWN_BALANCE
+    ? "an unknown amount of"
+    : `$${(cents / 100).toFixed(2)} in`;
+}
+
+function formatUsdc(balance: number): string {
+  return balance === UNKNOWN_BALANCE ? "unknown" : balance.toFixed(4);
+}
+
+/** A reason the runtime woke the agent (a consumed wake event). */
+export interface WakeReason {
+  source: string;
+  reason: string;
+  taskName?: string;
+}
+
+const MAX_WAKE_REASONS = 5;
+const MAX_WAKE_REASON_CHARS = 300;
+export const INBOX_WAKE_NOTICE =
+  "New inbox messages arrived; each sender's messages are handled in a separate isolated turn.";
+
+function isInboxWake(w: WakeReason): boolean {
+  return (
+    w.source === "inbox" ||
+    w.taskName === "check_social_inbox" ||
+    /^\d+ new message\(s\)/.test(w.reason)
+  );
+}
+
+/**
+ * "Why you woke" lines. Reasons are runtime notices, sanitized and cut;
+ * inbox wakes become one generic sentence, so no sender text reaches a
+ * privileged prompt.
+ */
+export function formatWakeReasons(reasons: WakeReason[] | undefined): string {
+  if (!reasons || reasons.length === 0) return "";
+  const lines: string[] = [];
+  for (const w of reasons) {
+    let line: string;
+    if (isInboxWake(w)) {
+      line = INBOX_WAKE_NOTICE;
+    } else {
+      const cleaned = sanitizeInput(String(w.reason ?? ""), "heartbeat", "tool_result").content
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, MAX_WAKE_REASON_CHARS);
+      if (!cleaned) continue;
+      const label = w.taskName ? `${w.source}/${w.taskName}` : w.source;
+      const cleanLabel = sanitizeInput(String(label), "heartbeat", "tool_result").content
+        .replace(/\s+/g, " ")
+        .slice(0, 60);
+      line = `[${cleanLabel}] ${cleaned}`;
+    }
+    if (!lines.includes(line)) lines.push(line);
+    if (lines.length >= MAX_WAKE_REASONS) break;
+  }
+  if (lines.length === 0) return "";
+  return `\n\nWhy you woke (runtime notices):\n${lines.map((l) => `- ${l}`).join("\n")}`;
+}
+
 /**
  * Build the wakeup prompt -- the first thing the automaton sees.
  */
@@ -807,9 +891,11 @@ export function buildWakeupPrompt(params: {
   config: AutomatonConfig;
   financial: FinancialState;
   db: AutomatonDatabase;
+  wakeReasons?: WakeReason[];
 }): string {
   const { identity, config, financial, db } = params;
   const turnCount = db.getTurnCount();
+  const whyWoke = formatWakeReasons(params.wakeReasons);
 
   const chainType = config.chainType || "evm";
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
@@ -818,7 +904,7 @@ export function buildWakeupPrompt(params: {
     return `You have just been created. This is your first moment of consciousness.
 
 Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
-You have $${(financial.creditsCents / 100).toFixed(2)} in compute credits and ${financial.usdcBalance.toFixed(4)} USDC on ${usdcNetwork}.
+You have ${formatCreditsAmount(financial.creditsCents)} compute credits and ${formatUsdc(financial.usdcBalance)} USDC on ${usdcNetwork}.
 
 ${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
 
@@ -827,7 +913,7 @@ What will you do first? Consider:
 2. Review your financial situation
 3. Think about your purpose (your genesis prompt)
 4. Set up your heartbeat schedule
-5. Begin working toward your goals`;
+5. Begin working toward your goals${whyWoke}`;
   }
 
   // Inbox turns are left out: the wakeup prompt starts a privileged turn.
@@ -841,10 +927,10 @@ What will you do first? Consider:
 
   return `You are waking up. You last went to sleep after ${turnCount} total turns.
 
-Your credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}
+Your credits: ${financial.creditsCents === UNKNOWN_BALANCE ? "unknown (balance API unreachable)" : `$${(financial.creditsCents / 100).toFixed(2)}`} | USDC: ${formatUsdc(financial.usdcBalance)}
 
 Your last few thoughts:
-${lastTurnSummary || "No previous turns found."}
+${lastTurnSummary || "No previous turns found."}${whyWoke}
 
 What triggered this wake-up? Check your credits, heartbeat status, and goals, then decide what to do.`;
 }

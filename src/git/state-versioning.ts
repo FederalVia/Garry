@@ -191,15 +191,20 @@ export async function commitStateChange(
 ): Promise<string> {
   const dir = resolveHome(AUTOMATON_DIR);
 
-  // Check if there are changes
-  const status = await gitStatus(conway, dir);
-  if (status.clean) {
-    return "No changes to commit";
-  }
+  // Never throws: a missing or broken state repo must not fail the change itself.
+  try {
+    const status = await gitStatus(conway, dir);
+    if (status.clean) {
+      return "No changes to commit";
+    }
 
-  const message = `${category}: ${description}`;
-  const result = await gitCommit(conway, dir, message);
-  return result;
+    const message = `${category}: ${description}`;
+    return await gitCommit(conway, dir, message);
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    logger.warn(`State repo commit skipped: ${msg}`);
+    return `State repo unavailable: ${msg}`;
+  }
 }
 
 /**
@@ -255,5 +260,10 @@ export async function getStateHistory(
   limit: number = 20,
 ) {
   const dir = resolveHome(AUTOMATON_DIR);
-  return gitLog(conway, dir, limit);
+  try {
+    return await gitLog(conway, dir, limit);
+  } catch (err: any) {
+    logger.warn(`State repo history unavailable: ${err?.message || String(err)}`);
+    return [];
+  }
 }

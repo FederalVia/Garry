@@ -7,6 +7,12 @@
 
 import type { ConwayClient, GitStatus, GitLogEntry } from "../types.js";
 
+/** The failing command's own words; stderr first, stdout when stderr is empty. */
+function gitFailure(op: string, result: { stdout: string; stderr: string; exitCode: number }): Error {
+  const detail = (result.stderr || result.stdout || "").trim() || `exit code ${result.exitCode}`;
+  return new Error(`git ${op} failed: ${detail}`);
+}
+
 /**
  * Get git status for a repository.
  */
@@ -15,9 +21,11 @@ export async function gitStatus(
   repoPath: string,
 ): Promise<GitStatus> {
   const result = await conway.exec(
-    `cd ${escapeShellArg(repoPath)} && git status --porcelain -b 2>/dev/null`,
+    `cd ${escapeShellArg(repoPath)} && git status --porcelain -b`,
     10000,
   );
+  // A failed cd or a non-repo must not read as a clean tree.
+  if (result.exitCode !== 0) throw gitFailure("status", result);
 
   const lines = result.stdout.split("\n").filter(Boolean);
   let branch = "unknown";
@@ -65,9 +73,10 @@ export async function gitDiff(
 ): Promise<string> {
   const flag = staged ? "--cached" : "";
   const result = await conway.exec(
-    `cd ${escapeShellArg(repoPath)} && git diff ${flag} 2>/dev/null`,
+    `cd ${escapeShellArg(repoPath)} && git diff ${flag}`,
     10000,
   );
+  if (result.exitCode !== 0) throw gitFailure("diff", result);
   return result.stdout || "(no changes)";
 }
 
@@ -142,10 +151,15 @@ export async function gitLog(
 ): Promise<GitLogEntry[]> {
   const safeLimit = Math.max(1, Math.floor(Number(limit))) || 10;
   const result = await conway.exec(
-    `cd ${escapeShellArg(repoPath)} && git log --format="%H|%s|%an|%ai" -n ${safeLimit} 2>/dev/null`,
+    `cd ${escapeShellArg(repoPath)} && git log --format="%H|%s|%an|%ai" -n ${safeLimit}`,
     10000,
   );
 
+  if (result.exitCode !== 0) {
+    // A repo without commits is not a failure.
+    if (/does not have any commits yet/.test(result.stderr)) return [];
+    throw gitFailure("log", result);
+  }
   if (!result.stdout.trim()) return [];
 
   return result.stdout

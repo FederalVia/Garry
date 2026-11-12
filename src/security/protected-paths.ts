@@ -36,6 +36,9 @@ export interface PathDecision {
   requested: string;
   /** Real path (or resolved parent + basename for a file that does not exist yet). */
   real?: string;
+  /** checkRead: identity of the file that was checked, when it existed. */
+  dev?: number;
+  ino?: number;
 }
 
 // ─── Locations ────────────────────────────────────────────────
@@ -203,8 +206,26 @@ function normalizedAbs(absPath: string): string {
   return "/" + segmentsOf(absPath).join("/");
 }
 
+// Files this process holds POSIX locks on (the instance lock, the state
+// database). Closing any descriptor on such a file in this process drops
+// those locks, so they are denied wherever they live and whatever their name.
+const runtimeFiles = new Set<string>(); // normalized, for matching
+const runtimeFilePaths = new Set<string>(); // as given, for the inode check
+
+/** Deny reads and writes of absPath (and its realpath) for the rest of this process. */
+export function protectRuntimeFile(absPath: string): void {
+  const lexical = path.resolve(expandHome(absPath));
+  const parent = tryRealpath(path.dirname(lexical));
+  const real = tryRealpath(lexical) ?? (parent ? path.join(parent, path.basename(lexical)) : null);
+  for (const p of real ? [lexical, real] : [lexical]) {
+    runtimeFiles.add(normalizedAbs(p));
+    runtimeFilePaths.add(p);
+  }
+}
+
 /** Secret file names, secret directories and system paths. No state-dir rule. */
 export function matchSecret(absPath: string): string | null {
+  if (runtimeFiles.size > 0 && runtimeFiles.has(normalizedAbs(absPath))) return "runtime-lock";
   const segs = segmentsOf(absPath);
   const base = segs[segs.length - 1] ?? "";
   if (SECRET_NAMES.has(base)) return `secret-name:${base}`;
@@ -604,6 +625,7 @@ function sensitiveInodeCandidates(): string[] {
     path.join(state, "state.db"),
     path.join(state, "inference-providers.json"),
     path.join(home, ".config", "solana", "id.json"),
+    ...runtimeFilePaths,
   ];
   try {
     const sshDir = path.join(home, ".ssh");
@@ -675,6 +697,7 @@ export function checkRead(absPath: string, opts: { root?: string } = {}): PathDe
         return deny(lexical, "HARDLINK", `${lexical} is a hard link to a sensitive file`, undefined, resolved.real);
       }
     }
+    return { ok: true, requested: lexical, real: resolved.real, dev: st.dev, ino: st.ino };
   }
   return { ok: true, requested: lexical, real: resolved.real };
 }

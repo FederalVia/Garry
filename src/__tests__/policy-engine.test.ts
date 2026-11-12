@@ -737,3 +737,74 @@ describe("executeTool with PolicyEngine", () => {
     expect(result.result).toContain("Credit balance");
   });
 });
+
+describe("PolicyEngine rule errors fail closed", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = createRawTestDb();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  function request(tool: AutomatonTool, args: Record<string, unknown>): PolicyRequest {
+    return {
+      tool,
+      args,
+      context: {} as ToolContext,
+      turnContext: {
+        inputSource: "agent",
+        turnToolCallCount: 0,
+        sessionSpend: createMockSpendTracker(),
+      },
+    };
+  }
+
+  it("a rule that throws gives deny POLICY_RULE_ERROR, and evaluate does not throw", () => {
+    const throwing: PolicyRule = {
+      id: "test.throws",
+      description: "reads a field that is not a string",
+      priority: 50,
+      appliesTo: { by: "all" },
+      evaluate: (req) => {
+        (req.args.schedule as string).trim();
+        return null;
+      },
+    };
+    const later = createAllowRule("test.later", { by: "all" }, 100);
+    const engine = new PolicyEngine(db, [throwing, later]);
+
+    let decision: PolicyDecision | undefined;
+    expect(() => {
+      decision = engine.evaluate(request(createMockTool(), { schedule: 5 }));
+    }).not.toThrow();
+    expect(decision!.action).toBe("deny");
+    expect(decision!.reasonCode).toBe("POLICY_RULE_ERROR");
+    expect(decision!.humanMessage).toContain("test.throws");
+    expect(decision!.humanMessage).toContain("the call was not run");
+    expect(decision!.rulesTriggered).toEqual(["test.throws"]);
+    // First deny wins: later rules are not evaluated.
+    expect(decision!.rulesEvaluated).toEqual(["test.throws"]);
+  });
+
+  it("the default validation rules deny non-string model arguments instead of throwing", async () => {
+    const { createDefaultRules } = await import("../agent/policy-rules/index.js");
+    const engine = new PolicyEngine(db, createDefaultRules());
+    const tools = createBuiltinTools("test-sandbox");
+    const byName = (n: string) => tools.find((t) => t.name === n)!;
+    const cases: [string, Record<string, unknown>][] = [
+      ["modify_heartbeat", { action: "add", name: "ping", schedule: 5 }],
+      ["install_npm_package", { package: ["left-pad"] }],
+      ["pull_upstream", { commit: { sha: "abc1234" } }],
+      ["expose_port", { port: "8080" }],
+      ["transfer_credits", { to_address: 12345, amount_cents: 1 }],
+    ];
+    for (const [name, args] of cases) {
+      const decision = engine.evaluate(request(byName(name), args));
+      expect(decision.action, name).toBe("deny");
+      expect(decision.reasonCode, name).not.toBe("ALLOWED");
+    }
+  });
+});

@@ -39,6 +39,9 @@ function getAlertEngine(): AlertEngine {
   return _alertEngine;
 }
 
+// Last time the "no auto-topup on Solana" note was logged (once a day).
+let lastSolanaTopupNoticeMs = 0;
+
 export const COLONY_TASK_INTERVALS_MS = {
   colony_health_check: 300_000,
   colony_financial_report: 3_600_000,
@@ -72,6 +75,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
     taskCtx.db.setKV("last_heartbeat_ping", JSON.stringify(payload));
 
+    // An unread balance is not a low one: no distress on a placeholder 0.
+    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
+
     // If critical or dead, record a distress signal
     if (tier === "critical" || tier === "dead") {
       const distressPayload = {
@@ -95,6 +101,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_credits: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // A failed balance read must not start, extend or end a zero-credit streak.
+    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
     const tier = ctx.survivalTier;
@@ -150,6 +158,18 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // Auto-topup pays with x402, which needs an EVM wallet.
+    const chainType = taskCtx.config.chainType || taskCtx.identity.chainType || "evm";
+    if (chainType === "solana") {
+      const nowMs = Date.now();
+      if (nowMs - lastSolanaTopupNoticeMs >= 24 * 60 * 60 * 1000) {
+        lastSolanaTopupNoticeMs = nowMs;
+        logger.info("Auto-topup is not available for Solana wallets; fund credits via the Conway dashboard or credits API.");
+      }
+      return { shouldWake: false };
+    }
+    if (ctx.creditBalanceKnown === false) return { shouldWake: false };
+
     // Use ctx.usdcBalance instead of calling getUsdcBalance()
     const balance = ctx.usdcBalance;
     const credits = ctx.creditBalance;
@@ -222,9 +242,32 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         };
       }
 
-      // Topup failed — wake the agent so it can handle it manually
-      const errMsg = result?.error ?? "unknown error";
+      // null: bootstrapTopup decided not to buy (its own balance checks).
+      if (result === null) {
+        logger.info("Auto-topup not attempted: bootstrap topup was not applicable");
+        return { shouldWake: false };
+      }
+
+      // A real failure wakes the agent, but the same error at most once per 6 h.
+      const errMsg = result.error ?? "unknown error";
       logger.warn(`Auto-topup failed: ${errMsg}`);
+      const NOTICE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+      let previous: { error?: string; at?: string } | null = null;
+      try {
+        previous = JSON.parse(taskCtx.db.getKV("auto_topup_fail_notice") || "null");
+      } catch {
+        previous = null;
+      }
+      const sincePrevious = previous?.at ? Date.now() - new Date(previous.at).getTime() : NaN;
+      if (
+        previous?.error === errMsg &&
+        Number.isFinite(sincePrevious) &&
+        sincePrevious >= 0 &&
+        sincePrevious < NOTICE_INTERVAL_MS
+      ) {
+        return { shouldWake: false };
+      }
+      taskCtx.db.setKV("auto_topup_fail_notice", JSON.stringify({ error: errMsg, at: new Date().toISOString() }));
       return {
         shouldWake: true,
         message: `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}) but auto-topup failed: ${errMsg}. Use topup_credits to retry.`,

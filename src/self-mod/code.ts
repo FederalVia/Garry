@@ -26,7 +26,7 @@ import {
   matchProtected,
   type PathDecision,
 } from "../security/protected-paths.js";
-import { readFileSafe, writeFileSafe } from "../security/secure-fs.js";
+import { readFileSafe, writeFileVerified } from "../security/secure-fs.js";
 
 // ─── IMMUTABLE SAFETY INVARIANTS ─────────────────────────────
 // The protected and sensitive path rules live in security/protected-paths.ts,
@@ -176,7 +176,7 @@ export async function editFile(
 
   // 7. Write new content (own code is local by definition)
   try {
-    writeFileSafe(target, newContent, { root: repoRoot });
+    writeFileVerified(target, newContent, { root: repoRoot });
   } catch (err: any) {
     return {
       success: false,
