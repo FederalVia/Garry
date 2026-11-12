@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { SimpleAgentTracker, SimpleFundingProtocol } from "../../orchestration/simple-tracker.js";
 import { createInMemoryDb } from "./test-db.js";
 import type BetterSqlite3 from "better-sqlite3";
+import { MIGRATION_V7 } from "../../state/schema.js";
+import { ChildLifecycle } from "../../replication/lifecycle.js";
+import { spawnChild } from "../../replication/spawn.js";
+import { MockConwayClient, createTestDb, createTestIdentity } from "../mocks.js";
 
 function createMockAutomatonDb(db: BetterSqlite3.Database) {
   return {
@@ -178,6 +182,15 @@ describe("orchestration/simple-tracker", () => {
       expect(children[0].address).toBe("0xnew");
     });
 
+    it("is an upsert by address: a second register adds no row", () => {
+      insertChild(db, "c1", "Agent", "0xsame", "running");
+
+      tracker.register({ address: "0xsame", name: "Dup", role: "generalist", sandboxId: "sb-2" });
+
+      const rows = db.prepare("SELECT id FROM children WHERE address = ?").all("0xsame");
+      expect(rows).toEqual([{ id: "c1" }]);
+    });
+
     it("stores the role in the genesis prompt", () => {
       tracker.register({
         address: "0xrole",
@@ -191,6 +204,125 @@ describe("orchestration/simple-tracker", () => {
         | undefined;
       expect(row?.genesis_prompt).toContain("security-expert");
     });
+  });
+});
+
+describe("orchestration/simple-tracker with lifecycle children (F067, H3-002, H3-003)", () => {
+  const CHILD = "0x" + "2".repeat(40);
+
+  function lifecycleDb() {
+    const db = createInMemoryDb();
+    db.exec(MIGRATION_V7);
+    db.exec("ALTER TABLE children ADD COLUMN chain_type TEXT DEFAULT 'evm'");
+    return db;
+  }
+
+  function makeHealthyLifecycleChild(db: BetterSqlite3.Database, id: string, address: string) {
+    const lifecycle = new ChildLifecycle(db);
+    lifecycle.initChild(id, "market-researcher", "sb-" + id, "own mission");
+    db.prepare("UPDATE children SET address = ? WHERE id = ?").run(address, id);
+    for (const state of ["sandbox_created", "runtime_ready", "wallet_verified", "funded", "starting", "healthy"] as const) {
+      lifecycle.transition(id, state);
+    }
+    return lifecycle;
+  }
+
+  it("getIdle never offers a lifecycle child as an orchestrator worker", () => {
+    const db = lifecycleDb();
+    try {
+      makeHealthyLifecycleChild(db, "kid", CHILD);
+      const tracker = new SimpleAgentTracker(createMockAutomatonDb(db));
+      expect(tracker.getIdle()).toEqual([]);
+      expect(tracker.getBestForTask("generalist")).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("updateStatus does not overwrite a lifecycle child's status", () => {
+    const db = lifecycleDb();
+    try {
+      const lifecycle = makeHealthyLifecycleChild(db, "kid", CHILD);
+      const tracker = new SimpleAgentTracker(createMockAutomatonDb(db));
+
+      tracker.updateStatus(CHILD, "running");
+
+      const row = db.prepare("SELECT status FROM children WHERE id = 'kid'").get() as { status: string };
+      expect(row.status).toBe("healthy");
+      expect(lifecycle.getCurrentState("kid")).toBe("healthy");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("updateStatus never revives a terminal legacy row", () => {
+    const db = lifecycleDb();
+    try {
+      insertChild(db, "old", "Old", "0xold", "dead");
+      const tracker = new SimpleAgentTracker(createMockAutomatonDb(db));
+      tracker.updateStatus("0xold", "starting");
+      const row = db.prepare("SELECT status FROM children WHERE id = 'old'").get() as { status: string };
+      expect(row.status).toBe("dead");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("spawnChild plus register with the same address leaves one row and a single ledger", async () => {
+    const db = createTestDb();
+    try {
+      const conway = new MockConwayClient();
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => ({
+        stdout: command.includes("--init") ? `Wallet: ${CHILD}` : "ok",
+        stderr: "",
+        exitCode: 0,
+      }));
+      const identity = createTestIdentity();
+      const child = await spawnChild(
+        conway,
+        identity,
+        db,
+        { name: "kid", genesisPrompt: "p", creatorAddress: identity.address, parentAddress: identity.address },
+        new ChildLifecycle(db.raw),
+        { maxChildren: 3 },
+      );
+      const tracker = new SimpleAgentTracker(db);
+
+      tracker.register({ address: child.address, name: child.name, role: "generalist", sandboxId: child.sandboxId });
+      tracker.updateStatus(child.address, "running");
+      const funding = new SimpleFundingProtocol(conway, identity, db);
+      expect(await funding.fundChild(child.address, 25)).toEqual({ success: true });
+
+      const rows = db.raw.prepare("SELECT status, funded_amount_cents FROM children WHERE address = ?").all(child.address);
+      expect(rows).toEqual([{ status: "wallet_verified", funded_amount_cents: 25 }]);
+      const sum = db.raw.prepare("SELECT SUM(funded_amount_cents) AS s FROM children").get() as { s: number };
+      expect(sum.s).toBe(25);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses to fund a child whose rows have all ended", async () => {
+    const db = createTestDb();
+    try {
+      const conway = new MockConwayClient();
+      const transfer = vi.spyOn(conway, "transferCredits");
+      db.insertChild({
+        id: "gone",
+        name: "gone",
+        address: CHILD as `0x${string}`,
+        sandboxId: "sb",
+        genesisPrompt: "p",
+        fundedAmountCents: 0,
+        status: "failed",
+        createdAt: new Date().toISOString(),
+      });
+      const funding = new SimpleFundingProtocol(conway, createTestIdentity(), db);
+      expect(await funding.fundChild(CHILD, 250)).toEqual({ success: false });
+      expect(transfer).not.toHaveBeenCalled();
+    } finally {
+      db.close();
+    }
   });
 });
 

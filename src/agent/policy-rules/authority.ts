@@ -140,6 +140,7 @@ const INBOX_SHELL_TOOLS = [
   "git_branch",
   "git_clone",
   "start_child",
+  "stop_child",
   "install_skill",
 ] as const;
 

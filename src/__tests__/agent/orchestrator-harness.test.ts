@@ -331,7 +331,7 @@ describe("agent/OrchestratorHarness", () => {
     expect(new Set(delegatedTasks.map((entry) => entry.id)).size).toBe(2);
   });
 
-  it("rebuilds dependency index mappings on replan so new dependent tasks bind to new prerequisite tasks", async () => {
+  it("on a replan after a rejected verification, reuses the completed prerequisite and redoes only the rejected task", async () => {
     const initialPlan: PlannerOutput = {
       analysis: "Initial two-step plan",
       strategy: "Implement then verify",
@@ -408,18 +408,236 @@ describe("agent/OrchestratorHarness", () => {
     });
     expect(verification).toContain("Planner-backed replan prepared");
 
-    await delegateTool!.execute({ plan_task_index: 0 });
-    await delegateTool!.execute({ plan_task_index: 1 });
+    // The implementation passed and is reused; only the rejected verification is redone.
+    expect(await delegateTool!.execute({ plan_task_index: 0 })).toContain("Sub-task already exists");
+    expect(await delegateTool!.execute({ plan_task_index: 1 })).toContain("Sub-task created");
 
     const allImplementTasks = getTasksByGoal(db, "goal-1").filter((entry) => entry.parentId === "orchestrator-task-1" && entry.title === "Implement feature");
     const allVerifyTasks = getTasksByGoal(db, "goal-1").filter((entry) => entry.parentId === "orchestrator-task-1" && entry.title === "Verify feature");
-    expect(allImplementTasks).toHaveLength(2);
+    expect(allImplementTasks).toHaveLength(1);
     expect(allVerifyTasks).toHaveLength(2);
 
-    const newImplement = allImplementTasks.find((entry) => entry.id !== initialImplement!.id);
     const newVerify = allVerifyTasks.find((entry) => entry.id !== initialVerify!.id);
-    expect(newImplement).toBeDefined();
-    expect(newVerify?.dependencies).toEqual([newImplement?.id]);
-    expect(newVerify?.dependencies).not.toEqual([initialImplement!.id]);
+    expect(newVerify?.dependencies).toEqual([initialImplement!.id]);
+    // Its dependency is complete, so it is ready at once.
+    expect(newVerify?.status).toBe("pending");
+  });
+
+  // ─── F058 / F059 / F060 ───────────────────────────────────────
+
+  function twoStepPlan(): PlannerOutput {
+    return {
+      analysis: "Two steps",
+      strategy: "Research then implement",
+      customRoles: [],
+      tasks: [
+        { title: "Research API", description: "Find the API.", agentRole: "researcher", dependencies: [], estimatedCostCents: 50, priority: 60, timeoutMs: 120_000 },
+        { title: "Implement client", description: "Write the client.", agentRole: "executor", dependencies: [0], estimatedCostCents: 50, priority: 55, timeoutMs: 600_000 },
+      ],
+      risks: [],
+      estimatedTotalCostCents: 100,
+      estimatedTimeMinutes: 10,
+    };
+  }
+
+  /** Counts planner calls; worker turns come from the given script. */
+  class CountingInference implements WorkerInferenceClient {
+    plannerCalls = 0;
+    private turn = 0;
+    constructor(private readonly plan: PlannerOutput, private readonly turns: Array<{ content: string; toolCalls?: any[] }> = []) {}
+    async chat(params: Parameters<WorkerInferenceClient["chat"]>[0]): ReturnType<WorkerInferenceClient["chat"]> {
+      if (params.responseFormat?.type === "json_object") {
+        this.plannerCalls += 1;
+        return { content: JSON.stringify(this.plan) };
+      }
+      return this.turns[this.turn++] ?? { content: "" };
+    }
+  }
+
+  function childOf(title: string) {
+    return getTasksByGoal(db, "goal-1").filter((entry) => entry.parentId === "orchestrator-task-1" && entry.title === title);
+  }
+
+  function complete(id: string): void {
+    db.prepare("UPDATE task_graph SET status = 'completed', result = ?, completed_at = ? WHERE id = ?").run(
+      JSON.stringify({ success: true, output: "ok", artifacts: [], costCents: 0, duration: 1 }),
+      new Date().toISOString(),
+      id,
+    );
+  }
+
+  it("F059: a retried orchestrator reuses a completed planned task instead of delegating it again", async () => {
+    const task = makeTask();
+    persistTask(task);
+    const first = new OrchestratorHarness();
+    await first.initialize(task, makeContext(new CountingInference(twoStepPlan())));
+    await first.getToolDefs().find((t) => t.name === "delegate_task")!.execute({ plan_task_index: 0 });
+    const research = childOf("Research API")[0];
+    complete(research.id);
+
+    // The retry re-initializes from the persisted plan.
+    const retry = new OrchestratorHarness();
+    const inference = new CountingInference(twoStepPlan());
+    await retry.initialize(task, makeContext(inference));
+    const delegate = retry.getToolDefs().find((t) => t.name === "delegate_task")!;
+
+    expect(await delegate.execute({ plan_task_index: 1 })).toContain("Sub-task created");
+    expect(childOf("Implement client")[0].dependencies).toEqual([research.id]);
+    expect(await delegate.execute({ plan_task_index: 0 })).toContain("Sub-task already exists");
+    expect(childOf("Research API")).toHaveLength(1);
+    expect(inference.plannerCalls).toBe(0);
+  });
+
+  it("F060: an argument-less refresh_plan with no failure loads the plan instead of regenerating it", async () => {
+    const task = makeTask();
+    persistTask(task);
+    const inference = new CountingInference(twoStepPlan());
+    const harness = new OrchestratorHarness();
+    await harness.initialize(task, makeContext(inference));
+    expect(inference.plannerCalls).toBe(1);
+
+    const refresh = harness.getToolDefs().find((t) => t.name === "refresh_plan")!;
+    await refresh.execute({});
+    await refresh.execute({});
+    expect(inference.plannerCalls).toBe(1);
+    const statePath = path.join(workspaceRoot, "workspace", "subplans", "orchestrator-task-1", "state.json");
+    expect(fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")).fixCycles : 0).toBe(0);
+  });
+
+  it("F060: a failure is replanned once; later refreshes and retries do not replan it again", async () => {
+    const task = makeTask();
+    persistTask(task);
+    const inference = new CountingInference(twoStepPlan());
+    const harness = new OrchestratorHarness();
+    await harness.initialize(task, makeContext(inference));
+    await harness.getToolDefs().find((t) => t.name === "delegate_task")!.execute({ plan_task_index: 0 });
+    const research = childOf("Research API")[0];
+    db.prepare("UPDATE task_graph SET status = 'failed' WHERE id = ?").run(research.id);
+
+    const refresh = harness.getToolDefs().find((t) => t.name === "refresh_plan")!;
+    expect(await refresh.execute({})).toContain("replan mode");
+    expect(inference.plannerCalls).toBe(2);
+    // Superseded by the fix plan, so it no longer holds up the goal.
+    expect(getTaskById(db, research.id)?.status).toBe("cancelled");
+    await refresh.execute({});
+    expect(inference.plannerCalls).toBe(2);
+
+    const statePath = path.join(workspaceRoot, "workspace", "subplans", "orchestrator-task-1", "state.json");
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    expect(saved).toMatchObject({ fixCycles: 1, handledFailures: [research.id] });
+
+    // A retry of the orchestrator does not replan around the same failure either.
+    const retry = new OrchestratorHarness();
+    const retryInference = new CountingInference(twoStepPlan());
+    await retry.initialize(task, makeContext(retryInference));
+    expect(retryInference.plannerCalls).toBe(0);
+  });
+
+  it("a replan around a failed prerequisite supersedes its blocked dependent, and the new dependent binds to the new prerequisite", async () => {
+    const task = makeTask();
+    persistTask(task);
+    const harness = new OrchestratorHarness();
+    await harness.initialize(task, makeContext(new CountingInference(twoStepPlan())));
+    const delegate = harness.getToolDefs().find((t) => t.name === "delegate_task")!;
+    await delegate.execute({ plan_task_index: 0 });
+    await delegate.execute({ plan_task_index: 1 });
+    const oldResearch = childOf("Research API")[0];
+    const oldImplement = childOf("Implement client")[0];
+    expect(oldImplement.dependencies).toEqual([oldResearch.id]);
+    db.prepare("UPDATE task_graph SET status = 'failed' WHERE id = ?").run(oldResearch.id);
+    db.prepare("UPDATE task_graph SET status = 'blocked' WHERE id = ?").run(oldImplement.id);
+
+    expect(await harness.getToolDefs().find((t) => t.name === "refresh_plan")!.execute({})).toContain("replan mode");
+    expect(getTaskById(db, oldResearch.id)?.status).toBe("cancelled");
+    expect(getTaskById(db, oldImplement.id)).toMatchObject({
+      status: "cancelled",
+      result: expect.objectContaining({ superseded_by_subplan: expect.any(Number) }),
+    });
+
+    expect(await delegate.execute({ plan_task_index: 0 })).toContain("Sub-task created");
+    expect(await delegate.execute({ plan_task_index: 1 })).toContain("Sub-task created");
+    const newResearch = childOf("Research API").find((t) => t.id !== oldResearch.id)!;
+    const newImplement = childOf("Implement client").find((t) => t.id !== oldImplement.id)!;
+    expect(newImplement.dependencies).toEqual([newResearch.id]);
+  });
+
+  it("a waiting sub-task whose prerequisite was cancelled is not reused by a later plan", async () => {
+    const task = makeTask();
+    persistTask(task);
+    const harness = new OrchestratorHarness();
+    await harness.initialize(task, makeContext(new CountingInference(twoStepPlan())));
+    const delegate = harness.getToolDefs().find((t) => t.name === "delegate_task")!;
+    await delegate.execute({ plan_task_index: 0 });
+    await delegate.execute({ plan_task_index: 1 });
+    const oldResearch = childOf("Research API")[0];
+    // Cancelled from outside the harness (no dependent cascade).
+    db.prepare("UPDATE task_graph SET status = 'cancelled' WHERE id = ?").run(oldResearch.id);
+
+    // A retried orchestrator maps the persisted plan again.
+    const retry = new OrchestratorHarness();
+    await retry.initialize(task, makeContext(new CountingInference(twoStepPlan())));
+    const retryDelegate = retry.getToolDefs().find((t) => t.name === "delegate_task")!;
+    expect(await retryDelegate.execute({ plan_task_index: 0 })).toContain("Sub-task created");
+    expect(await retryDelegate.execute({ plan_task_index: 1 })).toContain("Sub-task created");
+    const newResearch = childOf("Research API").find((t) => t.id !== oldResearch.id)!;
+    expect(childOf("Implement client").find((t) => t.dependencies.includes(newResearch.id))).toBeDefined();
+  });
+
+  it("F058: wait_for_tasks returns when a sub-task finishes, and repeated waits are not treated as a loop", async () => {
+    const task = makeTask();
+    persistTask(task);
+    db.prepare("UPDATE task_graph SET status = 'running', started_at = ? WHERE id = ?").run(new Date().toISOString(), task.id);
+    const waitCall = (n: number) => ({
+      content: "",
+      toolCalls: [{ id: `w${n}`, type: "function", function: { name: "wait_for_tasks", arguments: "{}" } }],
+    });
+    const turns = [
+      { content: "", toolCalls: [{ id: "d0", type: "function", function: { name: "delegate_task", arguments: JSON.stringify({ plan_task_index: 0 }) } }] },
+      ...Array.from({ length: 6 }, (_, i) => waitCall(i)),
+      { content: "", toolCalls: [{ id: "done", type: "function", function: { name: "task_done", arguments: JSON.stringify({ summary: "all done", success: true }) } }] },
+    ];
+    const inference = new CountingInference(twoStepPlan(), turns);
+    const context = { ...makeContext(inference), waitPollMs: 5 };
+    const waiting: boolean[] = [];
+    context.setWaiting = (w) => waiting.push(w);
+    const harness = new OrchestratorHarness();
+    await harness.initialize({ ...task, status: "running" }, context);
+
+    // The first wait blocks until the sub-task finishes; the five identical
+    // waits after it return at once and must not be blocked as a loop.
+    let polls = 0;
+    const timer = setInterval(() => {
+      polls += 1;
+      const research = childOf("Research API")[0];
+      if (research && polls > 30) complete(research.id);
+    }, 5);
+    try {
+      const result = await harness.execute();
+      expect(result).toMatchObject({ success: true, output: "all done" });
+    } finally {
+      clearInterval(timer);
+    }
+    expect(polls).toBeGreaterThan(30);
+    expect(waiting).toEqual([true, false]);
+    // Delegating extended this task's time budget and row timeout to cover the sub-task.
+    expect(context.budget.timeoutMs).toBeGreaterThanOrEqual(120_000 + 120_000);
+    expect(getTaskById(db, task.id)!.timeoutMs).toBeGreaterThanOrEqual(120_000 + 120_000);
+  });
+
+  it("F063: the sub-planner is not offered orchestrator or critic roles", async () => {
+    const task = makeTask();
+    persistTask(task);
+    let systemPrompt = "";
+    const inference: WorkerInferenceClient = {
+      chat: async (params) => {
+        systemPrompt = String(params.messages[0]?.content ?? "");
+        return { content: JSON.stringify(twoStepPlan()) };
+      },
+    };
+    await new OrchestratorHarness().initialize(task, makeContext(inference));
+    const roleLine = systemPrompt.split("\n").find((line) => line.includes("Available predefined roles")) ?? "";
+    expect(roleLine).toContain("executor");
+    expect(roleLine).not.toContain("orchestrator");
+    expect(roleLine).not.toContain("critic");
   });
 });

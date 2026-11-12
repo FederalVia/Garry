@@ -623,7 +623,8 @@ describe("automatic child funding goes through the gate (F074, F068)", () => {
     addChild(h, "a", a, "healthy", 5);
     addChild(h, "b", b, "healthy", 5);
     const funding = new SimpleFundingProtocol(h.conway, createTestIdentity(), h.db, "health.fund_child");
-    const monitor = new HealthMonitor(h.db, {} as never, funding, {} as never);
+    // Auto-funding is off by default; this pins the gate when it is on.
+    const monitor = new HealthMonitor(h.db, funding, { autoFund: true });
     const actions = await monitor.autoHeal(healthReport([a, b]));
     expect(actions.map((x) => x.success)).toEqual([false, false]);
     expect(h.inner.calls.transferCredits).toHaveLength(0);

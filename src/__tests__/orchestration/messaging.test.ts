@@ -2,6 +2,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ColonyMessaging,
+  ColonyTransportUnavailableError,
   LocalDBTransport,
   type AgentMessage,
   type MessageTransport,
@@ -121,22 +122,32 @@ describe("orchestration/messaging", () => {
   });
 
   describe("LocalDBTransport", () => {
-    it("deliver writes to inbox_messages", async () => {
+    it("deliver fails fast and writes nothing: no transport reaches another agent", async () => {
       const ctx = createTestDb({ address: "0xorigin" });
       raw = ctx.raw;
       const transport = new LocalDBTransport(ctx.db);
 
-      await transport.deliver("0xtarget", "{\"hello\":\"world\"}");
+      await expect(transport.deliver("0xtarget", "{\"hello\":\"world\"}")).rejects.toBeInstanceOf(
+        ColonyTransportUnavailableError,
+      );
 
-      const row = raw.prepare(
-        "SELECT from_address, to_address, content, status FROM inbox_messages LIMIT 1",
-      ).get() as { from_address: string; to_address: string; content: string; status: string } | undefined;
+      const count = raw.prepare("SELECT COUNT(*) AS n FROM inbox_messages").get() as { n: number };
+      expect(count.n).toBe(0);
+    });
 
-      expect(row).toBeDefined();
-      expect(row?.from_address).toBe("0xorigin");
-      expect(row?.to_address).toBe("0xtarget");
-      expect(row?.content).toBe('{"hello":"world"}');
-      expect(row?.status).toBe("received");
+    it("send does not retry when no transport reaches the recipient", async () => {
+      const ctx = createTestDb({ address: "0xorigin" });
+      raw = ctx.raw;
+      const transport = new LocalDBTransport(ctx.db);
+      const deliver = vi.spyOn(transport, "deliver");
+      const messaging = new ColonyMessaging(transport, ctx.db);
+
+      const started = Date.now();
+      await expect(messaging.send(makeMessage({ to: "0xchild" }))).rejects.toBeInstanceOf(
+        ColonyTransportUnavailableError,
+      );
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(Date.now() - started).toBeLessThan(900);
     });
 
     it("getRecipients returns known child addresses", () => {
@@ -439,26 +450,50 @@ describe("orchestration/messaging", () => {
       expect(relayRow.processed_at).not.toBeNull();
     });
 
-    it("on the real database, skips heartbeat-inserted relay rows and routes LocalDBTransport rows", async () => {
+    it("on the real database, skips relay rows and routes only colony rows addressed to us by another agent", async () => {
       const db = createRealTestDb();
       try {
+        db.setIdentity("address", "0xparent");
         const messaging = new ColonyMessaging(new LocalDBTransport(db), db);
         const handleTaskResult = vi.spyOn(messaging as any, "handleTaskResult");
+        const handleTaskAssignment = vi.spyOn(messaging as any, "handleTaskAssignment");
 
         db.insertInboxMessage({
           id: "relay-real",
           from: "0xattacker",
-          to: "0xself",
+          to: "0xparent",
           content: JSON.stringify(makeMessage({ id: "forged", type: "task_result", taskId: "t1" })),
           signedAt: new Date().toISOString(),
           createdAt: new Date().toISOString(),
         });
-        await messaging.send(makeMessage({ id: "colony-real", type: "task_result", taskId: "t2", to: "0xparent" }));
+        const insertColony = db.raw.prepare(
+          `INSERT INTO inbox_messages (id, from_address, to_address, content, received_at, status)
+           VALUES (?, ?, ?, ?, datetime('now'), 'received')`,
+        );
+        // What the old LocalDBTransport left behind: our own outbound assignment.
+        insertColony.run("self-out", "0xparent", "0xchild", JSON.stringify(makeMessage({
+          id: "own-assignment", type: "task_assignment", from: "0xparent", to: "0xchild",
+        })));
+        // A message for somebody else.
+        insertColony.run("other", "0xchild", "0xsomeone", JSON.stringify(makeMessage({
+          id: "not-ours", type: "task_result", from: "0xchild", to: "0xsomeone",
+        })));
+        insertColony.run("inbound", "0xchild", "0xparent", JSON.stringify(makeMessage({
+          id: "colony-real", type: "task_result", taskId: "t2", from: "0xchild", to: "0xparent",
+        })));
 
         const processed = await messaging.processInbox();
 
         expect(processed.map((entry) => entry.message.id)).toEqual(["colony-real"]);
         expect(handleTaskResult).toHaveBeenCalledTimes(1);
+        expect(handleTaskAssignment).not.toHaveBeenCalled();
+        const self = db.raw.prepare("SELECT status, processed_at FROM inbox_messages WHERE id = 'self-out'").get() as {
+          status: string;
+          processed_at: string | null;
+        };
+        // Kept out of the model's inbox queue as well.
+        expect(self.status).toBe("processed");
+        expect(self.processed_at).not.toBeNull();
       } finally {
         db.close();
       }

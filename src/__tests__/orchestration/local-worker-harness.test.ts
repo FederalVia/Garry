@@ -59,14 +59,83 @@ class SlowHarness implements AgentHarness {
   readonly id = "slow";
   readonly description = "slow harness";
   static release: (() => void) | null = null;
+  /** Every unreleased run, so a test can end them all. */
+  static pending: Array<() => void> = [];
 
   async initialize(): Promise<void> {}
   async execute(): Promise<TaskResult> {
     await new Promise<void>((resolve) => {
       SlowHarness.release = resolve;
+      SlowHarness.pending.push(resolve);
     });
     return { success: true, output: "slow done", artifacts: [], costCents: 0, duration: 1 };
   }
+  getToolDefs(): HarnessTool[] {
+    return [];
+  }
+  buildSystemPrompt(): string {
+    return "";
+  }
+  buildTaskPrompt(): string {
+    return "";
+  }
+}
+
+/** Spends 3c, then runs until aborted (as a real harness does mid-call). */
+class AbortAwareHarness implements AgentHarness {
+  readonly id = "abort-aware";
+  readonly description = "abort-aware harness";
+  static started = 0;
+  private context!: HarnessContext;
+
+  async initialize(_task: TaskNode, context: HarnessContext): Promise<void> {
+    this.context = context;
+  }
+
+  async execute(): Promise<TaskResult> {
+    AbortAwareHarness.started += 1;
+    this.context.budget.costUsedCents = 3;
+    await new Promise<void>((resolve) => {
+      if (this.context.abortSignal.aborted) return resolve();
+      this.context.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    throw new Error("Harness execution aborted by abort signal");
+  }
+
+  getToolDefs(): HarnessTool[] {
+    return [];
+  }
+  buildSystemPrompt(): string {
+    return "";
+  }
+  buildTaskPrompt(): string {
+    return "";
+  }
+}
+
+/** Blocks in a wait (like wait_for_tasks) until released. */
+class WaitingHarness implements AgentHarness {
+  readonly id = "waiting";
+  readonly description = "waiting harness";
+  static release: (() => void) | null = null;
+  private context!: HarnessContext;
+
+  async initialize(_task: TaskNode, context: HarnessContext): Promise<void> {
+    this.context = context;
+  }
+
+  async execute(): Promise<TaskResult> {
+    this.context.setWaiting?.(true);
+    try {
+      await new Promise<void>((resolve) => {
+        WaitingHarness.release = resolve;
+      });
+    } finally {
+      this.context.setWaiting?.(false);
+    }
+    return { success: true, output: "waited", artifacts: [], costCents: 0, duration: 1 };
+  }
+
   getToolDefs(): HarnessTool[] {
     return [];
   }
@@ -137,6 +206,8 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     insertGoal(db, "goal-1");
     SuccessHarness.capturedContext = null;
     SlowHarness.release = null;
+    WaitingHarness.release = null;
+    AbortAwareHarness.started = 0;
     OrchestratorBudgetHarness.capturedBudget = null;
     tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "local-worker-harness-home-"));
     // Workspaces land under HOME/.automaton/workspace; keep them out of the real HOME.
@@ -150,18 +221,171 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
-  function createPool(maxTurns?: number, allowedEditRoot: string = process.cwd()): LocalWorkerPool {
-    return new LocalWorkerPool({
+  const pools: LocalWorkerPool[] = [];
+  afterEach(async () => {
+    for (const release of SlowHarness.pending.splice(0)) release();
+    WaitingHarness.release?.();
+    for (const pool of pools.splice(0)) await pool.shutdown();
+  });
+
+  function createPool(maxTurns?: number, allowedEditRoot: string = process.cwd(), maxChildren?: number): LocalWorkerPool {
+    const pool = new LocalWorkerPool({
       db,
       conway: new MockConwayClient(),
       inference: { chat: async () => ({ content: "done" }) },
       maxTurns,
       harnessRegistry: registry,
       identity: createTestIdentity(),
-      config: createTestConfig(),
+      config: createTestConfig(maxChildren === undefined ? {} : { maxChildren }),
       allowedEditRoot,
     });
+    pools.push(pool);
+    return pool;
   }
+
+  function pendingTask(id: string, agentRole: string, maxRetries = 3): TaskNode {
+    return insertTask(db, { id, goalId: "goal-1", agentRole, status: "pending", assignedTo: null, maxRetries });
+  }
+
+  it("F065: a worker that finishes at once completes a task the pool assigned before starting it", async () => {
+    registry.register("custom-success", SuccessHarness);
+    const pool = createPool();
+    const task = pendingTask("task-instant", "custom-success");
+
+    const spawned = pool.spawn(task);
+    expect(spawned).not.toBeNull();
+    await waitFor(() => pool.getActiveCount() === 0);
+
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "completed", assignedTo: spawned!.address });
+    const goal = db.prepare("SELECT status FROM goals WHERE id = 'goal-1'").get() as { status: string };
+    expect(goal.status).toBe("completed");
+    // Workers are not children.
+    expect(db.prepare("SELECT COUNT(*) AS n FROM children").get()).toEqual({ n: 0 });
+  });
+
+  it("spawn returns null and changes nothing for a task that is not pending", () => {
+    registry.register("custom-success", SuccessHarness);
+    const pool = createPool();
+    const task = insertTask(db, { id: "task-held", goalId: "goal-1", agentRole: "custom-success", status: "assigned", assignedTo: "0xparent", maxRetries: 0 });
+    expect(pool.spawn(task)).toBeNull();
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "assigned", assignedTo: "0xparent" });
+    expect(pool.getActiveCount()).toBe(0);
+  });
+
+  it("F084: runs at most maxChildren workers; the rest stay pending until a slot frees", async () => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool(undefined, process.cwd(), 1);
+    const first = pendingTask("task-cap-1", "custom-slow");
+    const second = pendingTask("task-cap-2", "custom-slow");
+
+    expect(pool.spawn(first)).not.toBeNull();
+    expect(pool.spawn(second)).toBeNull();
+    expect(getTaskById(db, second.id)).toMatchObject({ status: "pending", assignedTo: null });
+
+    await waitFor(() => SlowHarness.release !== null);
+    SlowHarness.release!();
+    await waitFor(() => pool.getActiveCount() === 0);
+    expect(pool.spawn(second)).not.toBeNull();
+  });
+
+  it("maxChildren 0 still allows one worker", () => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool(undefined, process.cwd(), 0);
+    expect(pool.maxConcurrent).toBe(1);
+    expect(pool.spawn(pendingTask("task-zero", "custom-slow"))).not.toBeNull();
+  });
+
+  it("a worker blocked waiting on sub-tasks does not hold a slot", async () => {
+    registry.register("custom-waiting", WaitingHarness);
+    registry.register("custom-success", SuccessHarness);
+    const pool = createPool(undefined, process.cwd(), 1);
+
+    expect(pool.spawn(pendingTask("task-waiter", "custom-waiting"))).not.toBeNull();
+    await waitFor(() => WaitingHarness.release !== null);
+    // The waiter is live but not counted against the cap, so its sub-task can run.
+    expect(pool.getActiveCount()).toBe(1);
+    const sub = pendingTask("task-sub", "custom-success");
+    expect(pool.spawn(sub)).not.toBeNull();
+    await waitFor(() => getTaskById(db, sub.id)?.status === "completed");
+    WaitingHarness.release!();
+    await waitFor(() => pool.getActiveCount() === 0);
+    expect(getTaskById(db, "task-waiter")?.status).toBe("completed");
+  });
+
+  it("graceful shutdown defers the task without spending a retry", async () => {
+    registry.register("custom-abort", AbortAwareHarness);
+    const pool = createPool();
+    const task = pendingTask("task-shutdown", "custom-abort");
+    pool.spawn(task);
+    await waitFor(() => AbortAwareHarness.started === 1);
+
+    await pool.shutdown();
+
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "pending", assignedTo: null, retryCount: 0 });
+    expect(getTaskById(db, task.id)?.actualCostCents).toBe(3);
+  });
+
+  it("an aborted worker stops counting at once but keeps its task from running twice until it settles", async () => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool(undefined, process.cwd(), 1);
+    const task = pendingTask("task-abort", "custom-slow");
+    const spawned = pool.spawn(task)!;
+    await waitFor(() => SlowHarness.release !== null);
+
+    // The orchestrator times the worker out and releases its task.
+    expect(pool.abortWorker(spawned.address, "timeout")).toBe(true);
+    expect(pool.getActiveCount()).toBe(0);
+    expect(pool.hasWorker(spawned.address)).toBe(false);
+    db.prepare("UPDATE task_graph SET status = 'pending', assigned_to = NULL WHERE id = ?").run(task.id);
+
+    // Still inside its call: the task is not handed to a second worker.
+    expect(pool.spawn(task)).toBeNull();
+    // Other work can use the freed slot.
+    registry.register("custom-success", SuccessHarness);
+    expect(pool.spawn(pendingTask("task-other", "custom-success"))).not.toBeNull();
+
+    // The old worker returns: its late result is dropped and the task can run again.
+    const release = SlowHarness.release!;
+    SlowHarness.release = null;
+    release();
+    await waitFor(() => pool.getActiveCount() === 0 && (pool as any).activeWorkers.size === 0);
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "pending", assignedTo: null });
+    expect(pool.spawn(task)).not.toBeNull();
+  });
+
+  it("reapOrphans aborts a worker whose task was cancelled, and the worker reports nothing", async () => {
+    registry.register("custom-abort", AbortAwareHarness);
+    const pool = createPool();
+    const task = pendingTask("task-orphan", "custom-abort");
+    pool.spawn(task);
+    await waitFor(() => AbortAwareHarness.started === 1);
+
+    db.prepare("UPDATE task_graph SET status = 'cancelled' WHERE id = ?").run(task.id);
+    expect(pool.reapOrphans()).toBe(1);
+    await waitFor(() => (pool as any).activeWorkers.size === 0);
+
+    expect(getTaskById(db, task.id)?.status).toBe("cancelled");
+    // Spend so far is kept on the task.
+    expect(getTaskById(db, task.id)?.actualCostCents).toBe(3);
+  });
+
+  it("F063: passes the task's depth to the registry", async () => {
+    const seen: Array<{ role: string | null | undefined; depth: number | undefined }> = [];
+    registry.register("custom-success", SuccessHarness);
+    const original = registry.createForRole.bind(registry);
+    registry.createForRole = (role, options) => {
+      seen.push({ role, depth: options?.depth });
+      return original(role, options);
+    };
+    const pool = createPool();
+    insertTask(db, { id: "task-top", goalId: "goal-1", agentRole: "orchestrator", status: "running", assignedTo: "x", maxRetries: 0 });
+    const child = pendingTask("task-child", "custom-success");
+    db.prepare("UPDATE task_graph SET parent_id = 'task-top' WHERE id = ?").run(child.id);
+
+    pool.spawn({ ...child, parentId: "task-top" });
+    await waitFor(() => getTaskById(db, child.id)?.status === "completed");
+    expect(seen).toEqual([{ role: "custom-success", depth: 1 }]);
+  });
 
   it("routes a worker task through the configured harness and completes the task", async () => {
     registry.register("custom-success", SuccessHarness);
@@ -175,7 +399,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       maxRetries: 0,
     });
 
-    await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    await runAssigned(pool, task);
 
     const row = getTaskById(db, task.id);
     expect(row?.status).toBe("completed");
@@ -202,7 +426,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
         maxRetries: 0,
       });
 
-      await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+      await runAssigned(pool, task);
 
       expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(fs.realpathSync(projectDir));
     } finally {
@@ -224,7 +448,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
         assignedTo: "local://worker-test",
         maxRetries: 0,
       });
-      await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+      await runAssigned(pool, task);
       expect(SuccessHarness.capturedContext?.allowedEditRoot).toBe(fs.realpathSync(workspace));
     }
   });
@@ -241,7 +465,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       maxRetries: 0,
     });
 
-    await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    await runAssigned(pool, task);
 
     const row = getTaskById(db, task.id);
     expect(row?.status).toBe("failed");
@@ -255,12 +479,15 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       id: "task-slow",
       goalId: "goal-1",
       agentRole: "custom-slow",
-      status: "assigned",
+      status: "pending",
       assignedTo: null,
       maxRetries: 0,
     });
 
-    const spawned = pool.spawn(task);
+    const spawned = pool.spawn(task)!;
+    expect(spawned).not.toBeNull();
+    // The pool assigns the task before the worker starts.
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "running", assignedTo: spawned.address });
     expect(pool.getActiveCount()).toBe(1);
     expect(pool.hasWorker(spawned.address)).toBe(true);
     expect(pool.hasWorker(spawned.sandboxId)).toBe(true);
@@ -283,7 +510,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       maxRetries: 0,
     });
 
-    await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    await runAssigned(pool, task);
 
     expect(OrchestratorBudgetHarness.capturedBudget).toBe(50);
   });
@@ -355,7 +582,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
         allowedEditRoot: process.cwd(),
       });
 
-      await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+      await runAssigned(pool, task);
     } finally {
       process.env.HOME = originalHome;
     }
@@ -374,6 +601,11 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     expect(fs.existsSync(path.join(planDir, "plan.md"))).toBe(true);
   });
 });
+
+/** Run a worker in-line on a task already assigned to local://worker-test. */
+async function runAssigned(pool: LocalWorkerPool, task: TaskNode, signal = new AbortController().signal): Promise<void> {
+  await (pool as any).runWorker("worker-test", task, signal);
+}
 
 function insertGoal(db: ReturnType<typeof createInMemoryDb>, id: string): void {
   db.prepare(

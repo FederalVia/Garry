@@ -53,6 +53,8 @@ import {
   MIGRATION_V10,
   MIGRATION_V11,
   MIGRATION_V13,
+  MIGRATION_V14,
+  CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
 import { ensureTreasuryLedger } from "../treasury/ledger.js";
 import type {
@@ -112,6 +114,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
   // Apply migrations
   applyMigrations(db);
   repairPreV4InboxStatus(db);
+  ensureChildrenAddressIndex(db);
 
   // Ensure version is recorded
   const versionRow = db
@@ -660,6 +663,12 @@ function applyMigrations(db: DatabaseType): void {
       // last day of inference_costs so the upgrade keeps today's spend.
       apply: () => { ensureInferenceLedger(db, Date.now()); },
     },
+    {
+      version: 14,
+      // Removes duplicate children rows, resets each lifecycle child's status
+      // to its lifecycle state and retires self-sent colony messages.
+      apply: () => { db.exec(MIGRATION_V14); },
+    },
   ];
 
   for (const m of migrations) {
@@ -670,6 +679,35 @@ function applyMigrations(db: DatabaseType): void {
       });
       migrate();
     }
+  }
+}
+
+/**
+ * Add the unique index on children.address once no duplicate addresses
+ * remain. Checked on every open, so a database whose duplicates were cleared
+ * later still gets it. Returns whether the index exists.
+ */
+export function ensureChildrenAddressIndex(db: DatabaseType): boolean {
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_children_address'").get()) {
+      return true;
+    }
+    const dupes = db
+      .prepare("SELECT address, COUNT(*) AS n FROM children WHERE address <> '' GROUP BY address HAVING n > 1")
+      .all() as Array<{ address: string; n: number }>;
+    if (dupes.length > 0) {
+      logger.warn("children has duplicate addresses; unique address index not created", {
+        addresses: dupes.map((d) => d.address),
+      });
+      return false;
+    }
+    db.exec(CHILDREN_ADDRESS_INDEX);
+    return true;
+  } catch (error) {
+    logger.warn("Could not create the children address index", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
   }
 }
 
@@ -740,7 +778,8 @@ export interface SpendTrackingRow {
   windowDay: string;        // ISO date: '2026-02-19'
 }
 
-export type GoalStatus = "active" | "completed" | "failed" | "paused";
+/** Goal statuses as stored. cancel_goal writes 'cancelled'. */
+export type GoalStatus = "active" | "completed" | "failed" | "paused" | "cancelled";
 export type TaskGraphStatus =
   | "pending"
   | "assigned"
@@ -2597,14 +2636,14 @@ export function lifecycleInsertEvent(db: DatabaseType, row: ChildLifecycleEventR
 
 export function lifecycleGetEvents(db: DatabaseType, childId: string): ChildLifecycleEventRow[] {
   const rows = db
-    .prepare("SELECT * FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at ASC")
+    .prepare("SELECT * FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at ASC, rowid ASC")
     .all(childId) as any[];
   return rows.map(deserializeLifecycleEventRow);
 }
 
 export function lifecycleGetLatestState(db: DatabaseType, childId: string): ChildLifecycleState | null {
   const row = db
-    .prepare("SELECT to_state FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC LIMIT 1")
+    .prepare("SELECT to_state FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
     .get(childId) as { to_state: string } | undefined;
   return (row?.to_state as ChildLifecycleState) ?? null;
 }

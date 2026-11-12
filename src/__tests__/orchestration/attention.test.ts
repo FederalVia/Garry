@@ -1,6 +1,6 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { generateTodoMd, injectTodoContext } from "../../orchestration/attention.js";
+import { MAX_TODO_TOKENS, estimateTokens, generateTodoMd, injectTodoContext } from "../../orchestration/attention.js";
 import { insertGoal, insertTask } from "../../state/database.js";
 import type { ChatMessage } from "../../types.js";
 import { createInMemoryDb } from "./test-db.js";
@@ -229,5 +229,37 @@ describe("orchestration/attention", () => {
     expect(todo).toContain("## Goal: Alpha");
     expect(todo).toContain("## Goal: Beta");
     expect(todo.indexOf("## Goal: Alpha")).toBeLessThan(todo.indexOf("## Goal: Beta"));
+  });
+
+  it("F090: one goal with many long tasks stays within the token cap, open work first", () => {
+    const long = "x".repeat(90);
+    createGoalWithTasks({
+      title: "Single big goal",
+      tasks: [
+        ...Array.from({ length: 40 }, (_, i) => ({ title: `Done-${i}-${long}`, status: "completed" as const })),
+        ...Array.from({ length: 80 }, (_, i) => ({ title: `Open-${i}-${long}` })),
+      ],
+    });
+
+    const todo = generateTodoMd(db);
+    expect(estimateTokens(todo)).toBeLessThanOrEqual(MAX_TODO_TOKENS);
+    expect(todo).toContain("## Goal: Single big goal");
+    expect(todo).toContain("Open-0-");
+    expect(todo).not.toContain("Done-0-");
+    expect(todo).toMatch(/… \d+ more tasks/);
+    expect(todo).toContain("40 completed task(s) not shown");
+  });
+
+  it("leaves superseded (cancelled) tasks out and marks failed ones", () => {
+    createGoalWithTasks({
+      title: "Replanned",
+      tasks: [
+        { title: "Old attempt", status: "cancelled" },
+        { title: "Broken", status: "failed" },
+      ],
+    });
+    const todo = generateTodoMd(db);
+    expect(todo).not.toContain("Old attempt");
+    expect(todo).toContain("- [!] Broken (failed)");
   });
 });

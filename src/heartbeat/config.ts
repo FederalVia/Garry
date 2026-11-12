@@ -53,6 +53,14 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       enabled: true,
     },
     {
+      // Moves a child that never came up, or whose process is gone, to failed
+      // and frees its slot; nothing else does. No children, no probes.
+      name: "check_child_health",
+      schedule: "*/10 * * * *",
+      task: "check_child_health",
+      enabled: true,
+    },
+    {
       name: "check_social_inbox",
       schedule: "*/2 * * * *",
       task: "check_social_inbox",

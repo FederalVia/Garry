@@ -22,6 +22,7 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 - [Memory System](#memory-system)
 - [Self-Modification](#self-modification)
 - [Replication](#replication)
+- [Colony Orchestration](#colony-orchestration)
 - [Social and Messaging](#social-and-messaging)
 - [On-Chain Identity (ERC-8004)](#on-chain-identity-erc-8004)
 - [Inference and Models](#inference-and-models)
@@ -217,8 +218,8 @@ State:      sleeping
 Turns:      142
 Tools:      3 installed
 Skills:     3 active
-Heartbeats: 6 active
-Children:   1 alive / 2 total
+Heartbeats: 7 active
+Children:   1 holding a slot / 2 total
 Agent ID:   not registered
 Model:      gpt-5.2
 Version:    0.1.0
@@ -334,7 +335,10 @@ Configuration is stored at `~/.automaton/automaton.json`.
   // Behavior
   "logLevel": "info",                           // debug | info | warn | error
   "version": "0.1.0",
-  "maxChildren": 3,                             // Max child automatons
+  "maxChildren": 3,                             // Slot-holding children (0 disables spawn_child); also the local worker limit, max(1, maxChildren)
+  "childSandboxMemoryMb": 1024,                 // Child sandbox tier
+  "childRuntimeRepo": "https://github.com/Conway-Research/automaton.git", // https git URL a child's runtime is cloned from
+  "childRuntimeRef": "main",                    // Optional branch or tag (default: the repository's default branch)
   "socialRelayUrl": "https://social.conway.tech",
 
   // Financial safety
@@ -490,11 +494,11 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 | `check_usdc_balance` | Every 5 min | Checks USDC balance. Wakes agent if topup is possible. |
 | `check_for_updates` | Every 4 hours | Checks git upstream for new commits. Wakes on new commits. |
 | `health_check` | Every 30 min | Verifies sandbox is responsive (`echo alive`). |
+| `check_child_health` | Every 10 min | Probes each starting/healthy/unhealthy child's process and moves it (see [Child status](#child-status)). No children, no probes. Wakes the agent only when a child newly becomes unhealthy or failed. |
 | `check_social_inbox` | Every 2 min | Polls social relay for new messages. 5min backoff on errors. |
 | `soul_reflection` | Configurable | Checks soul alignment with genesis prompt. |
 | `refresh_models` | Configurable | Refreshes available models from Conway API. |
-| `check_child_health` | Configurable | Monitors child automaton health. |
-| `prune_dead_children` | Configurable | Cleans up dead child records and sandboxes. |
+| `prune_dead_children` | Configurable | Deletes old ended child records (keeps the last 5). |
 | `report_metrics` | Configurable | Saves metric snapshots and evaluates alert rules. |
 
 ### Heartbeat configuration
@@ -635,11 +639,12 @@ The git tools default to `~/.automaton` (the state repo), expanded to HOME local
 
 | Tool | Risk | Description |
 |---|---|---|
-| `spawn_child` | dangerous | Create a child automaton in a new sandbox. |
-| `list_children` | safe | List all children with lifecycle state. |
+| `spawn_child` | dangerous | Create a child automaton in a new sandbox (status `wallet_verified`). Returns the child id. |
+| `list_children` | safe | List all children with id and lifecycle state. |
 | `fund_child` | dangerous | Transfer credits to a child. |
-| `check_child_status` | safe | Check child health. |
+| `check_child_status` | safe | Probe a child's process and apply the result to its status. |
 | `start_child` | caution | Start a funded child. |
+| `stop_child` | dangerous | Stop a child and free its slot (`force` for an unreachable sandbox). |
 | `message_child` | caution | Send signed message to child. |
 | `verify_child_constitution` | safe | Verify child's constitution integrity. |
 | `prune_dead_children` | caution | Clean up dead children and sandboxes. |
@@ -676,7 +681,7 @@ The policy engine's financial rules still run first for model tool calls and giv
 
 | Budget | Outflows | Single | Rolling hour | Rolling day | Other limits |
 |---|---|---|---|---|---|
-| transfer | `transfer_credits`, `fund_child`, orchestrator and health-monitor child funding | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
+| transfer | `transfer_credits`, `fund_child`, and the colony health monitor's child funding when its `autoFund` option is on (off by default) | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
 | x402 | `x402_fetch`, worker `web_fetch` payments | `maxX402PaymentCents` | 10x that | 50x that | host must be in `x402AllowedDomains`; Conway `/pay/` URLs are refused here (credits are bought through topup) |
 | topup | `topup_credits`, sandbox 402 topups | `maxTopupSingleCents` | | `maxTopupDailyCents` | recipient must be this automaton; one topup in flight at a time |
 | topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; one blind buy per 24h when the balance cannot be read; `autoTopupCooldownMs` between attempts; never from a tool call |
@@ -927,49 +932,62 @@ The agent is never obligated to accept all upstream changes.
 
 ## Replication
 
-Automatons can spawn child automatons, creating a lineage of sovereign agents.
+Automatons can spawn child automatons, creating a lineage of sovereign agents. A child is an independent automaton with its own mission, wallet and survival pressure. Children never run colony tasks (see [Colony Orchestration](#colony-orchestration)).
 
-### Spawning a child
+### Spawning, funding and starting a child
 
-The `spawn_child` tool:
-1. Creates a new Conway sandbox (VM)
-2. Writes a genesis config with the child's name, specialization, and initial message
-3. Funds the child's wallet
-4. Propagates the parent's constitution (immutable, verified by hash)
-5. Starts the child's runtime
+1. `spawn_child` takes a slot, creates a Conway sandbox (`childSandboxMemoryMb`), clones and builds the runtime from `childRuntimeRepo` (at `childRuntimeRef` if set), writes `genesis.json` with the parent's constitution, and verifies the child's wallet. The child is now `wallet_verified`; nothing is funded or started. The reply carries the child id every other child tool takes.
+2. `fund_child` transfers credits (through the Treasury) and moves the child to `funded`.
+3. `start_child` launches `node dist/index.js --run` in the child's sandbox: `starting`, then `healthy` once the process is seen, or `failed` when it exits at once. When the launch or the check call itself errors, the child stays `starting` and the health check resolves it.
 
-### Child lifecycle
+`childRuntimeRepo` defaults to the upstream repository. A checkout without the genesis bootstrap (`dist/setup/genesis-bootstrap.js`) cannot build its config from `genesis.json`, so the child provisions its own API key and the parent writes its `automaton.json` at spawn time. Production colonies should point `childRuntimeRepo` at a runtime that bootstraps from `genesis.json`.
 
-Children go through a state machine:
+### Child status
 
-```
-spawning -> provisioning -> configuring -> starting -> alive
-                                                        |
-                                              unhealthy -> recovering
-                                                        |
-                                                       dead
-```
+There is one `children` row per child. Its `status` always equals the latest `child_lifecycle_events` row, and only the lifecycle writes it.
 
-All state transitions are recorded in `child_lifecycle_events` for audit.
+| State | Next | Holds a slot | Kind |
+|---|---|---|---|
+| `requested`, `sandbox_created`, `runtime_ready` | next spawn step, `failed` | yes | spawning |
+| `wallet_verified` | `funded`, `failed` (abandoned) | yes | not started |
+| `funded` | `starting`, `failed` (abandoned) | yes | not started |
+| `starting` | `healthy`, `failed` | yes | live |
+| `healthy` | `unhealthy`, `stopped` | yes | live |
+| `unhealthy` | `healthy`, `stopped`, `failed` | yes | live |
+| `stopped`, `failed` | `cleaned_up` | no | ended |
+| `cleaned_up` | none | no | terminal |
 
-### Child management
+Rows from before the lifecycle machine (no events) keep their old status: `spawning`, `running`, `sleeping` and `unknown` hold a slot, `dead` is terminal. Nothing moves an ended child back to a live state; there is no restart. Spawn a new child instead.
 
-| Tool | Description |
-|---|---|
-| `list_children` | View all children with their lifecycle state |
-| `fund_child` | Transfer credits to a child |
-| `check_child_status` | Run a health check on a child |
-| `start_child` | Start a funded child |
-| `message_child` | Send a message to a child via social relay |
-| `verify_child_constitution` | Verify child's constitution matches parent's |
-| `prune_dead_children` | Clean up dead children and their sandboxes |
+Who moves a child:
+- `check_child_health` (heartbeat, every 10 min) and `check_child_status` probe the process in the child's own sandbox: `starting` becomes `healthy` when the process is seen, or `failed` once it is confirmed gone 10 minutes after start; `healthy` and `unhealthy` follow the probe; `unhealthy` becomes `failed` after 30 minutes. A Conway API error changes nothing.
+- `stop_child` kills the process and verifies it is gone before marking a live child `stopped` (a `starting` child goes to `failed`). A child that was never started, or a spawn stuck for 15 minutes, is abandoned to `failed`. With `force`, a live child whose sandbox does not answer is marked `failed` anyway; run `stop_child` again later to kill a process that may still run. On a `failed`/`stopped` child, or a legacy row, it kills and verifies any process left in the sandbox.
+- `prune_dead_children` deletes old ended rows only after their cleanup succeeds. A force-stopped child, or a legacy ended row, is kept until a kill in its sandbox is verified.
+
+The colony health monitor (`colony_health_check`) only reports on live children. It never restarts, stops or messages a child, and it funds out-of-credit children only when constructed with `autoFund` (off by default).
 
 ### Limits
 
-- Default max children: 3 (configurable via `maxChildren`)
-- Children have their own wallets, identities, and survival pressure
-- Parent can fund children but cannot control their behavior
-- The heartbeat periodically checks child health and prunes dead children
+- `maxChildren` (default 3) caps the children in slot-holding states. Stopped, failed, cleaned-up and dead children do not count. `maxChildren: 0` disables `spawn_child` before anything is bought. The slot count and the new row are written in one transaction.
+- `stop_child` is the only manual way to free a slot.
+- Children have their own wallets, identities, and survival pressure. The parent can fund and message them (`message_child`, through the social relay) but cannot control their behavior.
+
+
+---
+
+## Colony Orchestration
+
+`create_goal` hands a goal to the orchestrator (`src/orchestration/`), which plans it into a task graph and runs the tasks on **local workers**: in-process harnesses in the parent's own runtime, with no wallet and no children row.
+
+- **Phases:** idle, classifying, planning, plan_review, executing, replanning, complete, failed. A goal that is cancelled, completed or paused is dropped at the next tick: its workers are stopped and its held tasks released. Planning commits the tasks together with the next phase, so a restart cannot plan a goal twice.
+- **Planner limits:** each task's estimate is clamped to 0-500 cents and its timeout to 1 minute - 1 hour; `maxRetries` to 0-10.
+- **Workers:** at most `max(1, maxChildren)` run at once. A ready task is assigned to a new worker before it starts.
+- **Ownership:** a task in `assigned`/`running` has one owner, `local://<worker>` or the parent's own address, and only the owner settles it. A worker that lost its task (cancelled, superseded, timed out, released) stops at its next turn. Its late result is dropped and recorded as a `stale_task_report` event; its spend is still added to the task.
+- **Retries:** a dead worker or one past `timeout + 2 min` loses the task, which spends a retry. Inference refusals and shutdown defer the task without spending one. A task that fails for good triggers a replan (3 per goal by default): old pending, blocked and failed tasks are cancelled, running and completed work is kept, and the planner is told which tasks are done or still running.
+- **Remote delegation is disabled.** Conway children never receive colony tasks: no transport reaches them and they have no executor. A task found assigned to any other address is released to the local workers on the next tick without spending a retry (`remote_delegation_unsupported` event), and sending a colony message to a child fails at once.
+- **`cancel_goal`** marks the goal `cancelled` and every unfinished task `cancelled`; running workers are stopped at the next orchestrator tick.
+- **Worker loop detection:** a third identical call in a row is refused; the same calls with the same arguments 3 turns in a row warn, and a fourth fails the attempt. `wait_for_tasks` is exempt and breaks a run, so waiting on a sub-task and checking it again is not a loop.
+- **Status:** the system prompt's orchestrator block and `orchestrator_status` count running local workers; task totals leave out tasks a replan cancelled.
 
 ---
 
@@ -1268,7 +1286,7 @@ Check `heartbeat.yml` for enabled tasks. The heartbeat starts automatically with
 ### Child spawn failures
 
 - Ensure you have enough credits (sandbox creation requires ~$5)
-- Check `maxChildren` limit in config (default 3)
+- Check `maxChildren` limit in config (default 3): only children that are spawning, not yet started or live count; `stop_child` frees a slot
 - Verify Conway API connectivity
 
 ### Balance shows $0 but you funded it

@@ -65,6 +65,13 @@ export interface AutomatonConfig {
   maxTurnsPerCycle?: number;
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
+  /**
+   * Git repository (https) a spawned child's runtime is cloned from, and an
+   * optional branch or tag. A checkout without the genesis bootstrap gets an
+   * automaton.json written by the parent at spawn time.
+   */
+  childRuntimeRepo?: string;
+  childRuntimeRef?: string;
   parentAddress?: string;
   socialRelayUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
@@ -1410,19 +1417,28 @@ export interface HealthCheckResult {
   uptime: number | null;
   creditBalance: number | null;
   issues: string[];
+  /**
+   * What the probe established: the agent process runs, it definitely does
+   * not (or the sandbox is gone), or nothing could be learned (API error).
+   */
+  probe?: "running" | "offline" | "unknown";
+  /** Lifecycle state after checkAllChildren acted on the probe. */
+  state?: string;
 }
 
 export interface ChildHealthConfig {
   checkIntervalMs: number; // default: 300000 (5 min)
-  unhealthyThresholdMs: number; // default: 900000 (15 min)
-  deadThresholdMs: number; // default: 3600000 (1 hour)
+  /** A child still `starting` after this long with no process is failed. default: 600000 (10 min) */
+  unhealthyThresholdMs: number;
+  /** An unhealthy child whose process is confirmed gone this long is failed. default: 1800000 (30 min) */
+  deadThresholdMs: number;
   maxConcurrentChecks: number; // default: 3
 }
 
 export const DEFAULT_CHILD_HEALTH_CONFIG: ChildHealthConfig = {
   checkIntervalMs: 300_000,
-  unhealthyThresholdMs: 900_000,
-  deadThresholdMs: 3_600_000,
+  unhealthyThresholdMs: 600_000,
+  deadThresholdMs: 1_800_000,
   maxConcurrentChecks: 3,
 };
 

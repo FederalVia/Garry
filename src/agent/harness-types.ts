@@ -55,6 +55,15 @@ export interface HarnessContext {
   inputSource?: InputSource;
   /** Waits between ordinary inference errors (default 1 s, then 2 s). */
   inferenceRetryBackoffMs?: readonly number[];
+  /**
+   * True while this worker still owns its task. Checked every turn: once it
+   * is false (cancelled, reassigned, completed by the parent) the worker stops.
+   */
+  isTaskOwned?: () => boolean;
+  /** Called around blocking waits so the pool does not count a waiting worker against its cap. */
+  setWaiting?: (waiting: boolean) => void;
+  /** Poll interval of wait_for_tasks (default 5 s). */
+  waitPollMs?: number;
 }
 
 export interface WorkerInferenceClient {
@@ -89,6 +98,14 @@ export class TaskBudgetExceededError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "TaskBudgetExceededError";
+  }
+}
+
+/** The worker no longer owns its task; it stops without reporting a result. */
+export class TaskOwnershipLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskOwnershipLostError";
   }
 }
 

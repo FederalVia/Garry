@@ -400,3 +400,47 @@ describe("custom role validation", () => {
     expect(() => validatePlannerOutput(output)).toThrow();
   });
 });
+
+describe("buildPlannerContext", () => {
+  it("F085: reports the agent's own cached balance and the canonical tier, never the child ledger", async () => {
+    const { createInMemoryDb } = await import("./test-db.js");
+    const { buildPlannerContext } = await import("../../orchestration/planner-context.js");
+    const db = createInMemoryDb();
+    try {
+      db.prepare("INSERT INTO kv (key, value, updated_at) VALUES ('last_known_balance', ?, datetime('now'))")
+        .run(JSON.stringify({ creditsCents: 50_000, usdcBalance: 100 }));
+      const funding = { getBalance: vi.fn().mockResolvedValue(0) };
+      const context = await buildPlannerContext({
+        db,
+        // An old caller passing the child-funding ledger: ignored.
+        ...({ funding, identityAddress: "0xparent" } as object),
+      } as Parameters<typeof buildPlannerContext>[0]);
+      expect(context.creditsCents).toBe(50_000);
+      expect(context.usdcBalance).toBe(100);
+      expect(context.survivalTier).toBe("high");
+      expect(funding.getBalance).not.toHaveBeenCalled();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("F085: prefers the gate's live balance over the cache", async () => {
+    const { createInMemoryDb } = await import("./test-db.js");
+    const { buildPlannerContext } = await import("../../orchestration/planner-context.js");
+    const gateModule = await import("../../inference/gate.js");
+    const db = createInMemoryDb();
+    const spy = vi.spyOn(gateModule, "getInstalledInferenceGate").mockReturnValue({
+      survival: () => ({ tier: "normal", creditsCents: 300 }),
+    } as never);
+    try {
+      db.prepare("INSERT INTO kv (key, value, updated_at) VALUES ('last_known_balance', ?, datetime('now'))")
+        .run(JSON.stringify({ creditsCents: 50_000 }));
+      const context = await buildPlannerContext({ db });
+      expect(context.creditsCents).toBe(300);
+      expect(context.survivalTier).toBe("normal");
+    } finally {
+      spy.mockRestore();
+      db.close();
+    }
+  });
+});

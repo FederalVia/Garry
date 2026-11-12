@@ -28,7 +28,7 @@ import {
 import type { ResolvedInferencePolicy } from "../../inference/policy.js";
 import { LocalWorkerPool } from "../../orchestration/local-worker.js";
 import { SimpleAgentTracker } from "../../orchestration/simple-tracker.js";
-import { Orchestrator } from "../../orchestration/orchestrator.js";
+import { Orchestrator, type OrchestratorWorkerPool } from "../../orchestration/orchestrator.js";
 import { ColonyMessaging, type MessageTransport } from "../../orchestration/messaging.js";
 import type { AgentTracker, FundingProtocol } from "../../orchestration/types.js";
 import {
@@ -116,7 +116,7 @@ function insertTask(goalId: string, opts: { estimatedCostCents?: number; maxRetr
         estimated_cost_cents, max_retries, created_at)
        VALUES (?, ?, 'Task', 'Do the work', ?, 'generalist', 50, '[]', ?, ?, ?)`,
     )
-    .run(id, goalId, opts.status ?? "assigned", opts.estimatedCostCents ?? 0, opts.maxRetries ?? 3, new Date().toISOString());
+    .run(id, goalId, opts.status ?? "pending", opts.estimatedCostCents ?? 0, opts.maxRetries ?? 3, new Date().toISOString());
   const row = getTaskById(db.raw, id)!;
   return {
     id: row.id,
@@ -157,9 +157,22 @@ function createPool(): LocalWorkerPool {
   return pool;
 }
 
+/** A pool that records spawn calls and starts nothing. */
+function stubPool(spawnResult: { address: string; name: string; sandboxId: string } | null = null): OrchestratorWorkerPool & {
+  spawn: ReturnType<typeof vi.fn>;
+} {
+  return {
+    spawn: vi.fn(() => spawnResult),
+    hasWorker: () => false,
+    abortWorker: () => false,
+    reapOrphans: () => 0,
+    getActiveCount: () => 0,
+  };
+}
+
 function makeOrchestrator(
-  spawnAgent: (task: TaskNode) => Promise<unknown>,
-  extra: { agentTracker?: AgentTracker; isWorkerAlive?: (address: string) => boolean } = {},
+  workerPool: OrchestratorWorkerPool,
+  extra: { agentTracker?: AgentTracker } = {},
 ): Orchestrator {
   const transport: MessageTransport = {
     deliver: vi.fn().mockResolvedValue(undefined),
@@ -186,12 +199,12 @@ function makeOrchestrator(
   return new Orchestrator({
     db: db.raw,
     agentTracker: extra.agentTracker ?? agentTracker,
-    isWorkerAlive: extra.isWorkerAlive,
+    workerPool,
     funding,
     messaging: new ColonyMessaging(transport, automataDb),
     inference: unified,
     identity: { ...createTestIdentity(), address: "0x1234" as any, name: "parent" },
-    config: { spawnAgent },
+    config: {},
   });
 }
 
@@ -308,7 +321,7 @@ describe("F057: the per-task budget is enforced, cumulatively", () => {
     expect(gate.taskSpendCents(task.id)).toBeCloseTo(row.actualCostCents, 6);
 
     // Re-queueing the same task does not grant a fresh budget.
-    db.raw.prepare("UPDATE task_graph SET status = 'assigned', result = NULL WHERE id = ?").run(task.id);
+    db.raw.prepare("UPDATE task_graph SET status = 'pending', assigned_to = NULL, result = NULL WHERE id = ?").run(task.id);
     createPool().spawn(task);
     await waitFor(() => getTaskById(db.raw, task.id)?.status === "failed");
     expect(hits).toBe(2);
@@ -323,18 +336,17 @@ describe("caps that clear with time defer the task", () => {
     const goalId = insertGoal();
     const task = insertTask(goalId, { estimatedCostCents: 1000, maxRetries: 3, status: "pending" });
 
-    // Wired as loop.ts wires it: the real tracker over the children table,
-    // spawns through the local pool, liveness from the pool.
+    // Wired as loop.ts wires it: the real tracker, spawns through the local pool.
     const pool = createPool();
     const spawned: string[] = [];
-    const spawnAgent = vi.fn(async (t: TaskNode) => {
-      const worker = pool.spawn(t);
-      spawned.push(worker.address);
+    const originalSpawn = pool.spawn.bind(pool);
+    const spawnAgent = vi.spyOn(pool, "spawn").mockImplementation((t: TaskNode) => {
+      const worker = originalSpawn(t);
+      if (worker) spawned.push(worker.address);
       return worker;
     });
-    const orchestrator = makeOrchestrator(spawnAgent, {
+    const orchestrator = makeOrchestrator(pool, {
       agentTracker: new SimpleAgentTracker(db),
-      isWorkerAlive: (address) => pool.hasWorker(address),
     });
     setState({ phase: "executing", goalId });
 
@@ -352,9 +364,8 @@ describe("caps that clear with time defer the task", () => {
       .prepare("SELECT value FROM kv WHERE key = ?")
       .get(ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY) as { value: string } | undefined;
     expect(blocked && Date.parse(blocked.value)).toBeGreaterThan(Date.now());
-    // The finished worker's registration is retired.
-    const child = db.raw.prepare("SELECT status FROM children WHERE address = ?").get(spawned[0]) as { status: string };
-    expect(child.status).toBe("cleaned_up");
+    // Workers are never registered as children.
+    expect(db.raw.prepare("SELECT COUNT(*) AS n FROM children").get()).toEqual({ n: 0 });
 
     await orchestrator.tick();
     expect(spawnAgent).toHaveBeenCalledTimes(1);
@@ -395,16 +406,15 @@ describe("caps that clear with time defer the task", () => {
       status: "running",
       createdAt: new Date().toISOString(),
     });
-    const spawnAgent = vi.fn().mockResolvedValue(null);
-    const orchestrator = makeOrchestrator(spawnAgent, {
+    const pool = stubPool(null);
+    const orchestrator = makeOrchestrator(pool, {
       agentTracker: new SimpleAgentTracker(db),
-      isWorkerAlive: () => false,
     });
     setState({ phase: "executing", goalId });
 
     await orchestrator.tick();
 
-    expect(spawnAgent).toHaveBeenCalledTimes(1);
+    expect(pool.spawn).toHaveBeenCalledTimes(1);
     expect(getTaskById(db.raw, task.id)?.assignedTo).not.toBe("local://local-worker-OLD");
   });
 });
@@ -414,8 +424,8 @@ describe("planner refusals never produce a fallback plan", () => {
     // A planner call reserves 8192 output tokens at $100/M (about 82c): over the 50c cap.
     installGate({ dailyCapCents: 50, hourlyCapCents: 50 });
     const goalId = insertGoal();
-    const spawnAgent = vi.fn();
-    const orchestrator = makeOrchestrator(spawnAgent);
+    const pool = stubPool();
+    const orchestrator = makeOrchestrator(pool);
     setState({ phase: "planning", goalId });
 
     await orchestrator.tick();
@@ -423,7 +433,7 @@ describe("planner refusals never produce a fallback plan", () => {
 
     expect(phase()).toBe("planning");
     expect(getTasksByGoal(db.raw, goalId)).toHaveLength(0);
-    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(pool.spawn).not.toHaveBeenCalled();
     expect(hits).toBe(0);
     const goal = db.raw.prepare("SELECT status FROM goals WHERE id = ?").get(goalId) as { status: string };
     expect(goal.status).toBe("active");
@@ -437,8 +447,8 @@ describe("F133: a paused survival tier stops orchestration inference and spawnin
       "Research the market, design the product, build the service, write the docs, deploy it, " +
         "announce it, collect feedback from early users and iterate on pricing until revenue covers costs",
     );
-    const spawnAgent = vi.fn();
-    const orchestrator = makeOrchestrator(spawnAgent);
+    const pool = stubPool();
+    const orchestrator = makeOrchestrator(pool);
     setState({ phase: "classifying", goalId });
 
     await orchestrator.tick();
@@ -447,7 +457,7 @@ describe("F133: a paused survival tier stops orchestration inference and spawnin
     expect(phase()).toBe("planning");
 
     expect(hits).toBe(0);
-    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(pool.spawn).not.toHaveBeenCalled();
     expect(db.raw.prepare("SELECT COUNT(*) AS n FROM inference_ledger").get()).toEqual({ n: 0 });
   });
 
@@ -455,13 +465,13 @@ describe("F133: a paused survival tier stops orchestration inference and spawnin
     installGate({}, "low_compute");
     const goalId = insertGoal();
     const task = insertTask(goalId, { status: "pending" });
-    const spawnAgent = vi.fn().mockResolvedValue({ address: "local://w", name: "w", sandboxId: "w" });
-    const orchestrator = makeOrchestrator(spawnAgent);
+    const pool = stubPool({ address: "local://w", name: "w", sandboxId: "w" });
+    const orchestrator = makeOrchestrator(pool);
     setState({ phase: "executing", goalId });
 
     await orchestrator.tick();
 
-    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(pool.spawn).not.toHaveBeenCalled();
     expect(getTaskById(db.raw, task.id)?.status).toBe("pending");
     expect(getTaskById(db.raw, task.id)?.assignedTo).toBeNull();
   });

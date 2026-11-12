@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ulid } from "ulid";
 import type BetterSqlite3 from "better-sqlite3";
-import { Orchestrator } from "../../orchestration/orchestrator.js";
+import { Orchestrator, type OrchestratorWorkerPool } from "../../orchestration/orchestrator.js";
+import { assignTask, settleTask, type TaskNode } from "../../orchestration/task-graph.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -126,6 +127,7 @@ function makeOrchestrator(
   db: BetterSqlite3.Database,
   mocks: ReturnType<typeof makeMocks>,
   config: Record<string, unknown> = {},
+  workerPool?: OrchestratorWorkerPool,
 ): Orchestrator {
   return new Orchestrator({
     db,
@@ -134,37 +136,44 @@ function makeOrchestrator(
     messaging: mocks.messaging as any,
     inference: mocks.inference as any,
     identity: IDENTITY,
-    config: { disableSpawn: true, maxReplans: 3, ...config },
+    workerPool,
+    config: { disableSpawn: workerPool === undefined, maxReplans: 3, ...config },
   });
 }
 
-function makeTaskResultInboxEntry(goalId: string, taskId: string) {
-  return {
-    success: true,
-    message: {
-      id: "m1",
-      type: "task_result",
-      from: "0xchild",
-      to: "0xparent",
-      goalId,
-      taskId,
-      content: JSON.stringify({
-        taskId,
-        result: {
-          success: true,
-          output: "done",
-          artifacts: [],
-          costCents: 50,
-          duration: 100,
-        },
-      }),
-      priority: "normal",
-      requiresResponse: false,
-      expiresAt: null,
-      createdAt: new Date().toISOString(),
+/**
+ * A local worker pool whose workers do nothing on their own: the test
+ * reports for them, as a real worker would, through settleTask.
+ */
+function makeStubPool(db: BetterSqlite3.Database) {
+  const live = new Set<string>();
+  let next = 0;
+  const pool = {
+    live,
+    spawn: vi.fn((task: TaskNode) => {
+      const address = `local://stub-worker-${++next}`;
+      try {
+        assignTask(db, task.id, address);
+      } catch {
+        return null;
+      }
+      live.add(address);
+      return { address, name: address, sandboxId: address };
+    }),
+    hasWorker: (address: string) => live.has(address),
+    abortWorker: vi.fn((address: string) => live.delete(address)),
+    reapOrphans: () => 0,
+    getActiveCount: () => live.size,
+    /** The worker reports and exits. */
+    report(taskId: string, success: boolean, output: string): void {
+      const owner = (db.prepare("SELECT assigned_to FROM task_graph WHERE id = ?").get(taskId) as { assigned_to: string }).assigned_to;
+      settleTask(db, taskId, owner, success
+        ? { kind: "complete", result: { success: true, output, artifacts: [], costCents: 50, duration: 100 } }
+        : { kind: "fail", error: output, retry: true, costCents: 10 });
+      live.delete(owner);
     },
-    handledBy: "test",
   };
+  return pool;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -253,7 +262,7 @@ describe("integration/plan-execute-flow", () => {
       expect(result.phase).toBe("executing");
     });
 
-    it("tick 5-6: executing assigns tasks, receives results, and completes goal", async () => {
+    it("tick 5-6: executing assigns tasks to a local worker, which completes the goal", async () => {
       const goalId = insertGoal(db, { status: "active" });
       const taskId = ulid();
       db.prepare(
@@ -263,28 +272,22 @@ describe("integration/plan-execute-flow", () => {
 
       setState(db, { phase: "executing", goalId, replanCount: 0, failedTaskId: null, failedError: null });
 
-      // Provide an idle agent so task assignment succeeds
-      mocks.agentTracker.getIdle.mockReturnValue([
-        { address: "0xchild", name: "Worker", role: "generalist", status: "healthy" },
-      ]);
+      const pool = makeStubPool(db);
+      const orc = makeOrchestrator(db, mocks, {}, pool);
+      const first = await orc.tick();
 
-      // First tick: assigns the task (inbox empty)
-      mocks.messaging.processInbox.mockResolvedValue([]);
-      const orc = makeOrchestrator(db, mocks);
-      await orc.tick();
-
-      // Verify task was assigned
+      // The task went to a local worker; nothing was sent to or funded for a child.
+      expect(first.tasksAssigned).toBe(1);
       const tasks = getTasksForGoal(db, goalId);
-      expect(tasks[0].assigned_to).toBe("0xchild");
+      expect(tasks[0].assigned_to).toBe("local://stub-worker-1");
+      expect(mocks.messaging.send).not.toHaveBeenCalled();
+      expect(mocks.funding.fundChild).not.toHaveBeenCalled();
 
-      // Second tick: process task result
-      mocks.messaging.processInbox.mockResolvedValue([
-        makeTaskResultInboxEntry(goalId, taskId),
-      ]);
-      const result2 = await orc.tick();
-
-      expect(result2.phase).toBe("complete");
+      // The worker reports success; the next tick moves on.
+      pool.report(taskId, true, "done");
       expect(getGoalStatus(db, goalId)).toBe("completed");
+      const result2 = await orc.tick();
+      expect(result2.phase).toBe("idle");
     });
   });
 
@@ -301,38 +304,14 @@ describe("integration/plan-execute-flow", () => {
 
       setState(db, { phase: "executing", goalId, replanCount: 0, failedTaskId: null, failedError: null });
 
-      mocks.agentTracker.getIdle.mockReturnValue([
-        { address: "0xchild", name: "Worker", role: "generalist", status: "healthy" },
-      ]);
+      const pool = makeStubPool(db);
+      const orc = makeOrchestrator(db, mocks, {}, pool);
+      await orc.tick();
+      pool.report(taskId, false, "error: something broke");
 
-      // Return a failed task result
-      mocks.messaging.processInbox.mockResolvedValue([
-        {
-          success: true,
-          message: {
-            id: "m2",
-            type: "task_result",
-            from: "0xchild",
-            to: "0xparent",
-            goalId,
-            taskId,
-            content: JSON.stringify({
-              taskId,
-              result: { success: false, output: "error: something broke", artifacts: [], costCents: 10, duration: 50 },
-            }),
-            priority: "normal",
-            requiresResponse: false,
-            expiresAt: null,
-            createdAt: new Date().toISOString(),
-          },
-          handledBy: "test",
-        },
-      ]);
-
-      const orc = makeOrchestrator(db, mocks);
       const result = await orc.tick();
-
       expect(result.phase).toBe("replanning");
+      expect(readState(db)?.failedTaskId).toBe(taskId);
     });
 
     it("replanning produces new tasks and transitions to plan_review", async () => {
@@ -369,37 +348,12 @@ describe("integration/plan-execute-flow", () => {
       // replanCount already at max
       setState(db, { phase: "executing", goalId, replanCount: 3, failedTaskId: null, failedError: null });
 
-      mocks.agentTracker.getIdle.mockReturnValue([
-        { address: "0xchild", name: "Worker", role: "generalist", status: "healthy" },
-      ]);
+      const pool = makeStubPool(db);
+      const orc = makeOrchestrator(db, mocks, { maxReplans: 3 }, pool);
+      await orc.tick();
+      pool.report(taskId, false, "fatal failure");
 
-      // Return a failed task result
-      mocks.messaging.processInbox.mockResolvedValue([
-        {
-          success: true,
-          message: {
-            id: "m3",
-            type: "task_result",
-            from: "0xchild",
-            to: "0xparent",
-            goalId,
-            taskId,
-            content: JSON.stringify({
-              taskId,
-              result: { success: false, output: "fatal failure", artifacts: [], costCents: 0, duration: 0 },
-            }),
-            priority: "normal",
-            requiresResponse: false,
-            expiresAt: null,
-            createdAt: new Date().toISOString(),
-          },
-          handledBy: "test",
-        },
-      ]);
-
-      const orc = makeOrchestrator(db, mocks, { maxReplans: 3 });
       const result = await orc.tick();
-
       expect(result.phase).toBe("failed");
     });
 

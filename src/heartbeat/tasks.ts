@@ -19,6 +19,7 @@ import type {
   SurvivalTier,
 } from "../types.js";
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
+import { LEGACY_LIVE, LIVE, holdsSlot } from "../replication/child-status.js";
 import { sanitizeInput } from "../agent/injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { createLogger } from "../observability/logger.js";
@@ -441,17 +442,29 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       const { ChildLifecycle } = await import("../replication/lifecycle.js");
       const { ChildHealthMonitor } = await import("../replication/health.js");
       const lifecycle = new ChildLifecycle(taskCtx.db.raw);
+      // The monitor probes each child in the child's own sandbox.
       const monitor = new ChildHealthMonitor(taskCtx.db.raw, taskCtx.conway, lifecycle);
       const results = await monitor.checkAllChildren();
 
-      const unhealthy = results.filter((r) => !r.healthy);
-      if (unhealthy.length > 0) {
-        for (const r of unhealthy) {
-          logger.warn(`Child ${r.childId} unhealthy: ${r.issues.join(", ")}`);
+      // Wake only when a child newly enters unhealthy or failed.
+      const previousRaw = taskCtx.db.getKV(CHILD_HEALTH_STATES_KEY);
+      if (results.length === 0 && !previousRaw) return { shouldWake: false };
+      const previous = readJsonRecord(previousRaw);
+      const current: Record<string, string> = {};
+      const changed: string[] = [];
+      for (const r of results) {
+        const state = r.state ?? (r.healthy ? "healthy" : "unhealthy");
+        current[r.childId] = state;
+        if (!r.healthy) logger.warn(`Child ${r.childId} ${state}: ${r.issues.join(", ")}`);
+        if ((state === "unhealthy" || state === "failed") && previous[r.childId] !== state) {
+          changed.push(`${r.childId.slice(0, 8)} ${state}`);
         }
+      }
+      taskCtx.db.setKV(CHILD_HEALTH_STATES_KEY, JSON.stringify(current));
+      if (changed.length > 0) {
         return {
           shouldWake: true,
-          message: `${unhealthy.length} child(ren) unhealthy: ${unhealthy.map((r) => r.childId.slice(0, 8)).join(", ")}`,
+          message: `${changed.length} child(ren) changed health: ${changed.join(", ")}`,
         };
       }
     } catch (error) {
@@ -563,6 +576,15 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       const report = await monitor.checkAll();
       const actions = await monitor.autoHeal(report);
 
+      const { unhealthySignature } = await import("../orchestration/health-monitor.js");
+      const previousRaw = taskCtx.db.getKV("last_colony_health_report");
+      let previousSignature: string | null = null;
+      try {
+        previousSignature = previousRaw ? unhealthySignature(JSON.parse(previousRaw)) : null;
+      } catch {
+        previousSignature = null;
+      }
+
       taskCtx.db.setKV("last_colony_health_report", JSON.stringify(report));
       taskCtx.db.setKV("last_colony_heal_actions", JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -570,7 +592,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       }));
 
       const failedActions = actions.filter((action) => !action.success).length;
-      const shouldWake = report.unhealthyAgents > 0 || failedActions > 0;
+      // The report is informational: wake only when its unhealthy part changed.
+      const shouldWake = report.unhealthyAgents > 0 && unhealthySignature(report) !== previousSignature;
 
       return {
         shouldWake,
@@ -637,9 +660,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         taskExecutionCostCents: taskCosts.total,
         pendingOutflowCents: pending.cents,
         pendingOutflows: pending.rows,
-        activeAgents: taskCtx.db.getChildren().filter(
-          (child) => child.status !== "dead" && child.status !== "cleaned_up",
-        ).length,
+        activeAgents: taskCtx.db.getChildren().filter((child) => holdsSlot(child.status)).length,
       };
 
       taskCtx.db.setKV("last_colony_financial_report", JSON.stringify(report));
@@ -656,8 +677,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     }
 
     try {
-      const IDLE_CULL_MS = 60 * 60 * 1000;
-      const now = Date.now();
+      // Report only. Children run their own missions and cannot execute
+      // colony tasks (local workers do), so nothing here stops, culls or
+      // asks for children.
       const children = taskCtx.db.getChildren();
 
       const activeAssignments = taskCtx.db.raw
@@ -675,20 +697,6 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
           .filter((value): value is string => typeof value === "string" && value.length > 0),
       );
 
-      let culled = 0;
-      for (const child of children) {
-        if (!["running", "healthy", "sleeping"].includes(child.status)) continue;
-        if (busyAgents.has(child.address)) continue;
-
-        const lastSeenIso = child.lastChecked ?? child.createdAt;
-        const lastSeenMs = Date.parse(lastSeenIso);
-        if (Number.isNaN(lastSeenMs)) continue;
-        if (now - lastSeenMs < IDLE_CULL_MS) continue;
-
-        taskCtx.db.updateChildStatus(child.id, "stopped");
-        culled += 1;
-      }
-
       const pendingUnassignedRow = taskCtx.db.raw
         .prepare(
           `SELECT COUNT(*) AS count
@@ -698,43 +706,22 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         )
         .get() as { count: number };
 
-      const idleAgents = children.filter(
-        (child) =>
-          (child.status === "running" || child.status === "healthy")
-          && !busyAgents.has(child.address),
-      ).length;
-
-      const activeAgents = children.filter(
-        (child) => child.status !== "dead" && child.status !== "cleaned_up" && child.status !== "failed",
-      ).length;
-
-      const spawnNeeded = Math.max(0, pendingUnassignedRow.count - idleAgents);
+      const liveChildren = children.filter((child) => LIVE.has(child.status) || LEGACY_LIVE.has(child.status));
+      const idleAgents = liveChildren.filter((child) => !busyAgents.has(child.address)).length;
+      const activeAgents = children.filter((child) => holdsSlot(child.status)).length;
       const spawnCapacity = Math.max(0, taskCtx.config.maxChildren - activeAgents);
-      const spawnRequested = Math.min(spawnNeeded, spawnCapacity);
 
       taskCtx.db.setKV("last_agent_pool_optimize", JSON.stringify({
         timestamp: new Date().toISOString(),
-        culled,
+        culled: 0,
         pendingTasks: pendingUnassignedRow.count,
         idleAgents,
-        spawnRequested,
+        activeAgents,
+        spawnCapacity,
+        spawnRequested: 0,
       }));
 
-      if (spawnRequested > 0) {
-        taskCtx.db.setKV("agent_pool_spawn_request", JSON.stringify({
-          timestamp: new Date().toISOString(),
-          requested: spawnRequested,
-          pendingTasks: pendingUnassignedRow.count,
-          idleAgents,
-        }));
-      }
-
-      return {
-        shouldWake: spawnRequested > 0,
-        message: spawnRequested > 0
-          ? `Agent pool needs ${spawnRequested} additional agent(s) for pending workload`
-          : undefined,
-      };
+      return { shouldWake: false };
     } catch (error) {
       logger.error("agent_pool_optimize failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
@@ -879,16 +866,26 @@ function shouldRunAtInterval(
 }
 
 async function createHealthMonitor(taskCtx: HeartbeatLegacyContext): Promise<ColonyHealthMonitor> {
-  const { LocalDBTransport, ColonyMessaging } = await import("../orchestration/messaging.js");
-  const { SimpleAgentTracker, SimpleFundingProtocol } = await import("../orchestration/simple-tracker.js");
+  const { SimpleFundingProtocol } = await import("../orchestration/simple-tracker.js");
   const { HealthMonitor } = await import("../orchestration/health-monitor.js");
 
-  const tracker = new SimpleAgentTracker(taskCtx.db);
   // The fourth argument names the Treasury origin of the monitor's funding
   // transfers, which share the automatic child-funding sub-cap and cooldown.
   const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db, "health.fund_child");
-  const transport = new LocalDBTransport(taskCtx.db);
-  const messaging = new ColonyMessaging(transport, taskCtx.db);
 
-  return new HealthMonitor(taskCtx.db, tracker, funding, messaging);
+  // Automatic funding stays off: there is no per-child balance query, and
+  // the ledger is cumulative funding, not a balance.
+  return new HealthMonitor(taskCtx.db, funding, { autoFund: false });
+}
+
+const CHILD_HEALTH_STATES_KEY = "child_health.last_states";
+
+function readJsonRecord(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
 }

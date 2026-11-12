@@ -51,6 +51,15 @@ const GENERAL_SPEC_ALIAS_TARGETS = {
   web_fetch: "x402_fetch",
 } as const;
 
+const EMPTY_SET: ReadonlySet<string> = new Set();
+/** Tools that move money or buy things. */
+const FINANCIAL_TOOLS: ReadonlySet<string> = new Set([
+  ...CREDIT_TRANSFER_TOOLS,
+  "transfer_credits",
+  "x402_fetch",
+  "register_domain",
+]);
+
 export class GeneralHarness extends BaseHarness {
   readonly id = "general";
   readonly description = "General-purpose agent for research, web interaction, and non-coding execution tasks.";
@@ -202,17 +211,24 @@ When calling task_done, provide:
     }
 
     const customToolNames = new Set(customTools.map((tool) => tool.name));
-    const aliasTools = this.createSpecAliasTools(toolCatalog, customToolNames);
+    const excluded = this.excludedCatalogTools();
+    const catalog = toolCatalog.filter((tool) => !excluded.has(tool.name));
+    const aliasTools = this.createSpecAliasTools(catalog, customToolNames);
     const reservedToolNames = new Set([
       ...customToolNames,
       ...aliasTools.map((tool) => tool.name),
     ]);
-    const wrappedTools = toolCatalog
+    const wrappedTools = catalog
       .filter((tool) => GENERAL_WRAPPED_TOOL_ALLOWLIST.has(tool.name))
       .filter((tool) => !reservedToolNames.has(tool.name))
       .map((tool) => this.createWrappedTool(tool, toolCatalog));
 
     return [...customTools, ...aliasTools, ...wrappedTools];
+  }
+
+  /** Catalog tools this harness never offers (aliases of them included). */
+  protected excludedCatalogTools(): ReadonlySet<string> {
+    return EMPTY_SET;
   }
 
   private createWrappedTool(tool: AutomatonTool, toolCatalog: AutomatonTool[]): HarnessTool {
@@ -294,5 +310,15 @@ When calling task_done, provide:
           },
         }];
       });
+  }
+}
+
+/**
+ * For roles the registry does not know (planner custom roles): the general
+ * harness without tools that move money or buy things.
+ */
+export class RestrictedGeneralHarness extends GeneralHarness {
+  protected override excludedCatalogTools(): ReadonlySet<string> {
+    return FINANCIAL_TOOLS;
   }
 }

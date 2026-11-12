@@ -7,6 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { runAgentLoop } from "../agent/loop.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
+import { LocalWorkerPool } from "../orchestration/local-worker.js";
 import {
   MockInferenceClient,
   MockConwayClient,
@@ -831,7 +832,7 @@ describe("Agent Loop", () => {
     expect(loopWarning).toBeDefined();
   });
 
-  it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {
+  it("sleeps early when local workers are running and no self-assigned parent task remains", async () => {
     const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockResolvedValue({
       phase: "executing",
       tasksAssigned: 0,
@@ -840,6 +841,7 @@ describe("Agent Loop", () => {
       goalsActive: 1,
       agentsActive: 1,
     });
+    const activeSpy = vi.spyOn(LocalWorkerPool.prototype, "getActiveCount").mockReturnValue(1);
 
     const inference = new MockInferenceClient([
       noToolResponse("This should never be used."),
@@ -857,6 +859,67 @@ describe("Agent Loop", () => {
     expect(db.getKV("sleep_until")).toBeDefined();
     expect(inference.calls.length).toBe(0);
     tickSpy.mockRestore();
+    activeSpy.mockRestore();
+  });
+
+  it("H3-001: does not sleep on delegated work when no local worker is alive", async () => {
+    // A child row that looks busy: it can never finish a colony task.
+    db.raw.prepare(
+      "INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run("child-1", "Kid", "0x2222222222222222222222222222222222222222", "sb-kid", "p", "m", 25, "running", new Date().toISOString());
+    const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockResolvedValue({
+      phase: "executing",
+      tasksAssigned: 0,
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      goalsActive: 1,
+      agentsActive: 1,
+    });
+
+    const inference = new MockInferenceClient([
+      noToolResponse("Checking on the goal."),
+    ]);
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+    });
+
+    expect(inference.calls.length).toBeGreaterThan(0);
+    tickSpy.mockRestore();
+  });
+
+  it("H3-001: the orchestrator wired by the loop runs tasks on local workers and never spawns or funds children", async () => {
+    const spawnModule = await import("../replication/spawn.js");
+    const spawnSpy = vi.spyOn(spawnModule, "spawnChild");
+    const funded = vi.spyOn(conway, "transferCredits");
+    const spawned = vi.spyOn(LocalWorkerPool.prototype, "spawn").mockReturnValue(null);
+    db.raw.prepare(
+      "INSERT INTO goals (id, title, description, status, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run("goal-w", "Worker goal", "d", "active", new Date().toISOString());
+    db.raw.prepare(
+      `INSERT INTO task_graph (id, goal_id, title, description, status, agent_role, priority, dependencies, created_at)
+       VALUES ('task-w', 'goal-w', 'T', 'd', 'pending', 'generalist', 50, '[]', ?)`,
+    ).run(new Date().toISOString());
+    db.setKV("orchestrator.state", JSON.stringify({ phase: "executing", goalId: "goal-w", replanCount: 0, failedTaskId: null, failedError: null }));
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference: new MockInferenceClient([noToolResponse("ok")]),
+    });
+
+    expect(spawned).toHaveBeenCalled();
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(funded).not.toHaveBeenCalled();
+    spawned.mockRestore();
+    spawnSpy.mockRestore();
+    funded.mockRestore();
   });
 
   it("does not sleep early when the parent has a self-assigned task", async () => {

@@ -445,6 +445,20 @@ describe("Authority Rules", () => {
       expect(autonomous.action).toBe("allow");
     });
 
+    it("blocks stop_child from inbox and unknown sources", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({
+        name: "stop_child",
+        riskLevel: "dangerous",
+        category: "replication",
+      });
+
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "external")).action).toBe("deny");
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "peer" as InputSource)).action).toBe("deny");
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "creator")).action).toBe("allow");
+    });
+
     it("does not take transfer_credits away from heartbeat or source-less turns", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);

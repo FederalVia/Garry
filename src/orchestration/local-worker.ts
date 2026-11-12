@@ -13,6 +13,7 @@ import type { HarnessContext, WorkerInferenceClient } from "../agent/harness-typ
 import {
   InferenceDeferredError,
   TaskBudgetExceededError,
+  TaskOwnershipLostError,
   buildWisdomFromGoal,
   createBudgetFromTask,
 } from "../agent/harness-types.js";
@@ -21,11 +22,15 @@ import { getInstalledInferenceGate, runWithInferenceScope } from "../inference/g
 import {
   MAX_INFERENCE_BLOCK_MS,
   ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY,
-  completeTask,
-  deferTask,
-  failTask,
+  assignTask,
+  claimTaskStart,
+  getTaskNode,
+  isTaskOwnedBy,
+  recordTaskSpend,
+  settleTask,
 } from "./task-graph.js";
-import type { TaskNode } from "./task-graph.js";
+import type { TaskNode, TaskOutcome } from "./task-graph.js";
+import { getTaskById } from "../state/database.js";
 import { AgentWorkspace } from "./workspace.js";
 import type {
   AutomatonConfig,
@@ -112,34 +117,92 @@ interface LocalWorkerConfig {
   policyEngine?: PolicyEngine;
   spendTracker?: SpendTrackerInterface;
   inputSource?: InputSource;
+  /** Workers running at once; default max(1, config.maxChildren). */
+  maxConcurrent?: number;
+  /** Poll interval passed to wait_for_tasks (tests). */
+  waitPollMs?: number;
 }
 
+/**
+ * Why a worker was aborted. "shutdown" puts its task back without spending
+ * a retry; for the others the orchestrator has already settled the task.
+ */
+export type WorkerAbortReason = "shutdown" | "cancelled" | "superseded" | "timeout";
+
+interface WorkerEntry {
+  promise: Promise<void>;
+  abortController: { abort: () => void };
+  taskId?: string;
+  /** Aborted and no longer counted; its task stays held until it settles. */
+  detached?: boolean;
+  detachedAt?: number;
+  /** Blocked in wait_for_tasks: not counted against the cap. */
+  waiting?: boolean;
+  abortReason?: WorkerAbortReason;
+}
+
+/** Default worker cap when the config has no usable maxChildren. */
+const DEFAULT_MAX_CONCURRENT = 3;
+/**
+ * An aborted worker keeps its task from being re-run until it settles (a
+ * tool call can outlive the abort). After this long it no longer does.
+ */
+const DETACHED_TASK_HOLD_MS = 10 * 60_000;
+/** Parent chain walk limit when computing a task's depth. */
+const MAX_DEPTH_WALK = 10;
+
 export class LocalWorkerPool {
-  private activeWorkers = new Map<string, { promise: Promise<void>; abortController: AbortController }>();
+  private activeWorkers = new Map<string, WorkerEntry>();
 
   constructor(private readonly config: LocalWorkerConfig) {}
 
-  spawn(task: TaskNode): { address: string; name: string; sandboxId: string } {
+  /** The most workers that may run at once. */
+  get maxConcurrent(): number {
+    const explicit = this.config.maxConcurrent;
+    if (typeof explicit === "number" && Number.isFinite(explicit)) return Math.max(1, Math.floor(explicit));
+    const configured = Number(this.config.config?.maxChildren);
+    return Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : DEFAULT_MAX_CONCURRENT;
+  }
+
+  /**
+   * Assign a pending task to a new worker and start it. Returns null, with
+   * nothing changed, when the pool is full, the task is no longer pending,
+   * or an aborted worker still holds the task.
+   */
+  spawn(task: TaskNode): { address: string; name: string; sandboxId: string } | null {
+    if (!this.hasCapacity() || this.isTaskHeld(task.id)) {
+      return null;
+    }
+
     const workerId = `local-worker-${ulid()}`;
     const workerName = `worker-${task.agentRole ?? "generalist"}-${workerId.slice(-6)}`;
     const address = `local://${workerId}`;
-    const abortController = new AbortController();
 
-    const workerPromise = this.runWorker(workerId, task, abortController.signal)
+    // Assign before the worker starts, so the worker can never act on a task it does not own.
+    try {
+      assignTask(this.config.db, task.id, address);
+    } catch {
+      return null;
+    }
+
+    const abortController = new AbortController();
+    const entry: WorkerEntry = { promise: Promise.resolve(), abortController, taskId: task.id };
+    this.activeWorkers.set(workerId, entry);
+
+    entry.promise = this.runWorker(workerId, task, abortController.signal, entry)
       .catch((error) => {
         logger.error("Local worker crashed", error instanceof Error ? error : new Error(String(error)), {
           workerId,
           taskId: task.id,
         });
         try {
-          failTask(
-            this.config.db,
-            task.id,
-            `Worker crashed: ${error instanceof Error ? error.message : String(error)}`,
-            true,
-          );
+          settleTask(this.config.db, task.id, address, {
+            kind: "fail",
+            error: `Worker crashed: ${error instanceof Error ? error.message : String(error)}`,
+            retry: true,
+          });
         } catch {
-          // Task may already be in a terminal state.
+          // Best effort: a dead owner is released by the orchestrator.
         }
       })
       .finally(() => {
@@ -147,45 +210,131 @@ export class LocalWorkerPool {
         markLocalWorkerFinished(this.config.db, address);
       });
 
-    this.activeWorkers.set(workerId, { promise: workerPromise, abortController });
     return { address, name: workerName, sandboxId: workerId };
   }
 
+  /** Live workers, including ones waiting on sub-tasks; aborted ones are not counted. */
   getActiveCount(): number {
-    return this.activeWorkers.size;
+    let count = 0;
+    for (const entry of this.activeWorkers.values()) {
+      if (!entry.detached) count++;
+    }
+    return count;
+  }
+
+  hasCapacity(): boolean {
+    let running = 0;
+    for (const entry of this.activeWorkers.values()) {
+      if (!entry.detached && !entry.waiting) running++;
+    }
+    return running < this.maxConcurrent;
   }
 
   hasWorker(addressOrId: string): boolean {
-    const id = addressOrId.replace("local://", "");
-    return this.activeWorkers.has(id);
+    const entry = this.activeWorkers.get(addressOrId.replace("local://", ""));
+    return entry !== undefined && !entry.detached;
+  }
+
+  /**
+   * Abort a worker and stop counting it at once, so a worker stuck in a
+   * call does not hold a slot. Its task stays held until it settles.
+   */
+  abortWorker(addressOrId: string, reason: WorkerAbortReason): boolean {
+    const entry = this.activeWorkers.get(addressOrId.replace("local://", ""));
+    if (!entry || entry.detached) return false;
+    entry.abortReason = reason;
+    entry.detached = true;
+    entry.detachedAt = Date.now();
+    entry.abortController.abort();
+    return true;
+  }
+
+  /** Abort every worker whose task row no longer names it as owner. */
+  reapOrphans(): number {
+    let reaped = 0;
+    for (const [workerId, entry] of [...this.activeWorkers.entries()]) {
+      if (entry.detached || !entry.taskId) continue;
+      if (!isTaskOwnedBy(this.config.db, entry.taskId, `local://${workerId}`)) {
+        logger.warn("Aborting a worker that no longer owns its task", { workerId, taskId: entry.taskId });
+        if (this.abortWorker(workerId, "cancelled")) reaped++;
+      }
+    }
+    return reaped;
   }
 
   async shutdown(): Promise<void> {
-    for (const [, worker] of this.activeWorkers) {
-      worker.abortController.abort();
+    for (const [workerId, entry] of this.activeWorkers) {
+      if (entry.detached) continue;
+      entry.abortReason = "shutdown";
+      entry.detached = true;
+      entry.detachedAt = Date.now();
+      try {
+        entry.abortController.abort();
+      } catch (error) {
+        logger.warn("Worker abort failed", { workerId, error: error instanceof Error ? error.message : String(error) });
+      }
     }
     await Promise.allSettled([...this.activeWorkers.values()].map((worker) => worker.promise));
     this.activeWorkers.clear();
   }
 
-  private async runWorker(workerId: string, task: TaskNode, signal: AbortSignal): Promise<void> {
-    const harness = this.config.harnessRegistry.createForRole(task.agentRole);
+  private isTaskHeld(taskId: string): boolean {
+    const now = Date.now();
+    for (const entry of this.activeWorkers.values()) {
+      if (entry.taskId !== taskId) continue;
+      if (entry.detached && entry.detachedAt !== undefined && now - entry.detachedAt > DETACHED_TASK_HOLD_MS) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /** Ancestors along parent_id: 0 for a top-level task. */
+  private taskDepth(task: TaskNode): number {
+    let depth = 0;
+    let parentId = task.parentId;
+    const seen = new Set<string>([task.id]);
+    while (parentId && depth < MAX_DEPTH_WALK && !seen.has(parentId)) {
+      seen.add(parentId);
+      depth++;
+      parentId = getTaskById(this.config.db, parentId)?.parentId ?? null;
+    }
+    return depth;
+  }
+
+  private async runWorker(
+    workerId: string,
+    assignedTask: TaskNode,
+    signal: AbortSignal,
+    entry: WorkerEntry = { promise: Promise.resolve(), abortController: { abort: () => {} } },
+  ): Promise<void> {
+    const address = `local://${workerId}`;
+    // Claimed before the first await: assigned -> running with started_at,
+    // which the orchestrator's deadline is measured from.
+    if (!claimTaskStart(this.config.db, assignedTask.id, address)) {
+      logger.warn(`[WORKER ${workerId}] Task ${assignedTask.id} is no longer assigned to this worker; exiting`);
+      return;
+    }
+    const task = getTaskNode(this.config.db, assignedTask.id);
+    if (!task) return;
+
+    const harness = this.config.harnessRegistry.createForRole(task.agentRole, { depth: this.taskDepth(task) });
     const workspace = new AgentWorkspace(task.goalId);
     const allowedEditRoot = resolveWorkerEditRoot(this.config.allowedEditRoot, workspace.basePath);
     const workerIdentity = createWorkerIdentity(this.config.identity, workerId, task.agentRole);
+    const db = this.config.db;
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,
       allowedEditRoot,
       workspace,
       identity: workerIdentity,
       config: this.config.config,
-      db: this.config.db,
+      db,
       conway: this.config.conway,
       inference: {
         chat: async (params) => this.config.inference.chat(params),
       },
       budget: createBudgetFromTask(task),
-      wisdom: buildWisdomFromGoal(this.config.db, task.goalId, workspace),
+      wisdom: buildWisdomFromGoal(db, task.goalId, workspace),
       abortSignal: signal,
       goalId: task.goalId,
       toolCatalog: this.config.tools,
@@ -198,6 +347,11 @@ export class LocalWorkerPool {
       policyEngine: this.config.policyEngine,
       spendTracker: this.config.spendTracker,
       inputSource: this.config.inputSource,
+      isTaskOwned: () => isTaskOwnedBy(db, task.id, address),
+      setWaiting: (waiting) => {
+        entry.waiting = waiting;
+      },
+      waitPollMs: this.config.waitPollMs,
     };
 
     if (this.config.maxTurns) {
@@ -224,7 +378,7 @@ export class LocalWorkerPool {
         sessionId: undefined,
         turnId: undefined,
       },
-      () => this.executeHarness(workerId, task, harness, context),
+      () => this.executeHarness(workerId, address, task, harness, context, entry),
     );
   }
 
@@ -254,18 +408,26 @@ export class LocalWorkerPool {
 
   private async executeHarness(
     workerId: string,
+    address: string,
     task: TaskNode,
     harness: ReturnType<HarnessRegistry["createForRole"]>,
     context: HarnessContext,
+    entry: WorkerEntry,
   ): Promise<void> {
     const db = this.config.db;
+    const settle = (outcome: TaskOutcome): void => {
+      if (settleTask(db, task.id, address, outcome) === "stale") {
+        logger.warn(`[WORKER ${workerId}] Result for task ${task.id} dropped: the worker no longer owns it`);
+      }
+    };
+
     try {
       await harness.initialize(task, context);
       const result = await harness.execute();
       const costCents = taskSpendCents(task.id, result.costCents);
 
       if (result.success) {
-        completeTask(db, task.id, { ...result, costCents });
+        settle({ kind: "complete", result: { ...result, costCents } });
         logger.info("Local worker completed task", {
           workerId,
           taskId: task.id,
@@ -275,7 +437,7 @@ export class LocalWorkerPool {
           costCents,
         });
       } else {
-        failTask(db, task.id, result.output || "Task reported failure", true, costCents);
+        settle({ kind: "fail", error: result.output || "Task reported failure", retry: true, costCents });
         logger.warn("Local worker reported task failure", {
           workerId,
           taskId: task.id,
@@ -288,10 +450,23 @@ export class LocalWorkerPool {
       const message = error instanceof Error ? error.message : String(error);
       const costCents = taskSpendCents(task.id, context.budget.costUsedCents);
 
+      if (context.abortSignal.aborted || error instanceof TaskOwnershipLostError) {
+        const reason = error instanceof TaskOwnershipLostError ? "cancelled" : (entry.abortReason ?? "shutdown");
+        if (reason === "shutdown") {
+          // Graceful shutdown: the task waits for the next run without spending a retry.
+          settle({ kind: "defer", reason: "the runtime is shutting down", costCents });
+        } else {
+          // The orchestrator (or the parent) already settled the task; keep the spend.
+          recordTaskSpend(db, task.id, costCents);
+          logger.info(`[WORKER ${workerId}] Stopped (${reason}); no result reported for task ${task.id}`);
+        }
+        return;
+      }
+
       if (error instanceof InferenceDeferredError) {
         // A refusal that clears with time: the task waits without using a retry.
         logger.warn(`[WORKER ${workerId}] Inference refused (${error.code}); deferring task ${task.id}`);
-        deferTask(db, task.id, message, costCents);
+        settle({ kind: "defer", reason: message, costCents });
         this.blockAssignments(error.retryAfterMs);
         return;
       }
@@ -299,12 +474,12 @@ export class LocalWorkerPool {
       if (error instanceof TaskBudgetExceededError) {
         // The cap is cumulative over every attempt, so a retry would be refused too.
         logger.warn(`[WORKER ${workerId}] ${message}`);
-        failTask(db, task.id, message, false, costCents);
+        settle({ kind: "fail", error: message, retry: false, costCents });
         return;
       }
 
       logger.error(`[WORKER ${workerId}] Harness execution failed: ${message}`);
-      failTask(db, task.id, message, true, costCents);
+      settle({ kind: "fail", error: message, retry: true, costCents });
     }
   }
 }
@@ -333,7 +508,7 @@ function createWorkerIdentity(
   };
 }
 
-/** The orchestrator registers local workers as running children; retire the row when the worker ends. */
+/** Workers are not children rows any more; this retires rows an older version registered. */
 export function markLocalWorkerFinished(db: Database, address: string): void {
   try {
     db.prepare(

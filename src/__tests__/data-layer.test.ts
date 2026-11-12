@@ -10,8 +10,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { createDatabase, pruneStaleKV } from "../state/database.js";
+import { claimInboxMessagesFromOneSender, createDatabase, pruneStaleKV, recoverStrandedInboxClaims } from "../state/database.js";
 import type { AutomatonDatabase } from "../types.js";
+import { countSlotHoldingChildren } from "../replication/child-status.js";
 
 // Mock erc8004.js to avoid ABI parse error at import time
 vi.mock("../registry/erc8004.js", () => ({
@@ -751,5 +752,185 @@ describe("Core Table CRUD", () => {
     expect(skills.length).toBe(1);
     expect(skills[0].name).toBe("test_skill");
     expect(skills[0].enabled).toBe(true);
+  });
+});
+
+// ─── Migration 14: colony bookkeeping repair ─────────────────────
+
+describe("Migration 14 (children dedupe, lifecycle status, self-sent colony rows)", () => {
+  const PARENT = "0x1111111111111111111111111111111111111111";
+  const A = "0x2222222222222222222222222222222222222222";
+  const B = "0x3333333333333333333333333333333333333333";
+  const C = "0x4444444444444444444444444444444444444444";
+  const D = "0x5555555555555555555555555555555555555555";
+
+  /** A schema-13 database carrying the damage the old runtime left behind. */
+  function makeDamagedV13(dbPath: string): void {
+    const db = createDatabase(dbPath);
+    const raw = db.raw;
+    raw.exec("DROP INDEX IF EXISTS idx_children_address");
+    raw.prepare("DELETE FROM schema_version WHERE version >= 14").run();
+    db.setIdentity("address", PARENT);
+
+    const child = raw.prepare(
+      `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at)
+       VALUES (?, ?, ?, ?, 'p', ?, ?, ?, datetime('now'))`,
+    );
+    const event = raw.prepare(
+      `INSERT INTO child_lifecycle_events (id, child_id, from_state, to_state, reason, metadata, created_at)
+       VALUES (?, ?, ?, ?, NULL, '{}', ?)`,
+    );
+    const addEvents = (id: string, states: string[]) => {
+      let from = "none";
+      states.forEach((to, i) => {
+        event.run(`${id}-e${i}`, id, from, to, new Date(Date.UTC(2026, 10, 1, 10, 0, i)).toISOString());
+        from = to;
+      });
+    };
+
+    // F067: spawnChild's lifecycle row plus the orchestrator's duplicate.
+    child.run("L1", "kid-a", A, "sbx-a", null, 25, "wallet_verified");
+    addEvents("L1", ["requested", "sandbox_created", "runtime_ready", "wallet_verified"]);
+    child.run("R1", "kid-a", A, "sbx-a", "registered by orchestrator", 25, "running");
+    // H3-003: the tracker wrote 'running' into a healthy lifecycle row.
+    child.run("L2", "kid-b", B, "sbx-b", null, 100, "running");
+    addEvents("L2", ["requested", "sandbox_created", "runtime_ready", "wallet_verified", "funded", "starting", "healthy"]);
+    // F065/F071: local worker rows left running or revived to 'starting'.
+    child.run("W1", "w1", "local://local-worker-1", "local", "registered by orchestrator", 0, "running");
+    child.run("W2", "w2", "local://local-worker-2", "local", "registered by orchestrator", 0, "starting");
+    // A registered row whose lifecycle twin was pruned.
+    child.run("R3", "kid-c", C, "sbx-c", "registered by orchestrator", 25, "running");
+    // F187 at base: L3 failed, its sandbox was reused by L4, which inherited
+    // the wallet; L3 was retired to cleaned_up without a lifecycle event.
+    child.run("L3", "kid-d", D, "sbx-d", null, 10, "cleaned_up");
+    addEvents("L3", ["requested", "sandbox_created", "runtime_ready", "wallet_verified", "funded", "starting", "failed"]);
+    child.run("L4", "kid-e", D, "sbx-d", null, 10, "healthy");
+    addEvents("L4", ["requested", "sandbox_created", "runtime_ready", "wallet_verified", "funded", "starting", "healthy"]);
+    // Legacy rows with no events: one the old health monitor "restarted"
+    // from dead to starting, and one the pool optimizer culled to stopped.
+    child.run("X1", "old-e", "0x6666666666666666666666666666666666666666", "sbx-x1", null, 5, "starting");
+    child.run("X2", "old-f", "0x7777777777777777777777777777777777777777", "sbx-x2", null, 5, "stopped");
+
+    const inbox = raw.prepare(
+      `INSERT INTO inbox_messages (id, from_address, to_address, content, received_at, status)
+       VALUES (?, ?, ?, ?, datetime('now'), 'received')`,
+    );
+    inbox.run("self-1", PARENT, A, '{"protocol":"colony_message_v1"}');
+    // Claimed by the old inbox loop when the process died.
+    inbox.run("self-2", PARENT, B, '{"protocol":"colony_message_v1"}');
+    raw.prepare("UPDATE inbox_messages SET status = 'in_progress' WHERE id = 'self-2'").run();
+    raw.prepare(
+      `INSERT INTO inbox_messages (id, from_address, content, received_at, status)
+       VALUES ('relay-1', '0x9999999999999999999999999999999999999999', 'hello', datetime('now'), 'received')`,
+    ).run();
+    db.close();
+  }
+
+  it("leaves one row per child with the true ledger, lifecycle statuses and a unique address index", () => {
+    const dbPath = makeTmpDbPath();
+    makeDamagedV13(dbPath);
+
+    const db = createDatabase(dbPath);
+    try {
+      const raw = db.raw;
+      const v = raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
+      expect(v.v).toBe(14);
+
+      const rows = raw.prepare("SELECT id, address, status, funded_amount_cents AS f FROM children ORDER BY id").all();
+      expect(rows).toEqual([
+        // The orchestrator never started it: failed, so it holds no slot.
+        { id: "L1", address: A, status: "failed", f: 25 },
+        { id: "L2", address: B, status: "healthy", f: 100 },
+        // Stays terminal, and gives up the address L4 inherited.
+        { id: "L3", address: "", status: "cleaned_up", f: 10 },
+        { id: "L4", address: D, status: "healthy", f: 10 },
+        { id: "R3", address: C, status: "dead", f: 25 },
+        { id: "W1", address: "local://local-worker-1", status: "cleaned_up", f: 0 },
+        { id: "W2", address: "local://local-worker-2", status: "cleaned_up", f: 0 },
+        // "Restarted" by the old monitor, which started nothing: dead, no slot.
+        { id: "X1", address: "0x6666666666666666666666666666666666666666", status: "dead", f: 5 },
+        { id: "X2", address: "0x7777777777777777777777777777777777777777", status: "stopped", f: 5 },
+      ]);
+      const sum = raw.prepare("SELECT SUM(funded_amount_cents) AS s FROM children WHERE address = ?").get(A) as { s: number };
+      expect(sum.s).toBe(25);
+      // Status still equals the latest lifecycle event, and the repairs say why.
+      const latest = raw.prepare(
+        "SELECT to_state, reason FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      );
+      expect(latest.get("L1")).toMatchObject({ to_state: "failed", reason: expect.stringContaining("never started") });
+      expect(latest.get("L3")).toMatchObject({ to_state: "cleaned_up" });
+      expect(countSlotHoldingChildren(raw)).toBe(2);
+
+      const inbox = raw.prepare("SELECT id, status, processed_at FROM inbox_messages ORDER BY id").all() as Array<{
+        id: string;
+        status: string;
+        processed_at: string | null;
+      }>;
+      expect(inbox.find((r) => r.id === "self-1")).toMatchObject({ status: "processed" });
+      expect(inbox.find((r) => r.id === "self-1")?.processed_at).not.toBeNull();
+      expect(inbox.find((r) => r.id === "self-2")).toMatchObject({ status: "processed" });
+      // Relay rows belong to the inbox turn and are left alone.
+      expect(inbox.find((r) => r.id === "relay-1")).toMatchObject({ status: "received", processed_at: null });
+      // Nothing self-sent reaches the model's inbox claim, even after startup
+      // requeues stranded claims.
+      recoverStrandedInboxClaims(raw);
+      expect(claimInboxMessagesFromOneSender(raw, 10).map((m) => m.fromAddress)).not.toContain(PARENT);
+
+      expect(() =>
+        raw.prepare(
+          `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status) VALUES ('dup', 'dup', ?, 's', 'p', 'running')`,
+        ).run(A),
+      ).toThrow(/UNIQUE/);
+      // Failed spawns keep an empty address; many may exist.
+      raw.prepare(`INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status) VALUES ('e1', 'e', '', 's', 'p', 'failed')`).run();
+      raw.prepare(`INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status) VALUES ('e2', 'e', '', 's', 'p', 'failed')`).run();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("is idempotent when it runs again", () => {
+    const dbPath = makeTmpDbPath();
+    makeDamagedV13(dbPath);
+    createDatabase(dbPath).close();
+    const again = createDatabase(dbPath);
+    again.raw.prepare("DELETE FROM schema_version WHERE version >= 14").run();
+    again.close();
+
+    const db = createDatabase(dbPath);
+    try {
+      const count = db.raw.prepare("SELECT COUNT(*) AS n FROM children").get() as { n: number };
+      expect(count.n).toBe(9);
+      const events = db.raw.prepare("SELECT COUNT(*) AS n FROM child_lifecycle_events WHERE reason LIKE '%upgrade repair%'").get() as { n: number };
+      expect(events.n).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("skips the unique index while duplicates remain, and adds it once they are gone", () => {
+    const dbPath = makeTmpDbPath();
+    const db = createDatabase(dbPath);
+    db.raw.exec("DROP INDEX IF EXISTS idx_children_address");
+    const insert = db.raw.prepare(
+      `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status) VALUES (?, 'x', ?, 's', 'p', 'failed')`,
+    );
+    insert.run("d1", A);
+    insert.run("d2", A);
+    db.close();
+
+    const reopened = createDatabase(dbPath);
+    const hasIndex = (raw: any) =>
+      raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_children_address'").get() !== undefined;
+    expect(hasIndex(reopened.raw)).toBe(false);
+    reopened.raw.prepare("DELETE FROM children WHERE id = 'd2'").run();
+    reopened.close();
+
+    const fixed = createDatabase(dbPath);
+    try {
+      expect(hasIndex(fixed.raw)).toBe(true);
+    } finally {
+      fixed.close();
+    }
   });
 });

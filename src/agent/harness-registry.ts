@@ -1,6 +1,6 @@
 import type { AgentHarness } from "./harness-types.js";
 import { CodingHarness } from "./harnesses/coding-harness.js";
-import { GeneralHarness } from "./harnesses/general-harness.js";
+import { GeneralHarness, RestrictedGeneralHarness } from "./harnesses/general-harness.js";
 import { OrchestratorHarness } from "./harnesses/orchestrator-harness.js";
 
 type HarnessConstructor = new () => AgentHarness;
@@ -15,9 +15,12 @@ const DEFAULT_ROLE_MAP: Record<string, HarnessConstructor> = {
   developer: CodingHarness,
   engineer: CodingHarness,
 
+  // Review roles do the review themselves instead of decomposing it.
+  critic: CodingHarness,
+  reviewer: CodingHarness,
+
   orchestrator: OrchestratorHarness,
   planner: OrchestratorHarness,
-  critic: OrchestratorHarness,
   coordinator: OrchestratorHarness,
 
   generalist: GeneralHarness,
@@ -30,13 +33,25 @@ const DEFAULT_ROLE_MAP: Record<string, HarnessConstructor> = {
   analyst: GeneralHarness,
 };
 
+/**
+ * Deepest task that may run the orchestrator harness. Top-level tasks
+ * (depth 0) may decompose once; the tasks they delegate run a plain harness.
+ */
+export const MAX_ORCHESTRATOR_TASK_DEPTH = 0;
+
+export interface CreateHarnessOptions {
+  /** Ancestors of the task along parent_id (0 for a top-level task). */
+  depth?: number;
+}
+
 export class HarnessRegistry {
   private readonly roleMap: Map<string, HarnessConstructor>;
   private fallback: HarnessConstructor;
 
   constructor() {
     this.roleMap = new Map(Object.entries(DEFAULT_ROLE_MAP));
-    this.fallback = GeneralHarness;
+    // Unknown (custom) roles get no financial tools.
+    this.fallback = RestrictedGeneralHarness;
   }
 
   register(role: string, constructor: HarnessConstructor): void {
@@ -47,9 +62,13 @@ export class HarnessRegistry {
     this.fallback = constructor;
   }
 
-  createForRole(role: string | null | undefined): AgentHarness {
+  createForRole(role: string | null | undefined, options: CreateHarnessOptions = {}): AgentHarness {
     const normalized = (role ?? "generalist").toLowerCase().trim();
     const Constructor = this.roleMap.get(normalized) ?? this.fallback;
+    // A task delegated by a sub-orchestrator must not decompose again.
+    if (Constructor === OrchestratorHarness && (options.depth ?? 0) > MAX_ORCHESTRATOR_TASK_DEPTH) {
+      return new GeneralHarness();
+    }
     return new Constructor();
   }
 

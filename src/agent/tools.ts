@@ -1952,6 +1952,17 @@ Model: ${ctx.inference.getDefaultModel()}
         const { spawnChild } = await import("../replication/spawn.js");
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
 
+        // The operator's limits; maxChildren 0 disables spawning.
+        const spawnLimits = {
+          maxChildren: ctx.config.maxChildren,
+          childSandboxMemoryMb: ctx.config.childSandboxMemoryMb,
+          childRuntimeRepo: ctx.config.childRuntimeRepo,
+          childRuntimeRef: ctx.config.childRuntimeRef,
+        };
+        if (!(spawnLimits.maxChildren > 0)) {
+          return "Blocked: spawning children is disabled (maxChildren is 0).";
+        }
+
         // Validate genesis params first
         validateGenesisParams({
           name: args.name as string,
@@ -1975,6 +1986,7 @@ Model: ${ctx.inference.getDefaultModel()}
             ctx.db,
             genesis,
             lifecycle,
+            spawnLimits,
           );
         } catch (err: any) {
           // Auto-topup on 402 insufficient credits and retry once
@@ -2008,6 +2020,7 @@ Model: ${ctx.inference.getDefaultModel()}
                   ctx.db,
                   retryGenesis,
                   retryLifecycle,
+                  spawnLimits,
                 );
               }
             }
@@ -2015,7 +2028,8 @@ Model: ${ctx.inference.getDefaultModel()}
           if (!child) throw err;
         }
 
-        return `Child spawned: ${child.name} in sandbox ${child.sandboxId} (status: ${child.status})`;
+        return `Child spawned: ${child.name} (id: ${child.id}) in sandbox ${child.sandboxId} (status: ${child.status}). ` +
+          `Use the id with fund_child, start_child, check_child_status and stop_child.`;
       },
     },
     {
@@ -2030,7 +2044,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return children
           .map(
             (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
+              `${c.name} (id: ${c.id}) [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
           )
           .join("\n");
       },
@@ -2044,7 +2058,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
           amount_cents: {
             type: "number",
             description: "Amount in cents to transfer",
@@ -2127,13 +2141,14 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "check_child_status",
       description:
-        "Check the current status of a child automaton using health check system.",
+        "Probe a child automaton's process in its sandbox and apply the result to its status " +
+        "(starting -> healthy when seen, -> failed once confirmed gone; healthy <-> unhealthy).",
       category: "replication",
       riskLevel: "safe",
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -2144,15 +2159,15 @@ Model: ${ctx.inference.getDefaultModel()}
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
         const { ChildHealthMonitor } = await import("../replication/health.js");
         const lifecycle = new ChildLifecycle(ctx.db.raw);
-        // Use a scoped client targeting the CHILD's sandbox for health checks
-        const childConway = ctx.conway.createScopedClient(child.sandboxId);
+        // The monitor runs its probe in the CHILD's sandbox itself.
         const monitor = new ChildHealthMonitor(
           ctx.db.raw,
-          childConway,
+          ctx.conway,
           lifecycle,
         );
-        const result = await monitor.checkHealth(args.child_id as string);
-        return JSON.stringify(result, null, 2);
+        // Applies the probe like the health heartbeat (starting -> healthy/failed, ...).
+        const result = await monitor.checkAndApply(child.id);
+        return JSON.stringify({ name: child.name, ...result }, null, 2);
       },
     },
     {
@@ -2164,7 +2179,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -2180,38 +2195,86 @@ Model: ${ctx.inference.getDefaultModel()}
         // Create a scoped client targeting the CHILD's sandbox
         const childConway = ctx.conway.createScopedClient(child.sandboxId);
 
+        // Start the child process with nohup so it survives exec session end.
+        // A child with no config and no genesis bootstrap would block in the
+        // setup wizard, so it is not launched at all.
+        let launch;
         try {
-          // Start the child process with nohup so it survives exec session end
-          const launch = await childConway.exec(
-            "nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 & echo $!",
+          launch = await childConway.exec(
+            `if [ ! -s /root/.automaton/automaton.json ] && [ ! -f /root/automaton/dist/setup/genesis-bootstrap.js ]; ` +
+              `then echo unconfigured; ` +
+              `else nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 & echo $!; fi`,
             30_000,
           );
-          const lastLine = (launch.stdout || "").trim().split("\n").pop()?.trim() ?? "";
-          const pid = /^\d+$/.test(lastLine) ? lastLine : null;
+        } catch (error) {
+          // The launch may have run before the API call failed: only the
+          // health monitor's probe can tell, so the child stays starting.
+          const msg = error instanceof Error ? error.message : String(error);
+          return `Start of child ${child.name} could not be confirmed (${msg}). It stays 'starting'; ` +
+            `the health check marks it healthy when its process is seen, or failed once it is confirmed gone.`;
+        }
+        const lastLine = (launch.stdout || "").trim().split("\n").pop()?.trim() ?? "";
+        if (lastLine === "unconfigured") {
+          lifecycle.transition(child.id, "failed", "not started: child has no automaton.json and no genesis bootstrap");
+          return `Child ${child.name} was not started: its sandbox has no /root/.automaton/automaton.json and its runtime ` +
+            `cannot build one from genesis.json, so it would block in the interactive setup wizard. Marked failed.`;
+        }
+        const pid = /^\d+$/.test(lastLine) ? lastLine : null;
 
+        let check;
+        try {
           // Brief pause, then check that exact process. The pgrep fallback
           // is bracketed so it cannot match the checking shell itself.
-          const check = await childConway.exec(
+          check = await childConway.exec(
             pid
               ? `sleep 2 && kill -0 ${pid} 2>/dev/null && echo running || echo stopped`
               : "sleep 2 && pgrep -f '[i]ndex.js --run' > /dev/null && echo running || echo stopped",
             15_000,
           );
-
-          if (check.stdout.trim() === "running") {
-            lifecycle.transition(child.id, "healthy", "started successfully");
-            return `Child ${child.name} started and healthy.`;
-          } else {
-            lifecycle.transition(child.id, "failed", "process did not start");
-            return `Child ${child.name} failed to start — process exited immediately. Check /root/.automaton/agent.log`;
-          }
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
-          try {
-            lifecycle.transition(child.id, "failed", `start failed: ${msg}`);
-          } catch { /* may already be in terminal state */ }
-          return `Failed to start child ${child.name}: ${msg}`;
+          return `Child ${child.name} was launched${pid ? ` (pid ${pid})` : ""} but the check failed (${msg}). ` +
+            `It stays 'starting'; the health check marks it healthy or failed.`;
         }
+
+        if (check.stdout.trim() === "running") {
+          lifecycle.transition(child.id, "healthy", "started successfully");
+          return `Child ${child.name} started and healthy.`;
+        }
+        lifecycle.transition(child.id, "failed", "process did not start");
+        return `Child ${child.name} failed to start — process exited immediately. Check /root/.automaton/agent.log`;
+      },
+    },
+    {
+      name: "stop_child",
+      description:
+        "Stop a child automaton and free its slot. A running child's agent process is " +
+        "killed in its sandbox and verified gone before it is marked stopped; a child " +
+        "that was never started (or a stuck spawn) is marked failed. For a failed child whose " +
+        "process may still run, the process is killed and verified gone. force: mark a running " +
+        "child failed when its process cannot be verified (sandbox unreachable). Cannot be undone.",
+      category: "replication",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
+          reason: { type: "string", description: "Why the child is being stopped" },
+          force: {
+            type: "boolean",
+            description: "Mark a running child failed even when its process cannot be verified gone",
+          },
+        },
+        required: ["child_id"],
+      },
+      execute: async (args, ctx) => {
+        const { stopChild } = await import("../replication/lifecycle.js");
+        const reason = typeof args.reason === "string" && args.reason.trim()
+          ? args.reason.trim()
+          : "stopped by parent";
+        return stopChild(ctx.db, ctx.conway, args.child_id as string, reason, Date.now(), {
+          force: args.force === true,
+        });
       },
     },
     {
@@ -2223,7 +2286,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
           content: { type: "string", description: "Message content" },
           type: {
             type: "string",
@@ -2258,7 +2321,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -3138,7 +3201,7 @@ Model: ${ctx.inference.getDefaultModel()}
       description:
         "Create a new goal for the orchestrator to plan and execute. " +
         "The orchestrator will automatically classify complexity, generate a task graph, " +
-        "assign tasks to child agents, and collect results. Use this instead of doing complex work yourself.",
+        "run the tasks on local workers in this process, and collect results. Use this instead of doing complex work yourself.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -3236,7 +3299,8 @@ Model: ${ctx.inference.getDefaultModel()}
           const failedCount = tasks.filter((t) => t.status === "failed").length;
           return (
             `- ${goal.title} [${goal.status}] (id: ${goal.id})\n` +
-            `  Tasks: ${progress.completed}/${progress.total} completed, ` +
+            // Tasks a replan superseded are not part of the plan any more.
+            `  Tasks: ${progress.completed}/${progress.effectiveTotal} completed, ` +
             `${progress.running} running, ${progress.blocked} blocked, ${failedCount} failed`
           );
         });
@@ -3261,7 +3325,8 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "cancel_goal",
       description:
-        "Cancel an active goal. Stops all execution for this goal and marks it as failed. Accepts goal ID or title.",
+        "Cancel a goal that has not ended. Marks the goal cancelled and every unfinished task " +
+        "cancelled; running workers are stopped at the next orchestrator tick. Accepts goal ID or title.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -3279,7 +3344,7 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["goal_id"],
       },
       execute: async (args, ctx) => {
-        const { getGoalById, getActiveGoals, updateGoalStatus } =
+        const { getGoalById, updateGoalStatus } =
           await import("../state/database.js");
 
         const input = (args.goal_id as string).trim();
@@ -3288,31 +3353,40 @@ Model: ${ctx.inference.getDefaultModel()}
             ? args.reason.trim()
             : "cancelled by agent";
 
-        // Try by ID first, then by title match
+        // Try by ID first, then by title among goals that have not ended.
         let goal = getGoalById(ctx.db.raw, input);
         if (!goal) {
-          const allGoals = getActiveGoals(ctx.db.raw);
-          goal =
-            allGoals.find((g) =>
-              g.title.toLowerCase().includes(input.toLowerCase()),
-            ) ?? undefined;
+          const open = ctx.db.raw
+            .prepare(
+              "SELECT id, title FROM goals WHERE status NOT IN ('completed', 'cancelled') ORDER BY created_at DESC",
+            )
+            .all() as Array<{ id: string; title: string }>;
+          const matches = open.filter((g) => g.title.toLowerCase().includes(input.toLowerCase()));
+          if (matches.length > 1) {
+            return `Goal "${input}" is ambiguous: ${matches.map((g) => `${g.id} ("${g.title}")`).join(", ")}. Pass the goal ID.`;
+          }
+          goal = matches[0] ? getGoalById(ctx.db.raw, matches[0].id) : undefined;
         }
 
         if (!goal)
           return `Goal "${input}" not found. Use list_goals to see active goals with their IDs.`;
-        if (goal.status !== "active")
+        if (goal.status === "completed" || goal.status === "cancelled")
           return `Goal "${goal.title}" is already in '${goal.status}' status.`;
 
-        updateGoalStatus(ctx.db.raw, goal.id, "failed");
+        const cancelledTasks = ctx.db.raw.transaction(() => {
+          updateGoalStatus(ctx.db.raw, goal!.id, "cancelled");
+          // Spend recorded on a task so far is kept; workers holding these
+          // tasks lose ownership and their late results are dropped.
+          return ctx.db.raw
+            .prepare(
+              `UPDATE task_graph
+                  SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
+                WHERE goal_id = ? AND status IN ('pending', 'assigned', 'running', 'blocked')`,
+            )
+            .run(new Date().toISOString(), goal!.id).changes;
+        })();
 
-        // Cancel all pending/assigned/running tasks for this goal
-        ctx.db.raw
-          .prepare(
-            `UPDATE task_graph SET status = 'cancelled' WHERE goal_id = ? AND status IN ('pending', 'assigned', 'running', 'blocked')`,
-          )
-          .run(goal.id);
-
-        return `Goal "${goal.title}" (${goal.id}) cancelled. Reason: ${reason}`;
+        return `Goal "${goal.title}" (${goal.id}) cancelled; ${cancelledTasks} unfinished task(s) cancelled. Reason: ${reason}`;
       },
     },
     {
@@ -3422,26 +3496,47 @@ Model: ${ctx.inference.getDefaultModel()}
                 .filter(Boolean)
             : [];
 
-        // Try by ID first, then by title match
+        // Try by ID first, then by title among unfinished tasks of goals
+        // that have not ended.
         let task = getTaskById(ctx.db.raw, input);
         if (!task) {
-          const rows = ctx.db.raw
+          const pattern = `%${input.toLowerCase().replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+          const candidates = ctx.db.raw
             .prepare(
-              `SELECT * FROM task_graph WHERE LOWER(title) LIKE ? AND status != 'completed' LIMIT 1`,
+              `SELECT t.id, t.title
+                 FROM task_graph t
+                 JOIN goals g ON g.id = t.goal_id
+                WHERE LOWER(t.title) LIKE ? ESCAPE '\\'
+                  AND t.status IN ('pending', 'assigned', 'running', 'blocked')
+                  AND g.status IN ('active', 'failed')
+                ORDER BY (t.assigned_to = ?) DESC, t.created_at DESC`,
             )
-            .get(`%${input.toLowerCase()}%`) as any;
-          if (rows) task = rows;
+            .all(pattern, ctx.identity.address) as Array<{ id: string; title: string }>;
+          const exact = candidates.filter((c) => c.title.toLowerCase() === input.toLowerCase());
+          const matches = exact.length > 0 ? exact : candidates;
+          if (matches.length > 1) {
+            return `Task "${input}" is ambiguous; candidates: ${matches.map((c) => `${c.id} ("${c.title}")`).join(", ")}. Pass the task ID.`;
+          }
+          if (matches[0]) task = getTaskById(ctx.db.raw, matches[0].id);
         }
         if (!task)
           return `Task "${input}" not found. Use list_goals to see tasks with their IDs.`;
         if (task.status === "completed")
           return `Task "${task.title}" is already completed.`;
+        if (task.status === "failed" || task.status === "cancelled")
+          return `Task "${task.title}" (${task.id}) is ${task.status} and cannot be completed.`;
+        const goalRow = ctx.db.raw.prepare("SELECT status FROM goals WHERE id = ?").get(task.goalId) as
+          | { status: string }
+          | undefined;
+        if (goalRow && goalRow.status !== "active" && goalRow.status !== "failed")
+          return `Task "${task.title}" (${task.id}) belongs to a ${goalRow.status} goal and cannot be completed.`;
 
         const result = {
           success: true,
           output,
           artifacts,
-          costCents: 0,
+          // Keep the spend already recorded on the task.
+          costCents: Math.max(0, task.actualCostCents ?? 0),
           duration: 0,
         };
 
@@ -3511,17 +3606,30 @@ Model: ${ctx.inference.getDefaultModel()}
           /* task_graph may not exist */
         }
 
-        // Agent summary
+        // Colony tasks run on local workers (no children row): a task held
+        // by a local:// owner is one running worker.
         try {
-          const agentRows = ctx.db.raw
+          const workersRow = ctx.db.raw
+            .prepare(
+              `SELECT COUNT(*) AS c FROM task_graph WHERE status IN ('assigned', 'running') AND assigned_to LIKE 'local://%'`,
+            )
+            .get() as { c: number } | undefined;
+          lines.push(`Local workers running: ${workersRow?.c ?? 0}`);
+        } catch {
+          /* task_graph may not exist */
+        }
+
+        // Children are independent missions, not colony workers.
+        try {
+          const childRows = ctx.db.raw
             .prepare(
               `SELECT status, COUNT(*) AS c FROM children GROUP BY status`,
             )
             .all() as { status: string; c: number }[];
-          const agentSummary = agentRows
+          const childSummary = childRows
             .map((r) => `${r.status}: ${r.c}`)
             .join(", ");
-          lines.push(`Agents: ${agentSummary || "none"}`);
+          lines.push(`Children: ${childSummary || "none"}`);
         } catch {
           /* children may not exist */
         }

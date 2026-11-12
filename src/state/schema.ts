@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -775,4 +775,116 @@ export const MIGRATION_V13 = `
   CREATE INDEX IF NOT EXISTS idx_infl_task ON inference_ledger(task_id) WHERE task_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_infl_session ON inference_ledger(session_id) WHERE session_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_infl_open ON inference_ledger(status) WHERE status IN ('reserved','unknown');
+`;
+
+// === Colony bookkeeping repair ===
+// Applied by the version 14 entry of applyMigrations (database.ts);
+// ensureChildrenAddressIndex then adds the unique address index once no
+// duplicates remain. Idempotent.
+
+export const MIGRATION_V14 = `
+  -- Schema version: 14
+  -- Local workers are in-process and never survive a restart: retire every
+  -- row the orchestrator registered for one.
+  UPDATE children SET status = 'cleaned_up'
+   WHERE address LIKE 'local://%' AND status NOT IN ('cleaned_up', 'dead');
+
+  -- The orchestrator never started the Conway children it spawned. One still
+  -- before start (its twin marks it) has no process: fail it, which frees
+  -- its slot. Lifecycle timestamps are ISO, so the repair events are
+  -- stamped that way to sort after the existing ones.
+  INSERT INTO child_lifecycle_events (id, child_id, from_state, to_state, reason, metadata, created_at)
+  SELECT lower(hex(randomblob(16))), c.id, latest.to_state, 'failed',
+         'orchestrator spawn never started (upgrade repair)', '{}',
+         MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), latest.created_at)
+    FROM children c
+    JOIN (SELECT e.child_id, e.to_state, e.created_at FROM child_lifecycle_events e
+           WHERE e.rowid = (SELECT e2.rowid FROM child_lifecycle_events e2
+                             WHERE e2.child_id = e.child_id
+                             ORDER BY e2.created_at DESC, e2.rowid DESC LIMIT 1)) latest
+      ON latest.child_id = c.id
+   WHERE latest.to_state IN ('wallet_verified', 'funded')
+     AND c.address <> ''
+     AND EXISTS (
+       SELECT 1 FROM children twin
+        WHERE twin.address = c.address AND twin.id <> c.id
+          AND twin.creator_message = 'registered by orchestrator'
+          AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e3 WHERE e3.child_id = twin.id)
+     );
+
+  -- A row the orchestrator registered for a Conway child duplicates that
+  -- child's lifecycle row (same address, same ledger updates): drop it.
+  DELETE FROM children
+   WHERE creator_message = 'registered by orchestrator'
+     AND address <> '' AND address NOT LIKE 'local://%'
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id)
+     AND EXISTS (
+       SELECT 1 FROM children c2
+        WHERE c2.address = children.address AND c2.id <> children.id
+          AND EXISTS (SELECT 1 FROM child_lifecycle_events e2 WHERE e2.child_id = c2.id)
+     );
+
+  -- A registered row whose lifecycle row is gone outlived a pruned (ended)
+  -- child; the orchestrator never started a process for it.
+  UPDATE children SET status = 'dead'
+   WHERE creator_message = 'registered by orchestrator'
+     AND address NOT LIKE 'local://%'
+     AND status NOT IN ('cleaned_up', 'dead')
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- Rows retired to cleaned_up without an event (a reused sandbox) get the
+  -- event, so the reconciliation below keeps them terminal.
+  INSERT INTO child_lifecycle_events (id, child_id, from_state, to_state, reason, metadata, created_at)
+  SELECT lower(hex(randomblob(16))), c.id, latest.to_state, 'cleaned_up',
+         'retired before upgrade (upgrade repair)', '{}',
+         MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), latest.created_at)
+    FROM children c
+    JOIN (SELECT e.child_id, e.to_state, e.created_at FROM child_lifecycle_events e
+           WHERE e.rowid = (SELECT e2.rowid FROM child_lifecycle_events e2
+                             WHERE e2.child_id = e.child_id
+                             ORDER BY e2.created_at DESC, e2.rowid DESC LIMIT 1)) latest
+      ON latest.child_id = c.id
+   WHERE c.status = 'cleaned_up' AND latest.to_state IN ('stopped', 'failed');
+
+  -- Lifecycle children: status is the latest lifecycle state. Undoes the
+  -- running/starting/stopped writes of the tracker, health monitor and pool
+  -- optimizer.
+  UPDATE children SET status = (
+      SELECT e.to_state FROM child_lifecycle_events e
+       WHERE e.child_id = children.id
+       ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1)
+   WHERE EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- Legacy runtimes wrote 'starting' without an event only when their health
+  -- monitor "restarted" a dead child, which started nothing. Nothing can
+  -- move such a row, and it would hold a slot forever.
+  UPDATE children SET status = 'dead'
+   WHERE status = 'starting'
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- An ended row sharing its address with a live or newer row (a wallet
+  -- inherited through a reused sandbox) gives the address up, so the unique
+  -- address index can be created.
+  UPDATE children SET address = ''
+   WHERE address <> ''
+     AND status IN ('stopped', 'failed', 'dead', 'cleaned_up')
+     AND EXISTS (
+       SELECT 1 FROM children other
+        WHERE other.address = children.address AND other.id <> children.id
+          AND (other.status NOT IN ('stopped', 'failed', 'dead', 'cleaned_up')
+               OR other.created_at > children.created_at
+               OR (other.created_at = children.created_at AND other.rowid > children.rowid))
+     );
+
+  -- Colony messages the old LocalDBTransport wrote into our own inbox are
+  -- our outbound messages, not inbound ones.
+  UPDATE inbox_messages
+     SET status = 'processed', processed_at = COALESCE(processed_at, datetime('now'))
+   WHERE status IN ('received', 'in_progress') AND to_address IS NOT NULL
+     AND from_address = (SELECT value FROM identity WHERE key = 'address');
+`;
+
+/** One row per child address (failed spawns keep an empty address). */
+export const CHILDREN_ADDRESS_INDEX = `
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_children_address ON children(address) WHERE address <> '';
 `;

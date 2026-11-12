@@ -62,7 +62,8 @@ describe("migration 13", () => {
     try {
       const v = upgraded.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
       expect(v.v).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(13);
+      // Later migrations run in the same upgrade.
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(13);
       const rows = upgraded.raw
         .prepare("SELECT status, budget_class, caller, cost_micro_usd, boot_id FROM inference_ledger")
         .all();

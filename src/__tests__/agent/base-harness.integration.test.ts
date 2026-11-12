@@ -6,6 +6,7 @@ import { BaseHarness } from "../../agent/harnesses/base-harness.js";
 import {
   InferenceDeferredError,
   TaskBudgetExceededError,
+  TaskOwnershipLostError,
   type HarnessContext,
   type HarnessTool,
 } from "../../agent/harness-types.js";
@@ -276,5 +277,68 @@ describe("agent/BaseHarness integration", () => {
     expect(stamps[1] - stamps[0]).toBeGreaterThanOrEqual(950);
     expect(stamps[2] - stamps[1]).toBeGreaterThanOrEqual(1950);
     (context.db as any).close?.();
+  });
+
+  it("F058: a text-only reply is answered with a reminder; a second one ends the task as a failure", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    let calls = 0;
+    context.inference = {
+      chat: async () => {
+        calls += 1;
+        return { content: "I could not complete this" };
+      },
+    };
+    await harness.initialize(createTask(), context);
+
+    const result = await harness.execute();
+
+    expect(calls).toBe(2);
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("I could not complete this");
+  });
+
+  it("F058: after the reminder, task_done finishes normally", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    const seen: string[] = [];
+    let calls = 0;
+    context.inference = {
+      chat: async (params) => {
+        calls += 1;
+        seen.push(String(params.messages[params.messages.length - 1]?.content ?? ""));
+        if (calls === 1) return { content: "Working on it." };
+        return {
+          content: "",
+          toolCalls: [{ id: "d", type: "function", function: { name: "task_done", arguments: JSON.stringify({ summary: "done", success: true }) } }],
+        };
+      },
+    };
+    await harness.initialize(createTask(), context);
+
+    const result = await harness.execute();
+
+    expect(result).toMatchObject({ success: true, output: "done" });
+    expect(seen[1]).toContain("task_done");
+  });
+
+  it("F015: stops at the next turn once the task is no longer owned", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    let owned = true;
+    let calls = 0;
+    context.isTaskOwned = () => owned;
+    context.inference = {
+      chat: async () => {
+        calls += 1;
+        // The task is cancelled while this turn runs.
+        owned = false;
+        return { content: "", toolCalls: [{ id: `p${calls}`, type: "function", function: { name: "ping", arguments: "{}" } }] };
+      },
+    };
+    await harness.initialize(createTask(), context);
+
+    await expect(harness.execute()).rejects.toBeInstanceOf(TaskOwnershipLostError);
+    expect(calls).toBe(1);
   });
 });

@@ -88,25 +88,28 @@ export interface MessageTransport {
   getRecipients(): string[];
 }
 
+/** No transport reaches the recipient; retrying cannot help. */
+export class ColonyTransportUnavailableError extends Error {
+  constructor(public readonly to: string) {
+    super(`no colony transport reaches ${to}; remote children do not execute colony tasks`);
+    this.name = "ColonyTransportUnavailableError";
+  }
+}
+
 /**
- * Local SQLite-based transport.
- * Writes messages directly to the inbox_messages table in the local DB.
- * Works for parent↔child communication on the same machine.
- * No external relay server required.
+ * Local SQLite transport. It can only write into this agent's own
+ * database, which no other agent reads: a row written there for another
+ * agent would be consumed by the sender itself. Delivery therefore fails
+ * fast instead of pretending to send. Remote children are reached only
+ * through the social relay (message_child).
  */
 export class LocalDBTransport implements MessageTransport {
   constructor(
     private readonly db: AutomatonDatabase,
   ) {}
 
-  async deliver(to: string, envelope: string): Promise<void> {
-    // Write directly to inbox_messages table
-    const id = ulid();
-    const fromAddress = this.db.getIdentity("address") ?? "unknown";
-    this.db.raw.prepare(
-      `INSERT INTO inbox_messages (id, from_address, to_address, content, received_at, status)
-       VALUES (?, ?, ?, ?, datetime('now'), 'received')`,
-    ).run(id, fromAddress, to, envelope);
+  async deliver(to: string, _envelope: string): Promise<void> {
+    throw new ColonyTransportUnavailableError(to);
   }
 
   getRecipients(): string[] {
@@ -140,6 +143,14 @@ export class ColonyMessaging {
         this.logActionEvent("message_sent", message);
         return;
       } catch (error) {
+        if (error instanceof ColonyTransportUnavailableError) {
+          logger.warn("Colony message not sent: no transport reaches the recipient", {
+            messageId: message.id,
+            to: message.to,
+            type: message.type,
+          });
+          throw error;
+        }
         lastError = normalizeError(error);
         const isFinalAttempt = attempt === SEND_RETRIES;
         logger.warn("Message send attempt failed", {
@@ -164,13 +175,24 @@ export class ColonyMessaging {
     const inbox = this.db.getUnprocessedInboxMessages(MAX_INBOX_BATCH);
     const pending: PendingInboxMessage[] = [];
     const processed: ProcessedMessage[] = [];
+    const ownAddress = (this.db.getIdentity("address") ?? "").toLowerCase();
 
     for (const row of inbox) {
-      // Only LocalDBTransport sets a recipient address. Rows without one
+      // Only colony transports set a recipient address. Rows without one
       // came from the social relay: they belong to the main loop's isolated
       // inbox turn and must never be routed as colony protocol messages.
       if (!row.to) {
         this.db.markInboxMessageProcessed(row.id);
+        continue;
+      }
+      // Route only messages addressed to us by someone else. Older runtimes
+      // wrote outbound messages into the sender's own inbox; those rows are
+      // ours, not inbound, and must not reach the model either.
+      const to = row.to.toLowerCase();
+      const from = (row.from ?? "").toLowerCase();
+      if (!ownAddress || to !== ownAddress || from === ownAddress) {
+        this.db.markInboxMessageProcessed(row.id);
+        markColonyRowHandled(this.db, row.id);
         continue;
       }
       try {
@@ -397,6 +419,15 @@ export class ColonyMessaging {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
+
+/** Keep a non-inbound colony row out of the model's inbox queue too. */
+function markColonyRowHandled(db: AutomatonDatabase, id: string): void {
+  try {
+    db.raw.prepare("UPDATE inbox_messages SET status = 'processed' WHERE id = ? AND status = 'received'").run(id);
+  } catch {
+    // Older schemas have no status column; processed_at is already set.
+  }
+}
 
 function extractAgentMessage(parsed: unknown): unknown {
   if (!parsed || typeof parsed !== "object") {

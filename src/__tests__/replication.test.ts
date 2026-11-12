@@ -274,13 +274,14 @@ describe("pruneDeadChildren", () => {
   });
 
   function insertChild(id: string, name: string, status: string, createdAt: string): void {
+    // One address per child: children.address is unique.
     db.raw.prepare(
       `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status, created_at)
-       VALUES (?, ?, '0xabc', 'sandbox-${id}', 'prompt', ?, ?)`,
-    ).run(id, name, status, createdAt);
+       VALUES (?, ?, ?, 'sandbox-${id}', 'prompt', ?, ?)`,
+    ).run(id, name, `0xabc-${id}`, status, createdAt);
   }
 
-  it("attempts sandbox cleanup for children with dead status", async () => {
+  it("deletes old dead (legacy, terminal) rows without a cleanup call", async () => {
     // Insert 7 dead children (exceeds keepLast=5, so 2 should be pruned)
     for (let i = 0; i < 7; i++) {
       insertChild(`dead-${i}`, `child-${i}`, "dead", `2020-01-0${i + 1} 00:00:00`);
@@ -298,8 +299,47 @@ describe("pruneDeadChildren", () => {
 
     // 2 oldest should be removed (dead-0 and dead-1)
     expect(removed).toBe(2);
-    // cleanup.cleanup should have been called for "dead" children
-    expect(cleanupCalls).toContain("dead-0");
-    expect(cleanupCalls).toContain("dead-1");
+    // A dead row is already terminal; there is nothing left to clean up.
+    expect(cleanupCalls).toEqual([]);
+    const ids = (db.raw.prepare("SELECT id FROM children").all() as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).not.toContain("dead-0");
+    expect(ids).not.toContain("dead-1");
+  });
+
+  it("keeps a row whose cleanup throws (H3-004)", async () => {
+    for (let i = 0; i < 7; i++) {
+      insertChild(`stopped-${i}`, `child-${i}`, "stopped", `2020-01-0${i + 1} 00:00:00`);
+    }
+    const mockCleanup = {
+      cleanup: vi.fn(async (childId: string) => {
+        if (childId === "stopped-0") throw new Error("Cannot clean up child in state: healthy");
+      }),
+    } as any;
+
+    const removed = await pruneDeadChildren(db, mockCleanup, 5);
+
+    expect(removed).toBe(1);
+    const ids = (db.raw.prepare("SELECT id FROM children").all() as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).toContain("stopped-0");
+    expect(ids).not.toContain("stopped-1");
+  });
+
+  it("never prunes a live lifecycle child whose stored status says stopped (H3-004)", async () => {
+    const lifecycle = new ChildLifecycle(db.raw);
+    lifecycle.initChild("live", "live", "sandbox-live", "prompt");
+    for (const s of ["sandbox_created", "runtime_ready", "wallet_verified", "funded", "starting", "healthy"] as const) {
+      lifecycle.transition("live", s);
+    }
+    // The old pool optimizer wrote 'stopped' straight into the row.
+    db.raw.prepare("UPDATE children SET status = 'stopped', created_at = '2019-01-01 00:00:00' WHERE id = 'live'").run();
+    for (let i = 0; i < 6; i++) {
+      insertChild(`dead-${i}`, `child-${i}`, "dead", `2020-01-0${i + 1} 00:00:00`);
+    }
+    const cleanup = new SandboxCleanup(conway, lifecycle, db.raw);
+
+    await pruneDeadChildren(db, cleanup, 5);
+
+    expect(db.raw.prepare("SELECT id FROM children WHERE id = 'live'").get()).toBeDefined();
+    expect(lifecycle.getCurrentState("live")).toBe("healthy");
   });
 });

@@ -19,6 +19,7 @@ Conway Automaton is a sovereign AI agent runtime. An automaton owns an Ethereum 
 - [Conway Client](#conway-client)
 - [Self-Modification](#self-modification)
 - [Replication](#replication)
+- [Colony Orchestration](#colony-orchestration)
 - [Social Layer](#social-layer)
 - [Soul System](#soul-system)
 - [Skills](#skills)
@@ -250,14 +251,23 @@ src/
     erc8004.ts             On-chain contract interaction (viem)
 
   replication/             Child automaton management
-    spawn.ts               Child creation (sandbox + genesis + funding)
-    lifecycle.ts           State machine (spawning->alive->..->dead)
-    health.ts              Child health monitoring
-    cleanup.ts             Dead child sandbox deletion
+    spawn.ts               Child creation (slot, sandbox, runtime clone, genesis, wallet)
+    lifecycle.ts           Status machine writer + stopChild
+    child-status.ts        Status sets (slot-holding, live, ended) + DB timestamp parsing
+    health.ts              Child process probe (in the child's sandbox) + kill/verify
+    cleanup.ts             Ended child -> cleaned_up (sandboxes are not deleted)
     constitution.ts        Constitution propagation + verification
     genesis.ts             Genesis config generation + validation
-    lineage.ts             Parent-child lineage tracking
+    lineage.ts             Parent-child lineage tracking + pruning
     messaging.ts           Parent-child message relay
+
+  orchestration/           Colony goals and tasks
+    orchestrator.ts        Phase machine (plan, execute, replan) over one goal at a time
+    planner.ts             Planner/replanner prompts + output validation
+    task-graph.ts          Task DAG, ownership-guarded settle/release, progress
+    local-worker.ts        In-process worker pool (runs harnesses on tasks)
+    health-monitor.ts      Colony health report on live children (report-only)
+    messaging.ts           Colony message envelopes (no transport reaches children)
 
   self-mod/                Self-modification
     code.ts                Safe file editing with protection checks
@@ -501,10 +511,10 @@ Every tick (default 60s):
 | `check_usdc_balance` | `*/5 * * * *` | Wake agent if USDC available for topup |
 | `check_for_updates` | `0 */4 * * *` | Git upstream monitoring (dedup: only new commits) |
 | `health_check` | `*/30 * * * *` | Sandbox liveness (dedup: only first failure) |
+| `check_child_health` | `*/10 * * * *` | Probe live children, apply starting/healthy/unhealthy/failed (no children: no probes) |
 | `check_social_inbox` | `*/2 * * * *` | Poll social relay (5min backoff on error) |
 | `soul_reflection` | configurable | Soul alignment check |
 | `refresh_models` | configurable | Model registry refresh from API |
-| `check_child_health` | configurable | Child sandbox health monitoring |
 | `prune_dead_children` | configurable | Cleanup dead child records/sandboxes |
 | `report_metrics` | configurable | Metrics snapshot + alert evaluation |
 
@@ -605,15 +615,35 @@ The `~/.automaton/` directory is a git repository. Every state change is version
 
 **Files:** `src/replication/`
 
-Automatons can spawn child automatons:
+Children are independent automatons with their own mission. They never execute colony tasks.
 
-1. **Spawn** (`spawn.ts`): Creates a Conway sandbox, writes genesis config, funds the child's wallet, starts the runtime. Limited by `maxChildren` config (default 3).
-2. **Lifecycle** (`lifecycle.ts`): State machine with validated transitions: `spawning -> provisioning -> configuring -> starting -> alive -> unhealthy -> recovering -> dead`. All transitions recorded in `child_lifecycle_events`.
-3. **Health** (`health.ts`): Heartbeat task checks each child's sandbox reachability, credit balance, and uptime.
-4. **Constitution** (`constitution.ts`): Parent's constitution is propagated to every child. Constitution integrity can be verified (hash comparison).
-5. **Genesis** (`genesis.ts`): Generates genesis config with injection-pattern validation and length limits.
-6. **Messaging** (`messaging.ts`): Parent-child message relay with rate/size limits.
-7. **Cleanup** (`cleanup.ts`): Dead children have their sandboxes deleted and records pruned.
+1. **Spawn** (`spawn.ts`): counts slot-holding children and inserts the `requested` row in one `BEGIN IMMEDIATE` transaction, so concurrent spawns cannot both take the last slot. Then it creates (or safely reuses) a sandbox sized by `childSandboxMemoryMb`, clones and builds the runtime from `childRuntimeRepo`/`childRuntimeRef` (default: upstream, default branch), writes `genesis.json` and verifies the wallet (`wallet_verified`). It neither funds nor starts the child. A checkout without the genesis bootstrap gets an `automaton.json` written by the parent; production colonies should use a runtime that bootstraps from `genesis.json`. `maxChildren: 0` refuses before anything is bought.
+2. **Status machine** (`lifecycle.ts`, `child-status.ts`): one `children` row per child (unique non-empty address). `children.status` equals the latest `child_lifecycle_events.to_state`; only `ChildLifecycle.transition` writes it. States: `requested -> sandbox_created -> runtime_ready -> wallet_verified -> funded -> starting -> healthy <-> unhealthy`, ending in `stopped` or `failed`, then `cleaned_up` (terminal). All states before `stopped`/`failed` hold a slot; legacy rows without events hold one in `spawning`/`running`/`sleeping`/`unknown`, and `dead` is terminal. Nothing moves an ended child back to a live state.
+3. **Health** (`health.ts`): `ChildHealthMonitor` is the only liveness prober. It runs `pgrep` inside the child's sandbox and applies the result: `starting -> healthy` (seen) or `-> failed` (confirmed gone after 10 min), `healthy <-> unhealthy`, `unhealthy -> failed` after 30 min. Only a confirmed-gone sandbox counts as offline; an API error changes nothing. The `check_child_health` heartbeat (every 10 min) and `check_child_status` use it.
+4. **Stop** (`stopChild` in `lifecycle.ts`, tool `stop_child`): kills the process and verifies it gone before `stopped`; abandons never-started children and stuck spawns to `failed`; `force` marks an unreachable live child `failed` with `processUnverified` in the event metadata.
+5. **Constitution** (`constitution.ts`): Parent's constitution is propagated to every child. Constitution integrity can be verified (hash comparison).
+6. **Genesis** (`genesis.ts`): Generates genesis config with injection-pattern validation and length limits.
+7. **Messaging** (`messaging.ts`): Parent-child message relay with rate/size limits.
+8. **Cleanup and pruning** (`cleanup.ts`, `lineage.ts`): `stopped`/`failed` -> `cleaned_up` (Conway sandboxes cannot be deleted). A force-stopped child, or a legacy ended row, is cleaned up only after a kill in its sandbox is verified, so a child that may still run is never untracked. `pruneDeadChildren` deletes old ended rows only after cleanup succeeds.
+
+The colony `HealthMonitor` (`src/orchestration/health-monitor.ts`) reports on live children only. It does not restart, stop, reassign or message, and funds out-of-credit children only with its `autoFund` option, which is off by default. `agent_pool_optimize` only reports.
+
+---
+
+## Colony Orchestration
+
+**Files:** `src/orchestration/`, `src/agent/harnesses/`
+
+The orchestrator ticks once per agent-loop cycle and works one goal at a time through `idle -> classifying -> planning -> plan_review -> executing -> complete`, with `replanning` and `failed`. Every phase but `idle` first runs a goal guard: a goal that is gone, cancelled, completed or paused has its workers aborted and its held tasks released, and the orchestrator returns to `idle`. The planning and replanning phases save their new tasks and the next phase in one transaction.
+
+- **Local workers only.** Tasks run on `LocalWorkerPool` workers (in-process harnesses), at most `max(1, maxChildren)` at once, with no children row. The task is assigned to `local://<worker>` before the worker starts. With `disableSpawn` or no pool, the parent self-assigns.
+- **Remote delegation is disabled and fails fast.** A task in `assigned`/`running` whose owner is neither `local://` nor the parent is released on the next executing tick without spending a retry (`remote_delegation_unsupported` event). `LocalDBTransport.deliver` throws `ColonyTransportUnavailableError`.
+- **Ownership** (`task-graph.ts`): only the owner settles a task (`settleTask` guards on `assigned_to` and status). A settle that matches no row is a late result: dropped, logged as a `stale_task_report` event, with `actual_cost_cents` raised to the reported spend. Workers check ownership every turn and exit silently when they lost the task.
+- **Executing tick:** release remote owners, release dead local owners (retry spent), abort workers past `started_at + timeout_ms + 2 min` and fail their task (retry spent), reap workers whose task was taken, spawn workers for ready tasks, then complete, replan, fail or wait. A goal whose remaining work can never become ready is replanned or failed.
+- **Replanning:** pending/blocked/failed tasks of the goal are cancelled (`superseded_by_replan`); running and completed tasks are kept. The planner gets the titles of completed and in-progress tasks and repeats a title to depend on one; a planned task with an existing task's title is bound to that task.
+- **Planner clamps:** estimate 0-500 cents (so the per-task inference cap `max(2 x est, 50)` stays at most 1000 cents), timeout 60 s - 1 h, `maxRetries` 0-10.
+- **`cancel_goal`:** goal and every unfinished task `cancelled`; the next tick aborts their workers.
+- **Harness loop detector** (`src/agent/loop-detector.ts`): blocks the third identical call in a row and fails the attempt on the fourth identical turn; `wait_for_tasks` is exempt and separates calls and turns on either side.
 
 ---
 
@@ -772,7 +802,10 @@ AutomatonConfig
   walletAddress           Agent's Ethereum address
   version                 Runtime version
   skillsDir               Skills directory path
-  maxChildren             Max child automatons (default: 3)
+  maxChildren             Slot-holding children (default: 3; 0 disables spawn_child); local workers max(1, maxChildren)
+  childSandboxMemoryMb    Child sandbox memory tier (default: 1024)
+  childRuntimeRepo        https git URL a child's runtime is cloned from (default: upstream)
+  childRuntimeRef         Optional branch or tag of childRuntimeRepo
   parentAddress           Parent's address (if this is a child)
   socialRelayUrl          Social relay URL
   treasuryPolicy          Financial limits (TreasuryPolicy)

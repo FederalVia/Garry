@@ -7,6 +7,10 @@ import type {
 } from "../types.js";
 import type { AgentTracker, FundingProtocol } from "./types.js";
 import { runWithTreasuryOrigin } from "../treasury/registry.js";
+import { createLogger } from "../observability/logger.js";
+import { TERMINAL, hasLifecycleEvents, isEnded } from "../replication/child-status.js";
+
+const logger = createLogger("orchestration.simple-tracker");
 
 const IDLE_STATUSES = new Set<ChildStatus>(["running", "healthy"]);
 
@@ -27,6 +31,8 @@ export class SimpleAgentTracker implements AgentTracker {
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     );
 
+    // Lifecycle children run their own mission and cannot execute colony
+    // tasks, so they are never idle workers.
     const children = this.db.raw.prepare(
       `SELECT id, name, address, status, COALESCE(role, 'generalist') AS role
        FROM children
@@ -40,7 +46,8 @@ export class SimpleAgentTracker implements AgentTracker {
         (child) =>
           IDLE_STATUSES.has(child.status as ChildStatus) &&
           !assignedAddresses.has(child.address) &&
-          !child.address.startsWith("local://"),
+          !child.address.startsWith("local://") &&
+          !hasLifecycleEvents(this.db.raw, child.id),
       )
       .map((child) => ({
         address: child.address,
@@ -68,10 +75,31 @@ export class SimpleAgentTracker implements AgentTracker {
       return;
     }
 
+    // Only ChildLifecycle writes the status of a lifecycle child, and an
+    // ended legacy row never comes back.
+    if (hasLifecycleEvents(this.db.raw, child.id)) {
+      logger.warn("Ignoring tracker status write to a lifecycle-managed child", {
+        address,
+        status,
+        current: child.status,
+      });
+      return;
+    }
+    if (TERMINAL.has(child.status)) {
+      return;
+    }
+
     this.db.updateChildStatus(child.id, status as ChildStatus);
   }
 
+  /** Adds a row for the agent unless one with this address already exists. */
   register(agent: { address: string; name: string; role: string; sandboxId: string }): void {
+    if (agent.address) {
+      const existing = this.db.raw
+        .prepare("SELECT 1 FROM children WHERE address = ? LIMIT 1")
+        .get(agent.address);
+      if (existing) return;
+    }
     this.db.insertChild({
       id: ulid(),
       name: agent.name,
@@ -103,6 +131,14 @@ export class SimpleFundingProtocol implements FundingProtocol {
     const transferAmount = Math.max(0, Math.floor(amountCents));
     if (transferAmount === 0) {
       return { success: true };
+    }
+
+    // Never send credits to a child whose rows are all ended.
+    const rows = this.db.raw
+      .prepare("SELECT status FROM children WHERE address = ?")
+      .all(childAddress) as Array<{ status: string }>;
+    if (rows.length > 0 && rows.every((row) => isEnded(row.status))) {
+      return { success: false };
     }
 
     try {

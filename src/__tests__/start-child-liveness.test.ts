@@ -83,4 +83,27 @@ describe("start_child liveness", () => {
     const check = child.execCalls[1].command;
     expect(check).toContain("pgrep -f '[i]ndex.js --run'");
   });
+
+  it("a check that fails after the launch returned a pid leaves the child starting, not failed", async () => {
+    const child = new ChildSandbox((cmd) => {
+      if (cmd.includes("nohup")) return { stdout: "4242\n", stderr: "", exitCode: 0 };
+      throw new Error("Conway API error 502");
+    });
+    const out = await startWith(child);
+
+    expect(out).toContain("stays 'starting'");
+    // Still slot-holding and still probed by the health monitor, which
+    // resolves it to healthy or failed.
+    expect(new ChildLifecycle(db.raw).getCurrentState("child-1")).toBe("starting");
+  });
+
+  it("a launch call that fails leaves the child starting: the process may have started", async () => {
+    const child = new ChildSandbox(() => {
+      throw new Error("Conway API error 504");
+    });
+    const out = await startWith(child);
+
+    expect(out).toContain("could not be confirmed");
+    expect(new ChildLifecycle(db.raw).getCurrentState("child-1")).toBe("starting");
+  });
 });

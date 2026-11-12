@@ -59,6 +59,7 @@ import { getSurvivalTier } from "./conway/credits.js";
 import { resolveInferencePolicy, registryPrice, checkPolicySanity } from "./inference/policy.js";
 import { DEFAULT_ROUTING_MATRIX } from "./inference/types.js";
 import { protectRuntimeFile } from "./security/protected-paths.js";
+import { holdsSlot } from "./replication/child-status.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -206,7 +207,7 @@ Turns:      ${turnCount}
 Tools:      ${tools.length} installed
 Skills:     ${skills.length} active
 Heartbeats: ${heartbeats.filter((h) => h.enabled).length} active
-Children:   ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
+Children:   ${children.filter((c) => holdsSlot(c.status)).length} holding a slot / ${children.length} total
 Agent ID:   ${registry?.agentId || "not registered"}
 Model:      ${config.inferenceModel}
 Version:    ${config.version}

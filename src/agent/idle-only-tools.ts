@@ -32,7 +32,7 @@ export function isIdleOnlyTool(name: string): boolean {
  */
 export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
-  "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
+  "spawn_child", "start_child", "stop_child", "delete_sandbox", "create_sandbox",
   "install_npm_package", "install_mcp_server", "install_skill",
   "create_skill", "remove_skill", "install_skill_from_git",
   "install_skill_from_url", "pull_upstream", "git_commit", "git_push",

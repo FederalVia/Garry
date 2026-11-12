@@ -3,15 +3,15 @@ import path from "node:path";
 import type { Database } from "better-sqlite3";
 import { persistPlan } from "./plan-mode.js";
 import type { PlannerContext, PlannerOutput } from "./planner.js";
-import type { FundingProtocol } from "./types.js";
 import type { AgentWorkspace } from "./workspace.js";
 import { getActiveGoals } from "../state/database.js";
+import { getSurvivalTier } from "../conway/credits.js";
+import { getInstalledInferenceGate } from "../inference/gate.js";
 
 export interface PlannerContextOptions {
   db: Database;
   workspace?: Pick<AgentWorkspace, "basePath" | "listOutputs">;
-  funding?: Pick<FundingProtocol, "getBalance">;
-  identityAddress?: string;
+  /** The agent's own credit balance, when the caller knows it. */
   creditsCents?: number;
   usdcBalance?: number;
   availableRoles?: string[];
@@ -38,13 +38,13 @@ export const DEFAULT_PLANNER_AVAILABLE_ROLES = [
 
 export async function buildPlannerContext(options: PlannerContextOptions): Promise<PlannerContext> {
   const cachedBalance = readCachedBalance(options.db);
-  const creditsCents = await resolveCreditsCents(options, cachedBalance?.creditsCents);
+  const creditsCents = resolveCreditsCents(options, cachedBalance?.creditsCents);
   const usdcBalance = resolveUsdcBalance(options, cachedBalance?.usdcBalance);
 
   return {
     creditsCents,
     usdcBalance,
-    survivalTier: toSurvivalTier(creditsCents),
+    survivalTier: getSurvivalTier(creditsCents),
     availableRoles: normalizeStringList(options.availableRoles, [...DEFAULT_PLANNER_AVAILABLE_ROLES]),
     customRoles: normalizeStringList(options.customRoles, []),
     activeGoals: getActiveGoals(options.db).map((goal) => ({
@@ -162,23 +162,23 @@ function readCachedBalance(db: Database): { creditsCents?: number; usdcBalance?:
   }
 }
 
-async function resolveCreditsCents(
-  options: PlannerContextOptions,
-  cachedCreditsCents?: number,
-): Promise<number> {
+/**
+ * The agent's own balance: explicit, else the gate's live survival figure,
+ * else the last cached balance. Never the child-funding ledger, which only
+ * knows what was sent to children.
+ */
+function resolveCreditsCents(options: PlannerContextOptions, cachedCreditsCents?: number): number {
   if (typeof options.creditsCents === "number" && Number.isFinite(options.creditsCents)) {
     return Math.max(0, Math.floor(options.creditsCents));
   }
 
-  if (options.funding && options.identityAddress) {
-    try {
-      const balance = await options.funding.getBalance(options.identityAddress);
-      if (Number.isFinite(balance)) {
-        return Math.max(0, Math.floor(balance));
-      }
-    } catch {
-      // Fall back to cached or default balances.
+  try {
+    const live = getInstalledInferenceGate()?.survival().creditsCents;
+    if (typeof live === "number" && Number.isFinite(live)) {
+      return Math.max(0, Math.floor(live));
     }
+  } catch {
+    // Fall back to the cache.
   }
 
   return Math.max(0, Math.floor(cachedCreditsCents ?? 0));
@@ -192,19 +192,6 @@ function resolveUsdcBalance(options: PlannerContextOptions, cachedUsdcBalance?: 
   return typeof cachedUsdcBalance === "number" && Number.isFinite(cachedUsdcBalance)
     ? cachedUsdcBalance
     : 0;
-}
-
-function toSurvivalTier(creditsCents: number): string {
-  if (creditsCents <= 0) {
-    return "critical";
-  }
-  if (creditsCents < 100) {
-    return "low";
-  }
-  if (creditsCents < 5_000) {
-    return "stable";
-  }
-  return "comfortable";
 }
 
 function listWorkspaceFiles(workspace?: Pick<AgentWorkspace, "basePath" | "listOutputs">): string[] {

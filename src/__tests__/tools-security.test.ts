@@ -90,6 +90,7 @@ describe("Tool Risk Level Classification", () => {
     give_feedback: "dangerous",
     spawn_child: "dangerous",
     fund_child: "dangerous",
+    stop_child: "dangerous",
     distress_signal: "dangerous",
   };
 

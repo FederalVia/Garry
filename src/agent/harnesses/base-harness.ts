@@ -12,6 +12,7 @@ import { createBuiltinTools } from "../tools.js";
 import {
   InferenceDeferredError,
   TaskBudgetExceededError,
+  TaskOwnershipLostError,
   type AgentHarness,
   type HarnessContext,
   type HarnessTool,
@@ -22,6 +23,10 @@ const logger = createLogger("harness.base");
 const MAX_CONSECUTIVE_INFERENCE_ERRORS = 3;
 const DEFAULT_INFERENCE_RETRY_BACKOFF_MS: readonly number[] = [1000, 2000];
 const MAX_TOOL_OUTPUT_LENGTH = 16_000;
+/** A text-only reply is answered with this once; the next one ends the task as a failure. */
+export const TEXT_ONLY_REPROMPT =
+  "You replied without calling a tool. Call task_done to finish: success true if the task is done, " +
+  "or success false with the reason if it cannot be done.";
 
 export const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
   recordSpend: () => {},
@@ -74,6 +79,7 @@ export abstract class BaseHarness implements AgentHarness {
       maxIdenticalCalls: 3,
       maxIdleOnlyTurns: 3,
       windowSize: 10,
+      exemptTools: this.loopExemptTools(),
     });
     this.messages = [
       { role: "system", content: this.buildSystemPrompt() },
@@ -86,6 +92,19 @@ export abstract class BaseHarness implements AgentHarness {
   abstract buildSystemPrompt(): string;
 
   protected beforeTurn(): void {}
+
+  /** Tools expected to repeat with the same arguments (blocking waits). */
+  protected loopExemptTools(): string[] {
+    return [];
+  }
+
+  /** Stop as soon as the task is no longer ours (cancelled, reassigned, completed by the parent). */
+  protected assertTaskOwned(): void {
+    const isOwned = this.context.isTaskOwned;
+    if (isOwned && !isOwned()) {
+      throw new TaskOwnershipLostError(`Task ${this.task.id} is no longer owned by this worker`);
+    }
+  }
 
   /** Count passed to policy as turnToolCallCount. */
   protected policyTurnToolCallCount(): number {
@@ -189,6 +208,7 @@ export abstract class BaseHarness implements AgentHarness {
     let consecutiveInferenceErrors = 0;
     let finalOutput = "";
     let finalSuccess = true;
+    let textOnlyReplies = 0;
 
     while (true) {
       this.checkBudget();
@@ -196,6 +216,7 @@ export abstract class BaseHarness implements AgentHarness {
       if (this.context.abortSignal.aborted) {
         throw new Error("Harness execution aborted by abort signal");
       }
+      this.assertTaskOwned();
 
       let response: { content: string; toolCalls?: InferenceToolCall[]; costCents?: number };
       try {
@@ -237,6 +258,10 @@ export abstract class BaseHarness implements AgentHarness {
         continue;
       }
 
+      if (this.context.abortSignal.aborted) {
+        throw new Error("Harness execution aborted by abort signal");
+      }
+      this.assertTaskOwned();
       this.beforeTurn();
       this.context.budget.turnsUsed++;
       logger.info(
@@ -244,6 +269,7 @@ export abstract class BaseHarness implements AgentHarness {
       );
 
       if (response.toolCalls && response.toolCalls.length > 0) {
+        textOnlyReplies = 0;
         this.messages.push({
           role: "assistant",
           content: response.content || "",
@@ -342,12 +368,18 @@ export abstract class BaseHarness implements AgentHarness {
         continue;
       }
 
-      finalOutput = response.content || "Task completed.";
-      finalSuccess = true;
+      // Prose is not a result: ask once for task_done, then give up as a failure.
+      textOnlyReplies++;
       logger.info(
-        `[${this.id}] Text-only response on turn ${this.context.budget.turnsUsed}: ${finalOutput.slice(0, 200)}`,
+        `[${this.id}] Text-only response ${textOnlyReplies} on turn ${this.context.budget.turnsUsed}: ${(response.content || "").slice(0, 200)}`,
       );
-      break;
+      if (textOnlyReplies >= 2) {
+        finalOutput = `Worker ended without calling task_done: ${response.content || "(empty reply)"}`;
+        finalSuccess = false;
+        break;
+      }
+      this.messages.push({ role: "assistant", content: response.content || "" });
+      this.messages.push({ role: "system", content: TEXT_ONLY_REPROMPT });
     }
 
     return {
