@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   checkRead,
   checkWrite,
+  GUARD_COMMAND_FRAGMENTS,
   matchProtected,
   matchSensitive,
   runtimeRoot,
@@ -109,6 +110,10 @@ describe("matchProtected (write-deny)", () => {
       `${root}/src/skills/format.ts`, `${root}/src/orchestration/local-worker.ts`,
       `${root}/src/inference/provider-registry.ts`, `${root}/src/inference/budget.ts`,
       `${root}/src/inference/inference-client.ts`, `${root}/src/observability/logger.ts`, `${root}/src/soul/validator.ts`,
+      // the inference spend gate and the paths that must pass through it
+      `${root}/src/inference/gate.ts`, `${root}/src/inference/policy.ts`, `${root}/src/inference/errors.ts`,
+      `${root}/src/inference/router.ts`, `${root}/dist/inference/gate.js`, `${root}/src/conway/inference.ts`,
+      `${root}/src/conway/http-client.ts`,
       `${root}/src/soul/tools.ts`, `${root}/src/soul/model.ts`, `${root}/src/heartbeat/config.ts`,
       `${root}/src/heartbeat/tasks.ts`, `${root}/dist/agent/harnesses/general-harness.js`,
       `${root}/src/security/x.ts`, `${root}/src/treasury/x.ts`, `${root}/src/conway/client.ts`,
@@ -145,6 +150,19 @@ describe("matchProtected (write-deny)", () => {
 
   it("allows ordinary project files and the state-dir write allowlist", () => {
     for (const p of allowed()) expect(matchProtected(p), p).toBeNull();
+  });
+
+  it("lists the inference spend gate files among the guard command fragments", () => {
+    for (const f of [
+      "inference/gate",
+      "inference/policy",
+      "inference/errors",
+      "inference/router",
+      "inference/budget",
+      "conway/inference",
+    ]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
   });
 
   it("SOUL.md is readable but not writable", () => {

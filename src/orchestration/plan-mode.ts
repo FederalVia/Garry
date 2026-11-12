@@ -2,6 +2,7 @@ import type { Database } from "better-sqlite3";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { runWithInferenceScope } from "../inference/gate.js";
 import type { PlannerOutput } from "./planner.js";
 import { validatePlannerOutput } from "./planner.js";
 
@@ -146,8 +147,10 @@ export async function classifyComplexity(
   const fallbackSteps = estimateStepsHeuristic(description, params.availableTools);
 
   try {
-    const result = await inference.chat({
+    // A refusal lands in the catch below and falls back to the heuristic.
+    const result = await runWithInferenceScope({ caller: "orchestrator.classify" }, () => inference.chat({
       tier: "cheap",
+      purpose: "classify",
       maxTokens: 220,
       responseFormat: { type: "json_object" },
       messages: [
@@ -169,7 +172,7 @@ export async function classifyComplexity(
           ].join("\n"),
         },
       ],
-    });
+    }));
 
     const parsed = safeJsonParse(result.content);
     const estimatedSteps = clampSteps(

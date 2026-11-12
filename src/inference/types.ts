@@ -23,7 +23,6 @@ export type {
 import type {
   RoutingMatrix,
   ModelEntry,
-  ModelStrategyConfig,
 } from "../types.js";
 
 // === Default Retry Policy ===
@@ -176,15 +175,26 @@ export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
 };
 
 // === Default Model Strategy Config ===
+// One definition, in ../types.ts.
 
-export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
-  inferenceModel: "gpt-5.2",
-  lowComputeModel: "gpt-5-mini",
-  criticalModel: "gpt-5-mini",
-  maxTokensPerTurn: 4096,
-  hourlyBudgetCents: 0,
-  sessionBudgetCents: 0,
-  perCallCeilingCents: 0,
-  enableModelFallback: true,
-  anthropicApiVersion: "2023-06-01",
-};
+export { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
+
+// === Per-caller deadlines (ms) for one logical inference call ===
+
+export const INFERENCE_DEADLINES = {
+  agent_turn: 120_000,
+  inbox_turn: 120_000,
+  survival_turn: 60_000,
+  planner: 120_000,
+  classifier: 30_000,
+  worker_turn: 120_000,
+} as const;
+
+/** Longest single HTTP attempt within a call's deadline. */
+export const MAX_ATTEMPT_MS = 120_000;
+
+/** HTTP attempts per logical call, across candidates and retries. */
+export const MAX_ATTEMPTS_PER_CALL = 4;
+
+/** Longest Retry-After honoured before a single retry. */
+export const MAX_RETRY_AFTER_MS = 10_000;

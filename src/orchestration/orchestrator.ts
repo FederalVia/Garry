@@ -3,6 +3,8 @@ import { ulid } from "ulid";
 import type { AutomatonIdentity } from "../types.js";
 import { createLogger } from "../observability/logger.js";
 import {
+  MAX_INFERENCE_BLOCK_MS,
+  ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY,
   assignTask,
   completeTask,
   decomposeGoal,
@@ -15,6 +17,7 @@ import {
   normalizeTaskResult,
 } from "./task-graph.js";
 import {
+  PlannerOutputError,
   goalToPlannerInput,
   planGoal,
   replanAfterFailure,
@@ -25,6 +28,8 @@ import {
 import { ColonyMessaging, type AgentMessage } from "./messaging.js";
 import { generateTodoMd } from "./attention.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { getInstalledInferenceGate, runWithInferenceScope } from "../inference/gate.js";
+import { InferenceRefusedError } from "../inference/errors.js";
 import { reviewPlan } from "./plan-mode.js";
 import { buildPlannerContext, getNextPlannerVersion, persistPlannerArtifacts } from "./planner-context.js";
 import { AgentWorkspace } from "./workspace.js";
@@ -50,6 +55,8 @@ const ORCHESTRATOR_STATE_KEY = "orchestrator.state";
 const ORCHESTRATOR_TODO_KEY = "orchestrator.todo_md";
 const DEFAULT_TASK_FUNDING_CENTS = 25;
 const DEFAULT_MAX_REPLANS = 3;
+/** Survival tiers at which orchestration inference is paused (owner decision D8). */
+const PAUSED_SURVIVAL_TIERS = new Set(["low_compute", "critical", "dead", "unknown"]);
 
 type ExecutionPhase =
   | "idle"
@@ -162,6 +169,24 @@ export class Orchestrator {
         }
       }
     } catch (error) {
+      if (error instanceof InferenceRefusedError) {
+        // Budget refusals clear with time; the goal is not at fault.
+        logger.warn("Orchestrator inference refused; staying in phase", {
+          phase: state.phase,
+          code: error.code,
+        });
+        this.saveState(state);
+        this.persistTodo();
+        return {
+          phase: state.phase,
+          tasksAssigned: counters.tasksAssigned,
+          tasksCompleted: counters.tasksCompleted,
+          tasksFailed: counters.tasksFailed,
+          goalsActive: getActiveGoals(this.params.db).length,
+          agentsActive: this.getActiveAgentCount(),
+        };
+      }
+
       const err = normalizeError(error);
       logger.error("Orchestrator tick failed", err, {
         phase: state.phase,
@@ -396,6 +421,12 @@ export class Orchestrator {
       };
     }
 
+    const pause = this.orchestrationPauseReason();
+    if (pause) {
+      logger.info("Planning deferred: orchestration inference paused", { goalId: goal.id, reason: pause });
+      return state;
+    }
+
     let output: PlannerOutput;
     try {
       output = await planGoal(
@@ -414,7 +445,17 @@ export class Orchestrator {
       );
     } catch (error) {
       const err = normalizeError(error);
-      logger.warn("Planner inference failed, falling back to single-task plan", {
+      if (!(error instanceof PlannerOutputError)) {
+        // A refusal or provider failure: no fallback plan (it would spawn a
+        // worker that spends the same budget); plan again on a later tick.
+        logger.warn("Planner inference unavailable, will retry planning later", {
+          goalId: goal.id,
+          error: err.message,
+          code: error instanceof InferenceRefusedError ? error.code : undefined,
+        });
+        return state;
+      }
+      logger.warn("Planner returned an unusable plan, falling back to single-task plan", {
         goalId: goal.id,
         error: err.message,
       });
@@ -550,7 +591,20 @@ export class Orchestrator {
     const ready = getReadyTasks(this.params.db)
       .filter((task) => task.goalId === goal.id);
 
-    for (const task of ready) {
+    // No assignment while orchestration inference cannot run. Blocking only
+    // local spawns is not enough: a skipped spawn falls through to
+    // reassignment or self-assignment, which would run the task as
+    // main-loop turns outside the orchestration share and the tier pause.
+    const assignmentBlock = ready.length > 0 ? this.assignmentBlockReason() : null;
+    if (assignmentBlock) {
+      logger.info("Task assignment deferred: orchestration inference unavailable", {
+        goalId: goal.id,
+        readyTasks: ready.length,
+        reason: assignmentBlock,
+      });
+    }
+
+    for (const task of assignmentBlock ? [] : ready) {
       try {
         const assignment = await this.matchTaskToAgent(task);
         assignTask(this.params.db, task.id, assignment.agentAddress);
@@ -696,6 +750,12 @@ export class Orchestrator {
       };
     }
 
+    const pause = this.orchestrationPauseReason();
+    if (pause) {
+      logger.info("Replanning deferred: orchestration inference paused", { goalId: goal.id, reason: pause });
+      return state;
+    }
+
     let output: PlannerOutput;
     try {
       output = await replanAfterFailure(
@@ -715,7 +775,15 @@ export class Orchestrator {
       );
     } catch (error) {
       const err = normalizeError(error);
-      logger.warn("Replanner inference failed, falling back to single-task plan", {
+      if (!(error instanceof PlannerOutputError)) {
+        logger.warn("Replanner inference unavailable, will retry replanning later", {
+          goalId: goal.id,
+          error: err.message,
+          code: error instanceof InferenceRefusedError ? error.code : undefined,
+        });
+        return state;
+      }
+      logger.warn("Replanner returned an unusable plan, falling back to single-task plan", {
         goalId: goal.id,
         error: err.message,
       });
@@ -807,9 +875,17 @@ export class Orchestrator {
   }
 
   private async classifyComplexity(goal: GoalRow): Promise<{ requiresPlanMode: boolean; estimatedSteps: number }> {
+    if (this.orchestrationPauseReason()) {
+      const estimatedSteps = heuristicStepEstimate(goal);
+      return { estimatedSteps, requiresPlanMode: estimatedSteps > 3 };
+    }
+
     try {
-      const result = await this.params.inference.chat({
+      // A refusal lands in the catch and uses the free heuristic.
+      const result = await runWithInferenceScope({ caller: "orchestrator.classify" }, () => this.params.inference.chat({
         tier: "cheap",
+        purpose: "classify",
+        maxTokens: 512,
         responseFormat: { type: "json_object" },
         messages: [
           {
@@ -825,7 +901,7 @@ export class Orchestrator {
             content: `Goal title: ${goal.title}\nGoal description: ${goal.description}`,
           },
         ],
-      });
+      }));
 
       const parsed = safeJsonParse(result.content);
       const estimatedSteps = clampSteps(
@@ -845,6 +921,44 @@ export class Orchestrator {
     }
   }
 
+  /** Why orchestration inference is paused by survival tier, or null. Without a gate the client decides. */
+  private orchestrationPauseReason(): string | null {
+    const gate = getInstalledInferenceGate();
+    if (!gate) return null;
+    try {
+      const { tier } = gate.survival();
+      return PAUSED_SURVIVAL_TIERS.has(tier) ? `survival tier ${tier}` : null;
+    } catch {
+      return "inference gate unavailable";
+    }
+  }
+
+  /** Why ready tasks must stay pending this tick, or null when they may be assigned. */
+  private assignmentBlockReason(): string | null {
+    const pause = this.orchestrationPauseReason();
+    if (pause) return pause;
+
+    const blockedUntil = this.params.db
+      .prepare("SELECT value FROM kv WHERE key = ?")
+      .get(ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY) as { value: string } | undefined;
+    const untilMs = blockedUntil ? Date.parse(blockedUntil.value) : NaN;
+    // Writers clamp to an hour; anything further out means the clock moved back.
+    if (Number.isFinite(untilMs) && untilMs > Date.now() && untilMs - Date.now() <= MAX_INFERENCE_BLOCK_MS) {
+      return `worker inference refused until ${new Date(untilMs).toISOString()}`;
+    }
+
+    const gate = getInstalledInferenceGate();
+    if (!gate) return null;
+    try {
+      // Workers carry a task, not a session: check as a worker would be checked.
+      const headroom = gate.headroom("orchestration", { caller: "worker" });
+      return headroom.allowed ? null : `no orchestration headroom (${headroom.code ?? "refused"})`;
+    } catch {
+      return "inference gate unavailable";
+    }
+  }
+
+  /** Local workers run only the task they were spawned with, so they are never reassigned. */
   private findBusyAgentForReassign(): { address: string; name: string } | null {
     const idleAddresses = new Set(this.params.agentTracker.getIdle().map((agent) => agent.address));
 
@@ -852,6 +966,7 @@ export class Orchestrator {
       `SELECT name, address, status
        FROM children
        WHERE status IN ('running', 'healthy')
+         AND address NOT LIKE 'local://%'
        ORDER BY created_at ASC`,
     ).all() as { name: string; address: string; status: string }[];
 
@@ -889,6 +1004,10 @@ export class Orchestrator {
     });
 
     this.params.agentTracker.updateStatus(spawned.address, "running");
+    // A local worker can finish before it is registered; do not leave its row running.
+    if (spawned.address.startsWith("local://") && this.params.isWorkerAlive?.(spawned.address) === false) {
+      this.params.agentTracker.updateStatus(spawned.address, "cleaned_up");
+    }
 
     return {
       agentAddress: spawned.address,

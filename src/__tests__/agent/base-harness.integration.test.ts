@@ -3,7 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BaseHarness } from "../../agent/harnesses/base-harness.js";
-import type { HarnessContext, HarnessTool } from "../../agent/harness-types.js";
+import {
+  InferenceDeferredError,
+  TaskBudgetExceededError,
+  type HarnessContext,
+  type HarnessTool,
+} from "../../agent/harness-types.js";
+import { InferenceRefusedError, type RefusalCode } from "../../inference/errors.js";
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
@@ -169,6 +175,7 @@ describe("agent/BaseHarness integration", () => {
       },
     };
 
+    context.inferenceRetryBackoffMs = [5];
     await harness.initialize(task, context);
     const result = await harness.execute();
 
@@ -176,6 +183,98 @@ describe("agent/BaseHarness integration", () => {
     expect(callCount).toBe(2);
     expect(context.budget.turnsUsed).toBe(1);
     expect(harness.beforeTurnCalls).toBe(1);
+    (context.db as any).close?.();
+  });
+
+  function pingTurn(costCents: number) {
+    return {
+      content: "",
+      costCents,
+      toolCalls: [{ id: `call-${Math.random()}`, type: "function" as const, function: { name: "ping", arguments: "{}" } }],
+    };
+  }
+
+  function refusal(code: RefusalCode, retryAfterMs: number | null = null): InferenceRefusedError {
+    return new InferenceRefusedError(code, `${code} refused`, { retryAfterMs, budgetClass: "orchestration" });
+  }
+
+  it("adds each call's committed cost to the budget and stops at the cost limit", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    context.budget.maxTurns = 10;
+    context.budget.maxCostCents = 5;
+    let calls = 0;
+    context.inference = {
+      chat: async () => {
+        calls += 1;
+        return pingTurn(2);
+      },
+    };
+
+    await harness.initialize(createTask(), context);
+    await expect(harness.execute()).rejects.toBeInstanceOf(TaskBudgetExceededError);
+    // 2c + 2c + 2c reaches 5c after the third turn; no fourth call is made.
+    expect(calls).toBe(3);
+    expect(context.budget.costUsedCents).toBe(6);
+    (context.db as any).close?.();
+  });
+
+  it("maps a task-cap refusal to TaskBudgetExceededError without retrying", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    let calls = 0;
+    context.inference = {
+      chat: async () => {
+        calls += 1;
+        throw refusal("TASK_CAP");
+      },
+    };
+
+    await harness.initialize(createTask(), context);
+    await expect(harness.execute()).rejects.toBeInstanceOf(TaskBudgetExceededError);
+    expect(calls).toBe(1);
+    (context.db as any).close?.();
+  });
+
+  it.each(["DAILY_CAP", "HOURLY_CAP", "ORCHESTRATION_SHARE", "SURVIVAL_TIER", "GATE_UNAVAILABLE"] as const)(
+    "maps a %s refusal to InferenceDeferredError without using the 3-strike retries",
+    async (code) => {
+      const harness = new TestHarness();
+      const context = createContext();
+      let calls = 0;
+      context.inference = {
+        chat: async () => {
+          calls += 1;
+          throw refusal(code, 60_000);
+        },
+      };
+
+      await harness.initialize(createTask(), context);
+      const error = await harness.execute().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(InferenceDeferredError);
+      expect((error as InferenceDeferredError).code).toBe(code);
+      expect((error as InferenceDeferredError).retryAfterMs).toBe(60_000);
+      expect(calls).toBe(1);
+      (context.db as any).close?.();
+    },
+  );
+
+  it("backs off 1 s then 2 s between ordinary inference errors", async () => {
+    const harness = new TestHarness();
+    const context = createContext();
+    const stamps: number[] = [];
+    context.inference = {
+      chat: async () => {
+        stamps.push(Date.now());
+        throw new Error("provider down");
+      },
+    };
+
+    await harness.initialize(createTask(), context);
+    await expect(harness.execute()).rejects.toThrow(/3 consecutive inference failures/);
+    expect(stamps).toHaveLength(3);
+    expect(stamps[1] - stamps[0]).toBeGreaterThanOrEqual(950);
+    expect(stamps[2] - stamps[1]).toBeGreaterThanOrEqual(1950);
     (context.db as any).close?.();
   });
 });

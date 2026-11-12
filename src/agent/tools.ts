@@ -2118,7 +2118,8 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "check_inference_spending",
       description:
-        "Query inference cost breakdown: hourly, daily, per-model, and per-session costs.",
+        "Inference spending against its caps: last hour and 24 h by class (main loop, orchestration, survival), " +
+        "remaining budget, and per-model breakdown.",
       category: "financial",
       riskLevel: "safe",
       parameters: {
@@ -2126,35 +2127,40 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           model: {
             type: "string",
-            description: "Filter by model ID (optional)",
-          },
-          days: {
-            type: "number",
-            description: "Number of days to look back (default: 1)",
+            description: "Filter the per-model breakdown by model ID (optional)",
           },
         },
       },
       execute: async (args, ctx) => {
         try {
-          const {
-            inferenceGetHourlyCost,
-            inferenceGetDailyCost,
-            inferenceGetModelCosts,
-          } = await import("../state/database.js");
-
-          const hourlyCost = inferenceGetHourlyCost(ctx.db.raw);
-          const dailyCost = inferenceGetDailyCost(ctx.db.raw);
-
-          let output = `=== Inference Spending ===\nCurrent hour: ${hourlyCost}c ($${(hourlyCost / 100).toFixed(2)})\nToday: ${dailyCost}c ($${(dailyCost / 100).toFixed(2)})`;
-
-          const model = args.model as string | undefined;
-          if (model) {
-            const days = (args.days as number) || 1;
-            const modelCosts = inferenceGetModelCosts(ctx.db.raw, model, days);
-            output += `\nModel ${model} (${days}d): ${modelCosts.totalCents}c ($${(modelCosts.totalCents / 100).toFixed(2)}) over ${modelCosts.callCount} calls`;
+          const { getInstalledInferenceGate } = await import("../inference/gate.js");
+          const gate = getInstalledInferenceGate();
+          if (!gate || !gate.usesDatabase(ctx.db.raw)) {
+            return "Inference spending data unavailable: no inference gate is installed.";
           }
-
-          return output;
+          const u = gate.usage();
+          const c = (n: number) => `${n.toFixed(2)}c ($${(n / 100).toFixed(2)})`;
+          const lines = [
+            "=== Inference Spending ===",
+            `Last hour: ${c(u.lastHour.cappedCents)} of ${u.caps.hourlyCents}c cap ` +
+              `(main ${c(u.lastHour.mainCents)}, orchestration ${c(u.lastHour.orchestrationCents)})`,
+            `Last 24h: ${c(u.last24h.cappedCents)} of ${u.caps.dailyCents}c cap ` +
+              `(main ${c(u.last24h.mainCents)}, orchestration ${c(u.last24h.orchestrationCents)})`,
+            `Remaining: hour ${c(u.remaining.hourlyCents)}, day ${c(u.remaining.dailyCents)}`,
+            `Survival allowance: ${c(u.last24h.survivalCents)} used of ${u.caps.survivalAllowanceCents}c per 24h`,
+            `Orchestration share: ${u.caps.orchestrationSharePct}% of the hourly and daily caps`,
+            `Per-call ceiling: ${u.caps.perCallCents > 0 ? `${u.caps.perCallCents}c` : "none"}; ` +
+              `session cap: ${u.caps.sessionCents > 0 ? `${u.caps.sessionCents}c per wake cycle` : "none"}`,
+            `Unsettled (held at estimate): ${c(u.unknownCents24h)}; in flight: ${u.openReservations}`,
+            `Survival tier seen by the gate: ${u.survival.tier}`,
+          ];
+          const filter = typeof args.model === "string" ? args.model : undefined;
+          const models = u.byModel24h.filter((m) => !filter || m.model === filter);
+          if (models.length > 0) {
+            lines.push("By model (24h):");
+            for (const m of models) lines.push(`  ${m.model}: ${c(m.cents)} over ${m.attempts} attempt(s)`);
+          }
+          return lines.join("\n");
         } catch (error) {
           return `Inference spending data unavailable: ${error instanceof Error ? error.message : String(error)}`;
         }

@@ -9,7 +9,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "../types.js";
 
 const openAiCalls = vi.hoisted(() => [] as any[]);
@@ -155,17 +155,55 @@ function expectNoSecrets(serialized: string): void {
   expect(serialized).toContain("[REDACTED:");
 }
 
+/** A permissive inference gate, so both clients can send (the legacy one needs a reservation). */
+async function installTestGate() {
+  const { InferenceGate, installInferenceGate } = await import("../inference/gate.js");
+  const { resolveInferencePolicy } = await import("../inference/policy.js");
+  const { createTestDb } = await import("./mocks.js");
+  const gate = new InferenceGate({
+    db: createTestDb().raw,
+    policy: resolveInferencePolicy({}, { maxInferenceDailyCents: 1_000_000 }),
+  });
+  gate.setSurvival({ tier: "high", creditsCents: 1_000_000 });
+  installInferenceGate(gate);
+  return gate;
+}
+
 describe("known secrets are redacted at the inference boundary", () => {
+  let gate: Awaited<ReturnType<typeof installTestGate>>;
+
   beforeAll(async () => {
     const { registerSecret } = await import("../security/secret-redaction.js");
     registerSecret(PRIVATE_KEY, "wallet");
     registerSecret(API_KEY, "conway-api-key");
   });
 
+  beforeEach(async () => {
+    gate = await installTestGate();
+  });
+
+  afterEach(async () => {
+    const { resetInferenceGateForTests } = await import("../inference/gate.js");
+    resetInferenceGateForTests();
+  });
+
   afterAll(async () => {
     const { clearRegisteredSecrets } = await import("../security/secret-redaction.js");
     clearRegisteredSecrets();
   });
+
+  const reservation = (model: string) =>
+    gate.reserve({
+      callId: `t-${model}`,
+      attempt: 1,
+      provider: "conway",
+      model,
+      price: { inputUsdPerM: 1, outputUsdPerM: 1, local: false },
+      estInputTokens: 10,
+      maxOutputTokens: 100,
+      minOutputTokens: 100,
+      scope: { caller: "agent_turn" },
+    }).id;
 
   it("createInferenceClient (OpenAI-compatible and Anthropic backends)", async () => {
     const { ResilientHttpClient } = await import("../conway/http-client.js");
@@ -187,8 +225,8 @@ describe("known secrets are redacted at the inference boundary", () => {
         maxTokens: 100,
         anthropicApiKey: "sk-ant-test-anthropic-key-000000",
       });
-      await client.chat(leakyMessages());
-      await client.chat(leakyMessages(), { model: "claude-test" });
+      await client.chat(leakyMessages(), { reservationId: reservation("some-model") });
+      await client.chat(leakyMessages(), { model: "claude-test", reservationId: reservation("claude-test") });
     } finally {
       spy.mockRestore();
     }
@@ -245,7 +283,15 @@ describe("known secrets are redacted at the inference boundary", () => {
       },
     ]);
     openAiCalls.length = 0;
-    await new UnifiedInferenceClient(registry).chat({ tier: "fast", messages: leakyMessages() });
+    // Providers without a configured key are skipped, so give p1 one.
+    const previousKey = process.env.P1_KEY;
+    process.env.P1_KEY = "p1-test-key";
+    try {
+      await new UnifiedInferenceClient(registry).chat({ tier: "fast", messages: leakyMessages() });
+    } finally {
+      if (previousKey === undefined) delete process.env.P1_KEY;
+      else process.env.P1_KEY = previousKey;
+    }
     expect(openAiCalls).toHaveLength(1);
     expectNoSecrets(JSON.stringify(openAiCalls[0].messages));
   });

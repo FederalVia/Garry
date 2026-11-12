@@ -16,8 +16,19 @@ import type {
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
 import { redactChatMessages } from "../security/secret-redaction.js";
+import { getInstalledInferenceGate, currentInferenceScope, budgetClassFor } from "../inference/gate.js";
+import {
+  InferenceRefusedError,
+  InferenceHttpError,
+  InferenceResponseError,
+  parseRetryAfter,
+} from "../inference/errors.js";
 
-const INFERENCE_TIMEOUT_MS = 60_000;
+/**
+ * Per-attempt ceiling. The router passes a signal carrying the call's real
+ * deadline; this only bounds a request made without one.
+ */
+const INFERENCE_TIMEOUT_MS = 120_000;
 
 interface InferenceClientOptions {
   apiUrl: string;
@@ -62,6 +73,22 @@ export function createInferenceClient(
     rawMessages: ChatMessage[],
     opts?: InferenceOptions,
   ): Promise<InferenceResponse> => {
+    // Only a caller holding an open reservation on the installed gate (the
+    // router) may spend; anything else fails closed before any I/O.
+    const gate = getInstalledInferenceGate();
+    if (!opts?.reservationId || !gate || !gate.isOpen(opts.reservationId)) {
+      throw new InferenceRefusedError(
+        "UNGATED_CALL",
+        "Inference must go through the inference router (no open budget reservation)",
+        { retryAfterMs: null, budgetClass: budgetClassFor(currentInferenceScope().caller) },
+      );
+    }
+    if (opts.signal?.aborted) {
+      const err = new Error("Inference aborted before sending");
+      err.name = "AbortError";
+      throw err;
+    }
+
     // Known secret values (wallet key, API keys, their hex/base64 forms)
     // never leave for a provider, whatever a tool printed.
     const messages = redactChatMessages(rawMessages);
@@ -111,6 +138,7 @@ export function createInferenceClient(
         temperature: opts?.temperature,
         anthropicApiKey: anthropicApiKey as string,
         httpClient,
+        signal: opts.signal,
       });
     }
 
@@ -130,6 +158,7 @@ export function createInferenceClient(
       apiKey: openAiLikeApiKey,
       backend,
       httpClient,
+      signal: opts.signal,
     });
   };
 
@@ -151,10 +180,22 @@ export function createInferenceClient(
     return currentModel;
   };
 
+  /**
+   * Whether some backend can serve the model: Ollama needs its base URL; any
+   * other model goes to its provider's key or, failing that, to Conway.
+   */
+  const canServe = (model: { modelId: string; provider: string }): boolean => {
+    if (model.provider === "ollama") return !!ollamaBaseUrl;
+    if (model.provider === "anthropic" && anthropicApiKey) return true;
+    if (model.provider === "openai" && openaiApiKey) return true;
+    return !!apiKey;
+  };
+
   return {
     chat,
     setLowComputeMode,
     getDefaultModel,
+    canServe,
   };
 }
 
@@ -211,7 +252,9 @@ async function chatViaOpenAiCompatible(params: {
   apiKey: string;
   backend: "conway" | "openai" | "ollama";
   httpClient: ResilientHttpClient;
+  signal?: AbortSignal;
 }): Promise<InferenceResponse> {
+  // retries: 0 — a billable POST is never resent here; the router owns retries.
   const resp = await params.httpClient.request(`${params.apiUrl}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -223,28 +266,25 @@ async function chatViaOpenAiCompatible(params: {
     },
     body: JSON.stringify(params.body),
     timeout: INFERENCE_TIMEOUT_MS,
+    retries: 0,
+    signal: params.signal,
   });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(
-      `Inference error (${params.backend}): ${resp.status}: ${text}`,
-    );
-  }
+  if (!resp.ok) throw await httpError(params.backend, resp);
 
-  const data = await resp.json() as any;
-  const choice = data.choices?.[0];
-
-  if (!choice) {
-    throw new Error("No completion choice returned from inference");
-  }
-
-  const message = choice.message;
+  const data = await readJson(resp);
   const usage: TokenUsage = {
     promptTokens: data.usage?.prompt_tokens || 0,
     completionTokens: data.usage?.completion_tokens || 0,
     totalTokens: data.usage?.total_tokens || 0,
   };
+  const choice = data.choices?.[0];
+
+  if (!choice || !choice.message) {
+    throw new InferenceResponseError("No completion choice returned from inference", usageOf(usage));
+  }
+
+  const message = choice.message;
 
   const toolCalls: InferenceToolCall[] | undefined =
     message.tool_calls?.map((tc: any) => ({
@@ -278,6 +318,7 @@ async function chatViaAnthropic(params: {
   temperature?: number;
   anthropicApiKey: string;
   httpClient: ResilientHttpClient;
+  signal?: AbortSignal;
 }): Promise<InferenceResponse> {
   const transformed = transformMessagesForAnthropic(params.messages);
   const body: Record<string, unknown> = {
@@ -315,14 +356,13 @@ async function chatViaAnthropic(params: {
     },
     body: JSON.stringify(body),
     timeout: INFERENCE_TIMEOUT_MS,
+    retries: 0,
+    signal: params.signal,
   });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Inference error (anthropic): ${resp.status}: ${text}`);
-  }
+  if (!resp.ok) throw await httpError("anthropic", resp);
 
-  const data = await resp.json() as any;
+  const data = await readJson(resp);
   const content = Array.isArray(data.content) ? data.content : [];
   const textBlocks = content.filter((c: any) => c?.type === "text");
   const toolUseBlocks = content.filter((c: any) => c?.type === "tool_use");
@@ -344,12 +384,16 @@ async function chatViaAnthropic(params: {
     .join("\n")
     .trim();
 
-  if (!textContent && !toolCalls?.length) {
-    throw new Error("No completion content returned from anthropic inference");
-  }
-
   const promptTokens = data.usage?.input_tokens || 0;
   const completionTokens = data.usage?.output_tokens || 0;
+
+  if (!textContent && !toolCalls?.length) {
+    throw new InferenceResponseError("No completion content returned from anthropic inference", {
+      inputTokens: promptTokens,
+      outputTokens: completionTokens,
+    });
+  }
+
   const usage: TokenUsage = {
     promptTokens,
     completionTokens,
@@ -368,6 +412,34 @@ async function chatViaAnthropic(params: {
     usage,
     finishReason: normalizeAnthropicFinishReason(data.stop_reason),
   };
+}
+
+async function httpError(backend: string, resp: Response): Promise<InferenceHttpError> {
+  let text = "";
+  try {
+    text = await resp.text();
+  } catch {
+    /* body unreadable; the status is what matters */
+  }
+  return new InferenceHttpError(backend, resp.status, text, parseRetryAfter(resp.headers?.get?.("retry-after")));
+}
+
+/** A 2xx body that is not JSON may still have been billed. */
+async function readJson(resp: Response): Promise<any> {
+  try {
+    return (await resp.json()) as any;
+  } catch (err) {
+    if ((err as any)?.name === "AbortError") throw err;
+    throw new InferenceResponseError(
+      `Unreadable inference response: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function usageOf(u: TokenUsage): { inputTokens: number; outputTokens: number } | undefined {
+  return u.promptTokens || u.completionTokens
+    ? { inputTokens: u.promptTokens, outputTokens: u.completionTokens }
+    : undefined;
 }
 
 function transformMessagesForAnthropic(

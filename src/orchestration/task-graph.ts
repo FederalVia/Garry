@@ -77,6 +77,11 @@ type CycleTask = {
   dependencies: string[];
 };
 
+/** KV key set when worker inference was refused; the orchestrator assigns nothing before it passes. */
+export const ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY = "orchestrator.inference_blocked_until";
+/** Longest such block; a later value means the clock moved backwards and is ignored. */
+export const MAX_INFERENCE_BLOCK_MS = 60 * 60_000;
+
 const TERMINAL_TASK_STATUSES = new Set<TaskStatus>([
   "completed",
   "failed",
@@ -278,7 +283,17 @@ export function completeTask(db: Database, taskId: string, result: TaskResult): 
   });
 }
 
-export function failTask(db: Database, taskId: string, error: string, shouldRetry: boolean): void {
+/**
+ * `costCents`, when given, is the task's cumulative inference spend and is
+ * written to actual_cost_cents.
+ */
+export function failTask(
+  db: Database,
+  taskId: string,
+  error: string,
+  shouldRetry: boolean,
+  costCents?: number,
+): void {
   withTransaction(db, () => {
     const task = getTaskById(db, taskId);
     if (!task) {
@@ -289,11 +304,16 @@ export function failTask(db: Database, taskId: string, error: string, shouldRetr
       throw new Error(`Task ${taskId} is already in terminal status '${task.status}'`);
     }
 
+    const hasCost = typeof costCents === "number" && Number.isFinite(costCents) && costCents >= 0;
+    if (hasCost) {
+      db.prepare("UPDATE task_graph SET actual_cost_cents = ? WHERE id = ?").run(costCents, taskId);
+    }
+
     const failureResult: TaskResult = {
       success: false,
       output: error,
       artifacts: [],
-      costCents: task.actualCostCents,
+      costCents: hasCost ? costCents : task.actualCostCents,
       duration: 0,
     };
 
@@ -319,6 +339,38 @@ export function failTask(db: Database, taskId: string, error: string, shouldRetr
 
     blockDependentsForFailedTask(db, taskId);
     refreshGoalStatus(db, task.goalId);
+  });
+}
+
+/**
+ * Put a task back in the queue without consuming a retry: used when
+ * inference was refused for a reason that clears with time. Returns false
+ * when the task is missing or already terminal.
+ */
+export function deferTask(db: Database, taskId: string, reason: string, costCents?: number): boolean {
+  return withTransaction(db, () => {
+    const task = getTaskById(db, taskId);
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) {
+      return false;
+    }
+
+    const nextStatus: TaskStatus = areDependenciesSatisfied(db, task.dependencies) ? "pending" : "blocked";
+    const hasCost = typeof costCents === "number" && Number.isFinite(costCents) && costCents >= 0;
+    const deferredResult: TaskResult = {
+      success: false,
+      output: `Deferred: ${reason}`,
+      artifacts: [],
+      costCents: hasCost ? costCents : task.actualCostCents,
+      duration: 0,
+    };
+
+    db.prepare(
+      `UPDATE task_graph
+       SET status = ?, assigned_to = NULL, started_at = NULL, completed_at = NULL, result = ?,
+           actual_cost_cents = ?
+       WHERE id = ?`,
+    ).run(nextStatus, JSON.stringify(deferredResult), deferredResult.costCents, taskId);
+    return true;
   });
 }
 

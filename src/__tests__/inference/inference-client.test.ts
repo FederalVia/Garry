@@ -1,10 +1,24 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ProviderRegistry,
   type ProviderConfig,
 } from "../../inference/provider-registry.js";
-import { UnifiedInferenceClient } from "../../inference/inference-client.js";
-import type { ChatMessage } from "../../types.js";
+import {
+  UnifiedInferenceClient,
+  resetProviderCircuitBreakers,
+  type UnifiedInferenceClientOptions,
+} from "../../inference/inference-client.js";
+import {
+  InferenceGate,
+  installInferenceGate,
+  resetInferenceGateForTests,
+} from "../../inference/gate.js";
+import type { ResolvedInferencePolicy } from "../../inference/policy.js";
+import { createDatabase } from "../../state/database.js";
+import type { AutomatonDatabase, ChatMessage, SurvivalTier } from "../../types.js";
 
 const mockState = vi.hoisted(() => {
   const queue: Array<(payload: any) => unknown | Promise<unknown>> = [];
@@ -46,8 +60,40 @@ function createDefaultRegistry(): ProviderRegistry {
   return ProviderRegistry.fromConfig("/tmp/definitely-missing-provider-config.json");
 }
 
-function createClient(registry = createDefaultRegistry()): UnifiedInferenceClient {
-  return new UnifiedInferenceClient(registry);
+const sleeps: number[] = [];
+const recordSleep = async (ms: number): Promise<void> => {
+  sleeps.push(ms);
+};
+
+function createClient(
+  registry = createDefaultRegistry(),
+  options: UnifiedInferenceClientOptions = {},
+): UnifiedInferenceClient {
+  return new UnifiedInferenceClient(registry, { sleep: recordSleep, ...options });
+}
+
+const PERMISSIVE_POLICY: ResolvedInferencePolicy = {
+  dailyCapCents: 1_000_000,
+  hourlyCapCents: 1_000_000,
+  sessionCapCents: 0,
+  perCallCeilingCents: 0,
+  orchestrationSharePct: 100,
+  survivalAllowanceCents: 25,
+  survivalMinIntervalMs: 1_800_000,
+  sessionCooldownMs: 1_800_000,
+  maxTokensPerTurn: 100_000,
+  enableModelFallback: true,
+  unknownPrice: { inputUsdPerM: 2, outputUsdPerM: 14 },
+};
+
+let tmpDir: string;
+let db: AutomatonDatabase;
+let gate: InferenceGate;
+
+function installGate(tier: SurvivalTier | "unknown" = "high"): void {
+  gate = new InferenceGate({ db: db.raw, policy: PERMISSIVE_POLICY });
+  gate.setSurvival({ tier, creditsCents: tier === "unknown" ? null : 100_000 });
+  installInferenceGate(gate);
 }
 
 function queueCompletion(params?: {
@@ -103,8 +149,22 @@ describe("UnifiedInferenceClient", () => {
     vi.clearAllMocks();
     mockState.queue.splice(0, mockState.queue.length);
     mockState.calls.splice(0, mockState.calls.length);
+    sleeps.length = 0;
     process.env = { ...ORIGINAL_ENV };
+    process.env.OPENAI_API_KEY = "sk-test-openai";
+    process.env.GROQ_API_KEY = "gsk-test-groq";
+    delete process.env.TOGETHER_API_KEY;
     delete process.env.AUTOMATON_CREDITS_BALANCE;
+    resetProviderCircuitBreakers();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-client-test-"));
+    db = createDatabase(path.join(tmpDir, "state.db"));
+    installGate();
+  });
+
+  afterEach(() => {
+    resetInferenceGateForTests();
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   afterAll(() => {
@@ -127,8 +187,8 @@ describe("UnifiedInferenceClient", () => {
     expect(result.metadata.tier).toBe("reasoning");
   });
 
-  it("chat uses survival tier resolution when credits are low", async () => {
-    process.env.AUTOMATON_CREDITS_BALANCE = "500";
+  it("chat steps the tier down at the normal survival tier (from the gate, not the env)", async () => {
+    installGate("normal");
     const client = createClient();
     queueCompletion({ content: "survival" });
 
@@ -137,6 +197,7 @@ describe("UnifiedInferenceClient", () => {
       messages: BASE_MESSAGES,
     });
 
+    // reasoning -> fast, whose preferred provider is groq.
     expect(result.metadata.providerId).toBe("groq");
     expect(result.metadata.modelId).toBe("llama-3.3-70b-versatile");
     expect(result.metadata.tier).toBe("reasoning");
@@ -151,25 +212,17 @@ describe("UnifiedInferenceClient", () => {
     expect(result.metadata.retries).toBe(0);
   });
 
-  it("chat retries transient errors and succeeds on the same provider", async () => {
+  it("chat retries a transient error once on the same provider, then fails over", async () => {
     const client = createClient();
-    queueError(429);
     queueError(429);
     queueCompletion({ content: "after-retry" });
 
-    vi.useFakeTimers();
-    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-
-    const pending = client.chat({ tier: "fast", messages: BASE_MESSAGES });
-    await vi.runAllTimersAsync();
-    const result = await pending;
+    const result = await client.chat({ tier: "fast", messages: BASE_MESSAGES });
 
     expect(result.content).toBe("after-retry");
-    expect(result.metadata.retries).toBe(2);
-    const waits = setTimeoutSpy.mock.calls.map((call) => Number(call[1]));
-    expect(waits).toEqual([1000, 2000]);
-
-    vi.useRealTimers();
+    expect(result.metadata.providerId).toBe("groq");
+    expect(result.metadata.retries).toBe(1);
+    expect(sleeps).toEqual([1000]);
   });
 
   it.each([429, 500, 503])(
@@ -177,23 +230,18 @@ describe("UnifiedInferenceClient", () => {
     async (status) => {
       const client = createClient();
 
-      // openai gets 4 failures (3 retries + final failure), then groq succeeds
-      queueError(status);
-      queueError(status);
+      // openai gets 2 attempts (one retry), then groq succeeds
       queueError(status);
       queueError(status);
       queueCompletion({ content: `from-groq-${status}` });
 
-      vi.useFakeTimers();
-      const pending = client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
-      await vi.runAllTimersAsync();
-      const result = await pending;
-      vi.useRealTimers();
+      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
       expect(result.content).toBe(`from-groq-${status}`);
       expect(result.metadata.providerId).toBe("groq");
       expect(result.metadata.failedProviders).toEqual(["openai"]);
-      expect(result.metadata.retries).toBe(3);
+      expect(result.metadata.retries).toBe(2);
+      expect(mockState.create).toHaveBeenCalledTimes(3);
     },
   );
 
@@ -209,24 +257,18 @@ describe("UnifiedInferenceClient", () => {
   it("stops retrying after max retry budget", async () => {
     const client = createClient();
 
-    // openai exhausted
+    // Each provider gets one retry: 2 + 2 HTTP requests in total.
     queueError(429, "openai-1");
     queueError(429, "openai-2");
-    queueError(429, "openai-3");
-    queueError(429, "openai-4");
-    // groq exhausted
     queueError(429, "groq-1");
     queueError(429, "groq-2");
-    queueError(429, "groq-3");
-    queueError(429, "groq-4");
+    queueError(429, "never-sent");
 
-    vi.useFakeTimers();
-    const pending = expect(
+    await expect(
       client.chat({ tier: "reasoning", messages: BASE_MESSAGES }),
     ).rejects.toThrow(/All providers failed/);
-    await vi.runAllTimersAsync();
-    await pending;
-    vi.useRealTimers();
+    expect(mockState.create).toHaveBeenCalledTimes(4);
+    expect(mockState.queue).toHaveLength(1);
   });
 
   it("throws when no providers are available for tier", async () => {
@@ -256,6 +298,7 @@ describe("UnifiedInferenceClient", () => {
       },
     ];
 
+    process.env.P1_KEY = "k";
     const registry = new ProviderRegistry(providers);
     const client = createClient(registry);
 
@@ -264,11 +307,11 @@ describe("UnifiedInferenceClient", () => {
     );
   });
 
-  it("circuit breaker opens after 5 consecutive failures", async () => {
+  it("circuit breaker opens after 5 consecutive health failures (502s)", async () => {
     const client = createClient();
 
     for (let i = 0; i < 5; i += 1) {
-      queueError(400, `hard-fail-${i}`);
+      queueError(502, `hard-fail-${i}`);
       await expect(
         client.chatDirect({
           providerId: "openai",
@@ -295,7 +338,7 @@ describe("UnifiedInferenceClient", () => {
     const client = createClient();
 
     for (let i = 0; i < 5; i += 1) {
-      queueError(400, `trip-${i}`);
+      queueError(502, `trip-${i}`);
       await expect(
         client.chatDirect({
           providerId: "openai",
@@ -315,7 +358,7 @@ describe("UnifiedInferenceClient", () => {
   it("successful chatDirect resets circuit breaker failure count", async () => {
     const client = createClient();
 
-    queueError(400, "first-fail");
+    queueError(502, "first-fail");
     await expect(
       client.chatDirect({ providerId: "openai", modelId: "gpt-4.1", messages: BASE_MESSAGES }),
     ).rejects.toThrow("first-fail");
@@ -326,7 +369,7 @@ describe("UnifiedInferenceClient", () => {
     ).resolves.toMatchObject({ content: "recovered" });
 
     for (let i = 0; i < 4; i += 1) {
-      queueError(400, `again-${i}`);
+      queueError(502, `again-${i}`);
       await expect(
         client.chatDirect({ providerId: "openai", modelId: "gpt-4.1", messages: BASE_MESSAGES }),
       ).rejects.toThrow(`again-${i}`);
@@ -360,7 +403,7 @@ describe("UnifiedInferenceClient", () => {
     const client = createClient();
 
     for (let i = 0; i < 5; i += 1) {
-      queueError(400, "trip-circuit");
+      queueError(502, "trip-circuit");
       await expect(
         client.chatDirect({ providerId: "openai", modelId: "gpt-4.1", messages: BASE_MESSAGES }),
       ).rejects.toThrow("trip-circuit");
@@ -377,15 +420,11 @@ describe("UnifiedInferenceClient", () => {
     queueError(429);
     queueCompletion({ content: "after-direct-retry" });
 
-    vi.useFakeTimers();
-    const pending = client.chatDirect({
+    const result = await client.chatDirect({
       providerId: "openai",
       modelId: "gpt-4.1",
       messages: BASE_MESSAGES,
     });
-    await vi.runAllTimersAsync();
-    const result = await pending;
-    vi.useRealTimers();
 
     expect(result.metadata.retries).toBe(1);
     expect(result.metadata.failedProviders).toEqual([]);
@@ -402,9 +441,11 @@ describe("UnifiedInferenceClient", () => {
 
     const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
     expect(result.usage).toEqual({ inputTokens: 2000, outputTokens: 500, totalTokens: 2500 });
-    expect(result.cost.inputCostCredits).toBeCloseTo(4); // 2k * 2.0 / 1k
-    expect(result.cost.outputCostCredits).toBeCloseTo(4); // 0.5k * 8.0 / 1k
-    expect(result.cost.totalCostCredits).toBeCloseTo(8);
+    // USD per 1M tokens: 2000 * $2 = $0.004 = 0.4c; 500 * $8 = $0.004 = 0.4c.
+    expect(result.cost.inputCostCents).toBeCloseTo(0.4);
+    expect(result.cost.outputCostCents).toBeCloseTo(0.4);
+    expect(result.cost.totalCostCents).toBeCloseTo(0.8);
+    expect(result.cost.costMicroUsd).toBe(8000);
   });
 
   it("extracts text content from structured content arrays", async () => {
@@ -438,6 +479,8 @@ describe("UnifiedInferenceClient", () => {
 
   it("throws when provider response has no completion choice", async () => {
     const client = createClient();
+    // Fails over to groq, which also returns nothing usable.
+    mockState.queue.push(async () => ({ choices: [] }));
     mockState.queue.push(async () => ({ choices: [] }));
 
     await expect(client.chat({ tier: "reasoning", messages: BASE_MESSAGES })).rejects.toThrow(
@@ -518,15 +561,18 @@ describe("UnifiedInferenceClient", () => {
       },
     ]);
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+    // Usage only arrives in a stream when it is asked for.
+    expect(mockState.calls.at(-1)).toMatchObject({ stream: true, stream_options: { include_usage: true } });
   });
 
   it("includes failed provider IDs in final all-failed error", async () => {
     const client = createClient();
 
-    queueUnknownError("openai-hard-fail");
-    // non-retryable error should stop immediately, without trying fallback provider
+    queueError(500, "openai-hard-fail");
+    queueError(500, "openai-hard-fail-again");
+    queueError(502, "groq-hard-fail");
     await expect(client.chat({ tier: "reasoning", messages: BASE_MESSAGES })).rejects.toThrow(
-      /openai-hard-fail/,
+      /All providers failed for tier 'reasoning'\. Failed providers: openai, groq.*groq-hard-fail/,
     );
   });
 
@@ -552,5 +598,43 @@ describe("UnifiedInferenceClient", () => {
       response_format: { type: "json_object" },
     });
     expect(Array.isArray(payload.tools)).toBe(true);
+  });
+  it("holds an error of unknown shape at its reservation and fails over", async () => {
+    const client = createClient();
+    queueUnknownError("socket hang up");
+    queueCompletion({ content: "from-groq" });
+
+    const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
+    expect(result.metadata.providerId).toBe("groq");
+    const rows = db.raw
+      .prepare("SELECT provider, status FROM inference_ledger ORDER BY attempt")
+      .all() as Array<{ provider: string; status: string }>;
+    expect(rows).toEqual([
+      { provider: "openai", status: "unknown" },
+      { provider: "groq", status: "committed" },
+    ]);
+  });
+
+  it("sends nothing when orchestration is paused by the survival tier", async () => {
+    installGate("critical");
+    const client = createClient();
+    queueCompletion({ content: "never" });
+
+    await expect(client.chat({ tier: "fast", messages: BASE_MESSAGES })).rejects.toMatchObject({
+      name: "InferenceRefusedError",
+      code: "SURVIVAL_TIER",
+    });
+    expect(mockState.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses paid providers when no gate is installed", async () => {
+    resetInferenceGateForTests();
+    const client = createClient();
+    queueCompletion({ content: "never" });
+
+    await expect(client.chat({ tier: "reasoning", messages: BASE_MESSAGES })).rejects.toMatchObject({
+      code: "GATE_UNAVAILABLE",
+    });
+    expect(mockState.create).not.toHaveBeenCalled();
   });
 });

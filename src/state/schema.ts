@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -730,4 +730,49 @@ export const MIGRATION_V12 = `
   CREATE INDEX IF NOT EXISTS idx_treasury_open ON treasury_ledger(status, debits_credits);
   CREATE INDEX IF NOT EXISTS idx_treasury_dedupe ON treasury_ledger(dedupe_key, status);
   CREATE INDEX IF NOT EXISTS idx_treasury_replay ON treasury_ledger(replay_of);
+`;
+
+// === Inference spend gate ledger ===
+// Applied through ensureInferenceLedger, which also copies the last day of
+// inference_costs when it first creates the table. One row per HTTP attempt;
+// amounts are integer micro-USD (1 cent = 10,000).
+
+export const MIGRATION_V13 = `
+  -- Schema version: 13
+  -- Tables: inference_ledger
+
+  CREATE TABLE IF NOT EXISTS inference_ledger (
+    id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('reserved','committed','released','unknown')),
+    budget_class TEXT NOT NULL CHECK(budget_class IN ('main','orchestration','survival')),
+    caller TEXT NOT NULL,
+    session_id TEXT,
+    task_id TEXT,
+    goal_id TEXT,
+    worker_id TEXT,
+    turn_id TEXT,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    tier TEXT,
+    survival_tier TEXT,
+    price_in_usd_per_m REAL NOT NULL,
+    price_out_usd_per_m REAL NOT NULL,
+    est_input_tokens INTEGER NOT NULL,
+    max_output_tokens INTEGER NOT NULL,
+    reserved_micro_usd INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_micro_usd INTEGER,
+    error_class TEXT,
+    latency_ms INTEGER,
+    boot_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    settled_at_ms INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_infl_created ON inference_ledger(created_at_ms);
+  CREATE INDEX IF NOT EXISTS idx_infl_task ON inference_ledger(task_id) WHERE task_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_infl_session ON inference_ledger(session_id) WHERE session_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_infl_open ON inference_ledger(status) WHERE status IN ('reserved','unknown');
 `;

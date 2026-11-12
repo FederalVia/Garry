@@ -52,6 +52,7 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V13,
 } from "./schema.js";
 import { ensureTreasuryLedger } from "../treasury/ledger.js";
 import type {
@@ -644,6 +645,12 @@ function applyMigrations(db: DatabaseType): void {
       // new, copies the last day of legacy spend so the upgrade keeps today's
       // usage against the caps.
       apply: () => { ensureTreasuryLedger(db, Date.now()); },
+    },
+    {
+      version: 13,
+      // Creates inference_ledger and, only when the table is new, copies the
+      // last day of inference_costs so the upgrade keeps today's spend.
+      apply: () => { ensureInferenceLedger(db, Date.now()); },
     },
   ];
 
@@ -1547,6 +1554,21 @@ export function markInboxFailed(db: DatabaseType, ids: string[]): void {
   ).run(...ids);
 }
 
+/**
+ * Return claimed messages to the queue without using up a retry: the turn
+ * never ran (inference was refused), so the claim's retry_count increment is
+ * undone.
+ */
+export function unclaimInboxMessages(db: DatabaseType, ids: string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(
+    `UPDATE inbox_messages
+     SET status = 'received', retry_count = MAX(retry_count - 1, 0)
+     WHERE status = 'in_progress' AND id IN (${placeholders})`,
+  ).run(...ids);
+}
+
 export function resetInboxToReceived(db: DatabaseType, ids: string[]): void {
   if (ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
@@ -2165,6 +2187,54 @@ function deserializeRelationshipRow(row: any): RelationshipMemoryEntry {
     relationshipType: row.relationship_type, trustScore: row.trust_score,
     interactionCount: row.interaction_count, lastInteractionAt: row.last_interaction_at ?? null,
     notes: row.notes ?? null, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+// ─── Inference spend ledger ─────────────────────────────────────
+
+/**
+ * Copy the last 24h of inference_costs as committed main-class rows, so an
+ * upgrade does not reset today's daily inference spend.
+ */
+const INFERENCE_LEGACY_COPY_SQL = `
+INSERT OR IGNORE INTO inference_ledger (id, call_id, attempt, status, budget_class, caller, session_id,
+  turn_id, provider, model, tier, price_in_usd_per_m, price_out_usd_per_m, est_input_tokens,
+  max_output_tokens, reserved_micro_usd, input_tokens, output_tokens, cost_micro_usd, latency_ms,
+  boot_id, created_at_ms, settled_at_ms)
+SELECT 'legacy:' || id, 'legacy:' || id, 1, 'committed', 'main', 'legacy:' || task_type, NULL,
+  turn_id, provider, model, tier, 0, 0, input_tokens, output_tokens, cost_cents * 10000,
+  input_tokens, output_tokens, cost_cents * 10000, latency_ms, 'legacy',
+  CAST(strftime('%s', created_at) AS INTEGER) * 1000,
+  CAST(strftime('%s', created_at) AS INTEGER) * 1000
+FROM inference_costs
+WHERE cost_cents > 0
+  AND created_at >= datetime(@nowSec, 'unixepoch', '-1 day')
+`;
+
+function sqliteTableExists(db: DatabaseType, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/**
+ * Create inference_ledger if needed and, only on first creation, copy the
+ * last day of legacy spend. One immediate transaction, so a crash cannot
+ * leave the table without its legacy rows.
+ */
+export function ensureInferenceLedger(
+  db: DatabaseType,
+  nowMs: number,
+): { created: boolean; legacyCopied: number } {
+  return db
+    .transaction(() => {
+      if (sqliteTableExists(db, "inference_ledger")) {
+        db.exec(MIGRATION_V13);
+        return { created: false, legacyCopied: 0 };
+      }
+      db.exec(MIGRATION_V13);
+      if (!sqliteTableExists(db, "inference_costs")) return { created: true, legacyCopied: 0 };
+      const info = db.prepare(INFERENCE_LEGACY_COPY_SQL).run({ nowSec: Math.floor(nowMs / 1000) });
+      return { created: true, legacyCopied: info.changes };
+    })
+    .immediate();
 }
 
 // ─── Phase 2.3: Inference Cost Helpers ──────────────────────────

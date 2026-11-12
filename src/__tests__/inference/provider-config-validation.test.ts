@@ -68,9 +68,14 @@ describe("F137: provider config validation", () => {
     expect(groq.baseUrl).toBe("https://api.groq.com/openai/v1");
     expect(groq.apiKeyEnvVar).toBe("GROQ_API_KEY");
 
+    // Without its own key groq is skipped entirely; the Conway key is never borrowed.
+    delete process.env.GROQ_API_KEY;
+    expect(registry.resolveCandidates("cheap").map((c) => c.provider.id)).not.toContain("groq");
+
+    process.env.GROQ_API_KEY = "gsk-test-groq";
     const resolved = registry.resolveModel("cheap");
     expect(resolved.provider.id).toBe("groq");
-    expect((resolved.client as any).apiKey).not.toBe(FAKE_CONWAY_KEY);
+    expect((resolved.client as any).apiKey).toBe("gsk-test-groq");
     expect((resolved.client as any).baseURL).toBe("https://api.groq.com/openai/v1");
   });
 

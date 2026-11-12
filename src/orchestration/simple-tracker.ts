@@ -33,8 +33,15 @@ export class SimpleAgentTracker implements AgentTracker {
        WHERE status IN ('running', 'healthy')`,
     ).all() as { id: string; name: string; address: string; status: string; role: string }[];
 
+    // A local worker gets its one task at spawn and ends with it: it is never
+    // idle, and a task assigned to it would never run.
     return children
-      .filter((child) => IDLE_STATUSES.has(child.status as ChildStatus) && !assignedAddresses.has(child.address))
+      .filter(
+        (child) =>
+          IDLE_STATUSES.has(child.status as ChildStatus) &&
+          !assignedAddresses.has(child.address) &&
+          !child.address.startsWith("local://"),
+      )
       .map((child) => ({
         address: child.address,
         name: child.name,

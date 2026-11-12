@@ -23,7 +23,9 @@ vi.mock("openai", () => ({
 }));
 
 import {
+  PROVIDER_CLIENT_TIMEOUT_MS,
   ProviderRegistry,
+  isLocalProvider,
   type ModelTier,
   type ProviderConfig,
 } from "../../inference/provider-registry.js";
@@ -46,14 +48,18 @@ function createRegistryFromDefaults(): ProviderRegistry {
   return ProviderRegistry.fromConfig(makeMissingPath());
 }
 
-function providerIdsForTier(registry: ProviderRegistry, tier: ModelTier, survivalMode = false): string[] {
-  return registry.resolveCandidates(tier, survivalMode).map((entry) => entry.provider.id);
+function providerIdsForTier(registry: ProviderRegistry, tier: ModelTier, downgrade = false): string[] {
+  return registry.resolveCandidates(tier, downgrade).map((entry) => entry.provider.id);
 }
 
 describe("ProviderRegistry", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env = { ...ORIGINAL_ENV };
+    // Providers without a key are skipped, so give the defaults one each.
+    process.env.OPENAI_API_KEY = "sk-test-openai";
+    process.env.GROQ_API_KEY = "gsk-test-groq";
+    delete process.env.TOGETHER_API_KEY;
     delete process.env.AUTOMATON_CREDITS_BALANCE;
     delete process.env.AUTOMATON_INFERENCE_TASK_TYPE;
   });
@@ -150,18 +156,19 @@ describe("ProviderRegistry", () => {
     expect(registry.getProviders().length).toBe(4);
   });
 
-  it("fromConfig uses emergencyStopCredits from config", () => {
+  it("fromConfig accepts and ignores the deprecated emergencyStopCredits", () => {
     const filePath = makeTempConfigFile({
       globalRateLimits: {
         emergencyStopCredits: 9999,
       },
     });
 
+    // Survival-tier pausing in the gate replaced the env-var emergency stop.
     process.env.AUTOMATON_CREDITS_BALANCE = "500";
     process.env.AUTOMATON_INFERENCE_TASK_TYPE = "agent_turn";
 
     const registry = ProviderRegistry.fromConfig(filePath);
-    expect(() => registry.resolveModel("reasoning")).toThrow(/Emergency stop active/);
+    expect(registry.resolveModel("reasoning").provider.id).toBe("openai");
   });
 
   it("resolveModel returns reasoning model from default tier", () => {
@@ -345,27 +352,78 @@ describe("ProviderRegistry", () => {
     expect(() => registry.getModel("openai", "gpt-4.1")).toThrow(/disabled/);
   });
 
-  it("emergency policy blocks non-planner calls below threshold", () => {
+  it("the credits env var no longer stops or downgrades anything", () => {
     const registry = createRegistryFromDefaults();
     process.env.AUTOMATON_CREDITS_BALANCE = "50";
     process.env.AUTOMATON_INFERENCE_TASK_TYPE = "agent_turn";
 
-    expect(() => registry.resolveModel("reasoning")).toThrow(/Emergency stop active/);
+    expect(registry.resolveModel("reasoning").model.id).toBe("gpt-4.1");
+    expect(registry.resolveModel("fast").model.tier).toBe("fast");
   });
 
-  it("emergency policy allows planner calls below threshold", () => {
+  it("skips providers whose API key is unset instead of using a placeholder", () => {
+    delete process.env.GROQ_API_KEY;
     const registry = createRegistryFromDefaults();
-    process.env.AUTOMATON_CREDITS_BALANCE = "50";
-    process.env.AUTOMATON_INFERENCE_TASK_TYPE = "planner_step";
 
-    expect(() => registry.resolveModel("reasoning")).not.toThrow();
+    expect(providerIdsForTier(registry, "fast")).toEqual(["openai"]);
+    expect(providerIdsForTier(registry, "cheap")).toEqual(["openai"]);
+    expect(providerIdsForTier(registry, "reasoning")).toEqual(["openai"]);
+    for (const call of openAiCtor.mock.calls) {
+      expect(String((call[0] as { apiKey?: string }).apiKey)).not.toMatch(/^missing-/);
+    }
   });
 
-  it("emergency policy does nothing when credits env var is missing", () => {
+  it("treats an empty or blank key as unset", () => {
+    process.env.GROQ_API_KEY = "  ";
+    process.env.OPENAI_API_KEY = "";
     const registry = createRegistryFromDefaults();
-    delete process.env.AUTOMATON_CREDITS_BALANCE;
 
-    expect(() => registry.resolveModel("reasoning")).not.toThrow();
+    expect(providerIdsForTier(registry, "fast")).toEqual([]);
+    expect(() => registry.getModel("openai", "gpt-4.1")).toThrow(/no API key/);
+  });
+
+  it("an enabled local provider needs no key", () => {
+    const filePath = makeTempConfigFile({
+      providers: [
+        {
+          id: "local",
+          enabled: true,
+          baseUrl: "http://127.0.0.1:11434/v1",
+          models: [
+            {
+              id: "llama3.1:8b",
+              tier: "cheap",
+              contextWindow: 131072,
+              maxOutputTokens: 4096,
+              costPerInputToken: 0,
+              costPerOutputToken: 0,
+            },
+          ],
+        },
+      ],
+    });
+    delete process.env.LOCAL_API_KEY;
+    const registry = ProviderRegistry.fromConfig(filePath);
+    const resolved = registry.resolveModel("cheap");
+    expect(resolved.provider.id).toBe("local");
+    expect(isLocalProvider(resolved.provider)).toBe(true);
+  });
+
+  it("isLocalProvider is true only for the local provider on loopback", () => {
+    expect(isLocalProvider({ id: "local", baseUrl: "http://localhost:11434/v1" })).toBe(true);
+    expect(isLocalProvider({ id: "local", baseUrl: "https://ollama.example.com/v1" })).toBe(false);
+    expect(isLocalProvider({ id: "custom", baseUrl: "http://127.0.0.1:8000/v1" })).toBe(false);
+  });
+
+  it("builds SDK clients with no SDK retries and an explicit timeout", () => {
+    const registry = createRegistryFromDefaults();
+    registry.resolveModel("reasoning");
+
+    expect(openAiCtor).toHaveBeenCalled();
+    for (const call of openAiCtor.mock.calls) {
+      expect(call[0]).toMatchObject({ maxRetries: 0, timeout: PROVIDER_CLIENT_TIMEOUT_MS });
+    }
+    expect(PROVIDER_CLIENT_TIMEOUT_MS).toBeLessThanOrEqual(120_000);
   });
 
   it("resolveModel throws when no provider has a model for the tier", () => {
@@ -395,6 +453,7 @@ describe("ProviderRegistry", () => {
       },
     ];
 
+    process.env.ONLY_FAST_KEY = "k";
     const registry = new ProviderRegistry(providers);
     expect(() => registry.resolveModel("reasoning")).toThrow(/No provider\/model/);
   });
@@ -405,5 +464,36 @@ describe("ProviderRegistry", () => {
     registry.resolveModel("fast");
 
     expect(openAiCtor).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("default provider prices", () => {
+  // USD per 1M tokens (input / output), public list prices:
+  // OpenAI https://openai.com/api/pricing, Groq https://groq.com/pricing,
+  // Together https://www.together.ai/pricing. Update the table and this
+  // test together; the gate's caps are only as accurate as these numbers.
+  const LIST_PRICES: Record<string, [number, number]> = {
+    "openai/gpt-4.1": [2.0, 8.0],
+    "openai/gpt-4.1-mini": [0.4, 1.6],
+    "openai/gpt-4.1-nano": [0.1, 0.4],
+    "groq/llama-3.3-70b-versatile": [0.59, 0.79],
+    "groq/llama-3.1-8b-instant": [0.05, 0.08],
+    "together/meta-llama/Llama-3.3-70B-Instruct-Turbo": [0.88, 0.88],
+    "together/meta-llama/Llama-3.1-8B-Instruct-Turbo": [0.18, 0.18],
+  };
+
+  it("pins every paid default model to its documented list price", () => {
+    const registry = ProviderRegistry.fromConfig(path.join(os.tmpdir(), "no-such-dir-xyz", "providers.json"));
+    const seen = new Set<string>();
+    for (const provider of registry.getProviders()) {
+      if (isLocalProvider(provider)) continue;
+      for (const model of provider.models) {
+        const key = `${provider.id}/${model.id}`;
+        expect(LIST_PRICES[key], `no documented price for ${key}`).toBeDefined();
+        expect([model.costPerInputToken, model.costPerOutputToken], key).toEqual(LIST_PRICES[key]);
+        seen.add(key);
+      }
+    }
+    expect([...seen].sort()).toEqual(Object.keys(LIST_PRICES).sort());
   });
 });

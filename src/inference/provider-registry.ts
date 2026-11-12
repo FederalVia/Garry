@@ -51,11 +51,13 @@ interface ProviderConfigFile {
   providers?: unknown;
   tierDefaults?: Partial<Record<ModelTier, Partial<TierDefault>>>;
   globalRateLimits?: {
+    /** Deprecated: survival-tier pausing in the inference gate replaces it. */
     emergencyStopCredits?: number;
   };
 }
 
-const DEFAULT_EMERGENCY_STOP_CREDITS = 100;
+/** SDK-level timeout; callers also pass a per-attempt timeout and signal. */
+export const PROVIDER_CLIENT_TIMEOUT_MS = 120_000;
 
 const DEFAULT_TIER_DEFAULTS: Record<ModelTier, TierDefault> = {
   reasoning: {
@@ -72,6 +74,9 @@ const DEFAULT_TIER_DEFAULTS: Record<ModelTier, TierDefault> = {
   },
 };
 
+// Prices are USD per 1M tokens at the providers' public list prices, rounded
+// up. The gate caps spend with them, so a stale low price lets real spend
+// exceed every cap; provider-registry.test.ts pins each one.
 const DEFAULT_PROVIDERS: ProviderConfig[] = [
   {
     id: "openai",
@@ -129,8 +134,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "reasoning",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.2,
-        costPerOutputToken: 0.2,
+        costPerInputToken: 0.59,
+        costPerOutputToken: 0.79,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -140,8 +145,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "fast",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.2,
-        costPerOutputToken: 0.2,
+        costPerInputToken: 0.59,
+        costPerOutputToken: 0.79,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -174,8 +179,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "reasoning",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.25,
-        costPerOutputToken: 0.5,
+        costPerInputToken: 0.88,
+        costPerOutputToken: 0.88,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -185,8 +190,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "fast",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.25,
-        costPerOutputToken: 0.5,
+        costPerInputToken: 0.88,
+        costPerOutputToken: 0.88,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -196,8 +201,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "cheap",
         contextWindow: 131072,
         maxOutputTokens: 4096,
-        costPerInputToken: 0.08,
-        costPerOutputToken: 0.1,
+        costPerInputToken: 0.18,
+        costPerOutputToken: 0.18,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -292,16 +297,27 @@ function isAcceptableBaseUrl(raw: unknown, allowLoopbackHttp: boolean, requireLo
   return url.protocol === "http:" && allowLoopbackHttp && loopback;
 }
 
+/**
+ * True for the built-in "local" provider on a loopback address. Only such a
+ * provider is free; a zero price anywhere else is treated as unknown.
+ */
+export function isLocalProvider(provider: Pick<ProviderConfig, "id" | "baseUrl">): boolean {
+  if (provider.id !== "local") return false;
+  try {
+    return isLoopbackHost(new URL(provider.baseUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+
 export class ProviderRegistry {
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
-  private readonly emergencyStopCredits: number;
 
   constructor(
     providers: ProviderConfig[],
     tierDefaults: Record<ModelTier, TierDefault> = DEFAULT_TIER_DEFAULTS,
-    emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS,
   ) {
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
@@ -311,7 +327,6 @@ export class ProviderRegistry {
       fast: normalizeTierDefault(tierDefaults.fast, DEFAULT_TIER_DEFAULTS.fast),
       cheap: normalizeTierDefault(tierDefaults.cheap, DEFAULT_TIER_DEFAULTS.cheap),
     };
-    this.emergencyStopCredits = emergencyStopCredits;
   }
 
   overrideBaseUrl(providerId: string, baseUrl: string): void {
@@ -324,7 +339,6 @@ export class ProviderRegistry {
   static fromConfig(configPath: string): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
-    let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;
 
     // No-follow read: a link or hard link at the config path is ignored.
     const text = readRegularFileNoFollow(configPath, {
@@ -332,7 +346,7 @@ export class ProviderRegistry {
       maxBytes: MAX_PROVIDER_CONFIG_BYTES,
     });
     if (text === null) {
-      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+      return new ProviderRegistry(providers, tierDefaults);
     }
 
     try {
@@ -350,34 +364,39 @@ export class ProviderRegistry {
         };
       }
 
-      const configuredEmergencyStop = raw.globalRateLimits?.emergencyStopCredits;
-      if (typeof configuredEmergencyStop === "number" && configuredEmergencyStop > 0) {
-        emergencyStopCredits = configuredEmergencyStop;
+      if (raw.globalRateLimits?.emergencyStopCredits !== undefined) {
+        logger.warn(
+          "globalRateLimits.emergencyStopCredits is deprecated and ignored; orchestration pauses at low survival tiers instead",
+        );
       }
     } catch {
       // Keep defaults if config is invalid.
     }
 
-    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+    return new ProviderRegistry(providers, tierDefaults);
   }
 
-  resolveModel(tier: ModelTier, survivalMode = false): ResolvedModel {
-    const candidates = this.resolveCandidates(tier, survivalMode);
+  /** `downgrade` steps the tier down once (reasoning to fast, fast to cheap). */
+  resolveModel(tier: ModelTier, downgrade = false): ResolvedModel {
+    const candidates = this.resolveCandidates(tier, downgrade);
     if (candidates.length === 0) {
       throw new Error(`No provider/model available for tier '${tier}'`);
     }
     return candidates[0];
   }
 
-  resolveCandidates(tier: ModelTier, survivalMode = false): ResolvedModel[] {
-    this.assertEmergencyPolicy();
-
-    const effectiveTier = this.applySurvivalTier(tier, survivalMode);
+  /**
+   * Providers for a tier in preference order. A provider with no API key is
+   * skipped rather than called with a placeholder, so a prompt never goes to
+   * a provider that cannot serve it.
+   */
+  resolveCandidates(tier: ModelTier, downgrade = false): ResolvedModel[] {
+    const effectiveTier = this.applySurvivalTier(tier, downgrade);
     const orderedProviders = this.getProviderOrderForTier(effectiveTier);
     const results: ResolvedModel[] = [];
 
     for (const provider of orderedProviders) {
-      if (!this.isProviderActive(provider)) {
+      if (!this.isProviderUsable(provider)) {
         continue;
       }
 
@@ -395,7 +414,7 @@ export class ProviderRegistry {
 
     if (effectiveTier !== tier) {
       for (const provider of this.getProviderOrderForTier(tier)) {
-        if (!this.isProviderActive(provider)) {
+        if (!this.isProviderUsable(provider)) {
           continue;
         }
 
@@ -419,6 +438,10 @@ export class ProviderRegistry {
 
     if (!this.isProviderActive(provider)) {
       throw new Error(`Provider '${providerId}' is disabled`);
+    }
+
+    if (this.resolveApiKey(provider) === null) {
+      throw new Error(`Provider '${providerId}' has no API key (${provider.apiKeyEnvVar} is not set)`);
     }
 
     const model = provider.models.find((candidate) => candidate.id === modelId);
@@ -488,9 +511,15 @@ export class ProviderRegistry {
 
   private buildResolvedModel(provider: ProviderConfig, model: ModelConfig): ResolvedModel {
     const apiKey = this.resolveApiKey(provider);
+    if (apiKey === null) {
+      throw new Error(`Provider '${provider.id}' has no API key`);
+    }
+    // Retries live in exactly one layer (the unified client), never in the SDK.
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
+      maxRetries: 0,
+      timeout: PROVIDER_CLIENT_TIMEOUT_MS,
     });
 
     return {
@@ -500,17 +529,22 @@ export class ProviderRegistry {
     };
   }
 
-  private resolveApiKey(provider: ProviderConfig): string {
+  private resolveApiKey(provider: ProviderConfig): string | null {
     const configured = process.env[provider.apiKeyEnvVar];
-    if (typeof configured === "string" && configured.length > 0) {
+    if (typeof configured === "string" && configured.trim().length > 0) {
       return configured;
     }
 
+    // Local servers usually need no key; "local" must still be enabled explicitly.
     if (provider.id === "local") {
       return "local";
     }
 
-    return `missing-${provider.apiKeyEnvVar.toLowerCase()}`;
+    return null;
+  }
+
+  private isProviderUsable(provider: ProviderConfig): boolean {
+    return this.isProviderActive(provider) && this.resolveApiKey(provider) !== null;
   }
 
   private isProviderActive(provider: ProviderConfig): boolean {
@@ -531,8 +565,8 @@ export class ProviderRegistry {
     return false;
   }
 
-  private applySurvivalTier(tier: ModelTier, survivalMode: boolean): ModelTier {
-    if (!survivalMode) {
+  private applySurvivalTier(tier: ModelTier, downgrade: boolean): ModelTier {
+    if (!downgrade) {
       return tier;
     }
 
@@ -545,27 +579,6 @@ export class ProviderRegistry {
     }
 
     return tier;
-  }
-
-  private assertEmergencyPolicy(): void {
-    const rawCredits = process.env.AUTOMATON_CREDITS_BALANCE;
-    if (!rawCredits) {
-      return;
-    }
-
-    const credits = Number(rawCredits);
-    if (!Number.isFinite(credits) || credits >= this.emergencyStopCredits) {
-      return;
-    }
-
-    const taskType = (process.env.AUTOMATON_INFERENCE_TASK_TYPE || "").toLowerCase();
-    const plannerCall = taskType.includes("planner") || taskType.includes("planning");
-
-    if (!plannerCall) {
-      throw new Error(
-        `Emergency stop active (${credits} credits < ${this.emergencyStopCredits}); only planner calls are allowed`,
-      );
-    }
   }
 }
 

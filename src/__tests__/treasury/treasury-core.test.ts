@@ -45,6 +45,7 @@ import {
 } from "../../treasury/index.js";
 import { DEFAULT_TREASURY_POLICY } from "../../types.js";
 import { createDatabase } from "../../state/database.js";
+import { SCHEMA_VERSION } from "../../state/schema.js";
 import { SpendTracker } from "../../agent/spend-tracker.js";
 import type { CreditTransferResult } from "../../types.js";
 import {
@@ -1137,7 +1138,8 @@ describe("legacy copy", () => {
         ["legacy", "transfer", "committed", 9000],
       ]);
       const v = upgraded.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
-      expect(v.v).toBe(12);
+      // Later migrations run in the same upgrade.
+      expect(v.v).toBe(SCHEMA_VERSION);
     } finally {
       upgraded.close();
     }

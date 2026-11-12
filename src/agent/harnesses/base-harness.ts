@@ -9,14 +9,18 @@ import type {
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
 import { createBuiltinTools } from "../tools.js";
-import type {
-  AgentHarness,
-  HarnessContext,
-  HarnessTool,
+import {
+  InferenceDeferredError,
+  TaskBudgetExceededError,
+  type AgentHarness,
+  type HarnessContext,
+  type HarnessTool,
 } from "../harness-types.js";
+import { InferenceRefusedError } from "../../inference/errors.js";
 
 const logger = createLogger("harness.base");
 const MAX_CONSECUTIVE_INFERENCE_ERRORS = 3;
+const DEFAULT_INFERENCE_RETRY_BACKOFF_MS: readonly number[] = [1000, 2000];
 const MAX_TOOL_OUTPUT_LENGTH = 16_000;
 
 export const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
@@ -193,16 +197,32 @@ export abstract class BaseHarness implements AgentHarness {
         throw new Error("Harness execution aborted by abort signal");
       }
 
-      let response: { content: string; toolCalls?: InferenceToolCall[] };
+      let response: { content: string; toolCalls?: InferenceToolCall[]; costCents?: number };
       try {
         response = await this.context.inference.chat({
           tier: "fast",
+          purpose: "worker_turn",
           messages: this.messages,
           tools: toolDefs,
           toolChoice: "auto",
+          signal: this.context.abortSignal,
         });
         consecutiveInferenceErrors = 0;
+        this.recordInferenceCost(response.costCents);
       } catch (error) {
+        // A budget refusal is not a provider failure: retrying now cannot help.
+        if (error instanceof InferenceRefusedError) {
+          if (error.code === "TASK_CAP") {
+            throw new TaskBudgetExceededError(
+              `Task "${this.task.title}" exhausted its inference budget: ${error.message}`,
+            );
+          }
+          throw new InferenceDeferredError(
+            `Inference refused (${error.code}): ${error.message}`,
+            error.code,
+            error.retryAfterMs,
+          );
+        }
         consecutiveInferenceErrors++;
         const message = error instanceof Error ? error.message : String(error);
         logger.error(
@@ -213,6 +233,7 @@ export abstract class BaseHarness implements AgentHarness {
             `${MAX_CONSECUTIVE_INFERENCE_ERRORS} consecutive inference failures. Last error: ${message}`,
           );
         }
+        await this.backoffAfterInferenceError(consecutiveInferenceErrors);
         continue;
       }
 
@@ -338,6 +359,32 @@ export abstract class BaseHarness implements AgentHarness {
     };
   }
 
+  /** Adds a call's committed cost; also used by subclasses that call inference directly. */
+  protected recordInferenceCost(costCents: number | undefined): void {
+    if (typeof costCents === "number" && Number.isFinite(costCents) && costCents > 0) {
+      this.context.budget.costUsedCents += costCents;
+    }
+  }
+
+  private async backoffAfterInferenceError(consecutiveErrors: number): Promise<void> {
+    const schedule = this.context.inferenceRetryBackoffMs ?? DEFAULT_INFERENCE_RETRY_BACKOFF_MS;
+    if (schedule.length === 0) return;
+    const delayMs = schedule[Math.min(consecutiveErrors - 1, schedule.length - 1)];
+    if (!(delayMs > 0)) return;
+    const signal = this.context.abortSignal;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
   private checkBudget(): void {
     const budget = this.context.budget;
 
@@ -349,7 +396,7 @@ export abstract class BaseHarness implements AgentHarness {
     }
 
     if (budget.costUsedCents >= budget.maxCostCents) {
-      throw new Error(
+      throw new TaskBudgetExceededError(
         `Budget exhausted: cost limit reached ($${(budget.costUsedCents / 100).toFixed(2)} / $${(budget.maxCostCents / 100).toFixed(2)}). ` +
         `Task "${this.task.title}" exceeded its cost budget.`,
       );

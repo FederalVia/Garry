@@ -143,8 +143,8 @@ export class ModelRegistry {
         provider: m.provider || m.owned_by || "conway",
         displayName: m.display_name || m.id,
         tierMinimum: existing?.tierMinimum || "normal",
-        costPer1kInput: m.pricing?.input_per_1k ?? existing?.costPer1kInput ?? 0,
-        costPer1kOutput: m.pricing?.output_per_1k ?? existing?.costPer1kOutput ?? 0,
+        costPer1kInput: listedPrice(m, "input") ?? existing?.costPer1kInput ?? 0,
+        costPer1kOutput: listedPrice(m, "output") ?? existing?.costPer1kOutput ?? 0,
         maxTokens: m.max_tokens ?? existing?.maxTokens ?? 4096,
         contextWindow: m.context_window ?? existing?.contextWindow ?? 128000,
         supportsTools: m.supports_tools ?? existing?.supportsTools ?? true,
@@ -186,4 +186,17 @@ export class ModelRegistry {
       updatedAt: row.updatedAt,
     };
   }
+}
+
+/**
+ * A listed price in registry units (hundredths of a cent per 1k tokens,
+ * which is USD per 1M x 10). listModels reports USD per 1M; a zero or
+ * missing price is treated as unknown so a known price is not overwritten.
+ */
+function listedPrice(m: any, side: "input" | "output"): number | undefined {
+  const perMillion = Number(m?.pricing?.[`${side}PerMillion`] ?? m?.pricing?.[`${side}_per_million`]);
+  if (Number.isFinite(perMillion) && perMillion > 0) return perMillion * 10;
+  const per1k = Number(m?.pricing?.[`${side}_per_1k`]);
+  if (Number.isFinite(per1k) && per1k > 0) return per1k;
+  return undefined;
 }

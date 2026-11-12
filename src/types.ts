@@ -343,6 +343,10 @@ export interface InferenceOptions {
   temperature?: number;
   tools?: InferenceToolDefinition[];
   stream?: boolean;
+  /** Aborts the HTTP request (deadline or shutdown). */
+  signal?: AbortSignal;
+  /** Open reservation on the installed inference gate; the legacy client refuses to send without one. */
+  reservationId?: string;
 }
 
 export interface InferenceToolDefinition {
@@ -790,6 +794,8 @@ export interface InferenceClient {
   ): Promise<InferenceResponse>;
   setLowComputeMode(enabled: boolean): void;
   getDefaultModel(): string;
+  /** Whether a backend is configured that can serve this model (router candidate filter). */
+  canServe?(model: { modelId: string; provider: string }): boolean;
 }
 
 // ─── Skills ─────────────────────────────────────────────────────
@@ -1251,10 +1257,24 @@ export interface InferenceRequest {
   messages: ChatMessage[];
   taskType: InferenceTaskType;
   tier: SurvivalTier;
+  /** Budget session (one wake cycle), not memory's session id. */
   sessionId: string;
   turnId?: string;
   maxTokens?: number; // override
   tools?: unknown[];
+  /** Who is calling, for budget attribution. Default "agent_turn". */
+  caller?: "agent_turn" | "inbox_turn" | "survival_turn";
+  /** A survival turn: cheapest model, survival allowance instead of the regular caps. */
+  survival?: boolean;
+  /** Aborts the call (shutdown). The router adds its own deadline. */
+  signal?: AbortSignal;
+}
+
+export interface InferenceRefusal {
+  code: string;
+  /** When the refusal clears on its own; null when it does not. */
+  retryAfterMs: number | null;
+  message: string;
 }
 
 export interface InferenceResult {
@@ -1263,10 +1283,14 @@ export interface InferenceResult {
   provider: ModelProvider;
   inputTokens: number;
   outputTokens: number;
+  /** Fractional cents; the inference ledger is authoritative. */
   costCents: number;
+  costMicroUsd?: number;
   latencyMs: number;
   toolCalls?: unknown[];
   finishReason: string;
+  /** Set (with finishReason "budget_exceeded") when every candidate was refused. */
+  refusal?: InferenceRefusal;
 }
 
 export interface InferenceCostRow {
@@ -1312,6 +1336,14 @@ export interface ModelStrategyConfig {
   perCallCeilingCents: number; // default: 0 (no limit)
   enableModelFallback: boolean; // default: true
   anthropicApiVersion: string; // default: "2023-06-01"
+  /** Share (%) of the hourly and daily inference caps orchestration may use. Default 50. */
+  orchestrationSharePct?: number;
+  /** Survival allowance per rolling 24 h once the regular caps are spent. 0 disables. Default 25. */
+  survivalAllowanceCents?: number;
+  /** At most one survival turn per this interval. Default 30 min. */
+  survivalMinIntervalMs?: number;
+  /** Sleep after a session-budget refusal. Default 30 min. */
+  sessionCooldownMs?: number;
 }
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
@@ -1324,6 +1356,10 @@ export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
   perCallCeilingCents: 0,
   enableModelFallback: true,
   anthropicApiVersion: "2023-06-01",
+  orchestrationSharePct: 50,
+  survivalAllowanceCents: 25,
+  survivalMinIntervalMs: 1_800_000,
+  sessionCooldownMs: 1_800_000,
 };
 
 // === Phase 3.1: Replication & Lifecycle Types ===

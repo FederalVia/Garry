@@ -39,6 +39,14 @@ function assertSecureUrl(
   );
 }
 
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error("The operation was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
 export class CircuitOpenError extends Error {
   constructor(public readonly resetAt: number) {
     super(
@@ -74,15 +82,22 @@ export class ResilientHttpClient {
     const opts = options ?? {};
     const timeout = opts.timeout ?? this.config.baseTimeout;
     const maxRetries = opts.retries ?? this.config.maxRetries;
+    const callerSignal = opts.signal ?? undefined;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // Never send (or resend) once the caller gave up.
+      if (callerSignal?.aborted) throw abortError(callerSignal);
+
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeout);
+      // The caller's signal stays attached to the fetch, so it still aborts
+      // the body read after headers arrive; the own timeout covers headers.
+      const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
 
       try {
         const response = await fetch(url, {
           ...opts,
-          signal: controller.signal,
+          signal,
           headers: {
             ...opts.headers,
             ...(opts.idempotencyKey
@@ -100,7 +115,7 @@ export class ResilientHttpClient {
           if (this.consecutiveFailures >= this.config.circuitBreakerThreshold) {
             this.circuitOpenUntil = Date.now() + this.config.circuitBreakerResetMs;
           }
-          if (attempt < maxRetries) {
+          if (attempt < maxRetries && !callerSignal?.aborted) {
             await this.backoff(attempt);
             continue;
           }
@@ -112,6 +127,8 @@ export class ResilientHttpClient {
         return response;
       } catch (error) {
         clearTimeout(timer);
+        // The caller's abort is not a server failure and is never retried.
+        if (callerSignal?.aborted) throw error;
         this.consecutiveFailures++;
         if (
           this.consecutiveFailures >= this.config.circuitBreakerThreshold

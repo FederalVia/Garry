@@ -247,12 +247,20 @@ async function configureModelStrategy(config: AutomatonConfig): Promise<void> {
   config.maxTokensPerTurn = maxTokens;
 
   s.hourlyBudgetCents = await askNumber(
-    "Hourly inference budget (cents, 0 = unlimited)",
+    "Hourly inference budget (cents, 0 = derived from the daily cap: daily / 6)",
     s.hourlyBudgetCents,
   );
   s.sessionBudgetCents = await askNumber(
-    "Session inference budget (cents, 0 = unlimited)",
+    "Inference budget per wake cycle (cents, 0 = unlimited)",
     s.sessionBudgetCents,
+  );
+  s.orchestrationSharePct = await askNumber(
+    "Share of the hourly and daily inference caps workers and planning may use (%)",
+    s.orchestrationSharePct ?? 50,
+  );
+  s.survivalAllowanceCents = await askNumber(
+    "Survival allowance once the caps are spent (cents per 24h, 0 = off)",
+    s.survivalAllowanceCents ?? 25,
   );
   s.perCallCeilingCents = await askNumber(
     "Per-call ceiling (cents, 0 = unlimited)",
@@ -280,7 +288,10 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
   t.maxDailyTransferCents = await askNumber("Max daily transfers", t.maxDailyTransferCents);
   t.minimumReserveCents = await askNumber("Minimum reserve", t.minimumReserveCents);
   t.maxX402PaymentCents = await askNumber("Max x402 payment", t.maxX402PaymentCents);
-  t.maxInferenceDailyCents = await askNumber("Max daily inference spend", t.maxInferenceDailyCents);
+  t.maxInferenceDailyCents = await askNumber(
+    "Max inference spend per rolling 24h (0 = paid inference off)",
+    t.maxInferenceDailyCents,
+  );
   t.requireConfirmationAboveCents = await askNumber(
     "Require confirmation above",
     t.requireConfirmationAboveCents,

@@ -23,6 +23,7 @@ import { SpendTracker } from "../agent/spend-tracker.js";
 import { INBOX_LABEL, isIsolatedTurn } from "../agent/inbox-isolation.js";
 import { summarizeTurns } from "../agent/context.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { InferenceHttpError } from "../inference/errors.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
 import { reflectOnSoul } from "../soul/reflection.js";
 import { createDefaultSoul, loadCurrentSoul, writeSoulMd } from "../soul/model.js";
@@ -211,15 +212,27 @@ describe("inbox turn isolation", () => {
     msgSeq = 0;
     // Planner and worker inference go through the unified client, not
     // options.inference. Capture those requests too.
+    // A free text-only reply: workers finish at once instead of holding the
+    // loop, and the planner cannot parse it and falls back to its own plan.
     unifiedCalls = [];
-    vi.spyOn(UnifiedInferenceClient.prototype, "chat").mockImplementation(async (params: any) => {
+    const textOnly = async (params: any) => {
       unifiedCalls.push(JSON.stringify(params));
-      throw new Error("no provider in tests");
-    });
-    vi.spyOn(UnifiedInferenceClient.prototype, "chatDirect").mockImplementation(async (params: any) => {
-      unifiedCalls.push(JSON.stringify(params));
-      throw new Error("no provider in tests");
-    });
+      return {
+        content: "done",
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        cost: { inputCostCents: 0, outputCostCents: 0, totalCostCents: 0, costMicroUsd: 0 },
+        metadata: {
+          providerId: "test",
+          modelId: "test-model",
+          tier: params.tier ?? "fast",
+          latencyMs: 0,
+          retries: 0,
+          failedProviders: [],
+        },
+      };
+    };
+    vi.spyOn(UnifiedInferenceClient.prototype, "chat").mockImplementation(textOnly);
+    vi.spyOn(UnifiedInferenceClient.prototype, "chatDirect").mockImplementation(textOnly);
   });
 
   afterEach(() => {
@@ -749,7 +762,8 @@ describe("inbox turn isolation", () => {
         sequence.push("inbox");
         if (!failed) {
           failed = true;
-          throw new Error("inference unavailable");
+          // A caller-side 400: the router neither retries nor falls back.
+          throw new InferenceHttpError("conway", 400, "inference unavailable");
         }
         return toolCallResponse([{ name: "send_message", arguments: { to_address: senderOf(call), content: "ack" } }]);
       },
@@ -783,7 +797,8 @@ describe("inbox turn isolation", () => {
     const sequence: string[] = [];
     const failingInbox = (): Responder => (_n, call) => {
       sequence.push(`inbox:${senderOf(call)}`);
-      throw new Error("request too large");
+      // A caller-side 413: the router neither retries nor falls back.
+      throw new InferenceHttpError("conway", 413, "request too large");
     };
     // Varied tools, so loop detection does not queue a warning input, which
     // would hold back the inbox claim.

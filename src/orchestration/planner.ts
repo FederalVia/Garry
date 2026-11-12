@@ -1,5 +1,6 @@
 import type { Goal, TaskNode } from "./task-graph.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { runWithInferenceScope } from "../inference/gate.js";
 import type { ModelTier } from "../inference/provider-registry.js";
 
 export interface PlannerOutput {
@@ -79,6 +80,19 @@ export interface PlannerFailureInput {
 }
 
 const MODEL_TIERS: readonly ModelTier[] = ["reasoning", "fast", "cheap"];
+const PLANNER_MAX_TOKENS = 8192;
+
+/**
+ * The model answered but its plan was unusable (empty, invalid JSON, failed
+ * validation). Only this error justifies a fallback plan; a refusal or a
+ * provider failure means "try again later".
+ */
+export class PlannerOutputError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "PlannerOutputError";
+  }
+}
 
 export async function planGoal(
   goal: PlannerGoalInput,
@@ -122,14 +136,29 @@ function runPlannerInference(params: {
     failedTask: params.failedTask,
   });
 
-  return params.inference.chat({
-    tier: "reasoning",
-    responseFormat: { type: "json_object" },
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  }).then((result) => validatePlannerOutput(parsePlannerResponse(result.content)));
+  // The caller is set here so a worker's nested planner call keeps its task
+  // attribution (the scope merges) but is priced and limited as a planner call.
+  // Refusals propagate untouched: callers must not treat them as model errors.
+  return runWithInferenceScope(
+    { caller: params.mode === "plan_goal" ? "orchestrator.plan" : "orchestrator.replan" },
+    () => params.inference.chat({
+      tier: "reasoning",
+      purpose: "planner",
+      // Not clamped: a truncated plan fails to parse.
+      maxTokens: PLANNER_MAX_TOKENS,
+      responseFormat: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    }),
+  ).then((result) => {
+    try {
+      return validatePlannerOutput(parsePlannerResponse(result.content));
+    } catch (error) {
+      throw new PlannerOutputError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+  });
 }
 
 export function goalToPlannerInput(goal: Goal): PlannerGoalInput {

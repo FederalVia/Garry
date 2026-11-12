@@ -35,6 +35,10 @@ import { prettySink } from "./observability/pretty-sink.js";
 import { startupBootstrapTopup } from "./conway/topup.js";
 import { readUsdcAuthorizationState } from "./conway/x402.js";
 import { Treasury, installTreasury, normalizeTreasuryPolicy } from "./treasury/index.js";
+import { InferenceGate, installInferenceGate } from "./inference/gate.js";
+import { getSurvivalTier } from "./conway/credits.js";
+import { resolveInferencePolicy, registryPrice, checkPolicySanity } from "./inference/policy.js";
+import { DEFAULT_ROUTING_MATRIX } from "./inference/types.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -266,6 +270,13 @@ async function run(): Promise<void> {
     conwayApiUrl: config.conwayApiUrl,
   });
   installTreasury(treasury);
+
+  // Inference spend gate: every inference attempt (main loop, orchestrator,
+  // workers) reserves against the same caps, including the daily cap from
+  // treasuryPolicy.maxInferenceDailyCents.
+  const inferencePolicy = resolveInferencePolicy(config, treasuryPolicy);
+  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy });
+  installInferenceGate(inferenceGate);
   // Resolve payments a previous run left without an answer.
   void treasury
     .reconcileX402({ limit: 20 })
@@ -313,6 +324,23 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  {
+    const criticalId = config.modelStrategy?.criticalModel || "gpt-5-mini";
+    const critical = modelRegistry.get(criticalId);
+    checkPolicySanity(
+      inferencePolicy,
+      critical
+        ? {
+            model: critical.modelId,
+            price: registryPrice(critical),
+            matrixCeilings: {
+              critical: DEFAULT_ROUTING_MATRIX.critical.agent_turn.ceilingCents,
+              low_compute: DEFAULT_ROUTING_MATRIX.low_compute.agent_turn.ceilingCents,
+            },
+          }
+        : null,
+    );
+  }
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
     apiKey,
@@ -481,9 +509,24 @@ async function run(): Promise<void> {
         // Sleep, but check for wake requests periodically
         const checkInterval = Math.min(sleepMs, 30_000);
         let slept = 0;
+        let sinceSurvivalRefresh = 0;
         while (slept < sleepMs) {
           await sleep(checkInterval);
           slept += checkInterval;
+          sinceSurvivalRefresh += checkInterval;
+
+          // Workers from earlier cycles keep running while the loop sleeps,
+          // so keep the gate's survival tier current. A failed read keeps the
+          // last tier rather than reading as zero.
+          if (sinceSurvivalRefresh >= SURVIVAL_REFRESH_MS) {
+            sinceSurvivalRefresh = 0;
+            try {
+              const creditsCents = await conway.getCreditsBalance();
+              inferenceGate.setSurvival({ tier: getSurvivalTier(creditsCents), creditsCents });
+            } catch (err: any) {
+              logger.warn(`Survival tier refresh failed: ${err?.message || String(err)}`);
+            }
+          }
 
           // Phase 1.1: Check for wake events from wake_events table (atomic consume)
           const wakeEvent = consumeNextWakeEvent(db.raw);
@@ -509,6 +552,9 @@ async function run(): Promise<void> {
     }
   }
 }
+
+/** How often the sleeping runtime refreshes the gate's survival tier. */
+const SURVIVAL_REFRESH_MS = 5 * 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
