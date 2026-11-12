@@ -439,22 +439,29 @@ describe("sandboxes and domains are priced, bounded and capped (F050)", () => {
     expect(h.inner.calls.createSandbox[0].args[0]).toMatchObject({ name: "box", vcpu: 1, memoryMb: 512, diskGb: 5 });
   });
 
-  it("C12: no matching price reserves the infra single cap as a ceiling", async () => {
+  it("C12: no matching price refuses the sandbox unsent (review TREASURY-2)", async () => {
     const h = harness({ pricing: [], balance: 100_000 });
     const res = await run(h, "create_sandbox", { name: "box" }, { source: "agent" });
-    expect(res.error).toBeUndefined();
-    const [row] = h.rows("infra", "committed");
-    expect(row.amount_cents).toBe(2500);
-    expect(row.amount_basis).toBe("ceiling");
+    expect(res.error).toContain("PRICE_UNKNOWN");
+    expect(h.inner.calls.createSandbox).toHaveLength(0);
+    expect(h.rows("infra", "committed")).toHaveLength(0);
+
+    // A spec no priced tier covers is refused too, never charged at the single cap.
+    const small = harness({ pricing: [SMALL_TIER], balance: 100_000 });
+    expect(await deniedCode(small.conway.createSandbox({ name: "big", vcpu: 4, memoryMb: 8192, diskGb: 80 }))).toBe(
+      "PRICE_UNKNOWN",
+    );
+    expect(small.inner.calls.createSandbox).toHaveLength(0);
   });
 
-  it("a pricing error also reserves the ceiling", async () => {
+  it("a pricing error refuses the sandbox unsent (review TREASURY-2)", async () => {
     const h = harness({ balance: 100_000 });
     h.inner.getCreditsPricing = async () => {
       throw new Error("pricing down");
     };
-    await h.conway.createSandbox({ name: "box" });
-    expect(h.rows("infra", "committed")[0]).toMatchObject({ amount_cents: 2500, amount_basis: "ceiling" });
+    expect(await deniedCode(h.conway.createSandbox({ name: "box" }))).toBe("PRICE_UNKNOWN");
+    expect(h.inner.calls.createSandbox).toHaveLength(0);
+    expect(h.rows("infra", "committed")).toHaveLength(0);
   });
 
   it("rejects non-integer, negative and out-of-range resources", async () => {
@@ -520,16 +527,32 @@ describe("sandboxes and domains are priced, bounded and capped (F050)", () => {
     expect(h.inner.calls.registerDomain).toHaveLength(1);
   });
 
-  it("C14 (units): small or fractional prices are dollars, whole cents above $1 are cents", async () => {
+  it("C14 (units): quotes are whole cents; a fractional quote is refused unsent (review TREASURY-3, PAYMENTS-2)", async () => {
     for (const [price, perYear] of [
-      [12.99, 1299],
-      [12, 1200],
       [1200, 1200],
+      [99, 99],
+      [15_000, 15_000],
     ] as const) {
-      const h = harness({ balance: 100_000 });
+      const h = harness({ balance: 1_000_000, policy: { maxInfraSingleCents: 100_000, maxInfraDailyCents: 100_000 } });
       h.inner.domains = [{ domain: "test.com", available: true, registrationPrice: price, currency: "USD" }];
       await h.conway.registerDomain("test.com", 1);
       expect(h.rows("infra", "committed")[0].amount_cents).toBe(perYear);
+      h.close();
+    }
+    // A $150 premium name is 15000 cents: above the default $25 single cap.
+    const premium = harness({ balance: 100_000 });
+    premium.inner.domains = [{ domain: "premium.com", available: true, registrationPrice: 15_000, currency: "USD" }];
+    expect(await deniedCode(premium.conway.registerDomain("premium.com", 1))).toBe("SPEND_LIMIT_EXCEEDED");
+    premium.close();
+    for (const [registrationPrice, renewalPrice] of [
+      [12.99, undefined],
+      [99.99, undefined],
+      [1200, 9.99],
+    ] as const) {
+      const h = harness({ balance: 100_000 });
+      h.inner.domains = [{ domain: "test.com", available: true, registrationPrice, renewalPrice, currency: "USD" }];
+      expect(await deniedCode(h.conway.registerDomain("test.com", 1))).toBe("PRICE_UNKNOWN");
+      expect(h.inner.calls.registerDomain).toHaveLength(0);
       h.close();
     }
   });
@@ -541,7 +564,7 @@ describe("sandboxes and domains are priced, bounded and capped (F050)", () => {
     await h.conway.registerDomain("test.com", 3);
     expect(h.rows("infra", "committed")[0].amount_cents).toBe(199 + 2 * 1500);
     // A renewal cheaper than the first year never lowers later years.
-    h.inner.domains = [{ domain: "two.com", available: true, registrationPrice: 12.99, renewalPrice: 9.99, currency: "USD" }];
+    h.inner.domains = [{ domain: "two.com", available: true, registrationPrice: 1299, renewalPrice: 999, currency: "USD" }];
     await h.conway.registerDomain("two.com", 2);
     expect(h.rows("infra", "committed").find((r) => r.counterparty === "two.com")?.amount_cents).toBe(2 * 1299);
   });
@@ -603,7 +626,7 @@ describe("sandboxes and domains are priced, bounded and capped (F050)", () => {
   });
 
   it("spawn_child creates its sandbox through the gate and surfaces a denial", async () => {
-    const h = harness({ pricing: [], balance: 2000 });
+    const h = harness({ pricing: [{ name: "child", vcpu: 1, memoryMb: 1024, diskGb: 10, monthlyCents: 1500 }], balance: 2000 });
     const res = await run(h, "spawn_child", { name: "kid" }, { source: "agent" });
     expect(res.error).toContain("Policy denied: RESERVE_VIOLATION");
     expect(h.inner.calls.createSandbox).toHaveLength(0);
@@ -784,6 +807,33 @@ describe("ambiguous and rejected transfers (H1-005, H1-006)", () => {
     expect(transfer.error).toContain("Transfer rejected (status rejected)");
     const auto = new SimpleFundingProtocol(h.conway, createTestIdentity(), h.db);
     expect((await auto.fundChild(OTHER_ADDRESS, 100)).success).toBe(false);
+  });
+
+  it("C22 (statuses): one shared classifier; declined-style statuses are rejected, unrecognised ones are held unknown (review PAYMENTS-3)", async () => {
+    for (const status of ["declined", "insufficient_funds", "denied", "invalid_recipient", "expired", "refused"]) {
+      const h = harness({ policy: AUDIT_POLICY, balance: 100_000 });
+      addChild(h, "kid", CHILD_ADDRESS);
+      h.inner.transferResult = { status, amountCents: 500 };
+      const res = await run(h, "fund_child", { child_id: "kid", amount_cents: 500 }, { source: "agent" });
+      expect(res.error).toBe(`Transfer rejected (status ${status}); nothing recorded as spent.`);
+      expect(h.rows("transfer", "released")).toHaveLength(1);
+      expect(transferOutRows(h)).toBe(0);
+      expect(funded(h, "kid")).toBe(0);
+      expect(h.db.getChildById("kid")!.status).toBe("wallet_verified");
+      h.close();
+    }
+
+    const h = harness({ policy: AUDIT_POLICY, balance: 100_000 });
+    addChild(h, "kid", CHILD_ADDRESS);
+    h.inner.transferResult = { status: "on_hold", amountCents: 500 };
+    const res = await run(h, "fund_child", { child_id: "kid", amount_cents: 500 }, { source: "agent" });
+    expect(res.error).toContain("Outcome unknown");
+    // Held as spent against the budget, but never reported or recorded as a completed transfer.
+    expect(h.rows("transfer", "unknown")).toHaveLength(1);
+    expect(h.treasury.usage("transfer", HOUR_MS)).toBe(500);
+    expect(transferOutRows(h)).toBe(0);
+    expect(funded(h, "kid")).toBe(0);
+    expect(h.db.getChildById("kid")!.status).toBe("wallet_verified");
   });
 
   it("R4: a lower server-reported amount never lowers what is counted", async () => {

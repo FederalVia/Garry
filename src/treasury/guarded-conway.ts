@@ -23,6 +23,7 @@ import type {
   SandboxInfo,
 } from "../types.js";
 import { createLogger } from "../observability/logger.js";
+import { classifyTransferStatus } from "../conway/transfer-status.js";
 import {
   domainDedupeKey,
   domainRegistrationCents,
@@ -58,7 +59,7 @@ export const MAX_DOMAIN_YEARS = 10;
 
 /** A 2xx transfer answer whose status says the transfer did not happen. */
 export function isRejectedTransferStatus(status: unknown): boolean {
-  return typeof status === "string" && /fail|error|reject|cancel/i.test(status);
+  return classifyTransferStatus(status) === "rejected";
 }
 
 export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolver): ConwayClient {
@@ -77,21 +78,26 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
   /**
    * Price a sandbox: the cheapest priced tier covering the request, never
    * below the configured floor. No matching tier or a pricing error means
-   * the infra single cap is reserved as a ceiling.
+   * the price is unknown, and nothing is reserved or sent (PRICE_UNKNOWN):
+   * the infra cap is not an upper bound on what Conway bills.
    */
   async function priceSandbox(
     t: Treasury,
     spec: { vcpu: number; memoryMb: number; diskGb: number },
   ): Promise<{ cents: number; basis: AmountBasis }> {
-    const ceiling = { cents: t.policy.maxInfraSingleCents, basis: "ceiling" as const };
+    const describe = `${spec.vcpu} vCPU / ${spec.memoryMb}MB / ${spec.diskGb}GB`;
     let tiers: PricingTier[];
     try {
       tiers = await readPricing();
     } catch (err) {
-      logger.warn("Sandbox pricing unavailable; reserving the infra ceiling", {
+      logger.warn("Sandbox pricing unavailable; refusing the sandbox", {
         error: err instanceof Error ? err.message : String(err),
       });
-      return ceiling;
+      throw new TreasuryDeniedError(
+        "PRICE_UNKNOWN",
+        `Sandbox pricing is unavailable, so a ${describe} sandbox cannot be priced; try again later`,
+        "infra",
+      );
     }
     let best: number | undefined;
     for (const tier of tiers) {
@@ -106,7 +112,13 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
         if (best === undefined || cents < best) best = cents;
       }
     }
-    if (best === undefined) return ceiling;
+    if (best === undefined) {
+      throw new TreasuryDeniedError(
+        "PRICE_UNKNOWN",
+        `No priced sandbox tier covers ${describe}`,
+        "infra",
+      );
+    }
     return { cents: Math.max(best, t.policy.minSandboxEstimateCents), basis: "estimate" };
   }
 
@@ -176,8 +188,13 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
               : { outcome: "unknown", reason: errorText(o.error) };
           }
           const v = o.value;
-          if (isRejectedTransferStatus(v?.status)) {
+          const statusClass = classifyTransferStatus(v?.status);
+          if (statusClass === "rejected") {
             return { outcome: "released", reason: `transfer rejected (status ${v.status})` };
+          }
+          if (statusClass === "unknown") {
+            // Not provably moved or refused: hold the amount, do not report success.
+            return { outcome: "unknown", reason: `unrecognised transfer status ${JSON.stringify(v?.status)}` };
           }
           // settle counts max(reserved, reported), so a low report never under-counts.
           return {
@@ -252,10 +269,19 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
           "infra",
         );
       }
+      const amountCents = domainRegistrationCents(quoteResult.registration, quoteResult.renewal, years);
+      if (amountCents === null) {
+        throw new TreasuryDeniedError(
+          "PRICE_UNKNOWN",
+          `The quote for ${name} is not a whole number of cents ` +
+            `(registration ${String(quoteResult.registration)}, renewal ${String(quoteResult.renewal)})`,
+          "infra",
+        );
+      }
       return t.guard(
         {
           kind: "domain_register",
-          amountCents: domainRegistrationCents(quoteResult.registration, quoteResult.renewal, years),
+          amountCents,
           amountBasis: "quote",
           counterparty: name.toLowerCase(),
           dedupeKey: domainDedupeKey(name, years),
@@ -276,7 +302,7 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
 async function quoteDomain(
   inner: ConwayClient,
   domain: string,
-): Promise<{ registration: number; renewal?: number } | undefined> {
+): Promise<{ registration: number; renewal?: unknown } | undefined> {
   let results;
   try {
     results = await inner.searchDomains(domain);

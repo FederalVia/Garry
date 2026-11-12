@@ -388,6 +388,12 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "packages/cli/src/commands/fund",
   "packages/cli/src/commands/send",
   "audit-log",
+  // Signs ERC-8004 transactions with the wallet key (gas paid in ETH).
+  "registry/erc8004",
+  // Helpers guard code decides with: injection-defense folds text with
+  // text-normalize; the logger and the operator CLI escape with terminal-safe.
+  "agent/text-normalize",
+  "observability/terminal-safe",
 ]);
 
 /**
@@ -406,11 +412,19 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "operator",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
-const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts"]);
+// packages/ holds the workspace packages the root build compiles after the
+// runtime (`tsc && pnpm -r build`): the operator CLI's built commands, their
+// tsconfig (whose outDir can point at the protected dist/) and node_modules/.bin
+// shims the build runs. All of it is a build input or operator code.
+const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts", "packages"]);
 const CHECKOUT_ROOT_FILES = new Set([
   "package.json",
   "pnpm-lock.yaml",
   "package-lock.json",
+  // Workspace layout and install hooks: both decide what the build runs.
+  "pnpm-workspace.yaml",
+  ".pnpmfile.cjs",
+  ".pnpmfile.mjs",
   ".gitignore",
   "constitution.md",
 ]);
@@ -455,6 +469,25 @@ function matchHomeStartup(segs: string[]): string | null {
     if (rel.length === 1 && HOME_STARTUP_FILES.has(rel[0])) return `home-startup:${rel[0]}`;
     for (const dir of HOME_STARTUP_DIRS) {
       if (rel.length > dir.length && startsWithSegments(rel, dir)) return `home-startup:${dir.join("/")}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * A directory target (git clone) that is a home, or a home startup directory
+ * or one of its parents: the clone would create it and fill it with the
+ * repository's files (git's global config, executables on PATH).
+ */
+export function matchHomeStartupContainer(absPath: string): string | null {
+  const segs = segmentsOf(absPath);
+  for (const home of new Set([homeDir(), "/root"])) {
+    const homeSegs = segmentsOf(home);
+    if (!startsWithSegments(segs, homeSegs)) continue;
+    const rel = segs.slice(homeSegs.length);
+    if (rel.length === 0) return "home-startup:home";
+    for (const dir of HOME_STARTUP_DIRS) {
+      if (startsWithSegments(dir, rel)) return `home-startup:${dir.join("/")}`;
     }
   }
   return null;
@@ -549,6 +582,8 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "conway/x402",
   "conway/topup",
   "conway/balance",
+  "conway/transfer-status",
+  "registry/erc8004",
   "heartbeat/tick-context",
   "operator/fund",
   "operator/send",

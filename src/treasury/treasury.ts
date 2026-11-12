@@ -121,6 +121,13 @@ export interface TreasuryDeps {
   bootId?: string;
   /** Rows of other boots created before this are recovered. Default: now() at construction. */
   processStartMs?: number;
+  /**
+   * The caller holds the state database's instance lock, so no other boot is
+   * alive: construction then recovers every open row of another boot, with
+   * no time condition (a clock stepped back behind a dead boot's rows must
+   * not leave them open). The hourly recovery pass keeps the time condition.
+   */
+  holdsInstanceLock?: boolean;
 }
 
 /** What an authorizationState read can say; see TreasuryDeps.readAuthorizationState. */
@@ -201,7 +208,7 @@ export class Treasury {
     if (ensured.legacyCopied > 0) {
       logger.info(`Copied ${ensured.legacyCopied} legacy spend rows into the treasury ledger`);
     }
-    const recovered = this.recover();
+    const recovered = this.recover({ allOtherBoots: deps.holdsInstanceLock === true });
     if (recovered.released || recovered.unknown) {
       logger.warn("Recovered open treasury rows from an earlier process", recovered);
     }
@@ -999,9 +1006,11 @@ export class Treasury {
   /**
    * Close rows left open by a process that is gone: 'reserved' -> 'released'
    * (nothing was sent), 'sent' -> 'unknown'. Only rows of another boot that
-   * were created before this process started, or are stale, are touched.
+   * were created before this process started, or are stale, are touched;
+   * with allOtherBoots (startup under the instance lock) every row of
+   * another boot is.
    */
-  recover(): { released: number; unknown: number } {
+  recover(opts: { allOtherBoots?: boolean } = {}): { released: number; unknown: number } {
     const now = this.now();
     const params = {
       boot: this.bootId,
@@ -1009,7 +1018,10 @@ export class Treasury {
       stale: now - STALE_OPEN_ROW_MS,
       now,
     };
-    const scope = `(boot_id IS NULL OR boot_id != @boot) AND (created_at_ms < @start OR created_at_ms < @stale)`;
+    const otherBoot = `(boot_id IS NULL OR boot_id != @boot)`;
+    const scope = opts.allOtherBoots
+      ? otherBoot
+      : `${otherBoot} AND (created_at_ms < @start OR created_at_ms < @stale)`;
     return this.db
       .transaction(() => {
         const released = this.db

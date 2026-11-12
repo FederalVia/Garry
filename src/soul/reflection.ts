@@ -135,17 +135,22 @@ function gatherRecentEvidence(db: BetterSqlite3.Database): RecentEvidence {
       toolsUsed.push(row.name);
     }
 
-    // Get recent social interactions
-    const inboxRows = db
-      .prepare(
-        "SELECT from_address FROM inbox_messages ORDER BY received_at DESC LIMIT 20",
-      )
-      .all() as { from_address: string }[];
-    for (const row of inboxRows) {
-      if (!isValidSenderAddress(row.from_address)) continue;
-      if (!interactions.includes(row.from_address)) {
-        interactions.push(row.from_address);
+    // Get recent social interactions: signed senders only, since an
+    // unsigned address is whatever the relay reported.
+    try {
+      const inboxRows = db
+        .prepare(
+          "SELECT from_address FROM inbox_messages WHERE verified = 1 ORDER BY received_at DESC LIMIT 20",
+        )
+        .all() as { from_address: string }[];
+      for (const row of inboxRows) {
+        if (!isValidSenderAddress(row.from_address)) continue;
+        if (!interactions.includes(row.from_address)) {
+          interactions.push(row.from_address);
+        }
       }
+    } catch {
+      // A database without the verified column has no signed senders.
     }
 
     // Get recent financial activity

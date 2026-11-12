@@ -99,6 +99,8 @@ declare module "@conway/automaton/operator/fund.js" {
     opts: { paths: readonly string[]; idempotencyKey?: string; timeoutMs?: number },
   ): Promise<FundResult>;
   export function formatUsd(cents: number): string;
+  export function formatFundResult(plan: FundPlan, result: FundResult): string;
+  export function formatFundError(err: unknown): string;
   export function confirmOnTty(question: string): Promise<boolean | null>;
   export const FUND_USAGE: string;
 }
@@ -114,4 +116,16 @@ declare module "@conway/automaton/operator/send.js" {
     to: string;
     content: string;
   }): Promise<SendOperatorResult>;
+  export function formatSendResult(result: SendOperatorResult): { ok: boolean; lines: string[] };
+}
+
+declare module "@conway/automaton/observability/terminal-safe.js" {
+  export function escapeForTerminal(text: string, opts?: { keepNewlines?: boolean }): string;
+}
+
+declare module "@conway/automaton/operator/turn-log.js" {
+  import type { CliTurn } from "@conway/automaton/state/database.js";
+
+  export function formatTurnLines(turn: CliTurn): string[];
+  export function formatActivityLine(turn: Pick<CliTurn, "timestamp" | "thinking" | "toolCalls">): string;
 }

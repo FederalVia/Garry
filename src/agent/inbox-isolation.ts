@@ -91,14 +91,40 @@ export function isolatedTurnSql(alias?: string): string {
 
 export const ISOLATED_TURN_SQL = isolatedTurnSql();
 
-/** Format one inbox message for the model. */
-export function formatInboxMessage(sender: string, body: string): string {
-  return `[${INBOX_LABEL} ${sender}]: ${body}`;
+/** What the label says about the sender address. */
+export const VERIFIED_SENDER_NOTE = "signature verified";
+export const UNVERIFIED_SENDER_NOTE = "NOT VERIFIED: address reported by relay";
+
+/** Marker in front of every line of a message body. */
+export const INBOX_QUOTE = "> ";
+
+function labelAddress(sender: string): string {
+  // Addresses are alphanumeric; anything else could break out of the label.
+  return sender.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128) || "unknown";
 }
 
-/** Prefix every stored inbox turn from this sender starts with. */
-export function inboxTurnPrefix(sender: string): string {
-  return `[${INBOX_LABEL} ${sender}]: `;
+/**
+ * Prefix every stored inbox turn from this sender starts with. It says
+ * whether the address was proven by a signature or only reported by the
+ * relay.
+ */
+export function inboxTurnPrefix(sender: string, verified: boolean): string {
+  const note = verified ? VERIFIED_SENDER_NOTE : UNVERIFIED_SENDER_NOTE;
+  return `[${INBOX_LABEL} ${labelAddress(sender)} | ${note}]:\n`;
+}
+
+/**
+ * Format one inbox message for the model: the label on its own line, then
+ * every line of the body quoted. A label typed inside a body therefore never
+ * starts a line, so a sender cannot forge another message's label (say, a
+ * "signature verified" one for the creator's address).
+ */
+export function formatInboxMessage(sender: string, body: string, verified: boolean): string {
+  const quoted = body
+    .split(/\r\n|\r|\n|\u2028|\u2029/)
+    .map((line) => INBOX_QUOTE + line)
+    .join("\n");
+  return inboxTurnPrefix(sender, verified) + quoted;
 }
 
 export interface InboxToolCallContext {

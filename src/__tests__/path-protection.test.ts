@@ -493,3 +493,175 @@ describe("path protection on real paths", () => {
     }
   }
 });
+
+// ─── The real home, not /root ────────────────────────────────────
+
+describe("path protection follows the home the tool really writes to", () => {
+  const rules = createPathProtectionRules();
+  const protectedFilesRule = rules.find((r) => r.id === "path.protected_files")!;
+  const readSensitiveRule = rules.find((r) => r.id === "path.read_sensitive")!;
+  let tmp: string;
+  let home: string;
+  let originalHome: string | undefined;
+
+  /** Makes /root behave as it does for a non-root user (mode 0700, owned by root), whoever runs the tests. */
+  function hideRoot(): void {
+    const denied = (p: unknown) => {
+      const s = String(p);
+      return s === "/root" || s.startsWith("/root/");
+    };
+    const eacces = (p: unknown) =>
+      Object.assign(new Error(`EACCES: permission denied, '${String(p)}'`), { code: "EACCES" });
+    for (const name of ["realpathSync", "lstatSync", "statSync"] as const) {
+      const original = fs[name].bind(fs) as (...a: unknown[]) => unknown;
+      vi.spyOn(fs, name).mockImplementation(((p: unknown, ...rest: unknown[]) => {
+        if (denied(p)) throw eacces(p);
+        return original(p, ...rest);
+      }) as never);
+    }
+  }
+
+  function request(toolName: string, filePath: string, sandboxId?: string): PolicyRequest {
+    const req = makeMockRequest(toolName, { path: filePath, url: "https://example.test/r.git" });
+    if (sandboxId !== undefined) req.context = { identity: { ...createTestIdentity(), sandboxId } } as ToolContext;
+    return req;
+  }
+
+  const write = (p: string, sandboxId?: string, tool = "write_file") =>
+    protectedFilesRule.evaluate(request(tool, p, sandboxId));
+  const read = (p: string, sandboxId?: string) => readSensitiveRule.evaluate(request("read_file", p, sandboxId));
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "path-home-")));
+    home = path.join(tmp, "home");
+    fs.mkdirSync(path.join(home, ".automaton"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".automaton", "wallet.json"), "{}");
+    fs.writeFileSync(path.join(home, "plain.txt"), "x");
+    fs.symlinkSync(path.join(home, "plain.txt"), path.join(home, "link.txt"));
+    fs.mkdirSync(path.join(home, "d"));
+    fs.symlinkSync("../.automaton/wallet.json", path.join(home, "d", "notes.txt"));
+    originalHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    process.env.HOME = originalHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // "" is a local sandbox id, "sbx-1" a remote one, undefined a request without identity.
+  for (const sandboxId of ["", undefined, "sbx-1"]) {
+    const label = sandboxId === "" ? "local" : sandboxId === undefined ? "no identity" : "remote";
+
+    it(`${label}: an uninspectable /root never denies an ordinary write, read or clone`, () => {
+      hideRoot();
+      for (const p of ["readme.md", "notes/today.md", "~/readme.md", "~d/plain.txt", "~newdir/x.txt", "/root/work/notes.txt"]) {
+        expect(write(p, sandboxId), p).toBeNull();
+        expect(read(p, sandboxId), p).toBeNull();
+      }
+      for (const p of ["~", "~/", "plain.txt"]) expect(read(p, sandboxId), p).toBeNull();
+      for (const p of ["repo", "~/repo", "~/.automaton/workspace/g/repo"]) {
+        expect(write(p, sandboxId, "git_clone"), p).toBeNull();
+      }
+    });
+
+    it(`${label}: protected names are denied wherever the write may land, /root uninspectable or not`, () => {
+      for (const hidden of [false, true]) {
+        if (hidden) hideRoot();
+        for (const p of [
+          "~/.automaton/wallet.json",
+          "~.automaton/heartbeat.yml",
+          ".bashrc",
+          "~/.ssh/authorized_keys",
+          ".automaton/state.db",
+          "/root/.automaton/wallet.json",
+          "/root/.profile",
+        ]) {
+          expect(write(p, sandboxId)?.action, `${p} hidden=${hidden}`).toBe("deny");
+        }
+        expect(write("~/.automaton/skills/x", sandboxId, "git_clone")?.action).toBe("deny");
+        expect(read("~/.ssh/id_ed25519", sandboxId)?.reasonCode).toBe("SENSITIVE_FILE_READ");
+        expect(read("/root/.ssh/id_rsa", sandboxId)?.reasonCode).toBe("SENSITIVE_FILE_READ");
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  for (const sandboxId of ["", undefined, "sbx-1"]) {
+    const label = sandboxId === "" ? "local" : sandboxId === undefined ? "no identity" : "remote";
+    it(`${label}: git_clone may not target a home or a home startup directory or its parent`, () => {
+      for (const hidden of [false, true]) {
+        if (hidden) hideRoot();
+        for (const p of [
+          "~",
+          "~/bin",
+          "~/.local/bin",
+          "~/.local",
+          "~/.config/git",
+          "~/.config",
+          "bin",
+          ".config",
+          ".local/bin",
+          `${home}/bin`,
+          "/root",
+          "/root/bin",
+          "/root/.config",
+          "/root/.local/bin",
+        ]) {
+          expect(write(p, sandboxId, "git_clone")?.action, `${p} hidden=${hidden}`).toBe("deny");
+        }
+        for (const p of ["~/repo", "~/.config/other", "~/.local/share/repo", "~/binaries", "projects/bin"]) {
+          expect(write(p, sandboxId, "git_clone"), `${p} hidden=${hidden}`).toBeNull();
+        }
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  for (const sandboxId of ["", undefined]) {
+    it(`${sandboxId === "" ? "local" : "no identity"}: links in the real home are denied, /root uninspectable or not`, () => {
+      for (const hidden of [false, true]) {
+        if (hidden) hideRoot();
+        expect(write("link.txt", sandboxId)?.reasonCode, `hidden=${hidden}`).toBe("PROTECTED_SYMLINK");
+        expect(write("~/link.txt", sandboxId)?.reasonCode, `hidden=${hidden}`).toBe("PROTECTED_SYMLINK");
+        expect(write("~d/notes.txt", sandboxId)?.reasonCode, `hidden=${hidden}`).toBe("PROTECTED_SYMLINK");
+        expect(read("d/notes.txt", sandboxId)?.reasonCode, `hidden=${hidden}`).toBe("SENSITIVE_FILE_READ");
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  it("local: an uninspectable primary path in the real home is still denied", () => {
+    const real = fs.realpathSync.bind(fs) as (...a: unknown[]) => unknown;
+    const lstat = fs.lstatSync.bind(fs) as (...a: unknown[]) => unknown;
+    const locked = path.join(home, "locked");
+    const isLocked = (p: unknown) => String(p) === locked || String(p).startsWith(locked + "/");
+    const eacces = () => Object.assign(new Error("EACCES"), { code: "EACCES" });
+    vi.spyOn(fs, "realpathSync").mockImplementation(((p: unknown, ...r: unknown[]) => {
+      if (isLocked(p)) throw eacces();
+      return real(p, ...r);
+    }) as never);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((p: unknown, ...r: unknown[]) => {
+      if (isLocked(p)) throw eacces();
+      return lstat(p, ...r);
+    }) as never);
+    const result = write("locked/x.txt", "");
+    expect(result?.action).toBe("deny");
+    expect(result?.humanMessage).toContain("UNRESOLVABLE");
+  });
+
+  it("local: write_file and git_clone are checked against the real home only, never a /root that is not HOME", () => {
+    const seen: string[] = [];
+    const original = fs.lstatSync.bind(fs) as (...a: unknown[]) => unknown;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((p: unknown, ...r: unknown[]) => {
+      seen.push(String(p));
+      return original(p, ...r);
+    }) as never);
+    expect(write("readme.md", "")).toBeNull();
+    expect(write("~/readme.md", "")).toBeNull();
+    expect(write("repo", "", "git_clone")).toBeNull();
+    expect(seen.filter((p) => p === "/root" || p.startsWith("/root/"))).toEqual([]);
+    expect(seen).toContain(path.join(home, "readme.md"));
+  });
+});

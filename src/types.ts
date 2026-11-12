@@ -194,6 +194,30 @@ export interface InboxMessage {
   signedAt: string;
   createdAt: string;
   replyTo?: string;
+  /**
+   * True only when the sender's signature was checked against `from`.
+   * Anything else (missing, false) means `from` is what the relay reported.
+   */
+  verified?: boolean;
+  /** Replay key derived from the signed message (or an exact re-delivery). */
+  sigHash?: string;
+}
+
+/**
+ * Inbox row statuses written at ingest. blocked and rate_limited are never
+ * claimed; deferred becomes received when the sender's rate allows.
+ */
+export type InboxIngestStatus = "received" | "deferred" | "blocked" | "rate_limited";
+
+/** Fields stored with an inbox row besides the message itself. */
+export interface InboxMessageInsert extends InboxMessage {
+  status?: InboxIngestStatus;
+  /** Screening verdict (JSON), rendered at claim time without screening again. */
+  screen?: string;
+  /** The relay's own createdAt; received_at is our local clock. */
+  relayCreatedAt?: string;
+  /** When the row became claimable (local clock); unset while it is not. */
+  availableAt?: string;
 }
 
 // ─── Heartbeat ───────────────────────────────────────────────────
@@ -777,7 +801,8 @@ export interface AutomatonDatabase {
   getReputation(agentAddress?: string): ReputationEntry[];
 
   // Inbox
-  insertInboxMessage(msg: InboxMessage): void;
+  /** Returns false when the row was a duplicate (same id or replay key). */
+  insertInboxMessage(msg: InboxMessageInsert): boolean;
   getUnprocessedInboxMessages(limit: number): InboxMessage[];
   markInboxMessageProcessed(id: string): void;
 

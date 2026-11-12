@@ -7,6 +7,7 @@
 import chalk from "chalk";
 import { loadConfig, resolvePath } from "@conway/automaton/config.js";
 import { createDatabase } from "@conway/automaton/state/database.js";
+import { formatActivityLine } from "@conway/automaton/operator/turn-log.js";
 
 const accent = chalk.rgb(131, 127, 255);
 
@@ -52,12 +53,7 @@ console.log(divider);
 if (recentTurns.length > 0) {
   console.log(chalk.bold("\nRecent activity"));
   for (const turn of recentTurns) {
-    const toolNames = turn.toolCalls.map((t) => t.name).join(", ");
-    console.log(
-      "  " + chalk.dim(turn.timestamp) + "  " +
-      chalk.white(turn.thinking.slice(0, 80)) + chalk.dim("...") +
-      (toolNames ? chalk.magenta(`  [${toolNames}]`) : "")
-    );
+    console.log(formatActivityLine(turn));
   }
 }
 

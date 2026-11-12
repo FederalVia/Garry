@@ -159,7 +159,7 @@ describe("schema version 15 migration", () => {
     try {
       const v = db.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
       expect(v.v).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(15);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(15);
 
       const rowsAfter = db.raw
         .prepare("SELECT model_id, provider, display_name, enabled, created_at, updated_at FROM model_registry ORDER BY model_id")

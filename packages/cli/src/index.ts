@@ -6,6 +6,8 @@
  * Usage: automaton-cli <command> [args]
  */
 
+import { escapeForTerminal } from "@conway/automaton/observability/terminal-safe.js";
+
 const args = process.argv.slice(2);
 const command = args[0];
 
@@ -38,6 +40,6 @@ Usage:
 }
 
 main().catch((err) => {
-  console.error(`Error: ${err.message}`);
+  console.error(`Error: ${escapeForTerminal(String(err?.message ?? err), { keepNewlines: false })}`);
   process.exit(1);
 });

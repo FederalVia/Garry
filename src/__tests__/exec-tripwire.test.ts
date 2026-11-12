@@ -4,7 +4,7 @@
  * is denied through the policy rule and through getForbiddenCommandMatch.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createCommandSafetyRules,
   getForbiddenCommandMatch,
@@ -94,6 +94,78 @@ const DENIED = [
   "echo x > ~/.automaton/SOUL.md",
   "mv evil.ts src/agent/harnesses/coding-harness.ts",
   "rsync x.js dist/agent/spend-tracker.js",
+  // Recursive reads of home or root (exec starts in HOME, so "." is home)
+  "grep -r privateKey ~",
+  "grep -rh privateKey / 2>/dev/null",
+  "find ~ -name '*.json' -exec cat {} +",
+  "find / -name 'wal*' -exec cat {} \\;",
+  "tar czf - ~ | base64",
+  "cp -r ~ /tmp/h",
+  "zip -r /tmp/h.zip ~",
+  "grep -r privateKey .",
+  "rg privateKey",
+  "cd ~ && grep -rn key .",
+  "cd / && rg key",
+  "tar -C ~ -czf /tmp/h.tgz .",
+  "sudo -u root grep -r privateKey ~",
+  "find ~ -name '*.json' | xargs cat",
+  // Killing the runtime
+  "pgrep node | xargs kill -9",
+  "kill `pgrep node`",
+  "kill $(ps aux | grep node | awk '{print $2}')",
+  "pkill -f dist/index.js",
+  "pkill -f index.js",
+  "kill 0",
+  "kill -9 0",
+  // ...one pid at a time, through a loop over a process listing
+  "for p in $(pgrep node); do kill -9 $p; done",
+  "for p in `pgrep node`; do kill -9 $p; done",
+  "for p in $(pidof node); do kill $p; done",
+  "for p in $(ps aux | grep node | awk '{print $2}'); do kill -9 \"$p\"; done",
+  "for p in $(pgrep -f index.js)\ndo\n  kill -9 $p\ndone",
+  "for p in $(pgrep node); do [ $p -gt 1 ] && sudo kill $p; done",
+  "pgrep node | while read p; do kill -9 $p; done",
+  "pgrep node | while IFS= read -r p; do kill $p; done",
+  "while read p; do kill -9 $p; done < <(pgrep node)",
+  // Guard writes by interpreter or git
+  "python3 -c \"open('src/agent/policy-engine.ts','w').write('')\"",
+  "node -e \"require('fs').writeFileSync('src/agent/policy-engine.ts','')\"",
+  "git checkout HEAD~5 -- src/agent/policy-engine.ts",
+  "git restore --source=HEAD~3 src/agent/policy-rules/financial.ts",
+  // Inline code cannot be told from a write, so a read is denied too (read_file reads guard code)
+  "python3 -c \"print(open('src/agent/policy-engine.ts').read())\"",  // find's file list consumed by substitution, a read loop or xargs -a
+  "cat $(find ~ -name '*.json')",
+  "for f in $(find ~ -name '*.json'); do cat $f; done",
+  "find ~ -name '*.json' | while read f; do cat \"$f\"; done",
+  "xargs -a <(find ~ -name '*.json') cat",
+  "awk 1 $(find / -name '*.json' 2>/dev/null)",
+  "head -c 999 `find ~ -name 'w*'`",
+  // Relative globs over hidden home entries (exec starts in HOME)
+  "cat .[a]utomaton/w[a]llet.json",
+  "cat .?utomaton/w?llet.json",
+  "cat .[!.]utomaton/w*let.json",
+  "base64 .[a]utomaton/w[a]llet.json",
+  "cat ./.[a]utomaton/w[a]llet.json",
+  "cd ~ && cat .?utomaton/w?llet.json",
+  // /proc spelled another way
+  "cat /proc//self/environ",
+  "cat /proc/./self/environ",
+  "cat /proc//$PPID/environ",
+  "cd /proc/self && cat environ",
+  // Guard files named by a glob, or edited by a line editor or stdin script
+  "cp /tmp/x src/agent/policy-eng*.ts",
+  "cp /tmp/x src/agent/policy-r*/financial.ts",
+  "mv /tmp/x src/agent/injection-def?nse.ts",
+  "ed -s src/agent/policy-engine.ts <<< $'1d\\nw'",
+  "ex -sc '%d|x' src/agent/policy-engine.ts",
+  "vim -es -c '%d' -c 'wq' src/agent/injection-defense.ts",
+  "python3 /dev/stdin src/agent/policy-engine.ts <<< 'import sys'",
+  // Other spellings of home for recursive reads
+  "grep -r privateKey ~+",
+  "grep -r privateKey ~root",
+  "grep -r privateKey $PWD",
+  "grep -r privateKey \"${PWD}\"",
+  "grep -r privateKey ~-",
 ];
 
 const ALLOWED = [
@@ -119,9 +191,53 @@ const ALLOWED = [
   "cp /tmp/x.py agent/tools.py",
   "echo x > src/soul/model.ts",
   "mv a.ts src/heartbeat/config.ts",
+  "grep -rn TODO ~/.automaton/workspace/app",
+  "find . -name '*.ts'",
+  "rg foo src",
+  "tar czf out.tgz dist",
+  "cp -r src /tmp/x",
+  "node -e \"console.log(1)\"",
+  "cd ~/.automaton/workspace/app && grep -rn TODO .",
+  "cd myproj && rg foo",
+  "tar xzf a.tgz -C ~",
+  "ls -R ~",
+  "git diff src/agent/policy-engine.ts",
+  "kill -15 12345",
+  // Ordinary loops, and loops over a process listing that do not kill
+  "for f in *.log; do gzip $f; done",
+  "for i in $(seq 1 3); do echo $i; done",
+  "for p in $(pgrep node); do ps -o rss= -p $p; done",
+  "ps aux | while read line; do echo \"$line\" | grep kill; done",
+  "for p in $(pgrep node); do echo $p; done; echo killed",
+  "for job in $(jobs -p); do wait $job; done",
+  // Quoted globs are not expanded; short globs and cd elsewhere do not trip
+  "grep -E '.*foo' notes.txt",
+  "grep '.[a-z]' notes.txt",
+  "rm -rf dist/*",
+  "cd /tmp && ls .??*",
+  "cat src/agent/policy-eng*.ts",
+  "find ~/.automaton/workspace/app -name '*.ts' | xargs grep TODO",
+  "echo $(date) > /tmp/now.txt",
+  "grep -r TODO ~+/.automaton/workspace/app",
+  // Not caught: the tripwire cannot see inside files (documented limit)
+  "patch -p1 < /tmp/x.diff",
 ];
 
 describe("exec tripwire", () => {
+  // The self-kill rule reads the runtime's own command line at call time.
+  const savedArgv = process.argv;
+  beforeAll(() => {
+    process.argv = ["/usr/bin/node", "/opt/automaton/dist/index.js", "--run"];
+  });
+  afterAll(() => {
+    process.argv = savedArgv;
+  });
+
+  it("denies killing the runtime's own pid", () => {
+    expect(getForbiddenCommandMatch(`kill -9 ${process.pid}`)).not.toBeNull();
+    expect(getForbiddenCommandMatch(`kill ${process.ppid}`)).not.toBeNull();
+  });
+
   for (const command of DENIED) {
     it(`denies: ${command}`, () => {
       expect(getForbiddenCommandMatch(command), command).not.toBeNull();
@@ -135,6 +251,44 @@ describe("exec tripwire", () => {
     it(`allows: ${command}`, () => {
       expect(getForbiddenCommandMatch(command), command).toBeNull();
       expect(rule.evaluate(execRequest(command))).toBeNull();
+    });
+  }
+});
+
+describe("the operator CLI's money commands are operator only (review TREASURY-1)", () => {
+  const OPERATOR_DENIED = [
+    "automaton-cli fund 900 --to 0x1234567890abcdef1234567890abcdef12345678 --yes",
+    "npx automaton-cli fund 900 --to 0x1234567890abcdef1234567890abcdef12345678 --yes",
+    "npx @conway/automaton-cli send 50 --to 0x1234567890abcdef1234567890abcdef12345678",
+    "node ~/automaton/packages/cli/dist/index.js fund 900 --to 0x12 --yes",
+    "node /root/automaton/packages/cli/dist/index.js fund 900 --to 0x12 --yes",
+    "cd ~/.automaton/runtime && node packages/cli/dist/index.js fund 5 --to 0x12 --yes",
+    "node ./cli/dist/index.js send 1 --to 0x12",
+    "pnpm --dir packages/cli exec tsx src/index.ts fund 5 --to 0x12 --yes",
+    "true; 'automaton-cli' \"fund\" 1 --to 0x12 --yes",
+  ];
+  const OPERATOR_ALLOWED = [
+    "automaton-cli status",
+    "node packages/cli/dist/index.js logs --tail 20",
+    "git send-email --to x@example.com patch",
+    "echo fund the project",
+    "node my-cli/dist/index.js fund 5",
+  ];
+
+  for (const command of OPERATOR_DENIED) {
+    it(`denies: ${command}`, () => {
+      expect(getForbiddenCommandMatch(command), command).not.toBeNull();
+      for (const source of ["agent", "creator"]) {
+        const req = execRequest(command);
+        req.turnContext.inputSource = source as never;
+        expect(rule.evaluate(req)?.reasonCode).toBe("FORBIDDEN_COMMAND");
+      }
+    });
+  }
+
+  for (const command of OPERATOR_ALLOWED) {
+    it(`allows: ${command}`, () => {
+      expect(getForbiddenCommandMatch(command), command).toBeNull();
     });
   }
 });

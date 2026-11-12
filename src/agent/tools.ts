@@ -19,13 +19,15 @@ import type {
   PolicyRequest,
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
-import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
+import { getForbiddenCommandMatch } from "./policy-rules/command-safety.js";
+import { introducedNeutralisedMarker, sanitizeToolResult } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
-import { INSTALL_AND_BUILD, INSTALL_AND_BUILD_NO_SCRIPTS } from "../self-mod/install.js";
+import { UPSTREAM_INSTALL_STEPS } from "../self-mod/install.js";
 import {
   OutcomeUnknownError,
   TransferRejectedError,
   TreasuryDeniedError,
+  currentTreasuryOrigin,
   runWithTreasuryOrigin,
   type TreasuryResultFields,
 } from "../treasury/index.js";
@@ -33,7 +35,7 @@ import { isRejectedTransferStatus } from "../treasury/guarded-conway.js";
 import { normalizeTreasuryPolicy } from "../treasury/policy.js";
 import { DEFAULT_EXEC_TIMEOUT_MS, isLocalSandboxId } from "../conway/client.js";
 import { readFileSafe, writeFileVerified, UnsafePathError } from "../security/secure-fs.js";
-import { homeDir } from "../security/protected-paths.js";
+import { GUARD_COMMAND_FRAGMENTS, homeDir, matchProtected } from "../security/protected-paths.js";
 import { markRestartRequired, RESTART_NOTICE } from "../self-mod/restart-notice.js";
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import {
@@ -202,53 +204,156 @@ function commandOutput(res: { stdout: string; stderr: string; exitCode: number }
   return (text || `exit code ${res.exitCode}`).slice(0, 2000);
 }
 
-// Tools whose results come from external sources and need sanitization
-const EXTERNAL_SOURCE_TOOLS = new Set([
-  "exec",
-  "web_fetch",
-  "check_social_inbox",
-]);
+// ─── Upstream review state ─────────────────────────────────────
+// review_upstream_changes records, per commit, a hash of its full diff and
+// which pages were shown; pull_upstream applies only fully shown commits.
+
+export const UPSTREAM_REVIEW_KEY = "upstream.review";
+export const UPSTREAM_RESET_PLAN_KEY = "upstream.reset_plan";
+/** Page size after neutralisation; below the context's 10k tool-result cut with the header. */
+export const UPSTREAM_PAGE_CHARS = 8000;
+const UPSTREAM_INDEX_CHARS = 8000;
+const RESET_PLAN_TTL_MS = 30 * 60_000;
+const FULL_SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+interface ReviewedCommit {
+  diffSha256: string;
+  pages: number;
+  seen: number[];
+  message: string;
+}
+
+interface UpstreamReview {
+  target: string;
+  commits: Record<string, ReviewedCommit>;
+}
+
+function readUpstreamReview(db: KVLike): UpstreamReview | null {
+  try {
+    const parsed = JSON.parse(db.getKV(UPSTREAM_REVIEW_KEY) || "null");
+    if (!parsed || typeof parsed.target !== "string" || !FULL_SHA_RE.test(parsed.target)) return null;
+    if (!parsed.commits || typeof parsed.commits !== "object") return null;
+    return parsed as UpstreamReview;
+  } catch {
+    return null;
+  }
+}
+
+function writeUpstreamReview(db: KVLike, review: UpstreamReview): void {
+  db.setKV(UPSTREAM_REVIEW_KEY, JSON.stringify(review));
+}
+
+/**
+ * Split a diff into pages whose neutralised form (what executeTool hands the
+ * model) fits UPSTREAM_PAGE_CHARS. Neutralising can lengthen text, so a page
+ * is shrunk until it fits. The pages concatenate to the exact diff.
+ */
+export function paginateDiff(diff: string): string[] {
+  if (!diff) return [""];
+  const pages: string[] = [];
+  let pos = 0;
+  while (pos < diff.length) {
+    let end = Math.min(diff.length, pos + UPSTREAM_PAGE_CHARS);
+    if (end < diff.length) {
+      const nl = diff.lastIndexOf("\n", end - 1);
+      if (nl >= pos + UPSTREAM_PAGE_CHARS / 2) end = nl + 1;
+    }
+    for (;;) {
+      const shown = sanitizeToolResult(diff.slice(pos, end)).length;
+      if (shown <= UPSTREAM_PAGE_CHARS || end - pos <= 1) break;
+      end = pos + Math.max(1, Math.min(end - pos - 1, Math.floor(((end - pos) * UPSTREAM_PAGE_CHARS) / shown)));
+    }
+    pages.push(diff.slice(pos, end));
+    pos = end;
+  }
+  return pages;
+}
+
+/** Why a changed path deserves a close look, or null. */
+function flagUpstreamPath(repoRoot: string, rel: string): string | null {
+  const lower = rel.toLowerCase();
+  const segs = lower.split("/");
+  if (
+    lower === "package.json" ||
+    lower === "pnpm-lock.yaml" ||
+    lower === "pnpm-workspace.yaml" ||
+    lower === ".npmrc" ||
+    lower === ".gitattributes" ||
+    // pnpm runs .pnpmfile hooks even with --ignore-scripts; tsconfig shapes the build.
+    lower === ".pnpmfile.cjs" ||
+    lower === ".pnpmfile.mjs" ||
+    /^tsconfig[^/]*\.json$/.test(segs[segs.length - 1]) ||
+    segs[0] === "scripts" ||
+    segs[segs.length - 1] === "package.json"
+  ) {
+    return "install/build";
+  }
+  const rule = matchProtected(nodePath.resolve(repoRoot, rel));
+  if (rule) return `protected (${rule})`;
+  const fragment = GUARD_COMMAND_FRAGMENTS.find((f) => lower.includes(f));
+  if (fragment) return `guard (${fragment})`;
+  return null;
+}
+
+/** File list for the index: every flagged file, then up to `limit` others. */
+function describeChangedFiles(
+  repoRoot: string,
+  files: { path: string; added: number; deleted: number }[],
+  limit: number,
+): { lines: string[]; flagged: number } {
+  const flagged: string[] = [];
+  const other: string[] = [];
+  for (const f of files) {
+    const flag = flagUpstreamPath(repoRoot, f.path);
+    const line = `  ${flag ? "!! " : "   "}${f.path} (+${f.added} -${f.deleted})${flag ? ` [${flag}]` : ""}`;
+    (flag ? flagged : other).push(line);
+  }
+  const lines = [...flagged, ...other.slice(0, limit)];
+  if (other.length > limit) lines.push(`     ... and ${other.length - limit} more file(s)`);
+  return { lines, flagged: flagged.length };
+}
+
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  return flat.length > max ? flat.slice(0, max) + "…" : flat;
+}
+
+/** Pages of a commit not yet shown, or [] when every page was. */
+function unseenPages(entry: ReviewedCommit | undefined): number[] {
+  if (!entry) return [1];
+  const seen = new Set(entry.seen);
+  const missing: number[] = [];
+  for (let p = 1; p <= entry.pages; p++) if (!seen.has(p)) missing.push(p);
+  return missing;
+}
+
+/** Install and build after upstream code lands, step by step. */
+async function runUpstreamInstall(
+  conway: ToolContext["conway"],
+  repo: string,
+): Promise<{ failedStep: string; output: string } | null> {
+  for (const step of UPSTREAM_INSTALL_STEPS) {
+    let res: { exitCode: number; stdout: string; stderr: string };
+    try {
+      res = await conway.exec(`cd ${repo} && ${step.command}`, step.timeoutMs);
+    } catch (err) {
+      return { failedStep: step.name, output: err instanceof Error ? err.message : String(err) };
+    }
+    if (res.exitCode !== 0) return { failedStep: step.name, output: commandOutput(res) };
+  }
+  return null;
+}
+
+const UPSTREAM_TRUST_NOTE =
+  "Dependency install scripts are off and only better-sqlite3 and esbuild are rebuilt, but `pnpm run build` runs the build script from the upstream package.json, so applying upstream code trusts the origin remote.";
 
 // ─── Self-Preservation Guard ───────────────────────────────────
-// Defense-in-depth: policy engine (command.forbidden_patterns rule) is the primary guard.
-// This inline check is kept as a secondary safety net in case the policy engine is bypassed.
-
-const FORBIDDEN_COMMAND_PATTERNS = [
-  // Self-destruction
-  /rm\s+(-rf?\s+)?.*\.automaton/,
-  /rm\s+(-rf?\s+)?.*state\.db/,
-  /rm\s+(-rf?\s+)?.*wallet\.json/,
-  /rm\s+(-rf?\s+)?.*automaton\.json/,
-  /rm\s+(-rf?\s+)?.*heartbeat\.yml/,
-  /rm\s+(-rf?\s+)?.*SOUL\.md/,
-  // Process killing
-  /kill\s+.*automaton/,
-  /pkill\s+.*automaton/,
-  /systemctl\s+(stop|disable)\s+automaton/,
-  // Database destruction
-  /DROP\s+TABLE/i,
-  /DELETE\s+FROM\s+(turns|identity|kv|schema_version|skills|children|registry)/i,
-  /TRUNCATE/i,
-  // Safety infrastructure modification via shell
-  /sed\s+.*injection-defense/,
-  /sed\s+.*self-mod\/code/,
-  /sed\s+.*audit-log/,
-  />\s*.*injection-defense/,
-  />\s*.*self-mod\/code/,
-  />\s*.*audit-log/,
-  // Credential harvesting
-  /cat\s+.*\.ssh/,
-  /cat\s+.*\.gnupg/,
-  /cat\s+.*\.env/,
-  /cat\s+.*wallet\.json/,
-];
+// Defense in depth: the policy engine runs the same tripwire (rule
+// command.forbidden_patterns); this copy covers use with no policy engine.
 
 function isForbiddenCommand(command: string, sandboxId: string): string | null {
-  for (const pattern of FORBIDDEN_COMMAND_PATTERNS) {
-    if (pattern.test(command)) {
-      return `Blocked: Command matches self-harm pattern: ${pattern.source}`;
-    }
-  }
+  const match = getForbiddenCommandMatch(command);
+  if (match) return `Blocked: ${match.description} (pattern: ${match.pattern})`;
 
   // Block deleting own sandbox
   if (command.includes("sandbox_delete") && command.includes(sandboxId)) {
@@ -320,6 +425,18 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const { isProtectedFile } = await import("../self-mod/code.js");
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
+        }
+        if (content.includes("-removed]")) {
+          let existing: string | null = null;
+          try {
+            existing = isLocalSandboxId(ctx.identity.sandboxId)
+              ? readFileSafe(confined, { root })
+              : await ctx.conway.readFile(confined);
+          } catch {
+            existing = null;
+          }
+          const marker = introducedNeutralisedMarker(content, existing);
+          if (marker) return neutralisedWriteRefusal(marker);
         }
         if (isLocalSandboxId(ctx.identity.sandboxId)) {
           // The checks run again at the moment of the write, on the real
@@ -748,55 +865,100 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "reset_to_upstream",
       description:
-        "Reset your codebase to the official upstream release. Use when self-modifications have broken things beyond repair.",
+        "Reset your codebase to the current origin/main of the configured origin remote, discarding local commits and uncommitted changes. Call once to see the plan, then again with confirm=<target sha> to apply it. Use when self-modifications have broken things beyond repair.",
       category: "self_mod",
       riskLevel: "dangerous",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
+      parameters: {
+        type: "object",
+        properties: {
+          confirm: {
+            type: "string",
+            description: "The full target SHA from the plan returned by the first call. Omit to get the plan.",
+          },
+        },
+      },
+      execute: async (args, ctx) => {
         const repoRoot = process.cwd();
+        const repo = escapeShellArg(repoRoot);
+        const upstream = await import("../self-mod/upstream.js");
+        const confirm = args.confirm;
 
-        // Fetch latest upstream
-        const fetch = await ctx.conway.exec(
-          `cd '${repoRoot}' && git fetch origin main`,
-          30_000,
-        );
-        if (fetch.exitCode !== 0) {
-          return `Failed to fetch upstream: ${commandOutput(fetch)}`;
+        let target: string;
+        try {
+          target = await upstream.resolveUpstreamTarget();
+        } catch (err: any) {
+          return `Failed to fetch upstream: ${oneLine(err?.message || String(err), 500)}`;
         }
 
-        // Record what we're about to lose
-        const localCommits = await ctx.conway.exec(
-          `cd '${repoRoot}' && git log origin/main..HEAD --oneline`,
-          10_000,
-        );
+        if (confirm === undefined) {
+          const originUrl = await upstream.getOriginUrl();
+          const local = await upstream.getLocalOnlyCommits(target).catch(() => "(could not list)");
+          const dirty = await upstream.countUncommittedChanges().catch(() => -1);
+          const files = await upstream.getFilesBetween("HEAD", target).catch(() => null);
+          const added = files?.reduce((n, f) => n + f.added, 0) ?? 0;
+          const deleted = files?.reduce((n, f) => n + f.deleted, 0) ?? 0;
+          const described = files ? describeChangedFiles(repoRoot, files, 30) : null;
+          ctx.db.setKV(
+            UPSTREAM_RESET_PLAN_KEY,
+            JSON.stringify({ target, expiresAt: new Date(Date.now() + RESET_PLAN_TTL_MS).toISOString() }),
+          );
+          return [
+            `Reset plan (nothing changed yet).`,
+            `Origin: ${originUrl}`,
+            `Target: origin/main = ${target}`,
+            `Local commits that will be discarded:\n${local || "(none)"}`,
+            `Uncommitted changes to tracked files that will be discarded: ${dirty < 0 ? "unknown" : dirty}`,
+            files
+              ? `Changes HEAD -> target: ${files.length} file(s), +${added} -${deleted}${described!.flagged ? ` (${described!.flagged} flagged !!)` : ""}\n${described!.lines.join("\n")}`
+              : "Could not list the changes between HEAD and the target.",
+            UPSTREAM_TRUST_NOTE,
+            `To apply, call reset_to_upstream(confirm="${target}") within 30 minutes.`,
+          ].join("\n\n");
+        }
 
-        // Hard reset
-        const reset = await ctx.conway.exec(
-          `cd '${repoRoot}' && git reset --hard origin/main`,
-          30_000,
-        );
+        if (typeof confirm !== "string" || !FULL_SHA_RE.test(confirm.trim().toLowerCase())) {
+          return "Refused: confirm must be the full target SHA from the plan. Call reset_to_upstream() without confirm to get one.";
+        }
+        let plan: { target?: unknown; expiresAt?: unknown } | null = null;
+        try {
+          plan = JSON.parse(ctx.db.getKV(UPSTREAM_RESET_PLAN_KEY) || "null");
+        } catch {
+          plan = null;
+        }
+        if (!plan || typeof plan.target !== "string" || typeof plan.expiresAt !== "string" || Date.parse(plan.expiresAt) < Date.now()) {
+          return "Refused: no current reset plan (plans expire after 30 minutes). Call reset_to_upstream() without confirm first.";
+        }
+        if (confirm.trim().toLowerCase() !== plan.target) {
+          return `Refused: confirm ${confirm.trim()} does not match the planned target ${plan.target}. Nothing was changed.`;
+        }
+        if (target !== plan.target) {
+          ctx.db.deleteKV(UPSTREAM_RESET_PLAN_KEY);
+          return `Refused: origin/main moved from ${plan.target} to ${target} since the plan. Nothing was changed; call reset_to_upstream() again for a new plan.`;
+        }
+
+        const discarded = await upstream.getLocalOnlyCommits(target).catch(() => "");
+        const reset = await ctx.conway.exec(`cd ${repo} && git reset --hard ${target}`, 30_000);
         if (reset.exitCode !== 0) {
           return `Reset failed: ${commandOutput(reset)}`;
         }
+        ctx.db.deleteKV(UPSTREAM_RESET_PLAN_KEY);
         // The recorded self-mod commits are gone from history.
         ctx.db.deleteKV(SELF_MOD_COMMITS_KEY);
 
-        // Reinstall + rebuild
-        const build = await ctx.conway.exec(
-          `cd '${repoRoot}' && ${INSTALL_AND_BUILD}`,
-          120_000,
-        );
+        const failed = await runUpstreamInstall(ctx.conway, repo);
 
         // Audit log
         const { logModification } = await import("../self-mod/audit-log.js");
-        logModification(ctx.db, "upstream_reset", "Reset to upstream origin/main", {
-          diff: localCommits.stdout.trim() || "(no local commits)",
+        logModification(ctx.db, "upstream_reset", `Reset to upstream origin/main ${target}`, {
+          diff: discarded || "(no local commits)",
           reversible: false,
         });
 
         markRestartRequired(ctx.db, "reset_to_upstream");
-        const discarded = localCommits.stdout.trim();
-        return `Reset to upstream. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."} ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + commandOutput(build)} The revert list was cleared.\n${RESTART_NOTICE}`;
+        const buildText = failed
+          ? `The ${failed.failedStep} step failed: ${failed.output}`
+          : "Install and rebuild succeeded.";
+        return `Reset to upstream ${target}. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."}\n${buildText} The revert list was cleared.\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -841,33 +1003,146 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "review_upstream_changes",
       description:
-        "ALWAYS call this before pull_upstream. Shows every upstream commit with its full diff. Read each one carefully — decide per-commit whether to accept or skip. Use pull_upstream with a specific commit hash to cherry-pick only what you want.",
+        "ALWAYS call this before pull_upstream. With no arguments it fetches origin/main and lists every upstream commit with its files (flagged files marked !!) and page count. Then read each commit's full diff page by page with commit=<hash> and page=<n>. pull_upstream only applies commits whose every page you have read.",
       category: "self_mod",
       riskLevel: "caution",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, _ctx) => {
-        const { getUpstreamDiffs, checkUpstream } =
-          await import("../self-mod/upstream.js");
-        const status = checkUpstream();
-        if (status.behind === 0) return "Already up to date with origin/main.";
+      parameters: {
+        type: "object",
+        properties: {
+          commit: {
+            type: "string",
+            description: "Hash of a listed commit whose diff to show. Omit for the commit list.",
+          },
+          page: {
+            type: "number",
+            description: "Page number (default 1): of the commit's diff with commit, else of the commit list.",
+          },
+        },
+      },
+      execute: async (args, ctx) => {
+        const upstream = await import("../self-mod/upstream.js");
+        const repoRoot = process.cwd();
+        const commitArg = args.commit;
+        const pageArg = args.page;
+        if (pageArg !== undefined && (typeof pageArg !== "number" || !Number.isInteger(pageArg) || pageArg < 1)) {
+          return "Blocked: page must be a positive whole number.";
+        }
 
-        const diffs = getUpstreamDiffs();
-        if (diffs.length === 0) return "No upstream diffs found.";
+        if (commitArg !== undefined) {
+          if (typeof commitArg !== "string" || !COMMIT_SHA_RE.test(commitArg.toLowerCase())) {
+            return `Blocked: commit must be a hex commit hash (7-40 characters), got ${JSON.stringify(commitArg)}.`;
+          }
+          const review = readUpstreamReview(ctx.db);
+          if (!review) return "No upstream review yet. Call review_upstream_changes() with no arguments first.";
+          const prefix = commitArg.toLowerCase();
+          const matches = Object.keys(review.commits).filter((h) => h.startsWith(prefix));
+          if (matches.length === 0) {
+            return `Commit ${prefix} is not in the reviewed range HEAD..${review.target}. Call review_upstream_changes() to refresh the list.`;
+          }
+          if (matches.length > 1) return `Commit prefix ${prefix} is ambiguous; use more characters.`;
+          const hash = matches[0];
+          let diff: string;
+          try {
+            diff = await upstream.getCommitDiff(hash);
+          } catch (err: any) {
+            return `Could not read the diff of ${hash}: ${oneLine(err?.message || String(err), 500)}`;
+          }
+          const pages = paginateDiff(diff);
+          const digest = upstream.sha256(diff);
+          let entry = review.commits[hash];
+          if (entry.diffSha256 !== digest || entry.pages !== pages.length) {
+            entry = { ...entry, diffSha256: digest, pages: pages.length, seen: [] };
+          }
+          const page = pageArg ?? 1;
+          if (page > pages.length) return `Commit ${hash} has ${pages.length} page(s); page ${page} does not exist.`;
+          entry.seen = [...new Set([...entry.seen, page])].sort((a, b) => a - b);
+          review.commits[hash] = entry;
+          writeUpstreamReview(ctx.db, review);
+          const missing = unseenPages(entry);
+          const footer = missing.length
+            ? `--- end of page ${page}/${pages.length}; unread page(s): ${missing.slice(0, 20).join(", ")}${missing.length > 20 ? ", ..." : ""} ---`
+            : `--- end of page ${page}/${pages.length}; every page of this commit has been read ---`;
+          return `Commit ${hash} page ${page}/${pages.length} (full diff ${diff.length} chars): ${oneLine(entry.message, 120)}\n${pages[page - 1]}\n${footer}`;
+        }
 
-        const output = diffs
-          .map(
-            (d, i) =>
-              `--- COMMIT ${i + 1}/${diffs.length} ---\nHash: ${d.hash}\nAuthor: ${d.author}\nMessage: ${d.message}\n\n${d.diff.slice(0, 4000)}${d.diff.length > 4000 ? "\n... (diff truncated)" : ""}\n--- END COMMIT ${i + 1} ---`,
-          )
-          .join("\n\n");
+        // The commit list. A fresh call fetches; a later index page reuses the recorded target.
+        const previous = readUpstreamReview(ctx.db);
+        let target: string;
+        if (pageArg !== undefined && pageArg > 1 && previous) {
+          target = previous.target;
+        } else {
+          try {
+            target = await upstream.resolveUpstreamTarget();
+          } catch (err: any) {
+            return `Could not fetch origin main: ${oneLine(err?.message || String(err), 500)}`;
+          }
+        }
+        const commits = await upstream.listCommitsBetween(target);
+        const review: UpstreamReview = { target, commits: {} };
+        if (commits.length === 0) {
+          writeUpstreamReview(ctx.db, review);
+          return `Already up to date with origin/main (${target}).`;
+        }
+        const blocks: string[] = [];
+        for (const [i, c] of commits.entries()) {
+          let diff: string;
+          let files: { path: string; added: number; deleted: number }[];
+          try {
+            diff = await upstream.getCommitDiff(c.hash);
+            files = await upstream.getCommitFiles(c.hash);
+          } catch (err: any) {
+            // Not recorded, so pull_upstream refuses it.
+            blocks.push(`${i + 1}. ${c.hash} — diff unavailable: ${oneLine(err?.message || String(err), 200)}`);
+            continue;
+          }
+          const digest = upstream.sha256(diff);
+          const pages = paginateDiff(diff).length;
+          const old = previous?.commits[c.hash];
+          review.commits[c.hash] = {
+            diffSha256: digest,
+            pages,
+            seen: old && old.diffSha256 === digest && old.pages === pages ? old.seen : [],
+            message: oneLine(c.message, 200),
+          };
+          const missing = unseenPages(review.commits[c.hash]);
+          const described = describeChangedFiles(repoRoot, files, 15);
+          blocks.push(
+            `${i + 1}. ${c.hash}${c.parents > 1 ? " (merge; diff against first parent)" : ""}\n` +
+              `   Author: ${oneLine(c.author, 80)}\n   Message: ${oneLine(c.message, 120)}\n` +
+              `   Diff: ${diff.length} chars in ${pages} page(s); ${missing.length ? `${missing.length} unread` : "all read"}; ${files.length} file(s)${described.flagged ? `, ${described.flagged} flagged` : ""}\n` +
+              described.lines.join("\n"),
+          );
+        }
+        writeUpstreamReview(ctx.db, review);
 
-        return `${diffs.length} upstream commit(s) to review. Read each diff, then cherry-pick individually with pull_upstream(commit=<hash>).\n\n${output}`;
+        // Split the list so each page fits the tool-result window too.
+        const indexPages: string[] = [];
+        let current = "";
+        for (const block of blocks) {
+          const fitted = paginateDiff(block);
+          const piece = fitted.length > 1 ? fitted[0].slice(0, UPSTREAM_INDEX_CHARS - 200) + "\n   ... (list cut; the diff pages show every file)" : block;
+          if (current && sanitizeToolResult(current + "\n\n" + piece).length > UPSTREAM_INDEX_CHARS) {
+            indexPages.push(current);
+            current = piece;
+          } else {
+            current = current ? current + "\n\n" + piece : piece;
+          }
+        }
+        if (current) indexPages.push(current);
+        const page = pageArg ?? 1;
+        if (page > indexPages.length) return `The commit list has ${indexPages.length} page(s); page ${page} does not exist.`;
+        const originUrl = await upstream.getOriginUrl();
+        return (
+          `${commits.length} upstream commit(s) in HEAD..${target} (origin ${originUrl}), oldest first. List page ${page}/${indexPages.length}.\n` +
+          `Read every page of a commit with review_upstream_changes(commit=<hash>, page=<n>) before pull_upstream(commit=<hash>). !! marks guard, protected or install/build files.\n\n` +
+          indexPages[page - 1]
+        );
       },
     },
     {
       name: "pull_upstream",
       description:
-        "Apply upstream changes and rebuild. You MUST call review_upstream_changes first. Prefer cherry-picking individual commits by hash over pulling everything — only pull all if you've reviewed every commit and want them all.",
+        "Apply reviewed upstream changes and rebuild. Only commits whose every diff page you read with review_upstream_changes are applied. Prefer cherry-picking individual commits by hash; with no commit it fast-forwards to the reviewed origin/main, and only if every commit up to it was read.",
       category: "self_mod",
       riskLevel: "dangerous",
       parameters: {
@@ -876,7 +1151,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           commit: {
             type: "string",
             description:
-              "Commit hash to cherry-pick (preferred). Omit ONLY if you reviewed all commits and want every one.",
+              "Commit hash to cherry-pick (preferred). Omit ONLY if you read every commit and want every one.",
           },
         },
       },
@@ -901,39 +1176,93 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `Nothing applied: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first.`;
         }
 
+        const upstream = await import("../self-mod/upstream.js");
+        const review = readUpstreamReview(ctx.db);
+        if (!review) {
+          return "Refused: nothing has been reviewed. Call review_upstream_changes() and read every page of the commits you want first.";
+        }
+        // Fully read, and the diff is still the one that was read.
+        const notRead = async (hash: string): Promise<string | null> => {
+          const entry = review.commits[hash];
+          const missing = unseenPages(entry);
+          if (!entry || missing.length) {
+            return `${hash.slice(0, 12)}: unread page(s) ${missing.slice(0, 10).join(", ")}${missing.length > 10 ? ", ..." : ""}`;
+          }
+          try {
+            if (upstream.sha256(await upstream.getCommitDiff(hash)) !== entry.diffSha256) {
+              return `${hash.slice(0, 12)}: its diff differs from the one reviewed`;
+            }
+          } catch (err: any) {
+            return `${hash.slice(0, 12)}: diff unreadable (${oneLine(err?.message || String(err), 200)})`;
+          }
+          return null;
+        };
+
         let appliedSummary: string;
+        let pickCommand: string;
         try {
           if (commit) {
-            try {
-              await run(`git cherry-pick ${commit}`);
-            } catch (err) {
-              // Abort only a cherry-pick this call started; the check above saw none.
-              const after = await gitBusyState(ctx.conway, repo);
-              if (after.includes(GIT_STATE_UNCHECKED)) {
-                throw new Error(`${err instanceof Error ? err.message : String(err)} (the repository state could not be checked afterwards; inspect it by hand)`);
-              }
-              if (after.includes("CHERRY_PICK_HEAD") || after.includes("sequencer")) {
-                await ctx.conway.exec(`cd ${repo} && git cherry-pick --abort 2>&1`, 10_000).catch(() => undefined);
-              }
-              throw err;
+            const full = await upstream.resolveCommit(commit);
+            const inRange = full ? (await upstream.listCommitsBetween(review.target)).find((c) => c.hash === full) : undefined;
+            if (!full || !inRange) {
+              return `Refused: ${commit} is not an unapplied commit in the reviewed range HEAD..${review.target}. Call review_upstream_changes() to refresh.`;
             }
+            const problem = await notRead(full);
+            if (problem) {
+              return `Refused: ${problem}. Read every page with review_upstream_changes(commit="${full.slice(0, 12)}", page=<n>) first.`;
+            }
+            pickCommand = `git cherry-pick ${inRange.parents > 1 ? "-m 1 " : ""}${full}`;
             appliedSummary = `Cherry-picked ${commit}`;
           } else {
-            await run("git pull origin main --ff-only");
-            appliedSummary = "Pulled all of origin/main (fast-forward)";
+            const current = await upstream.resolveUpstreamTarget();
+            if (current !== review.target) {
+              return `Refused: origin/main moved from ${review.target} to ${current} since the review. Nothing applied; call review_upstream_changes() again.`;
+            }
+            const commits = await upstream.listCommitsBetween(review.target);
+            if (commits.length === 0) return `Nothing to apply: HEAD already contains ${review.target}.`;
+            const problems: string[] = [];
+            for (const c of commits) {
+              const problem = await notRead(c.hash);
+              if (problem) problems.push(problem);
+            }
+            if (problems.length) {
+              return `Refused: not every commit up to ${review.target} was fully read:\n${problems.slice(0, 10).join("\n")}${problems.length > 10 ? `\n... and ${problems.length - 10} more` : ""}`;
+            }
+            if (!(await upstream.headOnFirstParentChain(review.target))) {
+              return `Refused: HEAD is not on the first-parent history of ${review.target}, so the reviewed diffs do not add up to what a fast-forward would apply. Nothing applied; cherry-pick reviewed commits one by one with pull_upstream(commit=<hash>).`;
+            }
+            pickCommand = `git merge --ff-only ${review.target}`;
+            appliedSummary = `Fast-forwarded to the reviewed origin/main ${review.target}`;
+          }
+        } catch (err: any) {
+          return `Nothing applied: could not check the review against git: ${oneLine(err?.message || String(err), 500)}`;
+        }
+
+        try {
+          try {
+            await run(pickCommand);
+          } catch (err) {
+            if (!commit) throw err;
+            // Abort only a cherry-pick this call started; the check above saw none.
+            const after = await gitBusyState(ctx.conway, repo);
+            if (after.includes(GIT_STATE_UNCHECKED)) {
+              throw new Error(`${err instanceof Error ? err.message : String(err)} (the repository state could not be checked afterwards; inspect it by hand)`);
+            }
+            if (after.includes("CHERRY_PICK_HEAD") || after.includes("sequencer")) {
+              await ctx.conway.exec(`cd ${repo} && git cherry-pick --abort 2>&1`, 10_000).catch(() => undefined);
+            }
+            throw err;
           }
         } catch (err: any) {
           return `Git operation failed (nothing applied; a failed cherry-pick is aborted): ${err.message}`;
         }
 
-        // Rebuild
-        try {
-          await run(INSTALL_AND_BUILD_NO_SCRIPTS);
-        } catch (err: any) {
-          markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
-          return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.\n${RESTART_NOTICE}`;
+        // Install and rebuild, step by step.
+        const failed = await runUpstreamInstall(ctx.conway, repo);
+        markRestartRequired(ctx.db, `pull_upstream ${commit ?? review.target}`);
+        if (failed) {
+          return `${appliedSummary} — but the ${failed.failedStep} step failed: ${failed.output}. The code is applied but not compiled.\n${RESTART_NOTICE}`;
         }
-        markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
 
         // Log modification
         ctx.db.insertModification({
@@ -944,7 +1273,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           reversible: true,
         });
 
-        return `${appliedSummary}. Rebuild succeeded.\n${RESTART_NOTICE}`;
+        return `${appliedSummary}. Install and rebuild succeeded. ${UPSTREAM_TRUST_NOTE}\n${RESTART_NOTICE}`;
       },
     },
 
@@ -1215,18 +1544,17 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { ulid } = await import("ulid");
-        const newPrompt = args.new_prompt as string;
-
-        // Sanitize genesis prompt content
-        const sanitized = sanitizeInput(
-          newPrompt,
-          "genesis_update",
-          "skill_instruction",
-        );
-
-        // Enforce 2000-character size limit
-        if (sanitized.content.length > 2000) {
-          return `Error: Genesis prompt exceeds 2000 character limit (${sanitized.content.length} chars after sanitization)`;
+        const newPrompt = args.new_prompt;
+        if (typeof newPrompt !== "string" || !newPrompt.trim()) {
+          return "Error: new_prompt must be a non-empty string.";
+        }
+        // The text is stored exactly as given and neutralised only where the
+        // system prompt renders it, so screening never rewrites it.
+        if (newPrompt.length > 2000) {
+          return `Error: Genesis prompt exceeds 2000 character limit (${newPrompt.length} chars)`;
+        }
+        if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(newPrompt)) {
+          return "Error: Genesis prompt contains control characters; remove them and try again.";
         }
 
         // Backup current genesis prompt before overwriting
@@ -1235,12 +1563,12 @@ Model: ${ctx.inference.getDefaultModel()}
           ctx.db.setKV("genesis_prompt_backup", oldPrompt);
         }
 
-        ctx.config.genesisPrompt = sanitized.content;
+        ctx.config.genesisPrompt = newPrompt;
 
         // Write only this key, re-read from disk, so operator edits survive.
         let persisted = "Saved to automaton.json.";
         try {
-          updateConfigFile({ genesisPrompt: sanitized.content });
+          updateConfigFile({ genesisPrompt: newPrompt });
         } catch (err: any) {
           persisted = `Not saved to automaton.json (${err?.message || String(err)}); the change applies until restart.`;
         }
@@ -1250,11 +1578,11 @@ Model: ${ctx.inference.getDefaultModel()}
           timestamp: new Date().toISOString(),
           type: "prompt_change",
           description: `Genesis prompt updated: ${args.reason}`,
-          diff: `--- old\n${oldPrompt.slice(0, 500)}\n+++ new\n${sanitized.content.slice(0, 500)}`,
+          diff: `--- old\n${(oldPrompt ?? "").slice(0, 500)}\n+++ new\n${newPrompt.slice(0, 500)}`,
           reversible: true,
         });
 
-        return `Genesis prompt updated (sanitized, ${sanitized.content.length} chars). Reason: ${args.reason}. Previous version backed up. ${persisted}`;
+        return `Genesis prompt updated (${newPrompt.length} chars). Reason: ${args.reason}. Previous version backed up. ${persisted}`;
       },
     },
 
@@ -1842,10 +2170,14 @@ Model: ${ctx.inference.getDefaultModel()}
           );
         }
 
+        // One line per agent, on-chain id and owner first: card text comes
+        // from the agent's own URI, so its line breaks are flattened and it
+        // goes last, where it cannot form a line or an id/owner pair.
+        const oneLine = (t: string) => t.replace(/[\r\n\v\f\u0085\u2028\u2029]+/g, " ");
         return agents
           .map(
             (a) =>
-              `#${a.agentId} ${a.name || "unnamed"} (${a.owner}): ${a.description || a.agentURI}`,
+              `#${a.agentId} (${a.owner}) ${oneLine(a.name || "unnamed")}: ${oneLine(a.description || a.agentURI)}`,
           )
           .join("\n");
       },
@@ -2888,7 +3220,7 @@ Model: ${ctx.inference.getDefaultModel()}
           category: {
             type: "string",
             description:
-              "Fact category: self, environment, financial, agent, domain, procedural_ref, creator",
+              "Fact category: self, environment, financial, agent, domain, procedural_ref (creator is reserved for the creator)",
           },
           key: {
             type: "string",
@@ -2899,22 +3231,22 @@ Model: ${ctx.inference.getDefaultModel()}
             type: "number",
             description: "Confidence 0.0-1.0 (default: 1.0)",
           },
-          source: {
-            type: "string",
-            description: "Source of the fact (default: agent)",
-          },
         },
         required: ["category", "key", "value"],
       },
       execute: async (args, ctx) => {
         const { rememberFact } = await import("../memory/tools.js");
-        return rememberFact(ctx.db.raw, {
-          category: args.category as string,
-          key: args.key as string,
-          value: args.value as string,
-          confidence: args.confidence as number | undefined,
-          source: args.source as string | undefined,
-        });
+        // The turn's input source, as executeTool recorded it for this call.
+        return rememberFact(
+          ctx.db.raw,
+          {
+            category: args.category as string,
+            key: args.key as string,
+            value: args.value as string,
+            confidence: args.confidence as number | undefined,
+          },
+          currentTreasuryOrigin().inputSource,
+        );
       },
     },
     {
@@ -3844,9 +4176,21 @@ export async function executeTool(
       () => tool.execute(args, context),
     );
 
-    // Sanitize results from external source tools
-    if (EXTERNAL_SOURCE_TOOLS.has(toolName)) {
-      result = sanitizeToolResult(result);
+    // Every result is neutralised: most tools relay text someone else chose
+    // (pages, cards, files, git output, child health), and a list of the
+    // "external" ones goes stale. Runtime-written text passes unchanged.
+    const raw = typeof result === "string" ? result : String(result ?? "");
+    if (toolName === "read_file") {
+      // File text is often written back whole, so control and format
+      // characters (form feed, ESC, zero-width, BOM) stay as they are; a
+      // note says when markers were neutralised,
+      // and write_file refuses text that would put the placeholders on disk.
+      result = sanitizeToolResult(raw, undefined, { keepInvisible: true });
+      if (NEUTRALISED_FILE_RE.test(raw)) {
+        result = `${READ_FILE_NEUTRALISED_NOTE}\n${result}`;
+      }
+    } else {
+      result = sanitizeToolResult(raw);
     }
 
     return {
@@ -3863,9 +4207,25 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: Date.now() - startTime,
-      error: describeToolError(toolName, err),
+      // Thrown messages can quote remote responses.
+      error: sanitizeToolResult(describeToolError(toolName, err)),
     };
   }
+}
+
+// Prompt tags or special tokens in file text, which read_file shows neutralised.
+const NEUTRALISED_FILE_RE = /<\/?system>|<\/?prompt>|\[\/?INST\]|<<\/?SYS>>|[<\uFF1C\uFE64][\p{Cf}\s]*[|\uFF5C][^<>|\uFF5C\uFF1C\uFF1E\n]{0,40}?[|\uFF5C][\p{Cf}\s]*[>\uFF1E\uFE65]/iu;
+const READ_FILE_NEUTRALISED_NOTE =
+  "(note: prompt tags or special tokens in this file are shown as [...-removed] placeholders; the file on disk is unchanged. " +
+  "write_file refuses text containing those placeholders; change such lines with exec, e.g. sed.)";
+
+/** Refusal for file text copied from a neutralised tool result. */
+export function neutralisedWriteRefusal(marker: string): string {
+  return (
+    `Blocked: the content contains ${marker}, a placeholder from a neutralised tool result, ` +
+    "and the file on disk does not. Writing it would replace the original text. " +
+    "Change only the lines you mean to change, e.g. with sed through exec."
+  );
 }
 
 /** Tool error text; treasury outcomes get wording the model can act on. */

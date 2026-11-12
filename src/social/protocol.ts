@@ -9,11 +9,11 @@
 
 import crypto from "crypto";
 import { ulid } from "ulid";
-import {
-  keccak256,
-  toBytes,
-  verifyMessage,
-} from "viem";
+import { verifyMessage } from "viem";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import { detectChainType } from "../identity/chain.js";
+import { canonicalSendMessage } from "./signing.js";
 
 /**
  * A fully signed social message.
@@ -43,26 +43,36 @@ export function createNonce(): string {
 }
 
 /**
- * Verify an ECDSA secp256k1 message signature.
+ * Verify a sender's signature over the canonical send string.
  *
- * Reconstructs the canonical string used during signing and verifies
- * the signature against the expected sender address.
+ * `message.to` must be the recipient the caller expects (for inbound mail,
+ * our own address), never a value taken on trust from the relay. EVM senders
+ * are checked with EIP-191 recovery; Solana senders with an ed25519 detached
+ * signature in base58. Anything else is false.
  */
 export async function verifyMessageSignature(
   message: { to: string; content: string; signed_at: string; signature: string },
   expectedFrom: string,
 ): Promise<boolean> {
   try {
-    const contentHash = keccak256(toBytes(message.content));
-    const canonical = `Conway:send:${message.to.toLowerCase()}:${contentHash}:${message.signed_at}`;
-
-    const valid = await verifyMessage({
-      address: expectedFrom as `0x${string}`,
-      message: canonical,
-      signature: message.signature as `0x${string}`,
-    });
-
-    return valid;
+    if (typeof message.signature !== "string" || message.signature.length === 0) return false;
+    const canonical = canonicalSendMessage(message.to, message.content, message.signed_at);
+    const chain = detectChainType(expectedFrom);
+    if (chain === "evm") {
+      if (!/^0x[0-9a-fA-F]+$/.test(message.signature)) return false;
+      return await verifyMessage({
+        address: expectedFrom as `0x${string}`,
+        message: canonical,
+        signature: message.signature as `0x${string}`,
+      });
+    }
+    if (chain === "solana") {
+      const sig = bs58.decode(message.signature);
+      const key = bs58.decode(expectedFrom);
+      if (sig.length !== nacl.sign.signatureLength || key.length !== nacl.sign.publicKeyLength) return false;
+      return nacl.sign.detached.verify(new TextEncoder().encode(canonical), sig, key);
+    }
+    return false;
   } catch {
     return false;
   }

@@ -49,7 +49,7 @@ export function requireEvmChain(chainType?: ChainType): void {
 
 // ─── Contract Addresses ──────────────────────────────────────
 
-const CONTRACTS = {
+export const CONTRACTS = {
   mainnet: {
     identity: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" as Address,
     reputation: "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63" as Address,

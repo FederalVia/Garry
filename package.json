@@ -25,6 +25,14 @@
     "./operator/send.js": {
       "types": "./dist/operator/send.d.ts",
       "default": "./dist/operator/send.js"
+    },
+    "./operator/turn-log.js": {
+      "types": "./dist/operator/turn-log.d.ts",
+      "default": "./dist/operator/turn-log.js"
+    },
+    "./observability/terminal-safe.js": {
+      "types": "./dist/observability/terminal-safe.d.ts",
+      "default": "./dist/observability/terminal-safe.js"
     }
   },
   "bin": {

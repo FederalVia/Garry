@@ -9,6 +9,8 @@
  */
 
 import { ulid } from "ulid";
+import { classifyTransferStatus } from "../conway/transfer-status.js";
+import { escapeForTerminal } from "../observability/terminal-safe.js";
 import { hasValidEvmChecksum, isValidAddress, isZeroAddress, normalizeAddress, type ChainType } from "../identity/chain.js";
 
 export interface OperatorFundConfig {
@@ -206,6 +208,32 @@ export type FundResult =
   | { status: "failed"; idempotencyKey: string; error: string }
   | { status: "unknown"; idempotencyKey: string; error: string };
 
+/**
+ * Text `automaton-cli fund` prints for a result. Error text, transfer id and
+ * status come from the API response, so they are escaped for the terminal.
+ */
+export function formatFundResult(plan: FundPlan, result: FundResult): string {
+  const safe = (s: string) => escapeForTerminal(s, { keepNewlines: false });
+  if (result.status !== "ok") return safe(result.error);
+  return `
+Transfer submitted.
+From:      ${plan.from || "(automaton)"}
+To:        ${plan.to}
+Amount:    ${formatUsd(plan.amountCents)} (${plan.amountCents} cents)
+Status:    ${safe(result.transferStatus)}
+Transfer:  ${safe(result.transferId)}
+Key:       ${result.idempotencyKey}
+${result.balanceAfterCents !== undefined ? `Balance:   ${formatUsd(result.balanceAfterCents)} after transfer` : ""}
+`;
+}
+
+/** An unexpected error from the fund command, on one escaped line. */
+export function formatFundError(err: unknown): string {
+  const message = (err as { message?: unknown } | null)?.message;
+  const text = typeof message === "string" && message ? message : String(err);
+  return `Credit transfer failed: ${escapeForTerminal(text, { keepNewlines: false })}`;
+}
+
 export const FUND_TIMEOUT_MS = 30_000;
 
 function unknownOutcome(key: string, why: string): FundResult {
@@ -275,8 +303,12 @@ export async function executeFund(
     const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
     const transferStatus = typeof data.status === "string" && data.status ? data.status : "submitted";
     // A 2xx can still carry a refusal; report it as a failure, not a submission.
-    if (/fail|error|reject|cancel|declin|insufficient|denied|refus|invalid|expired/i.test(transferStatus)) {
+    const statusClass = classifyTransferStatus(transferStatus);
+    if (statusClass === "rejected") {
       return { status: "failed", idempotencyKey: key, error: `Credit transfer ${transferStatus} (${path})` };
+    }
+    if (statusClass === "unknown") {
+      return unknownOutcome(key, `Server answered with unrecognised transfer status "${transferStatus}" (${path})`);
     }
     const balance = Number(data.balance_after_cents ?? data.new_balance_cents);
     return {

@@ -26,6 +26,7 @@ import type {
   RegistryEntry,
   ReputationEntry,
   InboxMessage,
+  InboxMessageInsert,
 } from "../types.js";
 import {
   ISOLATED_TURN_SQL,
@@ -55,6 +56,9 @@ import {
   MIGRATION_V13,
   MIGRATION_V14,
   MIGRATION_V15,
+  MIGRATION_V16,
+  MIGRATION_V16_INBOX_COLUMNS,
+  MIGRATION_V16_RETIRE_BLOCKED,
   CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
 import { STATIC_MODEL_BASELINE } from "../inference/types.js";
@@ -487,17 +491,30 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   // ─── Inbox Messages ──────────────────────────────────────────
 
-  const insertInboxMessage = (msg: InboxMessage): void => {
-    db.prepare(
-      `INSERT OR IGNORE INTO inbox_messages (id, from_address, content, received_at, reply_to)
-       VALUES (?, ?, ?, ?, ?)`,
+  const insertInboxMessage = (msg: InboxMessageInsert): boolean => {
+    // to_address stays NULL: the colony router treats a row with a recipient
+    // as a colony protocol message, and the relay's `to` was already checked
+    // against our address.
+    const info = db.prepare(
+      `INSERT OR IGNORE INTO inbox_messages
+         (id, from_address, content, received_at, reply_to, status, verified, sig_hash,
+          signed_at, relay_created_at, screen, available_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       msg.id,
       msg.from,
       msg.content,
       msg.createdAt || new Date().toISOString(),
       msg.replyTo ?? null,
+      msg.status ?? "received",
+      msg.verified === true ? 1 : 0,
+      msg.sigHash ?? null,
+      msg.verified === true ? msg.signedAt ?? null : null,
+      msg.relayCreatedAt ?? null,
+      msg.screen ?? null,
+      msg.availableAt ?? null,
     );
+    return info.changes > 0;
   };
 
   const getUnprocessedInboxMessages = (limit: number): InboxMessage[] => {
@@ -677,6 +694,11 @@ function applyMigrations(db: DatabaseType): void {
       // discovered from the Conway API or Ollama.
       apply: () => { migrateModelRegistryOrigin(db); },
     },
+    {
+      version: 16,
+      // Adds the inbox sender-verification, replay and screening columns.
+      apply: () => { migrateInboxVerification(db); },
+    },
   ];
 
   for (const m of migrations) {
@@ -719,6 +741,25 @@ export function migrateModelRegistryOrigin(db: DatabaseType): void {
         AND provider NOT IN ('ollama', 'other')
         AND model_id NOT IN (${placeholders})`,
   ).run(...known);
+}
+
+/**
+ * Version 16: inbox verified flag, replay key, signed_at, the relay's
+ * createdAt and the stored screening verdict. Adds only missing columns, so
+ * it is safe on a database that already has some of them.
+ */
+export function migrateInboxVerification(db: DatabaseType): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inbox_messages'").get()) {
+    return;
+  }
+  const have = new Set(
+    (db.prepare("PRAGMA table_info(inbox_messages)").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  for (const [column, sql] of MIGRATION_V16_INBOX_COLUMNS) {
+    if (!have.has(column)) db.exec(sql);
+  }
+  db.exec(MIGRATION_V16);
+  if (have.has("status")) db.exec(MIGRATION_V16_RETIRE_BLOCKED);
 }
 
 /**
@@ -1538,7 +1579,7 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
   const claimTx = db.transaction(() => {
     const rows = db.prepare(
       `SELECT id, from_address, content, received_at, processed_at, reply_to, to_address, raw_content,
-              status, retry_count, max_retries
+              status, retry_count, max_retries, verified, screen
        FROM inbox_messages
        WHERE status = 'received' AND retry_count < max_retries
        ORDER BY received_at ASC
@@ -1568,6 +1609,8 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
       status: 'in_progress' as const,
       retryCount: (row.retry_count ?? 0) + 1,
       maxRetries: row.max_retries ?? 3,
+      verified: row.verified === 1,
+      screen: row.screen ?? null,
     }));
   });
 
@@ -1576,8 +1619,10 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
 
 /**
  * Claim one sender's messages: the oldest claimable row, then up to `limit`
- * claimable rows from the same address. An inbox turn then only ever holds
- * text from a single sender, so it can be limited to replying to that sender.
+ * claimable rows from the same address with the same verified flag. An inbox
+ * turn then only ever holds text from a single sender, all signed or all
+ * unsigned, so it can be limited to replying to that sender and labelled
+ * truthfully. Verified senders are served first.
  */
 export function claimInboxMessagesFromOneSender(
   db: DatabaseType,
@@ -1585,21 +1630,21 @@ export function claimInboxMessagesFromOneSender(
 ): InboxMessageRow[] {
   const claimTx = db.transaction(() => {
     const first = db.prepare(
-      `SELECT from_address FROM inbox_messages
+      `SELECT from_address, verified FROM inbox_messages
        WHERE status = 'received' AND retry_count < max_retries
-       ORDER BY received_at ASC
+       ORDER BY verified DESC, received_at ASC
        LIMIT 1`,
-    ).get() as { from_address: string } | undefined;
+    ).get() as { from_address: string; verified: number } | undefined;
     if (!first) return [];
 
     const rows = db.prepare(
       `SELECT id, from_address, content, received_at, processed_at, reply_to, to_address, raw_content,
-              status, retry_count, max_retries
+              status, retry_count, max_retries, verified, screen
        FROM inbox_messages
-       WHERE status = 'received' AND retry_count < max_retries AND from_address = ?
+       WHERE status = 'received' AND retry_count < max_retries AND from_address = ? AND verified = ?
        ORDER BY received_at ASC
        LIMIT ?`,
-    ).all(first.from_address, limit) as any[];
+    ).all(first.from_address, first.verified, limit) as any[];
     if (rows.length === 0) return [];
 
     const ids = rows.map((r: any) => r.id);
@@ -1622,6 +1667,8 @@ export function claimInboxMessagesFromOneSender(
       status: 'in_progress' as const,
       retryCount: (row.retry_count ?? 0) + 1,
       maxRetries: row.max_retries ?? 3,
+      verified: row.verified === 1,
+      screen: row.screen ?? null,
     }));
   });
 
@@ -1632,19 +1679,23 @@ export function claimInboxMessagesFromOneSender(
  * Earlier inbox turns from one sender, oldest first, for continuity on that
  * sender's next inbox turn. Only exact sender matches are returned, and only
  * for a well-formed address, so one sender never sees another's exchange.
+ * Only a verified batch gets history, and only from earlier verified turns:
+ * anyone can claim an address in an unsigned message.
  */
 export function getInboxTurnsFromSender(
   db: DatabaseType,
   sender: string,
+  verified: boolean,
   limit: number,
 ): AgentTurn[] {
+  if (!verified) return [];
   if (!isValidSenderAddress(sender)) return [];
   // EVM addresses match case-insensitively; Solana base58 addresses are
   // case-sensitive and must match exactly.
   const caseInsensitive = detectChainType(sender) === "evm";
   const prefix = caseInsensitive
-    ? inboxTurnPrefix(sender).toLowerCase()
-    : inboxTurnPrefix(sender);
+    ? inboxTurnPrefix(sender, true).toLowerCase()
+    : inboxTurnPrefix(sender, true);
   const head = caseInsensitive ? "lower(substr(input, 1, ?))" : "substr(input, 1, ?)";
   const rows = db.prepare(
     `SELECT * FROM turns
@@ -1749,6 +1800,87 @@ export function updateTurnToolCalls(db: DatabaseType, turnId: string, toolCalls:
   db.prepare("UPDATE turns SET tool_calls = ? WHERE id = ?").run(JSON.stringify(toolCalls), turnId);
 }
 
+/**
+ * Inbox rows stored for one sender since `sinceIso`, counted separately for
+ * signed and unsigned rows so forged traffic claiming an address cannot use
+ * up that address's signed budget. Every stored status counts, so a sender
+ * that keeps flooding stays limited. Durable across restarts.
+ */
+export function countRecentInboxFrom(
+  db: DatabaseType,
+  from: string,
+  verified: boolean,
+  sinceIso: string,
+  untilIso?: string,
+): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM inbox_messages
+     WHERE from_address = ? AND verified = ? AND received_at >= ? AND received_at <= ?`,
+  ).get(from, verified ? 1 : 0, sinceIso, untilIso ?? "9999") as { n: number };
+  return row.n;
+}
+
+/** Deferred rows waiting for one sender bucket (address plus verified flag). */
+export function countDeferredInboxFrom(db: DatabaseType, from: string, verified: boolean): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM inbox_messages
+     WHERE status = 'deferred' AND from_address = ? AND verified = ?`,
+  ).get(from, verified ? 1 : 0) as { n: number };
+  return row.n;
+}
+
+/**
+ * Rows of one sender bucket made claimable (shown to the agent) at or after
+ * `sinceIso`, by the real time they became claimable, not their sender time.
+ * Rows stamped later than now (a clock step back) count too.
+ */
+export function countShownInboxSince(db: DatabaseType, from: string, verified: boolean, sinceIso: string): number {
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM inbox_messages
+     WHERE from_address = ? AND verified = ? AND available_at >= ?`,
+  ).get(from, verified ? 1 : 0, sinceIso) as { n: number };
+  return row.n;
+}
+
+/** Sender buckets (address plus verified flag) with deferred rows waiting. */
+export function listDeferredInboxBuckets(db: DatabaseType): Array<{ from: string; verified: boolean }> {
+  return (db.prepare(
+    "SELECT DISTINCT from_address, verified FROM inbox_messages WHERE status = 'deferred'",
+  ).all() as Array<{ from_address: string; verified: number }>).map((r) => ({
+    from: r.from_address,
+    verified: r.verified === 1,
+  }));
+}
+
+/**
+ * Make up to `max` of one bucket's oldest deferred rows claimable, stamped
+ * available_at = nowIso. received_at (the clamped sender time) is kept, so
+ * claim order and the ingest window are unchanged. Returns how many.
+ */
+export function releaseDeferredInbox(
+  db: DatabaseType,
+  from: string,
+  verified: boolean,
+  max: number,
+  nowIso: string,
+): number {
+  if (max <= 0) return 0;
+  return db.transaction(() => {
+    const rows = db.prepare(
+      `SELECT id FROM inbox_messages
+       WHERE status = 'deferred' AND from_address = ? AND verified = ?
+       ORDER BY received_at ASC, rowid ASC
+       LIMIT ?`,
+    ).all(from, verified ? 1 : 0, max) as Array<{ id: string }>;
+    const update = db.prepare(
+      "UPDATE inbox_messages SET status = 'received', available_at = ? WHERE id = ? AND status = 'deferred'",
+    );
+    let released = 0;
+    for (const { id } of rows) released += update.run(nowIso, id).changes;
+    return released;
+  })();
+}
+
 export function getUnprocessedInboxCount(db: DatabaseType): number {
   const row = db.prepare(
     "SELECT COUNT(*) as count FROM inbox_messages WHERE status IN ('received','in_progress')",
@@ -1768,6 +1900,10 @@ export interface InboxMessageRow {
   status: string;
   retryCount: number;
   maxRetries: number;
+  /** Sender signature checked at ingest; false means relay-reported. */
+  verified: boolean;
+  /** Stored screening verdict (JSON), or null for older rows. */
+  screen: string | null;
 }
 
 // ─── Safe JSON Parse ────────────────────────────────────────────
@@ -1916,9 +2052,10 @@ function deserializeInboxMessage(row: any): InboxMessage {
     from: row.from_address,
     to: row.to_address ?? "",
     content: row.content,
-    signedAt: row.received_at,
+    signedAt: row.signed_at ?? row.received_at,
     createdAt: row.received_at,
     replyTo: row.reply_to ?? undefined,
+    verified: row.verified === 1,
   };
 }
 

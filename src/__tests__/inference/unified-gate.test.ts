@@ -343,14 +343,14 @@ describe("F130: deadlines and failover on timeouts, connection errors, 502 and 5
     expect(ledger().map((r) => r.status)).toEqual(["unknown"]);
   });
 
-  it.each([502, 504])("fails over on %s and releases the failed attempt", async (status) => {
+  it.each([502, 504])("fails over on %s and holds the failed attempt as unknown (it may have billed)", async (status) => {
     scripts.openai.push({ status });
 
     const result = await asPlanner(() => client().chat({ tier: "reasoning", messages: MESSAGES }));
 
     expect(result.metadata.providerId).toBe("groq");
     expect(hits).toEqual({ openai: 1, groq: 1 });
-    expect(ledger().map((r) => `${r.provider}:${r.status}`)).toEqual(["openai:released", "groq:committed"]);
+    expect(ledger().map((r) => `${r.provider}:${r.status}`)).toEqual(["openai:unknown", "groq:committed"]);
   });
 
   it("fails over when the provider refuses the connection", async () => {
@@ -476,5 +476,45 @@ describe("streaming", () => {
     expect(bodies.openai[0].stream_options).toEqual({ include_usage: true });
     // 1000 * 2 + 500 * 8 = 6000 micro-USD
     expect(ledger()).toEqual([expect.objectContaining({ status: "committed", cost_micro_usd: 6000 })]);
+  });
+});
+
+describe("review INFERENCE-3: a paid model with no configured price is never sent", () => {
+  function unpricedRegistry(providers: unknown[]): ProviderRegistry {
+    const cfg = path.join(tmpDir, "inference-providers.json");
+    fs.writeFileSync(cfg, JSON.stringify({ providers }));
+    const reg = ProviderRegistry.fromConfig(cfg);
+    reg.overrideBaseUrl("openai", `http://127.0.0.1:${port}/openai/v1`);
+    if (providers.some((p) => (p as { id: string }).id === "groq")) {
+      reg.overrideBaseUrl("groq", `http://127.0.0.1:${port}/groq/v1`);
+    }
+    return reg;
+  }
+
+  it("refuses with NO_MODEL instead of charging an assumed baseline price", async () => {
+    const reg = unpricedRegistry([{ id: "openai", models: [{ id: "o1", tier: "reasoning", maxOutputTokens: 4096 }] }]);
+    expect(reg.getModel("openai", "o1").model.costPerInputToken).toBe(0);
+
+    const err = await asPlanner(() => client(reg).chat({ tier: "reasoning", messages: MESSAGES })).catch((e) => e);
+    expect(err).toMatchObject({ name: "InferenceRefusedError", code: "NO_MODEL" });
+    expect(hits.openai).toBe(0);
+    expect(ledger()).toEqual([]);
+
+    const direct = await asPlanner(() =>
+      client(reg).chatDirect({ providerId: "openai", modelId: "o1", messages: MESSAGES }),
+    ).catch((e) => e);
+    expect(direct).toMatchObject({ name: "InferenceRefusedError", code: "NO_MODEL" });
+    expect(hits.openai).toBe(0);
+  });
+
+  it("moves on to a priced candidate", async () => {
+    const reg = unpricedRegistry([
+      { id: "openai", models: [{ id: "o1", tier: "reasoning", maxOutputTokens: 4096 }] },
+      { id: "groq" },
+    ]);
+    const result = await asPlanner(() => client(reg).chat({ tier: "reasoning", messages: MESSAGES }));
+    expect(result.metadata.providerId).toBe("groq");
+    expect(hits).toEqual({ openai: 0, groq: 1 });
+    expect(ledger().map((r) => `${r.provider}:${r.status}`)).toEqual(["groq:committed"]);
   });
 });

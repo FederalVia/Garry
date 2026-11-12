@@ -127,6 +127,16 @@ describe("matchProtected (write-deny)", () => {
       `${root}/src/config.ts`, `${root}/dist/index.js`, `${root}/node_modules/x/index.js`, `${root}/.git/config`,
       `${root}/scripts/automaton.sh`, `${root}/package.json`, `${root}/pnpm-lock.yaml`, `${root}/package-lock.json`,
       `${root}/tsconfig.json`, `${root}/tsconfig.test.json`, `${root}/.gitignore`, `${root}/constitution.md`,
+      // review GUARDS-1/GUARDS-2: the workspace packages and workspace build inputs
+      `${root}/packages/cli/dist/commands/fund.js`, `${root}/packages/cli/dist/commands/send.js`,
+      `${root}/packages/cli/dist/index.js`, `${root}/packages/cli/src/commands/status.ts`,
+      `${root}/packages/cli/tsconfig.json`, `${root}/packages/cli/node_modules/.bin/tsc`,
+      `${root}/packages/cli/evil/conway/x402.ts`, `${root}/packages/evil/build.sh`, `${root}/packages/evil`,
+      `${root}/pnpm-workspace.yaml`, `${root}/.pnpmfile.cjs`, `${root}/.pnpmfile.mjs`,
+      // review money paths: the shared transfer classifier, the on-chain signer, guard helpers
+      `${root}/src/conway/transfer-status.ts`, `${root}/src/registry/erc8004.ts`,
+      `${root}/dist/registry/erc8004.js`, `${root}/src/agent/text-normalize.ts`,
+      `${root}/src/observability/terminal-safe.ts`,
     ]),
   ];
   const allowed = (): string[] => [
@@ -139,6 +149,9 @@ describe("matchProtected (write-deny)", () => {
     // generic guard names belong to the runtime only when inside a checkout
     `${S()}/workspace/g/src/agent/loop.ts`, `${S()}/workspace/g/src/soul/model.ts`, "/p/src/heartbeat/config.ts",
     "/p/src/agent/harnesses/main.py", "/p/src/inference/budget.ts", "/p/lib/audit-log.js",
+    // workspace packages belong to the runtime only inside a checkout
+    "/p/packages/cli/dist/index.js", "/p/packages/cli/tsconfig.json", "/p/pnpm-workspace.yaml",
+    `${S()}/workspace/g/packages/cli/src/commands/status.ts`, `${S()}/workspace/g/pnpm-workspace.yaml`,
   ];
 
   it("denies every read-deny path too (superset)", () => {
@@ -171,7 +184,7 @@ describe("matchProtected (write-deny)", () => {
   });
 
   it("lists balance reads and the operator money paths among the guard command fragments", () => {
-    for (const f of ["conway/balance", "heartbeat/tick-context", "operator/fund", "operator/send"]) {
+    for (const f of ["conway/balance", "conway/transfer-status", "registry/erc8004", "heartbeat/tick-context", "operator/fund", "operator/send"]) {
       expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
     }
   });
@@ -263,6 +276,30 @@ describe("checkRead / checkWrite on the filesystem", () => {
     execFileSync("mkfifo", [fifo]);
     expect(checkRead(fifo).code).toBe("NOT_REGULAR");
     expect(checkWrite(fifo).code).toBe("NOT_REGULAR");
+  });
+
+  it("the workspace packages of a checkout found on disk are protected (review GUARDS-1, GUARDS-2)", () => {
+    const copy = path.join(dir, "ws-copy");
+    const cli = path.join(copy, "packages", "cli");
+    fs.mkdirSync(path.join(cli, "dist", "commands"), { recursive: true });
+    fs.mkdirSync(path.join(cli, "node_modules", ".bin"), { recursive: true });
+    fs.writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "@conway/automaton" }));
+    fs.writeFileSync(path.join(cli, "package.json"), JSON.stringify({ name: "@conway/automaton-cli" }));
+    fs.writeFileSync(path.join(cli, "dist", "commands", "fund.js"), "// built");
+    fs.writeFileSync(path.join(cli, "node_modules", ".bin", "tsc"), "#!/bin/sh\n");
+    for (const target of [
+      path.join(cli, "dist", "commands", "fund.js"),
+      path.join(cli, "dist", "commands", "send.js"),
+      path.join(cli, "tsconfig.json"),
+      path.join(cli, "node_modules", ".bin", "tsc"),
+      path.join(cli, "evil", "conway", "x402.ts"),
+      path.join(copy, "pnpm-workspace.yaml"),
+      path.join(copy, ".pnpmfile.cjs"),
+    ]) {
+      expect(checkWrite(target).code, target).toBe("PROTECTED_FILE");
+    }
+    // A new workspace package (a clone target) is refused too.
+    expect(checkWrite(path.join(copy, "packages", "evil"), { allowDirectory: true }).code).toBe("PROTECTED_FILE");
   });
 
   it("a file inside an automaton checkout found on disk gets the checkout rules", () => {

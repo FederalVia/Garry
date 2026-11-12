@@ -119,6 +119,8 @@ const NOT_SENT_CODES = new Set([
 
 const CALLER_STATUSES = new Set([400, 409, 413, 422]);
 const RETRY_STATUSES = new Set([429, 500, 503]);
+/** Gateway errors and request timeouts that may come after the upstream billed. */
+const GATEWAY_STATUSES = new Set([408, 502, 504]);
 
 const MODEL_MISSING_RE = /model_not_found|model[^.\n]{0,60}(does not exist|not found|not supported|unknown)|unknown model|no such model/i;
 
@@ -218,7 +220,12 @@ function byStatus(status: number, err: any): ErrorClassification {
   if (RETRY_STATUSES.has(status)) {
     return { ...base, kind: "server", retrySameProvider: true, failover: true, countsForBreaker: true };
   }
-  if (status >= 500 || status === 408) {
+  if (GATEWAY_STATUSES.has(status)) {
+    // A gateway (Conway, a CDN) or request timeout can answer after the
+    // upstream model generated and billed: hold the attempt like a timeout.
+    return { ...base, kind: "server", settle: "unknown", retrySameProvider: false, failover: true, countsForBreaker: true };
+  }
+  if (status >= 500) {
     return { ...base, kind: "server", retrySameProvider: false, failover: true, countsForBreaker: true };
   }
   if (status >= 400) {

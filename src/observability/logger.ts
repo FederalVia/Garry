@@ -9,6 +9,7 @@
 import type { LogLevel, LogEntry } from "../types.js";
 import { LOG_LEVEL_PRIORITY } from "../types.js";
 import { redactKeyMaterial, redactSecrets, redactSecretsDeep } from "../security/secret-redaction.js";
+import { escapeForTerminal, escapeJsonForTerminal } from "./terminal-safe.js";
 
 /** Log lines reach stdout/journald and files the agent can read back. */
 function scrub(text: string): string {
@@ -105,12 +106,13 @@ export class StructuredLogger {
         return;
       }
 
-      const json = JSON.stringify(entry);
+      // JSON escapes C0 but leaves C1 and bidi controls raw.
+      const json = escapeJsonForTerminal(JSON.stringify(entry));
       process.stdout.write(json + "\n");
     } catch {
       // Fallback if JSON serialization fails
       try {
-        process.stderr.write(`[logger-fallback] ${message}\n`);
+        process.stderr.write(`[logger-fallback] ${escapeForTerminal(scrub(String(message)), { keepNewlines: false })}\n`);
       } catch {
         // Completely silent — never throw from logger
       }

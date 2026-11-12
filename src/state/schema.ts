@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -900,4 +900,38 @@ export const MIGRATION_V15 = `
   ALTER TABLE model_registry ADD COLUMN origin TEXT NOT NULL DEFAULT 'baseline'
     CHECK(origin IN ('baseline','api','ollama','manual'));
   UPDATE model_registry SET origin = 'ollama' WHERE provider IN ('ollama','other');
+`;
+
+// === Inbox sender verification ===
+// Applied by the version 16 entry of applyMigrations (database.ts), which
+// adds each column only when it is missing. Relay rows keep to_address NULL:
+// the colony router treats any row with a recipient as a colony message.
+
+export const MIGRATION_V16_INBOX_COLUMNS: ReadonlyArray<[string, string]> = [
+  ["verified", "ALTER TABLE inbox_messages ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"],
+  ["sig_hash", "ALTER TABLE inbox_messages ADD COLUMN sig_hash TEXT"],
+  ["signed_at", "ALTER TABLE inbox_messages ADD COLUMN signed_at TEXT"],
+  ["relay_created_at", "ALTER TABLE inbox_messages ADD COLUMN relay_created_at TEXT"],
+  ["screen", "ALTER TABLE inbox_messages ADD COLUMN screen TEXT"],
+  // When the row became claimable, for the per-sender rate in real time.
+  ["available_at", "ALTER TABLE inbox_messages ADD COLUMN available_at TEXT"],
+];
+
+export const MIGRATION_V16 = `
+  -- Schema version: 16
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_sig
+    ON inbox_messages(sig_hash) WHERE sig_hash IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_inbox_from_received
+    ON inbox_messages(from_address, received_at);
+  CREATE INDEX IF NOT EXISTS idx_inbox_deferred
+    ON inbox_messages(from_address, verified, received_at) WHERE status = 'deferred';
+  CREATE INDEX IF NOT EXISTS idx_inbox_available
+    ON inbox_messages(from_address, verified, available_at) WHERE available_at IS NOT NULL;
+`;
+
+// Rows the old ingest blocked were stored as 'received' with a placeholder
+// body; they are audit records, not mail to answer.
+export const MIGRATION_V16_RETIRE_BLOCKED = `
+  UPDATE inbox_messages SET status = 'blocked'
+   WHERE status = 'received' AND substr(content, 1, 10) = '[BLOCKED: ';
 `;

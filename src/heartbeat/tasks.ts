@@ -16,16 +16,27 @@ import type {
   TickContext,
   HeartbeatLegacyContext,
   HeartbeatTaskFn,
+  InboxIngestStatus,
+  InboxMessage,
   SurvivalTier,
 } from "../types.js";
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
 import { LEGACY_LIVE, LIVE, holdsSlot } from "../replication/child-status.js";
-import { sanitizeInput } from "../agent/injection-defense.js";
+import { screenInbound, serializeScreen, type ScreenVerdict } from "../agent/injection-defense.js";
+import { normalizeSenderAddress } from "../agent/inbox-isolation.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
-import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import {
+  countDeferredInboxFrom,
+  countRecentInboxFrom,
+  countShownInboxSince,
+  listDeferredInboxBuckets,
+  metricsInsertSnapshot,
+  metricsPruneOld,
+  releaseDeferredInbox,
+} from "../state/database.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
@@ -39,6 +50,25 @@ function getAlertEngine(): AlertEngine {
   if (!_alertEngine) _alertEngine = new AlertEngine(createDefaultAlertRules());
   return _alertEngine;
 }
+
+/**
+ * Inbox rows accepted per sender per minute, counted separately for signed
+ * and unsigned rows of the same address. Later rows wait as deferred and are
+ * released at this rate.
+ */
+export const INBOX_RATE_LIMIT_PER_MINUTE = 10;
+/**
+ * Deferred rows one sender bucket may have waiting: three hours at the rate,
+ * enough for the backlog of a multi-hour outage paged by the relay. Past it,
+ * rows are stored as rate_limited and never handled, so one burst cannot
+ * queue more than that many hours of inbox turns.
+ */
+export const INBOX_DEFER_MAX_PER_SENDER = INBOX_RATE_LIMIT_PER_MINUTE * 180;
+const INBOX_RATE_WINDOW_MS = 60_000;
+// How far back a sender's time may place a message on the first poll, when
+// no previous poll is recorded (new install, or a database from before the
+// poll time was kept). Matches how long the relay holds signed mail.
+const INBOX_FIRST_POLL_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 
 // Last time the "no auto-topup on Solana" note was logged (once a day).
 let lastSolanaTopupNoticeMs = 0;
@@ -291,7 +321,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
     const cursor = taskCtx.db.getKV("social_inbox_cursor") || undefined;
 
-    let messages: any[] = [];
+    let messages: InboxMessage[] = [];
     let nextCursor: string | undefined;
 
     try {
@@ -320,38 +350,154 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     }
 
     if (nextCursor) taskCtx.db.setKV("social_inbox_cursor", nextCursor);
+    // Every successful poll moves the floor for sender times (below).
+    const pollNow = Date.now();
+    const previousPoll = Date.parse(taskCtx.db.getKV("social_inbox_last_poll_at") ?? "");
+    taskCtx.db.setKV("social_inbox_last_poll_at", new Date(pollNow).toISOString());
 
-    if (!messages || messages.length === 0) return { shouldWake: false };
+    // Screen each new message once, here, and store the original text with
+    // the verdict. The inbox turn renders from the stored verdict and never
+    // screens again, so the rate limit counts each message once.
+    //
+    // The rate is measured against when the sender sent (signed time for
+    // verified rows, the relay's time otherwise), not when we polled: one
+    // poll can carry several minutes of mail. That time is clamped to
+    // [previous poll, now], so a relay cannot back-date or spread a flood
+    // beyond the limit over the time that actually passed. The floor is the
+    // previous successful poll however long ago it was: a backlog held over
+    // a restart, an outage or low-compute sleep keeps its real spacing,
+    // instead of collapsing into one instant and tripping the limit. Rows
+    // that still exceed the limit (a backlog the relay pages over several
+    // polls, or delivers late) wait as deferred for a later poll.
+    //
+    // Separately, the rows made claimable in this poll are bounded in real
+    // time: per sender bucket, the limit times the minutes since the previous
+    // successful poll (at least one minute's worth), less what was shown in
+    // the last real minute. Sender times are clamped into the poll interval
+    // but are not when the agent sees a row, so this keeps a flood at the
+    // limit per minute of real time however close together polls run.
+    const floor = Number.isFinite(previousPoll)
+      ? Math.min(previousPoll, pollNow)
+      : pollNow - INBOX_FIRST_POLL_LOOKBACK_MS;
+    const sentAt = (msg: InboxMessage, verified: boolean): number => {
+      const t = Date.parse(verified ? msg.signedAt : msg.createdAt);
+      if (!Number.isFinite(t)) return pollNow;
+      return Math.min(pollNow, Math.max(floor, t));
+    };
 
-    // Persist to inbox_messages table for deduplication
-    // Sanitize content before DB insertion
+    const pollIso = new Date(pollNow).toISOString();
+    const pollBudget = Math.floor(
+      INBOX_RATE_LIMIT_PER_MINUTE * Math.max(1, (pollNow - floor) / INBOX_RATE_WINDOW_MS),
+    );
+    const shownSince = new Date(pollNow - INBOX_RATE_WINDOW_MS).toISOString();
+    const room = new Map<string, number>();
+    const bucketKey = (from: string, verified: boolean) => `${verified ? 1 : 0}:${from}`;
+    const roomFor = (from: string, verified: boolean): number => {
+      const key = bucketKey(from, verified);
+      let left = room.get(key);
+      if (left === undefined) {
+        left = pollBudget - countShownInboxSince(taskCtx.db.raw, from, verified, shownSince);
+        room.set(key, left);
+      }
+      return left;
+    };
+    const take = (from: string, verified: boolean, n: number) =>
+      room.set(bucketKey(from, verified), roomFor(from, verified) - n);
+
     let newCount = 0;
-    for (const msg of messages) {
-      const existing = taskCtx.db.getKV(`inbox_seen_${msg.id}`);
-      if (!existing) {
-        const sanitizedFrom = sanitizeInput(msg.from, msg.from, "social_address");
-        const sanitizedContent = sanitizeInput(msg.content, msg.from, "social_message");
-        const sanitizedMsg = {
-          ...msg,
-          from: sanitizedFrom.content,
-          content: sanitizedContent.content,
-        };
-        taskCtx.db.insertInboxMessage(sanitizedMsg);
+    let verifiedCount = 0;
+
+    // Rows deferred by earlier polls go first, oldest first, so a backlog
+    // keeps its order. Only after a successful poll.
+    for (const { from, verified } of listDeferredInboxBuckets(taskCtx.db.raw)) {
+      const released = releaseDeferredInbox(taskCtx.db.raw, from, verified, roomFor(from, verified), pollIso);
+      take(from, verified, released);
+      newCount += released;
+      if (verified) verifiedCount += released;
+    }
+
+    const seenIds = new Set<string>();
+    const candidates: Array<{ msg: InboxMessage; from: string; verified: boolean; at: number }> = [];
+    for (const msg of messages ?? []) {
+      if (!msg || typeof msg.id !== "string" || msg.id.length === 0) continue;
+      if (seenIds.has(msg.id) || taskCtx.db.getKV(`inbox_seen_${msg.id}`)) continue;
+      seenIds.add(msg.id);
+
+      // Checked again here: a SocialClientInterface other than our own
+      // client may not have run the inbound checks.
+      const from = normalizeSenderAddress(msg.from);
+      if (!from || typeof msg.content !== "string") {
+        logger.warn(`[INBOX] dropped ${JSON.stringify(msg.id.slice(0, 80))}: invalid_sender`);
         taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
-        // Only count non-blocked messages toward wake threshold —
-        // blocked messages are stored for audit but should not wake
-        // the agent (prevents injection spam from draining credits).
-        if (!sanitizedContent.blocked) {
-          newCount++;
-        }
+        continue;
+      }
+      const verified = msg.verified === true;
+      candidates.push({ msg, from, verified, at: sentAt(msg, verified) });
+    }
+    // Oldest first, so the sliding window sees earlier rows before later ones.
+    candidates.sort((a, b) => a.at - b.at);
+
+    for (const { msg, from, verified, at } of candidates) {
+      const recent = countRecentInboxFrom(
+        taskCtx.db.raw,
+        from,
+        verified,
+        new Date(at - INBOX_RATE_WINDOW_MS).toISOString(),
+        new Date(at).toISOString(),
+      );
+      // A row waits behind the sender's deferred rows, so delivery keeps
+      // sender order.
+      const waiting = countDeferredInboxFrom(taskCtx.db.raw, from, verified);
+      const overRate = recent >= INBOX_RATE_LIMIT_PER_MINUTE || waiting > 0 || roomFor(from, verified) <= 0;
+      let verdict: ScreenVerdict;
+      let status: InboxIngestStatus;
+      if (overRate && waiting >= INBOX_DEFER_MAX_PER_SENDER) {
+        verdict = { level: "blocked", reasons: ["rate_limit"] };
+        status = "rate_limited";
+      } else {
+        verdict = screenInbound(msg.content);
+        if (verdict.level === "blocked") status = "blocked";
+        else status = overRate ? "deferred" : "received";
+      }
+
+      const inserted = taskCtx.db.insertInboxMessage({
+        id: msg.id,
+        from,
+        to: "",
+        content: msg.content,
+        signedAt: msg.signedAt,
+        // Our clock bounds it: never before the previous poll, never after
+        // now. It drives claim order, the rate window and liveness.
+        createdAt: new Date(at).toISOString(),
+        relayCreatedAt: typeof msg.createdAt === "string" && msg.createdAt ? msg.createdAt : undefined,
+        replyTo: msg.replyTo,
+        verified,
+        sigHash: msg.sigHash,
+        status,
+        screen: serializeScreen(verdict),
+        availableAt: status === "received" ? pollIso : undefined,
+      });
+      taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
+      // Blocked, rate-limited, deferred and duplicate rows do not wake the
+      // agent, so injection spam or a replay cannot drain credits.
+      if (inserted && status === "received") {
+        take(from, verified, 1);
+        newCount++;
+        if (verified) verifiedCount++;
+      } else if (inserted && status === "deferred") {
+        logger.info(`[INBOX] deferred ${JSON.stringify(msg.id.slice(0, 80))}: over the per-sender rate`);
+      } else if (status === "blocked" || status === "rate_limited") {
+        // Warn: these rows are never handled, so the operator should see them.
+        logger.warn(`[INBOX] stored ${JSON.stringify(msg.id.slice(0, 80))} as ${status} (not delivered)`);
       }
     }
 
     if (newCount === 0) return { shouldWake: false };
 
+    // Counts only: sender text never reaches the privileged wake prompt.
     return {
       shouldWake: true,
-      message: `${newCount} new message(s) from: ${messages.map((m) => m.from.slice(0, 10)).join(", ")}`,
+      message: `${newCount} new message(s), ${verifiedCount} verified`,
     };
   },
 

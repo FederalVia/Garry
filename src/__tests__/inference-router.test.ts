@@ -440,10 +440,10 @@ describe("InferenceRouter", () => {
           },
         ),
       ).rejects.toBeInstanceOf(InferenceCallError);
-      // 502 fails over: gpt-5.2 then gpt-5-mini, both released.
+      // 502 fails over: gpt-5.2 then gpt-5-mini, both held as unknown (a gateway error may follow billing).
       expect(ledger().map((r) => [r.model, r.status])).toEqual([
-        ["gpt-5.2", "released"],
-        ["gpt-5-mini", "released"],
+        ["gpt-5.2", "unknown"],
+        ["gpt-5-mini", "unknown"],
       ]);
     });
   });

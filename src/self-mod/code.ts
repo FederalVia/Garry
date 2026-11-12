@@ -27,6 +27,7 @@ import {
   type PathDecision,
 } from "../security/protected-paths.js";
 import { readFileSafe, writeFileVerified } from "../security/secure-fs.js";
+import { introducedNeutralisedMarker } from "../agent/injection-defense.js";
 
 // ─── IMMUTABLE SAFETY INVARIANTS ─────────────────────────────
 // The protected and sensitive path rules live in security/protected-paths.ts,
@@ -145,10 +146,19 @@ export async function editFile(
 
   // 5. Read current content for diff
   let oldContent = "(new file)";
+  let existing: string | null = null;
   try {
-    oldContent = readFileSafe(target, { root: repoRoot });
+    oldContent = existing = readFileSafe(target, { root: repoRoot });
   } catch {
     oldContent = "(new file)";
+  }
+  // Text copied from a neutralised read would replace the original markers.
+  const marker = introducedNeutralisedMarker(newContent, existing);
+  if (marker) {
+    return {
+      success: false,
+      error: `BLOCKED: the content contains ${marker}, a placeholder from a neutralised tool result, and ${filePath} does not. Writing it would replace the original text.`,
+    };
   }
 
   // Path of the file inside the repo, for pathspec-limited commits.

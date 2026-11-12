@@ -426,6 +426,8 @@ async function run(): Promise<void> {
     readAuthorizationState: readUsdcAuthorizationState,
     spendTracker,
     conwayApiUrl: config.conwayApiUrl,
+    // acquireInstanceLock above: no other boot is alive on this database.
+    holdsInstanceLock: true,
   });
   installTreasury(treasury);
 

@@ -18,6 +18,7 @@ describe("orchestration/workspace", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     for (const root of tmpRoots.splice(0)) {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -27,6 +28,21 @@ describe("orchestration/workspace", () => {
     expect(fs.existsSync(path.join(basePath, "outputs"))).toBe(true);
     expect(fs.existsSync(path.join(basePath, "context"))).toBe(true);
     expect(fs.existsSync(path.join(basePath, "checkpoints"))).toBe(true);
+  });
+
+  it("defaults to the workspace under the state directory of the HOME the runtime uses", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-home-"));
+    tmpRoots.push(home);
+    const saved = process.env;
+    // Tests replace process.env wholesale; os.homedir() would not see this HOME.
+    process.env = { ...saved, HOME: home };
+    try {
+      const ws = new AgentWorkspace("goal-default");
+      expect(ws.basePath).toBe(path.join(home, ".automaton", "workspace", "goal-default"));
+      expect(fs.existsSync(path.join(ws.basePath, "outputs"))).toBe(true);
+    } finally {
+      process.env = saved;
+    }
   });
 
   it("rejects empty goalId", () => {
@@ -170,11 +186,11 @@ describe("orchestration/workspace", () => {
     expect(file?.summary).toBe("x".repeat(100));
   });
 
-  it("createWorkspace uses homedir-based default path", () => {
+  it("createWorkspace uses the HOME-based default path", () => {
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-home-"));
     tmpRoots.push(fakeHome);
 
-    vi.spyOn(os, "homedir").mockReturnValue(fakeHome);
+    vi.stubEnv("HOME", fakeHome);
 
     const ws = createWorkspace("goal-create");
     expect(ws.basePath).toBe(path.join(fakeHome, ".automaton", "workspace", "goal-create"));
