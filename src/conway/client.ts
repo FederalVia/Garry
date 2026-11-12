@@ -6,7 +6,7 @@
  * Adapted from @aiws/sdk patterns.
  */
 
-import { execSync } from "child_process";
+import { spawn } from "child_process";
 import fs from "fs";
 import nodePath from "path";
 import type {
@@ -21,21 +21,303 @@ import type {
   DomainRegistration,
   DnsRecord,
   ModelInfo,
+  OutflowRequestOptions,
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
+import { BalanceUnavailableError } from "./balance.js";
+import { guardConwayClient, type TreasuryResolver } from "../treasury/guarded-conway.js";
 import { ulid } from "ulid";
 import { keccak256, toHex } from "viem";
 import type { Address, PrivateKeyAccount } from "viem";
 import { randomUUID } from "crypto";
 import type { ChainType, ChainIdentity } from "../identity/chain.js";
+import { childProcessEnv } from "../security/child-env.js";
 
-interface ConwayClientOptions {
+/** Default command timeout when the caller gives none. */
+export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+/** Remote exec: the HTTP call may outlive the command by this much (queueing, upload of output). */
+export const REMOTE_EXEC_HTTP_MARGIN_MS = 15_000;
+const MAX_EXEC_OUTPUT_BYTES = 10 * 1024 * 1024;
+const KILL_GRACE_MS = 2_000;
+/** After the shell exits, how long to wait for its pipes to close before detaching them. */
+const PIPE_CLOSE_GRACE_MS = 200;
+
+// Process groups of commands still running in the foreground. A runtime
+// that exits mid-command must not leave them behind.
+const activeExecGroups = new Set<number>();
+let execExitHookInstalled = false;
+
+function installExecExitHook(): void {
+  if (execExitHookInstalled) return;
+  execExitHookInstalled = true;
+  process.on("exit", () => {
+    for (const pid of activeExecGroups) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+}
+
+function groupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * Run a shell command on this machine without blocking the event loop. The
+ * command gets its own process group, the scrubbed child environment and
+ * HOME as cwd. On timeout the whole group is killed (SIGTERM, then SIGKILL
+ * after 2 s) and the result has exit code 124. Background jobs (`cmd &`)
+ * keep running after the shell exits; their output is discarded.
+ */
+export function execLocalCommand(
+  command: string,
+  timeoutMs?: number,
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<ExecResult> {
+  const timeout = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_EXEC_TIMEOUT_MS;
+  installExecExitHook();
+
+  return new Promise<ExecResult>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("/bin/sh", ["-c", command], {
+        cwd: opts.cwd ?? (process.env.HOME || "/root"),
+        env: opts.env ?? childProcessEnv(),
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err: any) {
+      resolve({ stdout: "", stderr: err?.message || String(err), exitCode: 1 });
+      return;
+    }
+
+    const pid = child.pid;
+    const out: Buffer[] = [];
+    const errOut: Buffer[] = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let collecting = true;
+    let settled = false;
+    let timedOut = false;
+    let overflow = false;
+    let shellExited = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+
+    if (pid !== undefined) activeExecGroups.add(pid);
+
+    const detachPipes = () => {
+      collecting = false;
+      // Keep draining so a background job never dies of SIGPIPE, but never
+      // let its pipes keep this process alive.
+      for (const stream of [child.stdout, child.stderr]) {
+        if (!stream) continue;
+        stream.removeAllListeners("data");
+        stream.on("data", () => {});
+        stream.on("error", () => {});
+        stream.resume();
+        (stream as unknown as { unref?: () => void }).unref?.();
+      }
+      child.unref();
+    };
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (closeTimer) clearTimeout(closeTimer);
+      if (pid !== undefined) activeExecGroups.delete(pid);
+      detachPipes();
+      const stdout = Buffer.concat(out).toString("utf8");
+      let stderr = Buffer.concat(errOut).toString("utf8");
+      if (overflow) {
+        resolve({
+          stdout,
+          stderr: `${stderr}${stderr ? "\n" : ""}Command output exceeded 10 MB; its process group was killed.`,
+          exitCode: 1,
+        });
+        return;
+      }
+      if (timedOut) {
+        resolve({
+          stdout,
+          stderr: `${stderr}${stderr ? "\n" : ""}Command timed out after ${timeout} ms; its process group was killed.`,
+          exitCode: 124,
+        });
+        return;
+      }
+      if (exitCode === null && exitSignal) {
+        stderr = `${stderr}${stderr ? "\n" : ""}Command terminated by ${exitSignal}`;
+      }
+      resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
+    };
+
+    const stopGroup = (reason: "timeout" | "overflow") => {
+      if (settled) return;
+      if (reason === "timeout") timedOut = true;
+      else overflow = true;
+      collecting = false;
+      if (pid === undefined) {
+        finish();
+        return;
+      }
+      killGroup(pid, reason === "overflow" ? "SIGKILL" : "SIGTERM");
+      if (killTimer) return;
+      killTimer = setTimeout(() => {
+        if (groupAlive(pid)) killGroup(pid, "SIGKILL");
+        finish();
+      }, reason === "overflow" ? 0 : KILL_GRACE_MS);
+    };
+
+    const collect = (chunks: Buffer[], which: "out" | "err") => (chunk: Buffer) => {
+      if (!collecting) return;
+      if (which === "out") outBytes += chunk.length;
+      else errBytes += chunk.length;
+      if (outBytes > MAX_EXEC_OUTPUT_BYTES || errBytes > MAX_EXEC_OUTPUT_BYTES) {
+        stopGroup("overflow");
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout?.on("data", collect(out, "out"));
+    child.stderr?.on("data", collect(errOut, "err"));
+
+    const timer = setTimeout(() => stopGroup("timeout"), timeout);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      errOut.push(Buffer.from(err.message));
+      exitCode = 1;
+      finish();
+    });
+
+    child.on("exit", (code, signal) => {
+      shellExited = true;
+      exitCode = code;
+      exitSignal = signal;
+      if (timedOut || overflow) {
+        // Finish as soon as the whole group is gone; else the kill timer does.
+        if (pid === undefined || !groupAlive(pid)) finish();
+        return;
+      }
+      if (pid !== undefined) activeExecGroups.delete(pid);
+      closeTimer = setTimeout(finish, PIPE_CLOSE_GRACE_MS);
+    });
+
+    child.on("close", () => {
+      if (shellExited && !timedOut && !overflow) finish();
+    });
+  });
+}
+
+export interface ConwayClientOptions {
   apiUrl: string;
   apiKey: string;
   sandboxId: string;
 }
 
-export function createConwayClient(options: ConwayClientOptions): ConwayClient {
+/**
+ * The Conway client the rest of the agent uses. Its value-moving calls
+ * (transferCredits, createSandbox, registerDomain) go through the Treasury,
+ * resolved at call time: the explicit resolver, else the installed one, else
+ * the call is refused and nothing is sent. Scoped clients are guarded too.
+ */
+export function createConwayClient(
+  options: ConwayClientOptions & { treasury?: TreasuryResolver },
+): ConwayClient {
+  const { treasury, ...rawOptions } = options;
+  return guardConwayClient(createRawConwayClient(rawOptions), treasury);
+}
+
+/**
+ * A balance reader for the Treasury with its own HTTP client, so failures of
+ * other Conway calls (which can open the shared circuit breaker) never make
+ * the gate's balance reads fail. Throws when the balance is missing.
+ */
+export function createCreditBalanceReader(options: {
+  apiUrl: string;
+  apiKey: string;
+  /** Base delay between 404 retries (attempt n waits n times this). Default 1000ms. */
+  notFoundRetryDelayMs?: number;
+}): () => Promise<number> {
+  const httpClient = new ResilientHttpClient();
+  const delayMs = options.notFoundRetryDelayMs ?? 1000;
+  return async () => {
+    // Conway's load balancer intermittently answers 404 for valid endpoints;
+    // retry those like the main client does, outside the circuit breaker.
+    const max404Retries = 3;
+    let resp: Response;
+    for (let attempt = 0; ; attempt++) {
+      resp = await httpClient.request(`${options.apiUrl}/v1/credits/balance`, {
+        method: "GET",
+        headers: { Authorization: options.apiKey },
+        retries: 1,
+      });
+      if (resp.status !== 404 || attempt >= max404Retries) break;
+      await resp.body?.cancel().catch(() => {});
+      await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+    }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw httpError("GET", "/v1/credits/balance", resp.status, text);
+    }
+    const text = await resp.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new BalanceUnavailableError("malformed_response", "credit balance response is not JSON");
+    }
+    return parseCreditBalanceBody(data);
+  };
+}
+
+/**
+ * The credit balance in cents from a /v1/credits/balance body. Anything
+ * other than a finite number in balance_cents (else credits_cents) throws:
+ * a proxy error page or a renamed field is not a zero balance. A negative
+ * number is a real answer (debt).
+ */
+export function parseCreditBalanceBody(data: unknown): number {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    throw new BalanceUnavailableError("malformed_response", "credit balance response is not a JSON object");
+  }
+  const body = data as Record<string, unknown>;
+  const value = body.balance_cents ?? body.credits_cents;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new BalanceUnavailableError(
+      "malformed_response",
+      `credit balance response has no numeric balance_cents or credits_cents (got ${JSON.stringify(value) ?? "undefined"})`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The unguarded client. Module-private: only createConwayClient (which wraps
+ * it) and its own scoped clients use it, so no caller can move value without
+ * a treasury ledger row.
+ */
+function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
   const { apiUrl, apiKey } = options;
   // Normalize sandbox ID defensively so values like whitespace/"undefined"/"null"
   // never produce malformed API paths such as /v1/sandboxes//exec.
@@ -46,12 +328,28 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     method: string,
     path: string,
     body?: unknown,
-    requestOptions?: { idempotencyKey?: string; retries404?: number },
+    requestOptions?: {
+      idempotencyKey?: string;
+      retries404?: number;
+      /** Passed to the HTTP client; 0 for value-moving calls. */
+      retries?: number;
+      /** Runs once, before the first attempt; 404 re-sends do not call it again. */
+      onSend?: () => void;
+      /** "manual" for value-moving calls: a redirect is an answer, never followed. */
+      redirect?: RequestRedirect;
+      /** Per-attempt HTTP timeout in ms (default: the client's base timeout). */
+      timeout?: number;
+    },
   ): Promise<any> {
     // Conway LB has an intermittent routing bug that returns 404 for valid
     // sandbox endpoints. Retry 404s here (outside ResilientHttpClient) to
     // avoid tripping the circuit breaker on transient routing failures.
-    const max404Retries = requestOptions?.retries404 ?? 3;
+    // Re-sends reuse the same idempotency key.
+    // A keyless non-idempotent request is sent once: a 404 from a backend
+    // that did the work would otherwise repeat it.
+    const resendable = IDEMPOTENT_METHODS.has(method.toUpperCase()) || !!requestOptions?.idempotencyKey;
+    const max404Retries = resendable ? (requestOptions?.retries404 ?? 3) : 0;
+    requestOptions?.onSend?.();
     for (let attempt = 0; attempt <= max404Retries; attempt++) {
       const resp = await httpClient.request(`${apiUrl}${path}`, {
         method,
@@ -61,6 +359,9 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         },
         body: body ? JSON.stringify(body) : undefined,
         idempotencyKey: requestOptions?.idempotencyKey,
+        retries: requestOptions?.retries,
+        ...(requestOptions?.timeout !== undefined ? { timeout: requestOptions.timeout } : {}),
+        ...(requestOptions?.redirect ? { redirect: requestOptions.redirect } : {}),
       });
 
       if (resp.status === 404 && attempt < max404Retries) {
@@ -70,14 +371,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
       if (!resp.ok) {
         const text = await resp.text();
-        const err: any = new Error(
-          `Conway API error: ${method} ${path} -> ${resp.status}: ${text}`,
-        );
-        err.status = resp.status;
-        err.responseText = text;
-        err.method = method;
-        err.path = path;
-        throw err;
+        throw httpError(method, path, resp.status, text);
       }
 
       return resp.headers.get("content-type")?.includes("application/json")
@@ -108,40 +402,29 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
   const isLocal = !sandboxId;
 
-  const execLocal = (command: string, timeout?: number): ExecResult => {
-    try {
-      const stdout = execSync(command, {
-        timeout: timeout || 30_000,
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024,
-        cwd: process.env.HOME || "/root",
-      });
-      return { stdout: stdout || "", stderr: "", exitCode: 0 };
-    } catch (err: any) {
-      return {
-        stdout: err.stdout || "",
-        stderr: err.stderr || err.message || "",
-        exitCode: err.status ?? 1,
-      };
-    }
-  };
-
   const exec = async (
     command: string,
     timeout?: number,
   ): Promise<ExecResult> => {
-    if (isLocal) return execLocal(command, timeout);
+    if (isLocal) return execLocalCommand(command, timeout);
 
     // Remote sandboxes default to / as cwd. Wrap commands to run from /root
     // (matching local exec behavior) unless the command already sets a directory.
     const wrappedCommand = `cd /root && ${command}`;
+    const commandTimeout = timeout && timeout > 0 ? timeout : DEFAULT_EXEC_TIMEOUT_MS;
 
     try {
+      // The HTTP call lasts as long as the command plus a margin, and is
+      // never re-sent after a client-side abort: the command may be running.
       const result = await request(
         "POST",
         `/v1/sandboxes/${sandboxId}/exec`,
-        { command: wrappedCommand, timeout },
-        { idempotencyKey: ulid() },
+        { command: wrappedCommand, timeout: commandTimeout },
+        {
+          idempotencyKey: ulid(),
+          timeout: commandTimeout + REMOTE_EXEC_HTTP_MARGIN_MS,
+          retries: 0,
+        },
       );
       return {
         stdout: result.stdout || "",
@@ -182,10 +465,13 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       return;
     }
     try {
-      await request("POST", `/v1/sandboxes/${sandboxId}/files/upload/json`, {
-        path: filePath,
-        content,
-      });
+      // The key makes the LB-404 re-sends safe; never auto-retried otherwise.
+      await request(
+        "POST",
+        `/v1/sandboxes/${sandboxId}/files/upload/json`,
+        { path: filePath, content },
+        { idempotencyKey: ulid() },
+      );
     } catch (err: any) {
       // SECURITY: Never silently fall back to local FS on auth failure.
       if (err?.status === 403) {
@@ -234,6 +520,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       "POST",
       `/v1/sandboxes/${sandboxId}/ports/expose`,
       { port },
+      { idempotencyKey: ulid() },
     );
     return {
       port: result.port,
@@ -252,13 +539,25 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   const createSandbox = async (
     options: CreateSandboxOptions,
   ): Promise<SandboxInfo> => {
-    const result = await request("POST", "/v1/sandboxes", {
-      name: options.name,
-      vcpu: options.vcpu || 1,
-      memory_mb: options.memoryMb || 512,
-      disk_gb: options.diskGb || 5,
-      region: options.region,
-    });
+    // Sandboxes are prepaid and non-refundable: never auto-retry, and send
+    // an idempotency key so a server that honours it creates at most one.
+    const result = await request(
+      "POST",
+      "/v1/sandboxes",
+      {
+        name: options.name,
+        vcpu: options.vcpu || 1,
+        memory_mb: options.memoryMb || 512,
+        disk_gb: options.diskGb || 5,
+        region: options.region,
+      },
+      {
+        idempotencyKey: options.idempotencyKey ?? ulid(),
+        onSend: options.onSend,
+        retries: 0,
+        redirect: "manual",
+      },
+    );
     return {
       id: result.id || result.sandbox_id,
       status: result.status || "running",
@@ -293,9 +592,13 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
   // ─── Credits ─────────────────────────────────────────────────
 
+  /** Throws BalanceUnavailableError unless the body holds a numeric balance. */
   const getCreditsBalance = async (): Promise<number> => {
     const result = await request("GET", "/v1/credits/balance");
-    return result.balance_cents ?? result.credits_cents ?? 0;
+    if (typeof result === "string") {
+      throw new BalanceUnavailableError("malformed_response", "credit balance response is not JSON");
+    }
+    return parseCreditBalanceBody(result);
   };
 
   const getCreditsPricing = async (): Promise<PricingTier[]> => {
@@ -314,6 +617,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     toAddress: string,
     amountCents: number,
     note?: string,
+    opts?: OutflowRequestOptions,
   ): Promise<CreditTransferResult> => {
     const payload = {
       to_address: toAddress,
@@ -321,10 +625,13 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       note,
     };
 
-    const idempotencyKey = ulid();
+    // One key for both endpoint shapes, and the caller's key when given, so
+    // a retried logical transfer is recognisable by the server.
+    const idempotencyKey = opts?.idempotencyKey ?? ulid();
     const paths = ["/v1/credits/transfer", "/v1/credits/transfers"];
 
-    let lastError = "Unknown transfer error";
+    let last404: { path: string; text: string } | undefined;
+    opts?.onSend?.();
 
     for (const path of paths) {
       const resp = await httpClient.request(`${apiUrl}${path}`, {
@@ -336,14 +643,19 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         body: JSON.stringify(payload),
         idempotencyKey,
         retries: 0, // Mutating: do not auto-retry transfers
+        // A redirect is not followed: it would re-send the transfer elsewhere,
+        // and a failure on the second hop would look like nothing was sent.
+        redirect: "manual",
       });
 
       if (!resp.ok) {
         const text = await resp.text();
-        lastError = `${resp.status}: ${text}`;
         // Try next known endpoint shape before failing.
-        if (resp.status === 404) continue;
-        throw new Error(`Conway API error: POST ${path} -> ${lastError}`);
+        if (resp.status === 404) {
+          last404 = { path, text };
+          continue;
+        }
+        throw httpError("POST", path, resp.status, text);
       }
 
       const data = await resp.json().catch(() => ({}) as any);
@@ -357,9 +669,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       };
     }
 
-    throw new Error(
-      `Conway API error: POST /v1/credits/transfer -> ${lastError}`,
-    );
+    throw httpError("POST", "/v1/credits/transfer", 404, last404?.text ?? "Unknown transfer error");
   };
 
   const registerAutomaton = async (params: {
@@ -451,7 +761,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       body.chain_type = "solana";
     }
 
-    return request("POST", "/v1/automatons/register", body);
+    return request("POST", "/v1/automatons/register", body, { idempotencyKey: ulid() });
   };
 
   // ─── Domains ──────────────────────────────────────────────────
@@ -476,11 +786,15 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   const registerDomain = async (
     domain: string,
     years: number = 1,
+    opts?: OutflowRequestOptions,
   ): Promise<DomainRegistration> => {
-    const result = await request("POST", "/v1/domains/register", {
-      domain,
-      years,
-    });
+    // Paid and not refundable: never auto-retry, always send a key.
+    const result = await request(
+      "POST",
+      "/v1/domains/register",
+      { domain, years },
+      { idempotencyKey: opts?.idempotencyKey ?? ulid(), onSend: opts?.onSend, retries: 0, redirect: "manual" },
+    );
     return {
       domain: result.domain || domain,
       status: result.status || "registered",
@@ -516,6 +830,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
       "POST",
       `/v1/domains/${encodeURIComponent(domain)}/dns`,
       { type, host, value, ttl: ttl || 3600 },
+      { idempotencyKey: ulid() },
     );
     return {
       id: result.id || result.record_id || "",
@@ -575,8 +890,10 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     return [];
   };
 
+  // Raw on purpose: the guarded wrapper re-guards scoped clients, so each
+  // outflow is gated exactly once.
   const createScopedClient = (targetSandboxId: string): ConwayClient => {
-    return createConwayClient({ apiUrl, apiKey, sandboxId: targetSandboxId });
+    return createRawConwayClient({ apiUrl, apiKey, sandboxId: targetSandboxId });
   };
 
   const client: ConwayClient = {
@@ -607,6 +924,23 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
   // that any code with a client reference could access.
 
   return client;
+}
+
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]);
+
+/** A Conway API error carrying the HTTP status and body (message format unchanged). */
+function httpError(method: string, path: string, status: number, text: string): Error {
+  const err: any = new Error(`Conway API error: ${method} ${path} -> ${status}: ${text}`);
+  err.status = status;
+  err.responseText = text;
+  err.method = method;
+  err.path = path;
+  return err;
+}
+
+/** True when this sandbox id means "run on this machine" (empty, whitespace, "undefined", "null"). */
+export function isLocalSandboxId(value: string | null | undefined): boolean {
+  return normalizeSandboxId(value) === "";
 }
 
 function normalizeSandboxId(value: string | null | undefined): string {

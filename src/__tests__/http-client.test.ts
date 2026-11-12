@@ -6,9 +6,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   ResilientHttpClient,
   CircuitOpenError,
+  RedirectRefusedError,
 } from "../conway/http-client.js";
 
 // ─── Mock fetch ────────────────────────────────────────────────
@@ -567,5 +570,224 @@ describe("ResilientHttpClient", () => {
       expect(clearTimeoutSpy).toHaveBeenCalled();
       clearTimeoutSpy.mockRestore();
     });
+  });
+});
+
+// ─── Which requests are re-sent ────────────────────────────────
+
+describe("retries follow the method", () => {
+  it("a POST that gets a 504 is sent once", async () => {
+    const client = new ResilientHttpClient({ backoffBase: 1 });
+    const fetchSpy = vi.fn().mockResolvedValue(mockResponse(504));
+    globalThis.fetch = fetchSpy as any;
+    const resp = await client.request("https://api.example.com/v1/thing", { method: "POST", body: "{}" });
+    expect(resp.status).toBe(504);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a POST whose send throws (or times out) is not re-sent", async () => {
+    const client = new ResilientHttpClient({ backoffBase: 1 });
+    const fetchSpy = vi.fn().mockRejectedValue(new Error("socket hang up"));
+    globalThis.fetch = fetchSpy as any;
+    await expect(client.request("https://api.example.com/v1/thing", { method: "POST", body: "{}" })).rejects.toThrow(
+      "socket hang up",
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("an idempotency key alone does not make a POST retryable", async () => {
+    const client = new ResilientHttpClient({ backoffBase: 1 });
+    const fetchSpy = vi.fn().mockResolvedValue(mockResponse(503));
+    globalThis.fetch = fetchSpy as any;
+    await client.request("https://api.example.com/v1/thing", { method: "POST", idempotencyKey: "k1", retries: 3 });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a GET that gets a 504 is still retried up to maxRetries", async () => {
+    const client = new ResilientHttpClient({ maxRetries: 3, backoffBase: 1, backoffMax: 1 });
+    const fetchSpy = vi.fn().mockResolvedValue(mockResponse(504));
+    globalThis.fetch = fetchSpy as any;
+    const pending = client.request("https://api.example.com/v1/thing");
+    await vi.runAllTimersAsync();
+    expect((await pending).status).toBe(504);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+  });
+
+  it("a POST marked retryUnsafe is retried", async () => {
+    const client = new ResilientHttpClient({ maxRetries: 2, backoffBase: 1, backoffMax: 1 });
+    const fetchSpy = vi.fn().mockResolvedValueOnce(mockResponse(503)).mockResolvedValueOnce(mockResponse(200));
+    globalThis.fetch = fetchSpy as any;
+    const pending = client.request("https://api.example.com/v1/poll", { method: "POST", retryUnsafe: true });
+    await vi.runAllTimersAsync();
+    expect((await pending).status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("fetch is always called with redirect: manual", async () => {
+    const client = new ResilientHttpClient({ maxRetries: 0 });
+    const fetchSpy = vi.fn().mockResolvedValue(mockResponse(200));
+    globalThis.fetch = fetchSpy as any;
+    await client.request("https://api.example.com/x", { redirect: "follow" });
+    expect(fetchSpy.mock.calls[0][1].redirect).toBe("manual");
+  });
+});
+
+// ─── Circuit breaker per origin ────────────────────────────────
+
+describe("circuit breaker per origin", () => {
+  it("a flaky host opens only its own breaker (paid fetches to other hosts still go out)", async () => {
+    const client = new ResilientHttpClient({ maxRetries: 0, circuitBreakerThreshold: 3 });
+    const fetchSpy = vi.fn(async (url: string) =>
+      url.startsWith("https://flaky.example") ? mockResponse(503) : mockResponse(200),
+    );
+    globalThis.fetch = fetchSpy as any;
+    for (let i = 0; i < 3; i++) await client.request("https://flaky.example/data");
+    await expect(client.request("https://flaky.example/data")).rejects.toThrow(CircuitOpenError);
+    expect(client.isCircuitOpen("https://flaky.example/x")).toBe(true);
+    expect(client.isCircuitOpen("https://other.example/x")).toBe(false);
+    expect(client.isCircuitOpen()).toBe(true);
+
+    const other = await client.request("https://other.example/pay", { headers: { "X-Payment": "sig" } });
+    expect(other.status).toBe(200);
+    expect(fetchSpy.mock.calls.filter(([u]) => String(u).startsWith("https://other.example"))).toHaveLength(1);
+    expect(client.getConsecutiveFailures("https://flaky.example/")).toBeGreaterThanOrEqual(3);
+    expect(client.getConsecutiveFailures()).toBe(0); // the most recent origin
+  });
+});
+
+// ─── Redirects (real loopback servers) ─────────────────────────
+
+describe("redirects", () => {
+  type Seen = { path: string; host?: string; idem?: string; xpay?: string; auth?: string };
+  let servers: http.Server[] = [];
+
+  beforeEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+  });
+
+  afterEach(async () => {
+    await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
+    servers = [];
+  });
+
+  async function serve(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void): Promise<number> {
+    const server = http.createServer(handler);
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    return (server.address() as AddressInfo).port;
+  }
+
+  function recorder(seen: Seen[]) {
+    return (req: http.IncomingMessage, res: http.ServerResponse) => {
+      seen.push({
+        path: req.url ?? "",
+        host: req.headers.host,
+        idem: req.headers["idempotency-key"] as string | undefined,
+        xpay: req.headers["x-payment"] as string | undefined,
+        auth: req.headers["authorization"] as string | undefined,
+      });
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    };
+  }
+
+  it("a 302 to another origin is never followed: the target receives nothing (F146)", async () => {
+    const seenB: Seen[] = [];
+    const bPort = await serve(recorder(seenB));
+    const aPort = await serve((_req, res) => {
+      res.writeHead(302, { location: `http://localhost:${bPort}/landing` });
+      res.end();
+    });
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    const url = `http://127.0.0.1:${aPort}/v1/x`;
+    const headers = { Authorization: "secret", "X-Payment": "sig", "x-api-key": "key" };
+
+    // Default: the 3xx comes back to the caller.
+    const resp = await client.request(url, { headers, idempotencyKey: "idem1" });
+    expect(resp.status).toBe(302);
+    expect(resp.ok).toBe(false);
+
+    // Opted in: refused as cross-origin, and a paid request is never followed.
+    await expect(client.request(url, { headers, idempotencyKey: "idem1", followRedirects: 3 })).rejects.toBeInstanceOf(
+      RedirectRefusedError,
+    );
+    await expect(client.request(url, { followRedirects: 3 })).rejects.toThrow(/cross-origin/);
+    expect(seenB).toEqual([]);
+  });
+
+  it("a paid request is not followed even to the same origin", async () => {
+    const seen: Seen[] = [];
+    const port = await serve((req, res) => {
+      if (req.url === "/start") {
+        res.writeHead(302, { location: "/next" });
+        res.end();
+        return;
+      }
+      recorder(seen)(req, res);
+    });
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    await expect(
+      client.request(`http://127.0.0.1:${port}/start`, { headers: { "X-Payment": "sig" }, followRedirects: 1 }),
+    ).rejects.toBeInstanceOf(RedirectRefusedError);
+    expect(seen).toEqual([]);
+  });
+
+  it("an opted-in same-origin GET redirect is followed", async () => {
+    const seen: Seen[] = [];
+    const port = await serve((req, res) => {
+      if (req.url === "/start") {
+        res.writeHead(302, { location: "/next" });
+        res.end();
+        return;
+      }
+      recorder(seen)(req, res);
+    });
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    const resp = await client.request(`http://127.0.0.1:${port}/start`, { followRedirects: 1 });
+    expect(resp.status).toBe(200);
+    expect(seen.map((s) => s.path)).toEqual(["/next"]);
+  });
+
+  it("a redirect loop stops at the opted-in hop count", async () => {
+    const port = await serve((_req, res) => {
+      res.writeHead(302, { location: "/again" });
+      res.end();
+    });
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    await expect(client.request(`http://127.0.0.1:${port}/start`, { followRedirects: 2 })).rejects.toThrow(
+      /more than 2 redirect/,
+    );
+  });
+
+  it("a POST is never redirected, even when opted in", async () => {
+    const seen: Seen[] = [];
+    const port = await serve((req, res) => {
+      if (req.url === "/start") {
+        res.writeHead(307, { location: "/next" });
+        res.end();
+        return;
+      }
+      recorder(seen)(req, res);
+    });
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    await expect(
+      client.request(`http://127.0.0.1:${port}/start`, { method: "POST", body: "{}", followRedirects: 1 }),
+    ).rejects.toBeInstanceOf(RedirectRefusedError);
+    expect(seen).toEqual([]);
+  });
+});
+
+describe("redirect hops are checked like the first URL", () => {
+  it("a redirect from https to http on a non-loopback host is refused", async () => {
+    const client = new ResilientHttpClient({ maxRetries: 0 });
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(null, { status: 301, headers: { location: "http://api.example.com/plain" } }),
+    );
+    globalThis.fetch = fetchSpy as any;
+    await expect(client.request("https://api.example.com/start", { followRedirects: 3 })).rejects.toThrow(
+      /HTTPS required/,
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

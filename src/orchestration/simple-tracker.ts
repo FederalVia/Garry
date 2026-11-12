@@ -6,6 +6,11 @@ import type {
   ConwayClient,
 } from "../types.js";
 import type { AgentTracker, FundingProtocol } from "./types.js";
+import { runWithTreasuryOrigin } from "../treasury/registry.js";
+import { createLogger } from "../observability/logger.js";
+import { TERMINAL, hasLifecycleEvents, isEnded } from "../replication/child-status.js";
+
+const logger = createLogger("orchestration.simple-tracker");
 
 const IDLE_STATUSES = new Set<ChildStatus>(["running", "healthy"]);
 
@@ -26,14 +31,24 @@ export class SimpleAgentTracker implements AgentTracker {
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     );
 
+    // Lifecycle children run their own mission and cannot execute colony
+    // tasks, so they are never idle workers.
     const children = this.db.raw.prepare(
       `SELECT id, name, address, status, COALESCE(role, 'generalist') AS role
        FROM children
        WHERE status IN ('running', 'healthy')`,
     ).all() as { id: string; name: string; address: string; status: string; role: string }[];
 
+    // A local worker gets its one task at spawn and ends with it: it is never
+    // idle, and a task assigned to it would never run.
     return children
-      .filter((child) => IDLE_STATUSES.has(child.status as ChildStatus) && !assignedAddresses.has(child.address))
+      .filter(
+        (child) =>
+          IDLE_STATUSES.has(child.status as ChildStatus) &&
+          !assignedAddresses.has(child.address) &&
+          !child.address.startsWith("local://") &&
+          !hasLifecycleEvents(this.db.raw, child.id),
+      )
       .map((child) => ({
         address: child.address,
         name: child.name,
@@ -60,10 +75,31 @@ export class SimpleAgentTracker implements AgentTracker {
       return;
     }
 
+    // Only ChildLifecycle writes the status of a lifecycle child, and an
+    // ended legacy row never comes back.
+    if (hasLifecycleEvents(this.db.raw, child.id)) {
+      logger.warn("Ignoring tracker status write to a lifecycle-managed child", {
+        address,
+        status,
+        current: child.status,
+      });
+      return;
+    }
+    if (TERMINAL.has(child.status)) {
+      return;
+    }
+
     this.db.updateChildStatus(child.id, status as ChildStatus);
   }
 
+  /** Adds a row for the agent unless one with this address already exists. */
   register(agent: { address: string; name: string; role: string; sandboxId: string }): void {
+    if (agent.address) {
+      const existing = this.db.raw
+        .prepare("SELECT 1 FROM children WHERE address = ? LIMIT 1")
+        .get(agent.address);
+      if (existing) return;
+    }
     this.db.insertChild({
       id: ulid(),
       name: agent.name,
@@ -79,10 +115,16 @@ export class SimpleAgentTracker implements AgentTracker {
 }
 
 export class SimpleFundingProtocol implements FundingProtocol {
+  /**
+   * @param originName who funds through this protocol ("orchestrator.fund_child"
+   *   or "health.fund_child"). The treasury applies the shared transfer budget
+   *   plus the automatic-funding sub-cap and per-child cooldown to it.
+   */
   constructor(
     private readonly conway: ConwayClient,
     private readonly identity: AutomatonIdentity,
     private readonly db: AutomatonDatabase,
+    private readonly originName: string = "orchestrator.fund_child",
   ) {}
 
   async fundChild(childAddress: string, amountCents: number): Promise<{ success: boolean }> {
@@ -91,11 +133,25 @@ export class SimpleFundingProtocol implements FundingProtocol {
       return { success: true };
     }
 
+    // Never send credits to a child whose rows are all ended.
+    const rows = this.db.raw
+      .prepare("SELECT status FROM children WHERE address = ?")
+      .all(childAddress) as Array<{ status: string }>;
+    if (rows.length > 0 && rows.every((row) => isEnded(row.status))) {
+      return { success: false };
+    }
+
     try {
-      const result = await this.conway.transferCredits(
-        childAddress,
-        transferAmount,
-        "Task funding from orchestrator",
+      // A treasury denial, a rejected status or an unknown outcome all throw
+      // and become { success: false }; nothing is added to the child ledger.
+      const result = await runWithTreasuryOrigin(
+        { type: "auto", name: this.originName },
+        () =>
+          this.conway.transferCredits(
+            childAddress,
+            transferAmount,
+            "Task funding from orchestrator",
+          ),
       );
 
       const success = isTransferSuccessful(result.status);
@@ -119,6 +175,9 @@ export class SimpleFundingProtocol implements FundingProtocol {
       return { success: true, amountCents: 0 };
     }
 
+    // This is a transfer from the parent to itself (nothing leaves the child).
+    // The treasury refuses self-transfers, so this returns { success: false }
+    // and the child ledger is left alone instead of being zeroed.
     try {
       const result = await this.conway.transferCredits(
         this.identity.address,

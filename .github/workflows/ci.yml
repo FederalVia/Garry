@@ -14,28 +14,25 @@ jobs:
       - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck
+      - name: Typecheck tests
+        run: pnpm run typecheck:test
+      # A timeout fails the job. The suite takes about 30 seconds.
       - name: Run tests
         timeout-minutes: 10
-        run: |
-          set +e
-          timeout 300 pnpm test
-          RC=$?
-          set -e
-          # Exit code 124 means timeout killed the process (vitest hung after tests completed)
-          if [ $RC -eq 124 ]; then echo "::warning::vitest process hung after tests, killed by timeout"; exit 0; fi
-          exit $RC
+        run: pnpm test
+      # vitest filters by test name with -t. It has no --grep option.
       - name: Run security tests
-        timeout-minutes: 10
-        run: |
-          set +e
-          timeout 180 pnpm test -- --grep "security|injection|policy|financial"
-          RC=$?
-          set -e
-          if [ $RC -eq 124 ]; then echo "::warning::vitest process hung after tests, killed by timeout"; exit 0; fi
-          exit $RC
+        timeout-minutes: 5
+        run: pnpm exec vitest run -t "security|injection|policy|financial"
 
   security-audit:
     runs-on: ubuntu-latest
+    # Fails on high and critical advisories. Four moderate ones remain under
+    # @solana/web3.js > jayson, in code the agent never loads: uuid (affects
+    # v3/v5/v6 with a buffer; jayson only calls v4) and stream-json (used by
+    # jayson's TCP/TLS server and client; @solana/web3.js only requires
+    # jayson/lib/client/browser, which never loads it). Clearing them needs
+    # jayson 5, outside @solana/web3.js's supported range.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -43,4 +40,4 @@ jobs:
           node-version: 22
       - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level=high || true
+      - run: pnpm audit --audit-level=high

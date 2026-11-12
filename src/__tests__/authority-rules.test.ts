@@ -34,6 +34,7 @@ import { createAuthorityRules } from "../agent/policy-rules/authority.js";
 import { createRateLimitRules } from "../agent/policy-rules/rate-limits.js";
 import { createFinancialRules } from "../agent/policy-rules/financial.js";
 import { createDefaultRules } from "../agent/policy-rules/index.js";
+import { MIGRATION_V12 } from "../state/schema.js";
 
 // ─── Test Helpers ───────────────────────────────────────────────
 
@@ -73,7 +74,28 @@ function createRawTestDb(): Database.Database {
       window_day TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- The rate limits count real effects in these tables.
+    CREATE TABLE IF NOT EXISTS modifications (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      type TEXT NOT NULL,
+      description TEXT NOT NULL,
+      file_path TEXT,
+      diff TEXT,
+      reversible INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS children (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      address TEXT NOT NULL,
+      sandbox_id TEXT NOT NULL,
+      genesis_prompt TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'spawning',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
+  db.exec(MIGRATION_V12);
 
   return db;
 }
@@ -328,11 +350,13 @@ describe("Authority Rules", () => {
         ),
       );
 
+      // The inbox allow list refuses these before any tool-specific rule.
       expect(spend.action).toBe("deny");
+      expect(spend.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(edit.action).toBe("deny");
-      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(edit.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(spawn.action).toBe("deny");
-      expect(spawn.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+      expect(spawn.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
     });
 
     it("blocks spending and code edits from an unknown source", () => {
@@ -375,9 +399,11 @@ describe("Authority Rules", () => {
       );
 
       expect(spend.action).toBe("deny");
+      expect(spend.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(edit.action).toBe("deny");
-      expect(edit.reasonCode).toBe("EXTERNAL_SELF_MOD");
+      expect(edit.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(spawn.action).toBe("deny");
+      expect(spawn.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
     });
 
     it("still allows spending and code edits from the creator", () => {
@@ -434,10 +460,25 @@ describe("Authority Rules", () => {
       );
 
       expect(inbox.action).toBe("deny");
-      expect(inbox.reasonCode).toBe("EXTERNAL_DANGEROUS_TOOL");
+      expect(inbox.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(unknown.action).toBe("deny");
+      expect(unknown.reasonCode).toBe("INBOX_TOOL_NOT_ALLOWED");
       expect(creator.action).toBe("allow");
       expect(autonomous.action).toBe("allow");
+    });
+
+    it("blocks stop_child from inbox and unknown sources", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({
+        name: "stop_child",
+        riskLevel: "dangerous",
+        category: "replication",
+      });
+
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "external")).action).toBe("deny");
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "peer" as InputSource)).action).toBe("deny");
+      expect(engine.evaluate(createRequest(tool, { child_id: "c1" }, "creator")).action).toBe("allow");
     });
 
     it("does not take transfer_credits away from heartbeat or source-less turns", () => {
@@ -517,6 +558,31 @@ describe("Authority Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
+    it("matches protected entries by path segment, not substring", () => {
+      const rules = createAuthorityRules();
+      const engine = new PolicyEngine(db, rules);
+      const tool = createMockTool({ name: "write_file", riskLevel: "caution", category: "vm" });
+      const decide = (p: string) => engine.evaluate(createRequest(tool, { path: p }, undefined)).action;
+
+      // Ordinary files whose names merely contain a protected entry.
+      expect(decide("/app/tsconfig.json")).toBe("allow");
+      expect(decide("/app/jest.config.json")).toBe("allow");
+      expect(decide("/app/app.config.json")).toBe("allow");
+      expect(decide("/app/docs/audit-log.md")).toBe("allow");
+
+      // Protected files and directories, including code modules by stem.
+      expect(decide("/root/.automaton/config.json")).toBe("deny");
+      expect(decide("~/.automaton/SOUL.md")).toBe("deny");
+      expect(decide("/root/.automaton/soul.md")).toBe("deny");
+      expect(decide("/app/src/agent/policy-rules/x.ts")).toBe("deny");
+      expect(decide("/app/src/agent/policy-engine.ts")).toBe("deny");
+      expect(decide("/app/dist/agent/injection-defense.js")).toBe("deny");
+      expect(decide("/app/src/self-mod/code.ts")).toBe("deny");
+      expect(decide("/app/src/self-mod/audit-log.ts")).toBe("deny");
+      expect(decide("/app/src/x/../agent/policy-rules/financial.ts")).toBe("deny");
+      expect(decide("C:\\app\\src\\agent\\policy-rules\\financial.ts")).toBe("deny");
+    });
+
     it("allows edit_own_file on protected paths from agent input", () => {
       const rules = createAuthorityRules();
       const engine = new PolicyEngine(db, rules);
@@ -563,12 +629,23 @@ describe("Rate Limit Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
-    it("blocks genesis prompt change after 1/day", () => {
-      // Insert a recent allowed decision for update_genesis_prompt
+    it("does not count an allow decision whose call changed nothing", () => {
       db.prepare(
         `INSERT INTO policy_decisions (id, tool_name, tool_args_hash, risk_level, decision, reason, created_at)
          VALUES ('dec1', 'update_genesis_prompt', 'hash1', 'dangerous', 'allow', 'ALLOWED', datetime('now'))`,
       ).run();
+
+      const engine = new PolicyEngine(db, createRateLimitRules());
+      const tool = createMockTool({ name: "update_genesis_prompt", riskLevel: "dangerous", category: "self_mod" });
+      expect(engine.evaluate(createRequest(tool, {}, "agent", db)).action).toBe("allow");
+    });
+
+    it("blocks genesis prompt change after 1/day", () => {
+      // A genesis prompt change that took effect today
+      db.prepare(
+        `INSERT INTO modifications (id, timestamp, type, description)
+         VALUES ('mod1', ?, 'prompt_change', 'Genesis prompt updated')`,
+      ).run(new Date().toISOString());
 
       const rules = createRateLimitRules();
       const engine = new PolicyEngine(db, rules);
@@ -603,12 +680,12 @@ describe("Rate Limit Rules", () => {
     });
 
     it("blocks self-mod after 10/hour", () => {
-      // Insert 10 recent allowed decisions for edit_own_file
+      // 10 own-code edits written in the last hour
       for (let i = 0; i < 10; i++) {
         db.prepare(
-          `INSERT INTO policy_decisions (id, tool_name, tool_args_hash, risk_level, decision, reason, created_at)
-           VALUES ('dec_edit_${i}', 'edit_own_file', 'hash${i}', 'dangerous', 'allow', 'ALLOWED', datetime('now'))`,
-        ).run();
+          `INSERT INTO modifications (id, timestamp, type, description)
+           VALUES ('mod_edit_${i}', ?, 'code_edit', 'edit')`,
+        ).run(new Date().toISOString());
       }
 
       const rules = createRateLimitRules();
@@ -644,10 +721,11 @@ describe("Rate Limit Rules", () => {
     });
 
     it("blocks spawn after 3/day", () => {
+      // Three children with sandboxes created today
       for (let i = 0; i < 3; i++) {
         db.prepare(
-          `INSERT INTO policy_decisions (id, tool_name, tool_args_hash, risk_level, decision, reason, created_at)
-           VALUES ('dec_spawn_${i}', 'spawn_child', 'hash${i}', 'dangerous', 'allow', 'ALLOWED', datetime('now'))`,
+          `INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, status, created_at)
+           VALUES ('child_${i}', 'c${i}', '', 'sbx-${i}', 'g', 'running', datetime('now'))`,
         ).run();
       }
 
@@ -791,7 +869,7 @@ describe("Financial Phase 1 Rules", () => {
     });
 
     it("quarantines transfers above confirmation threshold", () => {
-      const rules = createFinancialRules(DEFAULT_TREASURY_POLICY);
+      const rules = createFinancialRules({ ...DEFAULT_TREASURY_POLICY, maxSingleTransferCents: 5000 });
       const engine = new PolicyEngine(db, rules);
 
       const tool = createMockTool({
@@ -805,7 +883,7 @@ describe("Financial Phase 1 Rules", () => {
       // Should be quarantined (2000 > 1000 threshold), but may also be denied
       // by transfer_max_single if over that limit. 2000 < 5000 so it won't be denied.
       expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
     });
 
     it("returns quarantine, not deny, for confirmation threshold", () => {
@@ -827,7 +905,7 @@ describe("Financial Phase 1 Rules", () => {
 
       const decision = engine.evaluate(request);
       expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
+      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
     });
   });
 });
@@ -836,7 +914,8 @@ describe("Financial Phase 1 Rules", () => {
 
 describe("Treasury Config", () => {
   it("DEFAULT_TREASURY_POLICY has all required fields", () => {
-    expect(DEFAULT_TREASURY_POLICY.maxSingleTransferCents).toBe(5000);
+    // Equal to the confirmation threshold, which caps every transfer anyway.
+    expect(DEFAULT_TREASURY_POLICY.maxSingleTransferCents).toBe(1000);
     expect(DEFAULT_TREASURY_POLICY.maxHourlyTransferCents).toBe(10000);
     expect(DEFAULT_TREASURY_POLICY.maxDailyTransferCents).toBe(25000);
     expect(DEFAULT_TREASURY_POLICY.minimumReserveCents).toBe(1000);
@@ -873,11 +952,16 @@ describe("createDefaultRules", () => {
     expect(ruleIds).toContain("financial.require_confirmation");
   });
 
-  it("authority rules have priority 400", () => {
+  it("authority rules have priority 400, except the inbox allow list which runs first", () => {
     const rules = createDefaultRules();
     const authorityRules = rules.filter((r) => r.id.startsWith("authority."));
     for (const rule of authorityRules) {
-      expect(rule.priority).toBe(400);
+      if (rule.id === "authority.inbox_allow_list") {
+        // Runs before validation so its refusal does not echo arguments.
+        expect(rule.priority).toBeLessThan(Math.min(...rules.filter((r) => r !== rule).map((r) => r.priority)));
+      } else {
+        expect(rule.priority).toBe(400);
+      }
     }
   });
 

@@ -5,10 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CodingHarness } from "../../agent/harnesses/coding-harness.js";
 import type { HarnessContext } from "../../agent/harness-types.js";
 import type { TaskResult } from "../../orchestration/task-graph.js";
-import type { ConwayClient } from "../../types.js";
+import { PolicyEngine } from "../../agent/policy-engine.js";
+import { createDefaultRules } from "../../agent/policy-rules/index.js";
+import type { AutomatonDatabase, ConwayClient } from "../../types.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
-import { createInMemoryDb } from "../orchestration/test-db.js";
-import { createTestConfig, createTestIdentity } from "../mocks.js";
+import { createTestConfig, createTestDb, createTestIdentity } from "../mocks.js";
 
 function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
   return {
@@ -36,11 +37,11 @@ function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
 }
 
 describe("agent/CodingHarness confinement", () => {
-  let db: ReturnType<typeof createInMemoryDb>;
+  let db: AutomatonDatabase;
   let testRoot: string;
 
   beforeEach(() => {
-    db = createInMemoryDb();
+    db = createTestDb();
     testRoot = mkdtempSync(path.join(os.tmpdir(), "coding-harness-"));
   });
 
@@ -49,16 +50,19 @@ describe("agent/CodingHarness confinement", () => {
     rmSync(testRoot, { recursive: true, force: true });
   });
 
-  async function createHarness(conway: ConwayClient) {
+  async function createHarness(conway: ConwayClient, mode: "local" | "remote" = "remote") {
     const harness = new CodingHarness();
     const workspace = new AgentWorkspace("goal-coding", path.join(testRoot, "workspace"));
+    const identity = createTestIdentity();
+    // Local mode (no sandbox) is where the harness touches the host filesystem.
+    const config = mode === "local" ? createTestConfig({ sandboxId: "" }) : createTestConfig();
     const context: HarnessContext = {
       workspaceRoot: workspace.basePath,
       allowedEditRoot: testRoot,
       workspace,
-      identity: createTestIdentity(),
-      config: createTestConfig(),
-      db,
+      identity,
+      config,
+      db: db.raw,
       conway,
       inference: { chat: async () => ({ content: "done" }) },
       budget: {
@@ -72,6 +76,8 @@ describe("agent/CodingHarness confinement", () => {
       wisdom: { conventions: [], successes: [], failures: [], gotchas: [] },
       abortSignal: new AbortController().signal,
       goalId: "goal-coding",
+      toolContext: { identity, config, db, conway, inference: {} as any },
+      policyEngine: new PolicyEngine(db.raw, createDefaultRules()),
     };
 
     await harness.initialize(
@@ -104,8 +110,13 @@ describe("agent/CodingHarness confinement", () => {
     return harness;
   }
 
-  async function runTool(conway: ConwayClient, toolName: string, args: Record<string, unknown>): Promise<string> {
-    const harness = await createHarness(conway);
+  async function runTool(
+    conway: ConwayClient,
+    toolName: string,
+    args: Record<string, unknown>,
+    mode: "local" | "remote" = "remote",
+  ): Promise<string> {
+    const harness = await createHarness(conway, mode);
     const tool = harness.getToolDefs().find((entry) => entry.name === toolName);
     if (!tool) throw new Error(`missing tool: ${toolName}`);
     return tool.execute(args);
@@ -129,17 +140,32 @@ describe("agent/CodingHarness confinement", () => {
     expect(out).toContain("outside workspace");
   });
 
-  it("allows patch_file inside the allowed edit root via local fallback", async () => {
+  it("allows patch_file inside the allowed edit root in local mode", async () => {
+    const filePath = path.join(testRoot, "src", "example.ts");
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    writeFileSync(filePath, "const value = 'before';\n", "utf8");
+
+    const out = await runTool(createConwayStub(), "patch_file", {
+      path: filePath,
+      search: "'before'",
+      replace: "'after'",
+    }, "local");
+
+    expect(out).toContain("Patched");
+    expect(readFileSync(filePath, "utf8")).toContain("'after'");
+  });
+
+  it("in remote mode, a failing sandbox gives a patch error and never falls back to the host", async () => {
     const filePath = path.join(testRoot, "src", "example.ts");
     mkdirSync(path.dirname(filePath), { recursive: true });
     writeFileSync(filePath, "const value = 'before';\n", "utf8");
 
     const conway = createConwayStub({
       readFile: async () => {
-        throw new Error("force local fallback");
+        throw new Error("sandbox unavailable");
       },
       writeFile: async () => {
-        throw new Error("force local fallback");
+        throw new Error("sandbox unavailable");
       },
     });
 
@@ -149,7 +175,7 @@ describe("agent/CodingHarness confinement", () => {
       replace: "'after'",
     });
 
-    expect(out).toContain("Patched");
-    expect(readFileSync(filePath, "utf8")).toContain("'after'");
+    expect(out).toContain("patch error");
+    expect(readFileSync(filePath, "utf8")).toContain("'before'");
   });
 });

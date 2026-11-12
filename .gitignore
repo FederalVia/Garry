@@ -11,3 +11,15 @@ dist
 .automaton/wallet.json
 .automaton/state.db
 
+
+# Secrets and local state: never commit
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+automaton.json
+wallet.json
+inference-providers.json
+*.sqlite
+state.db*

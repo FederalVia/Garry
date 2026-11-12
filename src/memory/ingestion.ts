@@ -23,6 +23,7 @@ import {
   type KnowledgeEntry,
 } from "./knowledge-store.js";
 import { createLogger } from "../observability/logger.js";
+import { isIsolatedTurn, normalizeSenderAddress } from "../agent/inbox-isolation.js";
 const logger = createLogger("memory.ingestion");
 
 type Database = BetterSqlite3.Database;
@@ -81,6 +82,9 @@ export interface Contradiction {
   description: string;
 }
 
+/** Below the 0.3 threshold that memory retrieval uses for trusted entities. */
+const INBOX_SENDER_TRUST = 0.2;
+
 export class MemoryIngestionPipeline {
   private working: WorkingMemoryManager;
   private episodic: EpisodicMemoryManager;
@@ -105,8 +109,21 @@ export class MemoryIngestionPipeline {
    * Ingest a completed turn into the memory system.
    * Never throws -- all errors are caught and logged.
    */
-  ingest(sessionId: string, turn: AgentTurn, toolCallResults: ToolCallResult[]): void {
+  ingest(
+    sessionId: string,
+    turn: AgentTurn,
+    toolCallResults: ToolCallResult[],
+    options?: { inboxSenders?: string[] },
+  ): void {
     try {
+      // An inbox turn read untrusted text, so its thinking, tool arguments and
+      // tool results are not stored anywhere a later turn reads. Only the
+      // senders, taken from the inbox rows rather than the text, are recorded.
+      if (isIsolatedTurn(turn)) {
+        this.recordInboxSenders(options?.inboxSenders ?? []);
+        return;
+      }
+
       const classification = classifyTurn(toolCallResults, turn.thinking);
 
       // 1. Record episodic memory for the turn
@@ -720,28 +737,33 @@ export class MemoryIngestionPipeline {
         }
       }
 
-      // Track inbox message sources (once per turn, not per tool call).
-      // "external" is the untrusted inbox source. Recording the sender does
-      // not give that turn any tool authority.
-      if (
-        (turn.inputSource === "agent" || turn.inputSource === "external") &&
-        turn.input
-      ) {
-        const fromMatch = turn.input.match(
-          /\[UNTRUSTED EXTERNAL SENDER (0x[a-fA-F0-9]+)\]|\[Message from (0x[a-fA-F0-9]+)\]/,
-        );
-        const fromAddress = fromMatch?.[1] || fromMatch?.[2];
-        if (fromAddress) {
-          const existing = this.relationships.get(fromAddress);
-          if (existing) {
-            this.relationships.recordInteraction(fromAddress);
-          } else {
-            this.relationships.record({
-              entityAddress: fromAddress,
-              relationshipType: "messaged_us",
-              trustScore: 0.5,
-            });
-          }
+    } catch (error) {
+      logger.error("Relationship update failed", error instanceof Error ? error : undefined);
+    }
+  }
+
+  /**
+   * Record each distinct, well-formed sender of an inbox batch. Unsigned
+   * senders get a trust score below the retrieval threshold, so they do not
+   * fill the Known Entities section of every later turn.
+   */
+  private recordInboxSenders(senders: string[]): void {
+    try {
+      const seen = new Set<string>();
+      for (const sender of senders) {
+        const key = normalizeSenderAddress(sender);
+        if (!key) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const existing = this.relationships.get(sender);
+        if (existing) {
+          this.relationships.recordInteraction(sender);
+        } else {
+          this.relationships.record({
+            entityAddress: sender,
+            relationshipType: "messaged_us",
+            trustScore: INBOX_SENDER_TRUST,
+          });
         }
       }
     } catch (error) {

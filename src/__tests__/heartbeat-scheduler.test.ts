@@ -305,6 +305,26 @@ describe("DurableScheduler", () => {
       const acquired = acquireTaskLease(rawDb, "expired_lease", "new-owner", 60_000);
       expect(acquired).toBe(true);
     });
+
+    it("expires an ISO lease from earlier the same day", () => {
+      // ISO 'T' sorts after datetime()'s space, so a text compare never expires it.
+      seedScheduleRow(rawDb, "same_day_lease");
+      const justExpired = new Date(Date.now() - 2_000).toISOString();
+      rawDb.prepare(
+        "UPDATE heartbeat_schedule SET lease_owner = ?, lease_expires_at = ? WHERE task_name = ?",
+      ).run("old-owner", justExpired, "same_day_lease");
+
+      expect(acquireTaskLease(rawDb, "same_day_lease", "new-owner", 60_000)).toBe(true);
+
+      rawDb.prepare(
+        "UPDATE heartbeat_schedule SET lease_owner = ?, lease_expires_at = ? WHERE task_name = ?",
+      ).run("old-owner", justExpired, "same_day_lease");
+      expect(clearExpiredLeases(rawDb)).toBe(1);
+
+      // A live ISO lease is still respected.
+      acquireTaskLease(rawDb, "same_day_lease", "owner-a", 60_000);
+      expect(acquireTaskLease(rawDb, "same_day_lease", "owner-b", 60_000)).toBe(false);
+    });
   });
 
   describe("task execution history recording", () => {
@@ -367,6 +387,8 @@ describe("DurableScheduler", () => {
       expect(ctx.tickId).toBeTruthy();
       expect(ctx.startedAt).toBeInstanceOf(Date);
       expect(ctx.creditBalance).toBe(5_000);
+      expect(ctx.creditRead).toMatchObject({ known: true, value: 5_000 });
+      expect(ctx.survivalTierKnown).toBe(true);
       expect(ctx.survivalTier).toBe("high");
       expect(ctx.lowComputeMultiplier).toBe(4);
       expect(ctx.config).toBe(DEFAULT_HB_CONFIG);
@@ -385,9 +407,31 @@ describe("DurableScheduler", () => {
         DEFAULT_HB_CONFIG,
       );
 
-      // Should default to 0 credits (critical tier — zero is broke, not dead)
-      expect(ctx.creditBalance).toBe(0);
-      expect(ctx.survivalTier).toBe("critical");
+      // Unknown, not zero: no placeholder balance and no critical tier.
+      expect(ctx.creditBalance).toBeNull();
+      expect(ctx.creditRead).toMatchObject({ known: false, reason: "network_error" });
+      expect(ctx.survivalTierKnown).toBe(false);
+      expect(ctx.survivalTier).toBe("low_compute");
+    });
+
+    it("keeps the last known tier while the balance is unknown", async () => {
+      conway.creditsCents = 30; // low_compute
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      conway.creditsCents = 50_000; // high
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      conway.getCreditsBalance = async () => {
+        throw new Error("API unavailable");
+      };
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      expect(ctx.survivalTier).toBe("high");
+      expect(ctx.survivalTierKnown).toBe(false);
+      const since = (rawDb.prepare("SELECT value FROM kv WHERE key = 'balance_unknown_since'").get() as any)?.value;
+      expect(typeof since).toBe("string");
+
+      // A good read ends the outage.
+      conway.getCreditsBalance = async () => 50_000;
+      await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      expect(rawDb.prepare("SELECT value FROM kv WHERE key = 'balance_unknown_since'").get()).toBeUndefined();
     });
   });
 

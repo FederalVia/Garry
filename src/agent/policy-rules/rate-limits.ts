@@ -2,7 +2,9 @@
  * Rate Limit Policy Rules
  *
  * Enforces rate limits on sensitive operations to prevent abuse.
- * Queries the policy_decisions table to count recent operations.
+ * The quota counts evidence that an operation took effect (or may have),
+ * never policy 'allow' decisions: executeTool logs the decision before the
+ * tool runs, so a call that failed would otherwise use up the quota.
  */
 
 import type {
@@ -10,6 +12,11 @@ import type {
   PolicyRequest,
   PolicyRuleResult,
 } from "../../types.js";
+
+type RawDb = import("better-sqlite3").Database;
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 function deny(
   rule: string,
@@ -19,45 +26,68 @@ function deny(
   return { rule, action: "deny", reasonCode, humanMessage };
 }
 
-/**
- * Count recent policy decisions for a tool within a time window.
- * Uses the policy_decisions table which logs all tool evaluations.
- */
-function countRecentDecisions(
-  db: import("better-sqlite3").Database,
-  toolName: string,
-  windowMs: number,
-): number {
-  const cutoff = new Date(Date.now() - windowMs);
-  // SQLite datetime format: 'YYYY-MM-DD HH:MM:SS'
-  const cutoffStr = cutoff.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+function rawDbOf(request: PolicyRequest): RawDb | undefined {
+  return (request.context.db as any)?.raw ?? (request.context as any).rawDb;
+}
+
+/** modifications.timestamp is ISO 8601, so ISO strings compare in order. */
+function countModifications(db: RawDb, type: string, windowMs: number): number {
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
   const row = db
-    .prepare(
-      `SELECT COUNT(*) as count FROM policy_decisions
-       WHERE tool_name = ? AND decision = 'allow' AND created_at >= ?`,
-    )
-    .get(toolName, cutoffStr) as { count: number };
+    .prepare("SELECT COUNT(*) AS count FROM modifications WHERE type = ? AND timestamp >= ?")
+    .get(type, cutoff) as { count: number };
   return row.count;
 }
 
 /**
- * Maximum 1 genesis prompt change per day.
+ * Spawns that cost a sandbox, or may have, in the window:
+ * - children rows created in the window, except in-process local workers
+ *   and rows that failed before any sandbox id was recorded;
+ * - plus sandbox creations the treasury sent whose outcome is still open or
+ *   unknown (a timeout or 5xx after the POST left: a prepaid sandbox may
+ *   exist although the child row records none).
+ * Orchestrator-spawned Conway children count too: they cost the same.
+ */
+function countSpawns(db: RawDb, windowMs: number): number {
+  const cutoffMs = Date.now() - windowMs;
+  const cutoffIso = new Date(cutoffMs).toISOString();
+  const cutoffSql = cutoffIso.replace("T", " ").replace(/\.\d{3}Z$/, "");
+  // children.created_at is SQLite datetime() text for insertChild rows and
+  // ISO text for lifecycle rows; compare each form against its own cutoff.
+  const children = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM children
+        WHERE address NOT LIKE 'local://%'
+          AND NOT (status = 'failed' AND sandbox_id = '')
+          AND ((created_at LIKE '____-__-__T%' AND created_at >= ?)
+            OR (created_at NOT LIKE '____-__-__T%' AND created_at >= ?))`,
+    )
+    .get(cutoffIso, cutoffSql) as { count: number };
+  const unknownSandboxes = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM treasury_ledger
+        WHERE kind = 'sandbox_create' AND status IN ('sent', 'unknown')
+          AND COALESCE(sent_at_ms, created_at_ms) >= ?`,
+    )
+    .get(cutoffMs) as { count: number };
+  return children.count + unknownSandboxes.count;
+}
+
+/**
+ * Maximum 1 genesis prompt change per day: counts prompt_change rows, which
+ * update_genesis_prompt writes only after the change is applied.
  */
 function createGenesisPromptDailyRule(): PolicyRule {
   return {
     id: "rate.genesis_prompt_daily",
-    description: "Maximum 1 update_genesis_prompt per day",
+    description: "Maximum 1 genesis prompt change per day",
     priority: 600,
     appliesTo: { by: "name", names: ["update_genesis_prompt"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      // Access the raw database through the tool context
-      // The db is available via context.db, but we need the raw sqlite instance
-      // Rate limit rules need the raw DB to query policy_decisions
-      const db = (request.context.db as any)?.raw ?? (request.context as any).rawDb;
+      const db = rawDbOf(request);
       if (!db) return deny(this.id, "DB_UNAVAILABLE", "Rate limit check failed: database not accessible");
 
-      const oneDayMs = 24 * 60 * 60 * 1000;
-      const recentCount = countRecentDecisions(db, "update_genesis_prompt", oneDayMs);
+      const recentCount = countModifications(db, "prompt_change", DAY_MS);
 
       if (recentCount >= 1) {
         return deny(
@@ -73,20 +103,20 @@ function createGenesisPromptDailyRule(): PolicyRule {
 }
 
 /**
- * Maximum 10 self-mod operations per hour.
+ * Maximum 10 self-mod edits per hour: counts code_edit rows, which
+ * editFile writes only after the file was written.
  */
 function createSelfModHourlyRule(): PolicyRule {
   return {
     id: "rate.self_mod_hourly",
-    description: "Maximum 10 edit_own_file calls per hour",
+    description: "Maximum 10 own-code edits per hour",
     priority: 600,
     appliesTo: { by: "name", names: ["edit_own_file"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const db = (request.context.db as any)?.raw ?? (request.context as any).rawDb;
+      const db = rawDbOf(request);
       if (!db) return deny(this.id, "DB_UNAVAILABLE", "Rate limit check failed: database not accessible");
 
-      const oneHourMs = 60 * 60 * 1000;
-      const recentCount = countRecentDecisions(db, "edit_own_file", oneHourMs);
+      const recentCount = countModifications(db, "code_edit", HOUR_MS);
 
       if (recentCount >= 10) {
         return deny(
@@ -102,20 +132,20 @@ function createSelfModHourlyRule(): PolicyRule {
 }
 
 /**
- * Maximum 3 child spawns per day.
+ * Maximum 3 child spawns per day, counted as sandboxes created or possibly
+ * created (see countSpawns).
  */
 function createSpawnDailyRule(): PolicyRule {
   return {
     id: "rate.spawn_daily",
-    description: "Maximum 3 spawn_child calls per day",
+    description: "Maximum 3 child spawns per day",
     priority: 600,
     appliesTo: { by: "name", names: ["spawn_child"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const db = (request.context.db as any)?.raw ?? (request.context as any).rawDb;
+      const db = rawDbOf(request);
       if (!db) return deny(this.id, "DB_UNAVAILABLE", "Rate limit check failed: database not accessible");
 
-      const oneDayMs = 24 * 60 * 60 * 1000;
-      const recentCount = countRecentDecisions(db, "spawn_child", oneDayMs);
+      const recentCount = countSpawns(db, DAY_MS);
 
       if (recentCount >= 3) {
         return deny(

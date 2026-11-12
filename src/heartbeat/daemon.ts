@@ -9,6 +9,8 @@
  * - No setInterval remains; uses recursive setTimeout for overlap protection
  * - Tick frequency derived from config.defaultIntervalMs, not log level
  * - lowComputeMultiplier applied to non-essential tasks via scheduler
+ * - heartbeat.yml seeds the schedule without erasing run state or runtime
+ *   changes (see schedule-store.ts)
  */
 
 import type {
@@ -23,7 +25,7 @@ import type {
 } from "../types.js";
 import { BUILTIN_TASKS } from "./tasks.js";
 import { DurableScheduler } from "./scheduler.js";
-import { upsertHeartbeatSchedule } from "../state/database.js";
+import { seedHeartbeatSchedule } from "./schedule-store.js";
 import type BetterSqlite3 from "better-sqlite3";
 import { createLogger } from "../observability/logger.js";
 
@@ -47,6 +49,8 @@ export interface HeartbeatDaemon {
   stop(): void;
   isRunning(): boolean;
   forceRun(taskName: string): Promise<void>;
+  /** Wait for the current tick and any still-running task, at most timeoutMs. */
+  drain(timeoutMs: number): Promise<void>;
 }
 
 /**
@@ -76,27 +80,8 @@ export function createHeartbeatDaemon(
     taskMap.set(name, fn);
   }
 
-  // Seed heartbeat_schedule from config entries if not already present
-  for (const entry of heartbeatConfig.entries) {
-    upsertHeartbeatSchedule(rawDb, {
-      taskName: entry.name,
-      cronExpression: entry.schedule,
-      intervalMs: null,
-      enabled: entry.enabled ? 1 : 0,
-      priority: 0,
-      timeoutMs: 30_000,
-      maxRetries: 1,
-      tierMinimum: "dead",
-      lastRunAt: entry.lastRun ?? null,
-      nextRunAt: entry.nextRun ?? null,
-      lastResult: null,
-      lastError: null,
-      runCount: 0,
-      failCount: 0,
-      leaseOwner: null,
-      leaseExpiresAt: null,
-    });
-  }
+  // Insert missing entries; keep run state and runtime changes of existing ones.
+  seedHeartbeatSchedule(rawDb, heartbeatConfig.entries);
 
   const scheduler = new DurableScheduler(
     rawDb,
@@ -130,6 +115,7 @@ export function createHeartbeatDaemon(
   const start = (): void => {
     if (running) return;
     running = true;
+    scheduler.resume();
 
     // Run first tick immediately
     scheduler.tick().catch((err) => {
@@ -149,8 +135,12 @@ export function createHeartbeatDaemon(
       clearTimeout(timeoutId);
       timeoutId = null;
     }
+    // A tick in progress finishes its current task and starts no other.
+    scheduler.stop();
     logger.info("Daemon stopped.");
   };
+
+  const drain = (timeoutMs: number): Promise<void> => scheduler.drain(timeoutMs);
 
   const isRunning = (): boolean => running;
 
@@ -161,5 +151,5 @@ export function createHeartbeatDaemon(
     await scheduler.executeTask(taskName, context);
   };
 
-  return { start, stop, isRunning, forceRun };
+  return { start, stop, isRunning, forceRun, drain };
 }

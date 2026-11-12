@@ -7,6 +7,9 @@
  * Phase 1.1: All tasks accept TickContext as first parameter.
  * Credit balance is fetched once per tick and shared via ctx.creditBalance.
  * This eliminates 4x redundant getCreditsBalance() calls per tick.
+ *
+ * Every task runs with the Treasury origin "heartbeat.<task>", so an outflow
+ * a task starts is attributed to it (and is never mistaken for a tool call).
  */
 
 import type {
@@ -16,12 +19,14 @@ import type {
   SurvivalTier,
 } from "../types.js";
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
+import { LEGACY_LIVE, LIVE, holdsSlot } from "../replication/child-status.js";
 import { sanitizeInput } from "../agent/injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
 const logger = createLogger("heartbeat.tasks");
@@ -35,6 +40,9 @@ function getAlertEngine(): AlertEngine {
   return _alertEngine;
 }
 
+// Last time the "no auto-topup on Solana" note was logged (once a day).
+let lastSolanaTopupNoticeMs = 0;
+
 export const COLONY_TASK_INTERVALS_MS = {
   colony_health_check: 300_000,
   colony_financial_report: 3_600_000,
@@ -43,7 +51,7 @@ export const COLONY_TASK_INTERVALS_MS = {
   dead_agent_cleanup: 3_600_000,
 } as const;
 
-export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
+const TASKS: Record<string, HeartbeatTaskFn> = {
   heartbeat_ping: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
@@ -59,6 +67,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       address: taskCtx.identity.address,
       state,
       creditsCents: credits,
+      balanceKnown: credits !== null,
       uptimeSeconds: Math.floor(uptimeMs / 1000),
       version: taskCtx.config.version,
       sandboxId: taskCtx.identity.sandboxId,
@@ -67,6 +76,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     };
 
     taskCtx.db.setKV("last_heartbeat_ping", JSON.stringify(payload));
+
+    // An unread balance is not a low one: no distress without a reading.
+    if (credits === null) return { shouldWake: false };
 
     // If critical or dead, record a distress signal
     if (tier === "critical" || tier === "dead") {
@@ -91,6 +103,8 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_credits: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // A failed balance read must not start, extend or end a zero-credit streak.
+    if (ctx.creditBalance === null) return { shouldWake: false };
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
     const credits = ctx.creditBalance;
     const tier = ctx.survivalTier;
@@ -146,6 +160,19 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // Auto-topup pays with x402, which needs an EVM wallet.
+    const chainType = taskCtx.config.chainType || taskCtx.identity.chainType || "evm";
+    if (chainType === "solana") {
+      const nowMs = Date.now();
+      if (nowMs - lastSolanaTopupNoticeMs >= 24 * 60 * 60 * 1000) {
+        lastSolanaTopupNoticeMs = nowMs;
+        logger.info("Auto-topup is not available for Solana wallets; fund credits via the Conway dashboard or credits API.");
+      }
+      return { shouldWake: false };
+    }
+    // Spend only on balances read this tick.
+    if (ctx.creditBalance === null || ctx.usdcBalance === null) return { shouldWake: false };
+
     // Use ctx.usdcBalance instead of calling getUsdcBalance()
     const balance = ctx.usdcBalance;
     const credits = ctx.creditBalance;
@@ -168,13 +195,45 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
       taskCtx.db.setKV("last_auto_topup_attempt", new Date().toISOString());
 
-      const { bootstrapTopup } = await import("../conway/topup.js");
+      const { bootstrapTopup, ROUTINE_TOPUP_REFUSALS, DAILY_NOTICE_TOPUP_REFUSALS } = await import(
+        "../conway/topup.js"
+      );
       const result = await bootstrapTopup({
         apiUrl: taskCtx.config.conwayApiUrl,
         account: taskCtx.identity.account,
         creditsCents: credits,
         chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
       });
+
+      // The gate refused for a reason that needs nothing from the agent
+      // (credits not actually low, a buy in flight or just made, the gate's
+      // balance read failed, an unconfirmed payment). Waking would only cost a turn.
+      if (result?.denied && ROUTINE_TOPUP_REFUSALS.includes(result.denied.code)) {
+        logger.info(`Auto-topup not attempted: ${result.denied.code} — ${result.denied.message}`);
+        return { shouldWake: false };
+      }
+
+      // The survival daily cap or an untrusted payTo: retrying, or a manual
+      // topup, does not fix either. Tell the agent once a day, not every tick.
+      if (result?.denied && DAILY_NOTICE_TOPUP_REFUSALS.includes(result.denied.code)) {
+        logger.warn(`Auto-topup refused: ${result.denied.code} — ${result.denied.message}`);
+        const key = `auto_topup_notice:${result.denied.code}`;
+        const last = taskCtx.db.getKV(key);
+        const lastMs = last ? new Date(last).getTime() : NaN;
+        const nowMs = Date.now();
+        const sinceMs = nowMs - lastMs;
+        if (Number.isFinite(sinceMs) && sinceMs >= 0 && sinceMs < 24 * 60 * 60 * 1000) {
+          return { shouldWake: false };
+        }
+        taskCtx.db.setKV(key, new Date(nowMs).toISOString());
+        return {
+          shouldWake: true,
+          message:
+            `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}), ` +
+            `but automatic topups are refused: ${result.denied.code} — ${result.denied.message}. ` +
+            `They resume on their own when the limit allows; this notice repeats at most once a day.`,
+        };
+      }
 
       if (result?.success) {
         logger.info(
@@ -186,9 +245,32 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         };
       }
 
-      // Topup failed — wake the agent so it can handle it manually
-      const errMsg = result?.error ?? "unknown error";
+      // null: bootstrapTopup decided not to buy (its own balance checks).
+      if (result === null) {
+        logger.info("Auto-topup not attempted: bootstrap topup was not applicable");
+        return { shouldWake: false };
+      }
+
+      // A real failure wakes the agent, but the same error at most once per 6 h.
+      const errMsg = result.error ?? "unknown error";
       logger.warn(`Auto-topup failed: ${errMsg}`);
+      const NOTICE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+      let previous: { error?: string; at?: string } | null = null;
+      try {
+        previous = JSON.parse(taskCtx.db.getKV("auto_topup_fail_notice") || "null");
+      } catch {
+        previous = null;
+      }
+      const sincePrevious = previous?.at ? Date.now() - new Date(previous.at).getTime() : NaN;
+      if (
+        previous?.error === errMsg &&
+        Number.isFinite(sincePrevious) &&
+        sincePrevious >= 0 &&
+        sincePrevious < NOTICE_INTERVAL_MS
+      ) {
+        return { shouldWake: false };
+      }
+      taskCtx.db.setKV("auto_topup_fail_notice", JSON.stringify({ error: errMsg, at: new Date().toISOString() }));
       return {
         shouldWake: true,
         message: `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}) but auto-topup failed: ${errMsg}. Use topup_credits to retry.`,
@@ -362,17 +444,29 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const { ChildLifecycle } = await import("../replication/lifecycle.js");
       const { ChildHealthMonitor } = await import("../replication/health.js");
       const lifecycle = new ChildLifecycle(taskCtx.db.raw);
+      // The monitor probes each child in the child's own sandbox.
       const monitor = new ChildHealthMonitor(taskCtx.db.raw, taskCtx.conway, lifecycle);
       const results = await monitor.checkAllChildren();
 
-      const unhealthy = results.filter((r) => !r.healthy);
-      if (unhealthy.length > 0) {
-        for (const r of unhealthy) {
-          logger.warn(`Child ${r.childId} unhealthy: ${r.issues.join(", ")}`);
+      // Wake only when a child newly enters unhealthy or failed.
+      const previousRaw = taskCtx.db.getKV(CHILD_HEALTH_STATES_KEY);
+      if (results.length === 0 && !previousRaw) return { shouldWake: false };
+      const previous = readJsonRecord(previousRaw);
+      const current: Record<string, string> = {};
+      const changed: string[] = [];
+      for (const r of results) {
+        const state = r.state ?? (r.healthy ? "healthy" : "unhealthy");
+        current[r.childId] = state;
+        if (!r.healthy) logger.warn(`Child ${r.childId} ${state}: ${r.issues.join(", ")}`);
+        if ((state === "unhealthy" || state === "failed") && previous[r.childId] !== state) {
+          changed.push(`${r.childId.slice(0, 8)} ${state}`);
         }
+      }
+      taskCtx.db.setKV(CHILD_HEALTH_STATES_KEY, JSON.stringify(current));
+      if (changed.length > 0) {
         return {
           shouldWake: true,
-          message: `${unhealthy.length} child(ren) unhealthy: ${unhealthy.map((r) => r.childId.slice(0, 8)).join(", ")}`,
+          message: `${changed.length} child(ren) changed health: ${changed.join(", ")}`,
         };
       }
     } catch (error) {
@@ -440,18 +534,34 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const metrics = getMetrics();
       const alerts = getAlertEngine();
 
-      // Update gauges from tick context
-      metrics.gauge("balance_cents", ctx.creditBalance);
-      metrics.gauge("survival_tier", tierToInt(ctx.survivalTier));
+      // Balance gauges only from a balance read this tick. The collector
+      // cannot drop a gauge, so on an unknown read the stale balance gauges
+      // are left out of alert evaluation and of the snapshot: a low value
+      // from before the outage must not keep the critical alert waking.
+      const balanceKnown = ctx.creditBalance !== null;
+      metrics.gauge("balance_known", balanceKnown ? 1 : 0);
+      if (balanceKnown) {
+        metrics.gauge("balance_cents", ctx.creditBalance as number);
+        metrics.gauge("survival_tier", tierToInt(ctx.survivalTier));
+      }
 
       // Evaluate alerts
-      const firedAlerts = alerts.evaluate(metrics);
+      let firedAlerts;
+      let entries = metrics.getAll();
+      if (balanceKnown) {
+        firedAlerts = alerts.evaluate(metrics);
+      } else {
+        const snapshot = metrics.getSnapshot();
+        for (const name of BALANCE_GAUGES) snapshot.gauges.delete(name);
+        firedAlerts = alerts.evaluate(snapshot);
+        entries = entries.filter((e) => !(e.type === "gauge" && BALANCE_GAUGES.includes(e.name)));
+      }
 
       // Save snapshot to DB
       metricsInsertSnapshot(taskCtx.db.raw, {
         id: ulid(),
         snapshotAt: new Date().toISOString(),
-        metricsJson: JSON.stringify(metrics.getAll()),
+        metricsJson: JSON.stringify(entries),
         alertsJson: JSON.stringify(firedAlerts),
         createdAt: new Date().toISOString(),
       });
@@ -484,6 +594,15 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       const report = await monitor.checkAll();
       const actions = await monitor.autoHeal(report);
 
+      const { unhealthySignature } = await import("../orchestration/health-monitor.js");
+      const previousRaw = taskCtx.db.getKV("last_colony_health_report");
+      let previousSignature: string | null = null;
+      try {
+        previousSignature = previousRaw ? unhealthySignature(JSON.parse(previousRaw)) : null;
+      } catch {
+        previousSignature = null;
+      }
+
       taskCtx.db.setKV("last_colony_health_report", JSON.stringify(report));
       taskCtx.db.setKV("last_colony_heal_actions", JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -491,7 +610,8 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       }));
 
       const failedActions = actions.filter((action) => !action.success).length;
-      const shouldWake = report.unhealthyAgents > 0 || failedActions > 0;
+      // The report is informational: wake only when its unhealthy part changed.
+      const shouldWake = report.unhealthyAgents > 0 && unhealthySignature(report) !== previousSignature;
 
       return {
         shouldWake,
@@ -529,10 +649,13 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
           || tx.type === "tool_use"
           || tx.type === "transfer_out"
           || tx.type === "funding_request"
+          || tx.type === "x402_payment"
         ) {
           expenseCents += amount;
         }
       }
+
+      const pending = pendingOutflows(taskCtx);
 
       const childFunding = taskCtx.db.raw
         .prepare("SELECT COALESCE(SUM(funded_amount_cents), 0) AS total FROM children")
@@ -553,9 +676,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         netCents: revenueCents - expenseCents,
         fundedToChildrenCents: childFunding.total,
         taskExecutionCostCents: taskCosts.total,
-        activeAgents: taskCtx.db.getChildren().filter(
-          (child) => child.status !== "dead" && child.status !== "cleaned_up",
-        ).length,
+        pendingOutflowCents: pending.cents,
+        pendingOutflows: pending.rows,
+        activeAgents: taskCtx.db.getChildren().filter((child) => holdsSlot(child.status)).length,
       };
 
       taskCtx.db.setKV("last_colony_financial_report", JSON.stringify(report));
@@ -572,8 +695,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     }
 
     try {
-      const IDLE_CULL_MS = 60 * 60 * 1000;
-      const now = Date.now();
+      // Report only. Children run their own missions and cannot execute
+      // colony tasks (local workers do), so nothing here stops, culls or
+      // asks for children.
       const children = taskCtx.db.getChildren();
 
       const activeAssignments = taskCtx.db.raw
@@ -591,20 +715,6 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
           .filter((value): value is string => typeof value === "string" && value.length > 0),
       );
 
-      let culled = 0;
-      for (const child of children) {
-        if (!["running", "healthy", "sleeping"].includes(child.status)) continue;
-        if (busyAgents.has(child.address)) continue;
-
-        const lastSeenIso = child.lastChecked ?? child.createdAt;
-        const lastSeenMs = Date.parse(lastSeenIso);
-        if (Number.isNaN(lastSeenMs)) continue;
-        if (now - lastSeenMs < IDLE_CULL_MS) continue;
-
-        taskCtx.db.updateChildStatus(child.id, "stopped");
-        culled += 1;
-      }
-
       const pendingUnassignedRow = taskCtx.db.raw
         .prepare(
           `SELECT COUNT(*) AS count
@@ -614,43 +724,22 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         )
         .get() as { count: number };
 
-      const idleAgents = children.filter(
-        (child) =>
-          (child.status === "running" || child.status === "healthy")
-          && !busyAgents.has(child.address),
-      ).length;
-
-      const activeAgents = children.filter(
-        (child) => child.status !== "dead" && child.status !== "cleaned_up" && child.status !== "failed",
-      ).length;
-
-      const spawnNeeded = Math.max(0, pendingUnassignedRow.count - idleAgents);
+      const liveChildren = children.filter((child) => LIVE.has(child.status) || LEGACY_LIVE.has(child.status));
+      const idleAgents = liveChildren.filter((child) => !busyAgents.has(child.address)).length;
+      const activeAgents = children.filter((child) => holdsSlot(child.status)).length;
       const spawnCapacity = Math.max(0, taskCtx.config.maxChildren - activeAgents);
-      const spawnRequested = Math.min(spawnNeeded, spawnCapacity);
 
       taskCtx.db.setKV("last_agent_pool_optimize", JSON.stringify({
         timestamp: new Date().toISOString(),
-        culled,
+        culled: 0,
         pendingTasks: pendingUnassignedRow.count,
         idleAgents,
-        spawnRequested,
+        activeAgents,
+        spawnCapacity,
+        spawnRequested: 0,
       }));
 
-      if (spawnRequested > 0) {
-        taskCtx.db.setKV("agent_pool_spawn_request", JSON.stringify({
-          timestamp: new Date().toISOString(),
-          requested: spawnRequested,
-          pendingTasks: pendingUnassignedRow.count,
-          idleAgents,
-        }));
-      }
-
-      return {
-        shouldWake: spawnRequested > 0,
-        message: spawnRequested > 0
-          ? `Agent pool needs ${spawnRequested} additional agent(s) for pending workload`
-          : undefined,
-      };
+      return { shouldWake: false };
     } catch (error) {
       logger.error("agent_pool_optimize failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
@@ -706,6 +795,66 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 };
 
+/** The heartbeat tasks, each run with its own Treasury origin. */
+export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = withTreasuryOrigins(TASKS);
+
+function withTreasuryOrigins(tasks: Record<string, HeartbeatTaskFn>): Record<string, HeartbeatTaskFn> {
+  const wrapped: Record<string, HeartbeatTaskFn> = {};
+  for (const [name, fn] of Object.entries(tasks)) {
+    wrapped[name] = (ctx, taskCtx) =>
+      runWithTreasuryOrigin({ type: "auto", name: `heartbeat.${name}` }, () => fn(ctx, taskCtx));
+  }
+  return wrapped;
+}
+
+interface PendingOutflow {
+  id: string;
+  kind: string;
+  amountCents: number;
+  counterparty: string;
+  createdAt: string;
+}
+
+/**
+ * Outflows that were sent without a reliable answer ('unknown' ledger rows).
+ * They may still settle, so the report lists them as pending.
+ */
+function pendingOutflows(taskCtx: HeartbeatLegacyContext): { cents: number; rows: PendingOutflow[] } {
+  try {
+    const exists = taskCtx.db.raw
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'treasury_ledger'")
+      .get();
+    if (!exists) return { cents: 0, rows: [] };
+    const rows = taskCtx.db.raw
+      .prepare(
+        `SELECT id, kind, amount_cents, counterparty, created_at_ms FROM treasury_ledger
+         WHERE status = 'unknown' ORDER BY created_at_ms DESC LIMIT 50`,
+      )
+      .all() as Array<{ id: string; kind: string; amount_cents: number; counterparty: string; created_at_ms: number }>;
+    const total = taskCtx.db.raw
+      .prepare("SELECT COALESCE(SUM(amount_cents), 0) AS total FROM treasury_ledger WHERE status = 'unknown'")
+      .get() as { total: number };
+    return {
+      cents: total.total,
+      rows: rows.map((r) => ({
+        id: r.id,
+        kind: r.kind,
+        amountCents: r.amount_cents,
+        counterparty: r.counterparty,
+        createdAt: new Date(r.created_at_ms).toISOString(),
+      })),
+    };
+  } catch (error) {
+    logger.warn("Could not read pending treasury outflows", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { cents: 0, rows: [] };
+  }
+}
+
+/** Gauges that only mean something when this tick's balance was read. */
+const BALANCE_GAUGES: readonly string[] = ["balance_cents", "survival_tier"];
+
 function tierToInt(tier: SurvivalTier): number {
   const map: Record<SurvivalTier, number> = {
     dead: 0,
@@ -738,14 +887,26 @@ function shouldRunAtInterval(
 }
 
 async function createHealthMonitor(taskCtx: HeartbeatLegacyContext): Promise<ColonyHealthMonitor> {
-  const { LocalDBTransport, ColonyMessaging } = await import("../orchestration/messaging.js");
-  const { SimpleAgentTracker, SimpleFundingProtocol } = await import("../orchestration/simple-tracker.js");
+  const { SimpleFundingProtocol } = await import("../orchestration/simple-tracker.js");
   const { HealthMonitor } = await import("../orchestration/health-monitor.js");
 
-  const tracker = new SimpleAgentTracker(taskCtx.db);
-  const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db);
-  const transport = new LocalDBTransport(taskCtx.db);
-  const messaging = new ColonyMessaging(transport, taskCtx.db);
+  // The fourth argument names the Treasury origin of the monitor's funding
+  // transfers, which share the automatic child-funding sub-cap and cooldown.
+  const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db, "health.fund_child");
 
-  return new HealthMonitor(taskCtx.db, tracker, funding, messaging);
+  // Automatic funding stays off: there is no per-child balance query, and
+  // the ledger is cumulative funding, not a balance.
+  return new HealthMonitor(taskCtx.db, funding, { autoFund: false });
+}
+
+const CHILD_HEALTH_STATES_KEY = "child_health.last_states";
+
+function readJsonRecord(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
 }

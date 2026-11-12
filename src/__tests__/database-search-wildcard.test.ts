@@ -19,6 +19,18 @@ import {
 } from "../state/database.js";
 import { createDatabase } from "../state/database.js";
 import Database from "better-sqlite3";
+import type { ProceduralStep } from "../types.js";
+
+function makeSteps(...descriptions: string[]): ProceduralStep[] {
+  return descriptions.map((description, i) => ({
+    order: i + 1,
+    description,
+    tool: null,
+    argsTemplate: null,
+    expectedOutcome: null,
+    onFailure: null,
+  }));
+}
 
 let dbPath: string;
 let db: ReturnType<typeof Database>;
@@ -186,12 +198,12 @@ describe("proceduralSearch wildcard escaping", () => {
     proceduralUpsert(db, {
       name: "deploy_100pct_coverage",
       description: "Deploy with 100% coverage",
-      steps: ["test", "deploy"],
+      steps: makeSteps("test", "deploy"),
     });
     proceduralUpsert(db, {
       name: "deploy_basic",
       description: "Basic deployment",
-      steps: ["deploy"],
+      steps: makeSteps("deploy"),
     });
 
     // Search for "100%" — should only match the first
@@ -204,12 +216,12 @@ describe("proceduralSearch wildcard escaping", () => {
     proceduralUpsert(db, {
       name: "run_tests",
       description: "Run test suite with run_tests command",
-      steps: ["run"],
+      steps: makeSteps("run"),
     });
     proceduralUpsert(db, {
       name: "runXtests",
       description: "Run X tests",
-      steps: ["run"],
+      steps: makeSteps("run"),
     });
 
     // Search for "run_tests" — _ should NOT match arbitrary character

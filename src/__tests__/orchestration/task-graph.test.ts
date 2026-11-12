@@ -2,6 +2,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   assignTask,
+  claimTaskStart,
   completeTask,
   createGoal,
   decomposeGoal,
@@ -9,7 +10,11 @@ import {
   failTask,
   getGoalProgress,
   getReadyTasks,
+  isTaskOwnedBy,
   pruneCompletedGoals,
+  releaseTask,
+  settleTask,
+  supersedeOpenTasks,
   type TaskNode,
   type TaskResult,
 } from "../../orchestration/task-graph.js";
@@ -615,12 +620,19 @@ describe("orchestration/task-graph", () => {
       insertTask(db, { goalId: goal.id, title: "assigned", description: "d", status: "assigned" });
       insertTask(db, { goalId: goal.id, title: "running", description: "d", status: "running" });
 
+      insertTask(db, { goalId: goal.id, title: "cancelled", description: "d", status: "cancelled" });
+
       expect(getGoalProgress(db, goal.id)).toEqual({
-        total: 6,
+        total: 7,
         completed: 1,
         failed: 1,
+        failedUnderLiveParent: 0,
         blocked: 1,
         running: 2,
+        pending: 1,
+        cancelled: 1,
+        active: 3,
+        effectiveTotal: 6,
       });
     });
 
@@ -629,9 +641,22 @@ describe("orchestration/task-graph", () => {
         total: 0,
         completed: 0,
         failed: 0,
+        failedUnderLiveParent: 0,
         blocked: 0,
         running: 0,
+        pending: 0,
+        cancelled: 0,
+        active: 0,
+        effectiveTotal: 0,
       });
+    });
+
+    it("a goal whose only open task was cancelled completes when the rest complete", () => {
+      const goal = createGoal(db, "Goal", "Desc");
+      insertTask(db, { goalId: goal.id, title: "old", description: "d", status: "cancelled" });
+      const live = insertTask(db, { goalId: goal.id, title: "new", description: "d", status: "running", assignedTo: "w" });
+      completeTask(db, live, SUCCESS_RESULT);
+      expect(getGoalById(db, goal.id)?.status).toBe("completed");
     });
   });
 
@@ -726,6 +751,175 @@ describe("orchestration/task-graph", () => {
         { id: "a", dependencies: ["missing"] },
         { id: "b", dependencies: ["a"] },
       ])).toBe(false);
+    });
+  });
+
+  describe("task ownership", () => {
+    const OLD = "local://local-worker-OLD";
+    const NEW = "local://local-worker-NEW";
+
+    function assignedTo(owner: string, overrides: { maxRetries?: number; retryCount?: number } = {}) {
+      const goal = createGoal(db, "Goal", "Desc");
+      const taskId = insertTask(db, {
+        goalId: goal.id,
+        title: "T",
+        description: "d",
+        status: "assigned",
+        assignedTo: owner,
+        maxRetries: overrides.maxRetries ?? 3,
+        retryCount: overrides.retryCount ?? 0,
+      });
+      return { goalId: goal.id, taskId };
+    }
+
+    it("H2-002: a superseded owner's late failure is dropped and the live owner's completion applies", () => {
+      // The task was taken from OLD and is now NEW's, on its last retry.
+      const { goalId, taskId } = assignedTo(NEW, { maxRetries: 1, retryCount: 1 });
+
+      expect(settleTask(db, taskId, OLD, { kind: "fail", error: "Budget exhausted", retry: true, costCents: 7 })).toBe("stale");
+      let row = getTaskById(db, taskId)!;
+      expect(row.status).toBe("assigned");
+      expect(row.assignedTo).toBe(NEW);
+      expect(row.retryCount).toBe(1);
+      // The stale report's spend is kept.
+      expect(row.actualCostCents).toBe(7);
+      expect(getGoalById(db, goalId)?.status).toBe("active");
+      const events = db.prepare("SELECT type, agent_address FROM event_stream WHERE task_id = ?").all(taskId);
+      expect(events).toEqual([{ type: "stale_task_report", agent_address: OLD }]);
+
+      expect(settleTask(db, taskId, NEW, { kind: "complete", result: { ...SUCCESS_RESULT, costCents: 5 } })).toBe("applied");
+      row = getTaskById(db, taskId)!;
+      expect(row.status).toBe("completed");
+      // Spend never goes down.
+      expect(row.actualCostCents).toBe(7);
+      expect(getGoalById(db, goalId)?.status).toBe("completed");
+    });
+
+    it("a late completion by a superseded owner does not complete the task", () => {
+      const { taskId } = assignedTo(NEW);
+      expect(settleTask(db, taskId, OLD, { kind: "complete", result: SUCCESS_RESULT })).toBe("stale");
+      expect(getTaskById(db, taskId)?.status).toBe("assigned");
+    });
+
+    it("a report on a cancelled task is stale", () => {
+      const { taskId } = assignedTo(OLD);
+      db.prepare("UPDATE task_graph SET status = 'cancelled' WHERE id = ?").run(taskId);
+      expect(settleTask(db, taskId, OLD, { kind: "complete", result: SUCCESS_RESULT })).toBe("stale");
+      expect(getTaskById(db, taskId)?.status).toBe("cancelled");
+      expect(isTaskOwnedBy(db, taskId, OLD)).toBe(false);
+    });
+
+    it("claimTaskStart moves an owned assigned task to running with started_at", () => {
+      const { taskId } = assignedTo(NEW);
+      expect(claimTaskStart(db, taskId, OLD)).toBe(false);
+      expect(claimTaskStart(db, taskId, NEW)).toBe(true);
+      const row = getTaskById(db, taskId)!;
+      expect(row.status).toBe("running");
+      expect(Date.parse(row.startedAt!)).toBeGreaterThan(Date.now() - 5000);
+      // Only once.
+      expect(claimTaskStart(db, taskId, NEW)).toBe(false);
+      expect(isTaskOwnedBy(db, taskId, NEW)).toBe(true);
+    });
+
+    it("releaseTask with retry spends a retry; without, it defers", () => {
+      const { taskId } = assignedTo(OLD);
+      expect(releaseTask(db, taskId, OLD, "owner died", { retry: true })).toBe("applied");
+      let row = getTaskById(db, taskId)!;
+      expect(row).toMatchObject({ status: "pending", assignedTo: null, retryCount: 1 });
+      expect(row.result).toMatchObject({ failedBy: OLD });
+
+      db.prepare("UPDATE task_graph SET status = 'assigned', assigned_to = ? WHERE id = ?").run(NEW, taskId);
+      expect(releaseTask(db, taskId, NEW, "shutdown", { retry: false })).toBe("applied");
+      row = getTaskById(db, taskId)!;
+      expect(row).toMatchObject({ status: "pending", assignedTo: null, retryCount: 1 });
+      // Not the owner any more: nothing happens.
+      expect(releaseTask(db, taskId, NEW, "again", { retry: true })).toBe("stale");
+    });
+
+    it("F076: a permanent failure keeps assigned_to", () => {
+      const { taskId } = assignedTo(OLD, { maxRetries: 0 });
+      failTask(db, taskId, "boom", true);
+      expect(getTaskById(db, taskId)).toMatchObject({ status: "failed", assignedTo: OLD });
+
+      const other = assignedTo(NEW, { maxRetries: 2, retryCount: 2 });
+      expect(settleTask(db, other.taskId, NEW, { kind: "fail", error: "boom", retry: true })).toBe("applied");
+      expect(getTaskById(db, other.taskId)).toMatchObject({ status: "failed", assignedTo: NEW });
+    });
+
+    it("supersedeOpenTasks cancels pending, blocked and failed tasks but not running or completed ones", () => {
+      const goal = createGoal(db, "Goal", "Desc");
+      const ids = Object.fromEntries(
+        (["pending", "blocked", "failed", "running", "assigned", "completed"] as const).map((status) => [
+          status,
+          insertTask(db, { goalId: goal.id, title: status, description: "d", status }),
+        ]),
+      );
+      expect(supersedeOpenTasks(db, goal.id, 2)).toBe(3);
+      expect(getTaskById(db, ids.pending)?.status).toBe("cancelled");
+      expect(getTaskById(db, ids.blocked)?.status).toBe("cancelled");
+      expect(getTaskById(db, ids.failed)?.status).toBe("cancelled");
+      expect(getTaskById(db, ids.failed)?.result).toMatchObject({ superseded_by_replan: 2 });
+      expect(getTaskById(db, ids.running)?.status).toBe("running");
+      expect(getTaskById(db, ids.assigned)?.status).toBe("assigned");
+      expect(getTaskById(db, ids.completed)?.status).toBe("completed");
+    });
+
+    it("a failed sub-task of a running orchestrator task does not fail the goal, and a replan leaves it to its parent", () => {
+      const goal = createGoal(db, "Goal", "Desc");
+      const parent = insertTask(db, { goalId: goal.id, title: "orchestrate", description: "d", status: "running", assignedTo: OLD });
+      const child = insertTask(db, { goalId: goal.id, parentId: parent, title: "child", description: "d", status: "running", assignedTo: NEW, maxRetries: 0 });
+
+      failTask(db, child, "boom", true);
+      expect(getGoalById(db, goal.id)?.status).toBe("active");
+      expect(getGoalProgress(db, goal.id)).toMatchObject({ failed: 0, failedUnderLiveParent: 1 });
+      expect(supersedeOpenTasks(db, goal.id, 1)).toBe(0);
+      expect(getTaskById(db, child)?.status).toBe("failed");
+
+      // Once the parent ends, the failure is the goal's again.
+      failTask(db, parent, "gave up", false);
+      expect(getGoalProgress(db, goal.id)).toMatchObject({ failed: 2, failedUnderLiveParent: 0 });
+      expect(getGoalById(db, goal.id)?.status).toBe("failed");
+    });
+
+    it("an orchestrator task that completes supersedes its failed sub-tasks and their waiting dependents, so the goal completes", () => {
+      const goal = createGoal(db, "Goal", "Desc");
+      const parent = insertTask(db, { goalId: goal.id, title: "orchestrate", description: "d", status: "running", assignedTo: OLD });
+      const failed = insertTask(db, { goalId: goal.id, parentId: parent, title: "first try", description: "d", status: "running", assignedTo: NEW, maxRetries: 0 });
+      const waiting = insertTask(db, { goalId: goal.id, parentId: parent, title: "after first try", description: "d", status: "pending", dependencies: [failed] });
+      const done = insertTask(db, { goalId: goal.id, parentId: parent, title: "second try", description: "d", status: "completed" });
+      failTask(db, failed, "boom", true);
+      expect(getTaskById(db, waiting)?.status).toBe("blocked");
+
+      expect(settleTask(db, parent, OLD, { kind: "complete", result: SUCCESS_RESULT })).toBe("applied");
+
+      expect(getTaskById(db, failed)).toMatchObject({ status: "cancelled", result: expect.objectContaining({ superseded_by_parent: parent }) });
+      expect(getTaskById(db, waiting)?.status).toBe("cancelled");
+      expect(getTaskById(db, done)?.status).toBe("completed");
+      expect(getGoalById(db, goal.id)?.status).toBe("completed");
+    });
+
+    it("never overwrites a cancelled or paused goal's status", () => {
+      for (const status of ["cancelled", "paused"]) {
+        const goalId = insertGoal(db, { title: status, description: "d", status: status as never });
+        const taskId = insertTask(db, { goalId, title: "t", description: "d", status: "running", assignedTo: OLD });
+        completeTask(db, taskId, SUCCESS_RESULT);
+        expect(getGoalById(db, goalId)?.status).toBe(status);
+      }
+    });
+  });
+
+  describe("planner metadata", () => {
+    it("F070: decomposeGoal stores clamped estimate and timeout", () => {
+      const goal = createGoal(db, "Goal", "Desc");
+      decomposeGoal(db, goal.id, [
+        { ...makeTask(goal.id, "big"), estimatedCostCents: 15_000, timeoutMs: 3_600_000 },
+        { ...makeTask(goal.id, "tiny"), estimatedCostCents: -5, timeoutMs: 10 },
+        { ...makeTask(goal.id, "huge"), estimatedCostCents: 100, timeoutMs: 99_999_999 },
+      ]);
+      const rows = Object.fromEntries(getTasksByGoal(db, goal.id).map((row) => [row.title, row]));
+      expect(rows.big).toMatchObject({ estimatedCostCents: 500, timeoutMs: 3_600_000 });
+      expect(rows.tiny).toMatchObject({ estimatedCostCents: 0, timeoutMs: 60_000 });
+      expect(rows.huge).toMatchObject({ estimatedCostCents: 100, timeoutMs: 3_600_000 });
     });
   });
 });

@@ -1,113 +1,108 @@
 /**
- * automaton-cli fund <amount> [--to 0x...]
+ * automaton-cli fund <usd> --to <address> [--cents] [--yes]
  *
- * Transfer Conway credits using the configured Conway API key.
+ * Transfer Conway credits with the automaton's Conway API key. The amount is
+ * dollars (at most two decimals); --cents makes it a whole number of cents.
+ * The plan is printed and must be confirmed with --yes or an interactive y.
  */
 
 import { loadConfig } from "@conway/automaton/config.js";
+import {
+  parseUsdAmount,
+  planFund,
+  executeFund,
+  formatUsd,
+  confirmOnTty,
+  FUND_USAGE as USAGE,
+} from "@conway/automaton/operator/fund.js";
+
+// The operator's own transfer, with the automaton's key and outside the
+// agent's treasury budgets; both endpoint shapes share one idempotency key.
+const TRANSFER_PATHS = ["/v1/credits/transfer", "/v1/credits/transfers"];
 
 const args = process.argv.slice(3);
-const amount = args[0];
-const toIndex = args.indexOf("--to");
-const toAddress = toIndex >= 0 ? args[toIndex + 1] : undefined;
+let amountArg: string | undefined;
+let toArg: string | undefined;
+let cents = false;
+let yes = false;
+let argError = "";
 
-if (!amount) {
-  console.log("Usage: automaton-cli fund <amount> [--to 0x...]");
-  console.log("Examples:");
-  console.log("  automaton-cli fund 5.00");
-  console.log("  automaton-cli fund 500 --to 0xabc...");
-  process.exit(1);
+for (let i = 0; i < args.length; i++) {
+  const a = args[i]!;
+  if (a === "--to") {
+    toArg = args[i + 1];
+    i++;
+  } else if (a.startsWith("--to=")) {
+    toArg = a.slice("--to=".length);
+  } else if (a === "--cents") {
+    cents = true;
+  } else if (a === "--yes" || a === "-y") {
+    yes = true;
+  } else if (a.startsWith("-") && !/^-\d/.test(a)) {
+    argError = `Unknown option: ${a}`;
+  } else if (amountArg === undefined) {
+    amountArg = a;
+  } else {
+    argError = `Unexpected argument: ${a}`;
+  }
 }
 
-const config = loadConfig();
-if (!config) {
-  console.log("No automaton configuration found.");
-  process.exit(1);
-}
-
-if (!config.conwayApiKey) {
-  console.log("No Conway API key found in automaton config.");
-  process.exit(1);
-}
-
-const amountCents = parseAmountToCents(amount);
-if (amountCents <= 0) {
-  console.log(`Invalid amount: ${amount}`);
-  process.exit(1);
-}
-
-const destination = toAddress || config.walletAddress;
-
-const payload = {
-  to_address: destination,
-  amount_cents: amountCents,
-  note: `fund via automaton-cli (${config.name})`,
-};
-
-const apiUrl = config.conwayApiUrl || "https://api.conway.tech";
-const paths = ["/v1/credits/transfer", "/v1/credits/transfers"];
-
-let success: any | null = null;
-let lastError = "";
-
-for (const path of paths) {
-  const resp = await fetch(`${apiUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: config.conwayApiKey,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    lastError = `${resp.status}: ${text}`;
-    if (resp.status === 404) {
-      continue;
-    }
-    console.log(`Credit transfer failed (${path}): ${lastError}`);
+try {
+  if (argError || amountArg === undefined) {
+    if (argError) console.log(argError);
+    console.log(USAGE);
     process.exit(1);
   }
 
-  success = await resp.json().catch(() => ({}));
-  break;
-}
-
-if (!success) {
-  console.log(`Credit transfer failed: ${lastError || "unknown error"}`);
-  process.exit(1);
-}
-
-const transferId = success.transfer_id || success.id || "n/a";
-const status = success.status || "submitted";
-const balanceAfter = success.balance_after_cents ?? success.new_balance_cents;
-
-console.log(`
-Transfer submitted.
-From key:  ${maskKey(config.conwayApiKey)}
-To:        ${destination}
-Amount:    $${(amountCents / 100).toFixed(2)} (${amountCents} cents)
-Status:    ${status}
-Transfer:  ${transferId}
-${balanceAfter !== undefined ? `Balance:   $${(Number(balanceAfter) / 100).toFixed(2)} after transfer` : ""}
-`);
-
-function parseAmountToCents(raw: string): number {
-  const trimmed = raw.trim();
-  if (!trimmed) return 0;
-
-  // If user provides integer >= 100, treat as cents.
-  if (/^\d+$/.test(trimmed) && Number(trimmed) >= 100) {
-    return Number(trimmed);
+  const amount = parseUsdAmount(amountArg, { cents });
+  if (!amount.ok) {
+    console.log(amount.error);
+    process.exit(1);
   }
 
-  const dollars = Number(trimmed);
-  if (!Number.isFinite(dollars)) return 0;
-  return Math.round(dollars * 100);
-}
+  const config = loadConfig();
+  if (!config) {
+    console.log("No automaton configuration found.");
+    process.exit(1);
+  }
 
-function maskKey(key: string): string {
-  if (key.length < 8) return "***";
-  return `${key.slice(0, 4)}...${key.slice(-4)}`;
+  const planned = planFund({ config, to: toArg, amountCents: amount.cents });
+  if (!planned.ok) {
+    console.log(planned.error);
+    process.exit(1);
+  }
+  const plan = planned.plan;
+
+  console.log(`Transfer ${plan.description}`);
+  if (!yes) {
+    const answer = await confirmOnTty(`Send ${formatUsd(plan.amountCents)} of Conway credits? [y/N] `);
+    if (answer === null) {
+      console.log("Refusing without confirmation: re-run with --yes, or run it in an interactive terminal.");
+      process.exit(1);
+    }
+    if (!answer) {
+      console.log("Cancelled. Nothing was sent.");
+      process.exit(1);
+    }
+  }
+
+  const result = await executeFund(plan, { paths: TRANSFER_PATHS });
+  if (result.status !== "ok") {
+    console.log(result.error);
+    process.exit(result.status === "unknown" ? 2 : 1);
+  }
+
+  console.log(`
+Transfer submitted.
+From:      ${plan.from || "(automaton)"}
+To:        ${plan.to}
+Amount:    ${formatUsd(plan.amountCents)} (${plan.amountCents} cents)
+Status:    ${result.transferStatus}
+Transfer:  ${result.transferId}
+Key:       ${result.idempotencyKey}
+${result.balanceAfterCents !== undefined ? `Balance:   ${formatUsd(result.balanceAfterCents)} after transfer` : ""}
+`);
+} catch (err: any) {
+  console.log(`Credit transfer failed: ${err?.message || String(err)}`);
+  process.exit(1);
 }

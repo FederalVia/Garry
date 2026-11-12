@@ -16,6 +16,7 @@ import type {
 import type { AgentWorkspace } from "../orchestration/workspace.js";
 import { getTasksByGoal } from "../state/database.js";
 import type { PolicyEngine } from "./policy-engine.js";
+import type { InferencePurpose } from "../inference/inference-client.js";
 
 export interface AgentHarness {
   readonly id: string;
@@ -52,6 +53,17 @@ export interface HarnessContext {
   policyEngine?: PolicyEngine;
   spendTracker?: SpendTrackerInterface;
   inputSource?: InputSource;
+  /** Waits between ordinary inference errors (default 1 s, then 2 s). */
+  inferenceRetryBackoffMs?: readonly number[];
+  /**
+   * True while this worker still owns its task. Checked every turn: once it
+   * is false (cancelled, reassigned, completed by the parent) the worker stops.
+   */
+  isTaskOwned?: () => boolean;
+  /** Called around blocking waits so the pool does not count a waiting worker against its cap. */
+  setWaiting?: (waiting: boolean) => void;
+  /** Poll interval of wait_for_tasks (default 5 s). */
+  waitPollMs?: number;
 }
 
 export interface WorkerInferenceClient {
@@ -66,10 +78,52 @@ export interface WorkerInferenceClient {
     maxTokens?: number;
     temperature?: number;
     responseFormat?: { type: string };
+    purpose?: InferencePurpose;
+    /** Worker shutdown: an in-flight call stops instead of being awaited. */
+    signal?: AbortSignal;
   }): Promise<{
     content: string;
     toolCalls?: InferenceToolCall[];
+    /** Committed cost of the call in fractional cents. */
+    costCents?: number;
+    usage?: { inputTokens: number; outputTokens: number };
   }>;
+}
+
+/**
+ * The task's cumulative inference cap is spent. Retrying would hit the same
+ * cap (it counts every attempt of the task), so the task fails for good.
+ */
+export class TaskBudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskBudgetExceededError";
+  }
+}
+
+/** The worker no longer owns its task; it stops without reporting a result. */
+export class TaskOwnershipLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskOwnershipLostError";
+  }
+}
+
+/**
+ * Inference was refused for a reason that clears with time (hourly, daily or
+ * orchestration-share cap, paused survival tier). The task goes back to
+ * pending without consuming a retry.
+ */
+export class InferenceDeferredError extends Error {
+  readonly code: string;
+  readonly retryAfterMs: number | null;
+
+  constructor(message: string, code: string, retryAfterMs: number | null) {
+    super(message);
+    this.name = "InferenceDeferredError";
+    this.code = code;
+    this.retryAfterMs = retryAfterMs;
+  }
 }
 
 export interface IterationBudget {

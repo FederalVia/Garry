@@ -3,17 +3,27 @@
  *
  * These tests exercise the interaction between UnifiedInferenceClient and
  * ProviderRegistry as a unit: registry tier resolution, circuit-breaker state
- * synced back into the registry, survival-mode tier downgrade, and the
- * emergency stop policy all working together.
+ * synced back into the registry, and the survival-tier mapping (read from the
+ * inference gate) all working together.
  *
  * The OpenAI network layer is mocked via vi.hoisted so no real HTTP calls are
  * made. Each test gets a fresh client + registry pair to avoid state bleed.
  */
 
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderRegistry, type ProviderConfig } from "../../inference/provider-registry.js";
-import { UnifiedInferenceClient } from "../../inference/inference-client.js";
-import type { ChatMessage } from "../../types.js";
+import { UnifiedInferenceClient, resetProviderCircuitBreakers } from "../../inference/inference-client.js";
+import {
+  InferenceGate,
+  installInferenceGate,
+  resetInferenceGateForTests,
+} from "../../inference/gate.js";
+import type { ResolvedInferencePolicy } from "../../inference/policy.js";
+import { createDatabase } from "../../state/database.js";
+import type { AutomatonDatabase, ChatMessage, SurvivalTier } from "../../types.js";
 
 // ---------------------------------------------------------------------------
 // OpenAI mock — must be hoisted so the module mock runs before imports resolve
@@ -113,8 +123,36 @@ function makeRegistry(providers: ProviderConfig[], preferredForReasoning?: strin
   });
 }
 
+const sleeps: number[] = [];
+
 function makeClient(registry: ProviderRegistry): UnifiedInferenceClient {
-  return new UnifiedInferenceClient(registry);
+  return new UnifiedInferenceClient(registry, {
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+}
+
+const PERMISSIVE_POLICY: ResolvedInferencePolicy = {
+  dailyCapCents: 1_000_000,
+  hourlyCapCents: 1_000_000,
+  sessionCapCents: 0,
+  perCallCeilingCents: 0,
+  orchestrationSharePct: 100,
+  survivalAllowanceCents: 25,
+  survivalMinIntervalMs: 1_800_000,
+  sessionCooldownMs: 1_800_000,
+  maxTokensPerTurn: 100_000,
+  enableModelFallback: true,
+  unknownPrice: { inputUsdPerM: 2, outputUsdPerM: 14 },
+};
+
+let tmpDir: string;
+let db: AutomatonDatabase;
+let gate: InferenceGate;
+
+function setSurvival(tier: SurvivalTier | "unknown"): void {
+  gate.setSurvival({ tier, creditsCents: tier === "unknown" ? null : 1000 });
 }
 
 /** Push a successful chat completion onto the mock queue. */
@@ -146,9 +184,26 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockState.queue.splice(0, mockState.queue.length);
   mockState.calls.splice(0, mockState.calls.length);
+  sleeps.length = 0;
   process.env = { ...ORIGINAL_ENV };
+  process.env.ALPHA_API_KEY = "alpha-key";
+  process.env.BETA_API_KEY = "beta-key";
+  process.env["PRICING-TEST_API_KEY"] = "pricing-key";
   delete process.env.AUTOMATON_CREDITS_BALANCE;
   delete process.env.AUTOMATON_INFERENCE_TASK_TYPE;
+  resetProviderCircuitBreakers();
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inference-failover-"));
+  db = createDatabase(path.join(tmpDir, "state.db"));
+  gate = new InferenceGate({ db: db.raw, policy: PERMISSIVE_POLICY });
+  setSurvival("high");
+  installInferenceGate(gate);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  resetInferenceGateForTests();
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 afterAll(() => {
@@ -219,11 +274,11 @@ describe("integration/inference-failover", () => {
 
       const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
-      // costPerInputToken=1.0 -> 1000/1000 * 1.0 = 1.0 credit
-      // costPerOutputToken=2.0 -> 500/1000 * 2.0 = 1.0 credit
-      expect(result.cost.inputCostCredits).toBeCloseTo(1.0);
-      expect(result.cost.outputCostCredits).toBeCloseTo(1.0);
-      expect(result.cost.totalCostCredits).toBeCloseTo(2.0);
+      // Prices are USD per 1M tokens: 1000 * $1.0 = $0.001 = 0.1c; 500 * $2.0 = 0.1c.
+      expect(result.cost.inputCostCents).toBeCloseTo(0.1);
+      expect(result.cost.outputCostCents).toBeCloseTo(0.1);
+      expect(result.cost.totalCostCents).toBeCloseTo(0.2);
+      expect(result.cost.costMicroUsd).toBe(2000);
     });
   });
 
@@ -238,23 +293,18 @@ describe("integration/inference-failover", () => {
       const registry = makeRegistry([alpha, beta], "alpha");
       const client = makeClient(registry);
 
-      // Alpha gets 4 calls: 3 retried + final failure (exhausted retry budget)
-      queueError(429, "alpha-rate-limit");
-      queueError(429, "alpha-rate-limit");
+      // Alpha gets 2 calls: the first and its single retry.
       queueError(429, "alpha-rate-limit");
       queueError(429, "alpha-rate-limit");
       queueCompletion("from-beta");
 
-      vi.useFakeTimers();
-      const pending = client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
-      await vi.runAllTimersAsync();
-      const result = await pending;
-      vi.useRealTimers();
+      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
       expect(result.content).toBe("from-beta");
       expect(result.metadata.providerId).toBe("beta");
       expect(result.metadata.failedProviders).toContain("alpha");
-      expect(result.metadata.retries).toBe(3);
+      expect(result.metadata.retries).toBe(2);
+      expect(sleeps).toEqual([1000]);
     });
 
     it("falls over to secondary provider after primary exhausts retries on 503", async () => {
@@ -265,15 +315,9 @@ describe("integration/inference-failover", () => {
 
       queueError(503);
       queueError(503);
-      queueError(503);
-      queueError(503);
       queueCompletion("beta-ok");
 
-      vi.useFakeTimers();
-      const pending = client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
-      await vi.runAllTimersAsync();
-      const result = await pending;
-      vi.useRealTimers();
+      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
       expect(result.metadata.providerId).toBe("beta");
       expect(result.metadata.failedProviders).toContain("alpha");
@@ -303,17 +347,14 @@ describe("integration/inference-failover", () => {
       const registry = makeRegistry([alpha, beta], "alpha");
       const client = makeClient(registry);
 
-      // Both exhaust their 3-retry budget (4 calls each)
-      for (let i = 0; i < 4; i++) queueError(429, `alpha-${i}`);
-      for (let i = 0; i < 4; i++) queueError(500, `beta-${i}`);
+      // Both use their single retry: 2 calls each, 4 in total (the per-call limit).
+      for (let i = 0; i < 2; i++) queueError(429, `alpha-${i}`);
+      for (let i = 0; i < 2; i++) queueError(500, `beta-${i}`);
 
-      vi.useFakeTimers();
-      const pending = expect(
+      await expect(
         client.chat({ tier: "reasoning", messages: BASE_MESSAGES }),
       ).rejects.toThrow(/All providers failed.*alpha.*beta/);
-      await vi.runAllTimersAsync();
-      await pending;
-      vi.useRealTimers();
+      expect(mockState.create).toHaveBeenCalledTimes(4);
     });
   });
 
@@ -322,7 +363,27 @@ describe("integration/inference-failover", () => {
   // -------------------------------------------------------------------------
 
   describe("circuit breaker and registry coordination", () => {
-    it("circuit breaker opens after 5 non-retryable failures and skips provider in chat()", async () => {
+    it("caller payload errors (400) never open the circuit breaker", async () => {
+      const alpha = makeProvider("alpha", 1);
+      const beta = makeProvider("beta", 2);
+      const registry = makeRegistry([alpha, beta], "alpha");
+      const client = makeClient(registry);
+
+      for (let i = 0; i < 5; i++) {
+        queueError(400, `context_length_exceeded-${i}`);
+        await expect(
+          client.chatDirect({ providerId: "alpha", modelId: "alpha-reasoning", messages: BASE_MESSAGES }),
+        ).rejects.toThrow(`context_length_exceeded-${i}`);
+      }
+
+      // The fault was in the payload, not the provider: alpha stays in service.
+      expect(registry.getProviders().find((p) => p.id === "alpha")?.enabled).toBe(true);
+      queueCompletion("alpha-still-serving");
+      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
+      expect(result.metadata.providerId).toBe("alpha");
+    });
+
+    it("circuit breaker opens after 5 health failures and skips provider in chat()", async () => {
       const alpha = makeProvider("alpha", 1);
       const beta = makeProvider("beta", 2);
       const registry = makeRegistry([alpha, beta], "alpha");
@@ -330,7 +391,7 @@ describe("integration/inference-failover", () => {
 
       // Trip the circuit on alpha via chatDirect
       for (let i = 0; i < 5; i++) {
-        queueError(400, `trip-${i}`);
+        queueError(502, `trip-${i}`);
         await expect(
           client.chatDirect({ providerId: "alpha", modelId: "alpha-reasoning", messages: BASE_MESSAGES }),
         ).rejects.toThrow(`trip-${i}`);
@@ -352,7 +413,7 @@ describe("integration/inference-failover", () => {
       const disableSpy = vi.spyOn(registry, "disableProvider");
 
       for (let i = 0; i < 5; i++) {
-        queueError(400, `fail-${i}`);
+        queueError(502, `fail-${i}`);
         await expect(
           client.chatDirect({ providerId: "alpha", modelId: "alpha-reasoning", messages: BASE_MESSAGES }),
         ).rejects.toThrow();
@@ -366,7 +427,7 @@ describe("integration/inference-failover", () => {
     });
 
     it("circuit breaker re-enables provider after cooldown and registry reflects it", async () => {
-      vi.useFakeTimers();
+      vi.useFakeTimers({ toFake: ["Date"] });
 
       const alpha = makeProvider("alpha", 1);
       const beta = makeProvider("beta", 2);
@@ -375,7 +436,7 @@ describe("integration/inference-failover", () => {
 
       // Trip the circuit on alpha
       for (let i = 0; i < 5; i++) {
-        queueError(400, `trip-${i}`);
+        queueError(504, `trip-${i}`);
         await expect(
           client.chatDirect({ providerId: "alpha", modelId: "alpha-reasoning", messages: BASE_MESSAGES }),
         ).rejects.toThrow();
@@ -384,8 +445,13 @@ describe("integration/inference-failover", () => {
       // Alpha is circuit-open; registry also has it disabled
       expect(registry.getProviders().find((p) => p.id === "alpha")?.enabled).toBe(false);
 
+      // A new client (as each wake cycle builds) still sees the open circuit.
+      await expect(
+        makeClient(registry).chatDirect({ providerId: "alpha", modelId: "alpha-reasoning", messages: BASE_MESSAGES }),
+      ).rejects.toThrow(/circuit is open/);
+
       // Advance past the 5-minute cooldown (CIRCUIT_BREAKER_DISABLE_MS = 5 * 60_000)
-      vi.advanceTimersByTime(5 * 60_000 + 1);
+      vi.setSystemTime(Date.now() + 5 * 60_000 + 1);
 
       // A successful call to alpha resets the state
       queueCompletion("alpha-recovered");
@@ -406,9 +472,9 @@ describe("integration/inference-failover", () => {
   // 4. Survival mode tier downgrade
   // -------------------------------------------------------------------------
 
-  describe("survival mode tier downgrade", () => {
-    it("downgrades reasoning to fast tier when credits are in survival range (100-999)", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "500";
+  describe("survival tier mapping (from the gate)", () => {
+    it("normal tier steps reasoning down to fast", async () => {
+      setSurvival("normal");
 
       const alpha = makeProvider("alpha", 1);
       const registry = makeRegistry([alpha]);
@@ -418,14 +484,14 @@ describe("integration/inference-failover", () => {
 
       const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
-      // Survival mode maps reasoning -> fast, so the actual model served is fast
+      // reasoning -> fast, so the actual model served is fast
       expect(result.metadata.modelId).toBe("alpha-fast");
       // But the requested tier is preserved in metadata
       expect(result.metadata.tier).toBe("reasoning");
     });
 
-    it("downgrades fast to cheap tier when credits are in survival range", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "200";
+    it("normal tier steps fast down to cheap", async () => {
+      setSurvival("normal");
 
       const alpha = makeProvider("alpha", 1);
       const registry = makeRegistry([alpha]);
@@ -439,8 +505,8 @@ describe("integration/inference-failover", () => {
       expect(result.metadata.tier).toBe("fast");
     });
 
-    it("does not downgrade when credits are above survival threshold (>=1000)", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "1000";
+    it("high tier serves the requested tier", async () => {
+      setSurvival("high");
 
       const alpha = makeProvider("alpha", 1);
       const registry = makeRegistry([alpha]);
@@ -453,8 +519,9 @@ describe("integration/inference-failover", () => {
       expect(result.metadata.modelId).toBe("alpha-reasoning");
     });
 
-    it("does not downgrade when AUTOMATON_CREDITS_BALANCE is not set", async () => {
-      delete process.env.AUTOMATON_CREDITS_BALANCE;
+    it("ignores the old AUTOMATON_CREDITS_BALANCE env var", async () => {
+      setSurvival("high");
+      process.env.AUTOMATON_CREDITS_BALANCE = "30";
 
       const alpha = makeProvider("alpha", 1);
       const registry = makeRegistry([alpha]);
@@ -467,62 +534,41 @@ describe("integration/inference-failover", () => {
       expect(result.metadata.modelId).toBe("alpha-reasoning");
     });
 
-    it("populates failedProviders in metadata when failover occurs during survival mode", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "300";
+    it("populates failedProviders in metadata when failover occurs at the normal tier", async () => {
+      setSurvival("normal");
 
       const alpha = makeProvider("alpha", 1);
       const beta = makeProvider("beta", 2);
       const registry = makeRegistry([alpha, beta], "alpha");
       const client = makeClient(registry);
 
-      // In survival mode, reasoning -> fast; alpha-fast fails, beta-fast succeeds
-      queueError(429);
-      queueError(429);
+      // reasoning -> fast; alpha-fast fails twice, beta-fast succeeds
       queueError(429);
       queueError(429);
       queueCompletion("beta-survival");
 
-      vi.useFakeTimers();
-      const pending = client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
-      await vi.runAllTimersAsync();
-      const result = await pending;
-      vi.useRealTimers();
+      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
 
       expect(result.metadata.failedProviders).toContain("alpha");
       expect(result.metadata.providerId).toBe("beta");
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // 5. Emergency stop policy
-  // -------------------------------------------------------------------------
-
-  describe("emergency stop policy", () => {
-    it("throws when credits are below emergency threshold for non-planner tasks", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "50";
-      process.env.AUTOMATON_INFERENCE_TASK_TYPE = "agent_turn";
-
-      const alpha = makeProvider("alpha", 1);
-      const registry = makeRegistry([alpha]);
-      const client = makeClient(registry);
-
-      await expect(
-        client.chat({ tier: "reasoning", messages: BASE_MESSAGES }),
-      ).rejects.toThrow(/Emergency stop active/);
+      expect(result.metadata.modelId).toBe("beta-fast");
     });
 
-    it("allows planner calls through even below emergency threshold", async () => {
-      process.env.AUTOMATON_CREDITS_BALANCE = "50";
-      process.env.AUTOMATON_INFERENCE_TASK_TYPE = "planner_step";
+    it.each(["low_compute", "critical", "dead", "unknown"] as const)(
+      "%s pauses orchestration inference without sending a request",
+      async (tier) => {
+        setSurvival(tier);
 
-      const alpha = makeProvider("alpha", 1);
-      const registry = makeRegistry([alpha]);
-      const client = makeClient(registry);
+        const alpha = makeProvider("alpha", 1);
+        const registry = makeRegistry([alpha]);
+        const client = makeClient(registry);
+        queueCompletion("never");
 
-      queueCompletion("planner-allowed");
-
-      const result = await client.chat({ tier: "reasoning", messages: BASE_MESSAGES });
-      expect(result.content).toBe("planner-allowed");
-    });
+        await expect(
+          client.chat({ tier: "reasoning", messages: BASE_MESSAGES }),
+        ).rejects.toMatchObject({ code: "SURVIVAL_TIER" });
+        expect(mockState.create).not.toHaveBeenCalled();
+      },
+    );
   });
 });

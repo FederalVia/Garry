@@ -1,8 +1,13 @@
 /**
  * Financial Policy Rules
  *
- * Enforces spend limits, domain allowlists, and transfer caps
- * to prevent iterative credit drain and unauthorized payments.
+ * Early, friendly denials for spending tools: amount shape, per-payment and
+ * per-turn limits, the confirmation threshold, the x402 allowlist and the
+ * hourly/daily envelopes. The Treasury is the authoritative gate: it checks
+ * the same limits (and the reserve, half balance and cooldowns) atomically
+ * on rolling windows for every outflow, including automatic ones. These
+ * rules read the calendar-bucket spend mirror; a current-hour bucket is a
+ * subset of the rolling hour, so a rule never denies what the gate allows.
  */
 
 import type {
@@ -11,6 +16,12 @@ import type {
   PolicyRuleResult,
   TreasuryPolicy,
 } from "../../types.js";
+import { createLogger } from "../../observability/logger.js";
+
+const logger = createLogger("policy.financial");
+
+/** Tools that move Conway credits to another address; they share one transfer budget. */
+export const CREDIT_TRANSFER_TOOLS = ["transfer_credits", "fund_child"] as const;
 
 function deny(
   rule: string,
@@ -21,20 +32,25 @@ function deny(
 }
 
 /**
- * Deny x402 payments above the configured per-payment max.
+ * Deny x402 fetches once the x402 hourly or daily envelope is used up. The
+ * exact amount is only known from the server's 402 quote, so the treasury
+ * checks it before signing; this rule refuses early when nothing is left.
  */
-function createX402MaxSingleRule(policy: TreasuryPolicy): PolicyRule {
+function createX402EnvelopeRule(policy: TreasuryPolicy): PolicyRule {
   return {
-    id: "financial.x402_max_single",
-    description: `Deny x402 payments above ${policy.maxX402PaymentCents} cents`,
+    id: "financial.x402_envelope",
+    description: `Deny x402 payments once the x402 envelope (${policy.maxX402PaymentCents * 10}c/h, ${policy.maxX402PaymentCents * 50}c/day) is used up`,
     priority: 500,
     appliesTo: { by: "name", names: ["x402_fetch"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      // The amount is checked pre-payment in x402Fetch itself,
-      // but we also enforce via policy for the declared max.
-      // x402 payment amounts aren't in tool args — they come from the server.
-      // This rule serves as a policy declaration; actual enforcement
-      // happens in x402Fetch when maxPaymentCents is injected.
+      const check = request.turnContext.sessionSpend.checkLimit(1, "x402", policy);
+      if (!check.allowed) {
+        return deny(
+          "financial.x402_envelope",
+          "SPEND_LIMIT_EXCEEDED",
+          `x402 spending envelope used up: ${check.currentHourlySpend}c this hour (cap ${check.limitHourly}c), ${check.currentDailySpend}c today (cap ${check.limitDaily}c)`,
+        );
+      }
       return null;
     },
   };
@@ -99,10 +115,10 @@ function createTransferMaxSingleRule(policy: TreasuryPolicy): PolicyRule {
     id: "financial.transfer_max_single",
     description: `Deny transfers above ${policy.maxSingleTransferCents} cents`,
     priority: 500,
-    appliesTo: { by: "name", names: ["transfer_credits"] },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const amount = request.args.amount_cents as number | undefined;
-      if (amount === undefined) return null;
+      const amount = request.args.amount_cents;
+      if (typeof amount !== "number") return null;
 
       if (amount > policy.maxSingleTransferCents) {
         return deny(
@@ -125,10 +141,10 @@ function createTransferHourlyCapRule(policy: TreasuryPolicy): PolicyRule {
     id: "financial.transfer_hourly_cap",
     description: `Deny if hourly transfers exceed ${policy.maxHourlyTransferCents} cents`,
     priority: 500,
-    appliesTo: { by: "name", names: ["transfer_credits"] },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const amount = request.args.amount_cents as number | undefined;
-      if (amount === undefined) return null;
+      const amount = request.args.amount_cents;
+      if (typeof amount !== "number") return null;
 
       const spendTracker = request.turnContext.sessionSpend;
       const check = spendTracker.checkLimit(amount, "transfer", policy);
@@ -154,10 +170,10 @@ function createTransferDailyCapRule(policy: TreasuryPolicy): PolicyRule {
     id: "financial.transfer_daily_cap",
     description: `Deny if daily transfers exceed ${policy.maxDailyTransferCents} cents`,
     priority: 500,
-    appliesTo: { by: "name", names: ["transfer_credits"] },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const amount = request.args.amount_cents as number | undefined;
-      if (amount === undefined) return null;
+      const amount = request.args.amount_cents;
+      if (typeof amount !== "number") return null;
 
       const spendTracker = request.turnContext.sessionSpend;
       const check = spendTracker.checkLimit(amount, "transfer", policy);
@@ -176,48 +192,40 @@ function createTransferDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 }
 
 /**
- * Deny any financial operation that would bring balance below minimum reserve.
+ * Deny credit transfers whose amount is not a positive whole number of cents.
+ * The other rules compare numbers, so "5,000" or NaN would slip past them.
  */
-function createMinimumReserveRule(policy: TreasuryPolicy): PolicyRule {
+function createAmountIntegerRule(): PolicyRule {
   return {
-    id: "financial.minimum_reserve",
-    description: `Deny if balance would drop below ${policy.minimumReserveCents} cents reserve`,
+    id: "financial.amount_integer",
+    description: "Deny credit transfers whose amount is not a positive whole number of cents",
     priority: 500,
-    appliesTo: {
-      by: "name",
-      names: ["transfer_credits", "x402_fetch", "fund_child"],
-    },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      // For transfer_credits and fund_child, we can check from args
-      const amount = request.args.amount_cents as number | undefined;
-      if (amount === undefined) return null;
-
-      // We need the current balance from context
-      // The balance check is done inside the tool execute function,
-      // but we can check spend tracker totals as an additional guard
-      const spendTracker = request.turnContext.sessionSpend;
-      const hourlySpend = spendTracker.getHourlySpend("transfer");
-      const dailySpend = spendTracker.getDailySpend("transfer");
-
-      // This rule is a declaration — actual balance checking
-      // requires the async getCreditsBalance call which happens
-      // inside the tool execution. The tool itself has a guard
-      // (cannot transfer more than half balance).
-      return null;
+      const amount = request.args.amount_cents;
+      if (typeof amount === "number" && Number.isSafeInteger(amount) && amount > 0) {
+        return null;
+      }
+      return deny(
+        "financial.amount_integer",
+        "INVALID_AMOUNT",
+        `amount_cents must be a positive whole number of cents (got ${JSON.stringify(amount) ?? String(amount)})`,
+      );
     },
   };
 }
 
 /**
  * Deny if too many transfer operations in a single turn.
- * Prevents iterative credit drain within one turn.
+ * Prevents iterative credit drain within one turn. turnToolCallCount is
+ * counted by the caller (the agent loop and the worker harness).
  */
 function createTurnTransferLimitRule(policy: TreasuryPolicy): PolicyRule {
   return {
     id: "financial.turn_transfer_limit",
     description: `Deny more than ${policy.maxTransfersPerTurn} transfers per turn`,
     priority: 500,
-    appliesTo: { by: "name", names: ["transfer_credits"] },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
       const count = request.turnContext.turnToolCallCount;
 
@@ -267,25 +275,28 @@ function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 }
 
 /**
- * Return 'quarantine' (not deny) for transfer amounts above
- * requireConfirmationAboveCents. This is a soft limit requiring confirmation.
+ * Refuse transfers above requireConfirmationAboveCents. No confirmation flow
+ * exists, so this is a hard cap (the treasury caps every transfer at the same
+ * threshold); the action stays 'quarantine' so the decision log keeps the
+ * distinction, and the message says plainly that nothing will confirm it.
  */
 function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
+  const threshold = policy.requireConfirmationAboveCents;
   return {
     id: "financial.require_confirmation",
-    description: `Quarantine transfers above ${policy.requireConfirmationAboveCents} cents for confirmation`,
+    description: `Refuse transfers above ${threshold} cents (no confirmation flow exists)`,
     priority: 500,
-    appliesTo: { by: "name", names: ["transfer_credits"] },
+    appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const amount = request.args.amount_cents as number | undefined;
-      if (amount === undefined) return null;
+      const amount = request.args.amount_cents;
+      if (typeof amount !== "number") return null;
 
-      if (amount > policy.requireConfirmationAboveCents) {
+      if (amount > threshold) {
         return {
           rule: "financial.require_confirmation",
           action: "quarantine",
-          reasonCode: "CONFIRMATION_REQUIRED",
-          humanMessage: `Transfer of ${amount} cents ($${(amount / 100).toFixed(2)}) exceeds confirmation threshold of ${policy.requireConfirmationAboveCents} cents ($${(policy.requireConfirmationAboveCents / 100).toFixed(2)})`,
+          reasonCode: "TRANSFER_ABOVE_CONFIRMATION_THRESHOLD",
+          humanMessage: `Transfer of ${amount} cents (${usd(amount)}) refused: transfers above ${usd(threshold)} are refused because no confirmation flow exists. The operator can raise treasuryPolicy.requireConfirmationAboveCents.`,
         };
       }
 
@@ -294,19 +305,38 @@ function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
   };
 }
 
+function usd(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/**
+ * The warning createFinancialRules logs when maxSingleTransferCents is above
+ * the confirmation threshold (which then caps every transfer), else null.
+ */
+export function transferCapWarning(policy: TreasuryPolicy): string | null {
+  if (policy.maxSingleTransferCents > policy.requireConfirmationAboveCents) {
+    return `treasuryPolicy.maxSingleTransferCents (${policy.maxSingleTransferCents}c) has no effect above requireConfirmationAboveCents (${policy.requireConfirmationAboveCents}c): transfers above ${usd(policy.requireConfirmationAboveCents)} are refused because no confirmation flow exists.`;
+  }
+  return null;
+}
+
 /**
  * Create all financial policy rules.
  */
 export function createFinancialRules(
   treasuryPolicy: TreasuryPolicy,
 ): PolicyRule[] {
+  const warning = transferCapWarning(treasuryPolicy);
+  if (warning) logger.warn(warning);
+  // Same priority: the first deny in this order wins, so the amount shape is
+  // checked before any rule compares the amount.
   return [
-    createX402MaxSingleRule(treasuryPolicy),
+    createX402EnvelopeRule(treasuryPolicy),
     createX402DomainAllowlistRule(treasuryPolicy),
+    createAmountIntegerRule(),
     createTransferMaxSingleRule(treasuryPolicy),
     createTransferHourlyCapRule(treasuryPolicy),
     createTransferDailyCapRule(treasuryPolicy),
-    createMinimumReserveRule(treasuryPolicy),
     createTurnTransferLimitRule(treasuryPolicy),
     createInferenceDailyCapRule(treasuryPolicy),
     createRequireConfirmationRule(treasuryPolicy),

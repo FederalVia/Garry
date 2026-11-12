@@ -13,7 +13,8 @@ import type {
 import { SURVIVAL_THRESHOLDS } from "../types.js";
 
 /**
- * Check the current financial state of the automaton.
+ * Check the current financial state of the automaton. Throws when the
+ * credit balance cannot be read.
  */
 export async function checkFinancialState(
   conway: ConwayClient,
@@ -24,6 +25,8 @@ export async function checkFinancialState(
   return {
     creditsCents,
     usdcBalance,
+    credits: "live",
+    usdc: "live",
     lastChecked: new Date().toISOString(),
   };
 }

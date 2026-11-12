@@ -7,7 +7,7 @@
  * Ported from aiws control-plane wallet.ts + siws.ts utilities.
  */
 
-import type { PrivateKeyAccount } from "viem";
+import { getAddress, type PrivateKeyAccount } from "viem";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 
@@ -19,6 +19,21 @@ export type ChainType = "evm" | "solana";
 
 export function isValidEvmAddress(address: string): boolean {
   return /^0x[a-fA-F0-9]{40}$/.test(address);
+}
+
+/**
+ * A mixed-case EVM address carries an EIP-55 checksum; a wrong one is almost
+ * always a typo. All-lowercase and all-uppercase addresses carry none.
+ */
+export function hasValidEvmChecksum(address: string): boolean {
+  if (!isValidEvmAddress(address)) return false;
+  const body = address.slice(2);
+  if (body === body.toLowerCase() || body === body.toUpperCase()) return true;
+  try {
+    return getAddress(address) === address;
+  } catch {
+    return false;
+  }
 }
 
 export function isValidSolanaAddress(address: string): boolean {
@@ -39,6 +54,17 @@ export function detectChainType(address: string): ChainType | null {
   if (isValidEvmAddress(address)) return "evm";
   if (isValidSolanaAddress(address)) return "solana";
   return null;
+}
+
+/** The EVM zero address or the all-zero Solana key (system program): sends there are lost. */
+export function isZeroAddress(address: string): boolean {
+  if (isValidEvmAddress(address)) return /^0x0{40}$/i.test(address);
+  try {
+    const bytes = bs58.decode(address);
+    return bytes.length > 0 && bytes.every((b) => b === 0);
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeAddress(address: string, chain: ChainType): string {

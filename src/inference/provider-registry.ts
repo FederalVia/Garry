@@ -1,5 +1,9 @@
-import fs from "node:fs";
+import path from "node:path";
 import OpenAI from "openai";
+import { readRegularFileNoFollow } from "../security/secure-fs.js";
+import { createLogger } from "../observability/logger.js";
+
+const logger = createLogger("inference.providers");
 
 export type ModelTier = "reasoning" | "fast" | "cheap";
 
@@ -47,11 +51,13 @@ interface ProviderConfigFile {
   providers?: unknown;
   tierDefaults?: Partial<Record<ModelTier, Partial<TierDefault>>>;
   globalRateLimits?: {
+    /** Deprecated: survival-tier pausing in the inference gate replaces it. */
     emergencyStopCredits?: number;
   };
 }
 
-const DEFAULT_EMERGENCY_STOP_CREDITS = 100;
+/** SDK-level timeout; callers also pass a per-attempt timeout and signal. */
+export const PROVIDER_CLIENT_TIMEOUT_MS = 120_000;
 
 const DEFAULT_TIER_DEFAULTS: Record<ModelTier, TierDefault> = {
   reasoning: {
@@ -68,6 +74,9 @@ const DEFAULT_TIER_DEFAULTS: Record<ModelTier, TierDefault> = {
   },
 };
 
+// Prices are USD per 1M tokens at the providers' public list prices, rounded
+// up. The gate caps spend with them, so a stale low price lets real spend
+// exceed every cap; provider-registry.test.ts pins each one.
 const DEFAULT_PROVIDERS: ProviderConfig[] = [
   {
     id: "openai",
@@ -125,8 +134,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "reasoning",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.2,
-        costPerOutputToken: 0.2,
+        costPerInputToken: 0.59,
+        costPerOutputToken: 0.79,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -136,8 +145,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "fast",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.2,
-        costPerOutputToken: 0.2,
+        costPerInputToken: 0.59,
+        costPerOutputToken: 0.79,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -170,8 +179,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "reasoning",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.25,
-        costPerOutputToken: 0.5,
+        costPerInputToken: 0.88,
+        costPerOutputToken: 0.88,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -181,8 +190,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "fast",
         contextWindow: 131072,
         maxOutputTokens: 8192,
-        costPerInputToken: 0.25,
-        costPerOutputToken: 0.5,
+        costPerInputToken: 0.88,
+        costPerOutputToken: 0.88,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -192,8 +201,8 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         tier: "cheap",
         contextWindow: 131072,
         maxOutputTokens: 4096,
-        costPerInputToken: 0.08,
-        costPerOutputToken: 0.1,
+        costPerInputToken: 0.18,
+        costPerOutputToken: 0.18,
         supportsTools: true,
         supportsVision: false,
         supportsStreaming: true,
@@ -240,17 +249,84 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
 ];
 
+/**
+ * Known providers keep their endpoint and key variable whatever the config
+ * file says: the file is not trusted to redirect a credential elsewhere.
+ */
+const KNOWN_PROVIDER_PINS: Record<string, { baseUrl: string; apiKeyEnvVar: string }> = Object.fromEntries(
+  DEFAULT_PROVIDERS.map((p) => [p.id, { baseUrl: p.baseUrl, apiKeyEnvVar: p.apiKeyEnvVar }]),
+);
+
+/** Credentials the runtime itself holds; never handed to a configured provider. */
+const RESERVED_KEY_VARS = new Set([
+  "CONWAY_API_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GROQ_API_KEY",
+  "TOGETHER_API_KEY",
+]);
+
+/** Operator opt-in (process environment) before unknown provider ids are honoured. */
+export const CUSTOM_PROVIDERS_ENV = "AUTOMATON_ALLOW_CUSTOM_PROVIDERS";
+const CUSTOM_PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const MAX_PROVIDER_CONFIG_BYTES = 256 * 1024;
+
+/** Env var an unknown provider must use: a dedicated prefix, so it can never name an operator key. */
+export function customProviderKeyEnvVar(id: string): string {
+  return `AUTOMATON_PROVIDER_${id.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+/** https with no userinfo, or http on loopback. */
+function isAcceptableBaseUrl(raw: unknown, allowLoopbackHttp: boolean, requireLoopback = false): raw is string {
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password) return false;
+  const loopback = isLoopbackHost(url.hostname);
+  if (requireLoopback && !loopback) return false;
+  if (url.protocol === "https:") return true;
+  return url.protocol === "http:" && allowLoopbackHttp && loopback;
+}
+
+/**
+ * True for the built-in "local" provider on a loopback address. Only such a
+ * provider is free; a zero price anywhere else is treated as unknown.
+ */
+export function isLocalProvider(provider: Pick<ProviderConfig, "id" | "baseUrl">): boolean {
+  if (provider.id !== "local") return false;
+  try {
+    return isLoopbackHost(new URL(provider.baseUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** Keys by env var name, handed in so the runtime never copies them into process.env. */
+export interface ProviderRegistryOptions {
+  keys?: Record<string, string | undefined>;
+}
+
 export class ProviderRegistry {
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
-  private readonly emergencyStopCredits: number;
+  private readonly keys: Record<string, string | undefined>;
 
   constructor(
     providers: ProviderConfig[],
     tierDefaults: Record<ModelTier, TierDefault> = DEFAULT_TIER_DEFAULTS,
-    emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS,
+    options: ProviderRegistryOptions = {},
   ) {
+    this.keys = { ...(options.keys ?? {}) };
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
       .sort((a, b) => a.priority - b.priority);
@@ -259,7 +335,6 @@ export class ProviderRegistry {
       fast: normalizeTierDefault(tierDefaults.fast, DEFAULT_TIER_DEFAULTS.fast),
       cheap: normalizeTierDefault(tierDefaults.cheap, DEFAULT_TIER_DEFAULTS.cheap),
     };
-    this.emergencyStopCredits = emergencyStopCredits;
   }
 
   overrideBaseUrl(providerId: string, baseUrl: string): void {
@@ -269,17 +344,21 @@ export class ProviderRegistry {
     }
   }
 
-  static fromConfig(configPath: string): ProviderRegistry {
+  static fromConfig(configPath: string, options: ProviderRegistryOptions = {}): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
-    let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;
 
-    if (!fs.existsSync(configPath)) {
-      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+    // No-follow read: a link or hard link at the config path is ignored.
+    const text = readRegularFileNoFollow(configPath, {
+      root: path.dirname(path.resolve(configPath)),
+      maxBytes: MAX_PROVIDER_CONFIG_BYTES,
+    });
+    if (text === null) {
+      return new ProviderRegistry(providers, tierDefaults, options);
     }
 
     try {
-      const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ProviderConfigFile;
+      const raw = JSON.parse(text) as ProviderConfigFile;
       const configuredProviders = normalizeProviders(raw.providers);
       if (configuredProviders.length > 0) {
         providers = configuredProviders;
@@ -293,34 +372,39 @@ export class ProviderRegistry {
         };
       }
 
-      const configuredEmergencyStop = raw.globalRateLimits?.emergencyStopCredits;
-      if (typeof configuredEmergencyStop === "number" && configuredEmergencyStop > 0) {
-        emergencyStopCredits = configuredEmergencyStop;
+      if (raw.globalRateLimits?.emergencyStopCredits !== undefined) {
+        logger.warn(
+          "globalRateLimits.emergencyStopCredits is deprecated and ignored; orchestration pauses at low survival tiers instead",
+        );
       }
     } catch {
       // Keep defaults if config is invalid.
     }
 
-    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+    return new ProviderRegistry(providers, tierDefaults, options);
   }
 
-  resolveModel(tier: ModelTier, survivalMode = false): ResolvedModel {
-    const candidates = this.resolveCandidates(tier, survivalMode);
+  /** `downgrade` steps the tier down once (reasoning to fast, fast to cheap). */
+  resolveModel(tier: ModelTier, downgrade = false): ResolvedModel {
+    const candidates = this.resolveCandidates(tier, downgrade);
     if (candidates.length === 0) {
       throw new Error(`No provider/model available for tier '${tier}'`);
     }
     return candidates[0];
   }
 
-  resolveCandidates(tier: ModelTier, survivalMode = false): ResolvedModel[] {
-    this.assertEmergencyPolicy();
-
-    const effectiveTier = this.applySurvivalTier(tier, survivalMode);
+  /**
+   * Providers for a tier in preference order. A provider with no API key is
+   * skipped rather than called with a placeholder, so a prompt never goes to
+   * a provider that cannot serve it.
+   */
+  resolveCandidates(tier: ModelTier, downgrade = false): ResolvedModel[] {
+    const effectiveTier = this.applySurvivalTier(tier, downgrade);
     const orderedProviders = this.getProviderOrderForTier(effectiveTier);
     const results: ResolvedModel[] = [];
 
     for (const provider of orderedProviders) {
-      if (!this.isProviderActive(provider)) {
+      if (!this.isProviderUsable(provider)) {
         continue;
       }
 
@@ -338,7 +422,7 @@ export class ProviderRegistry {
 
     if (effectiveTier !== tier) {
       for (const provider of this.getProviderOrderForTier(tier)) {
-        if (!this.isProviderActive(provider)) {
+        if (!this.isProviderUsable(provider)) {
           continue;
         }
 
@@ -362,6 +446,10 @@ export class ProviderRegistry {
 
     if (!this.isProviderActive(provider)) {
       throw new Error(`Provider '${providerId}' is disabled`);
+    }
+
+    if (this.resolveApiKey(provider) === null) {
+      throw new Error(`Provider '${providerId}' has no API key (${provider.apiKeyEnvVar} is not set)`);
     }
 
     const model = provider.models.find((candidate) => candidate.id === modelId);
@@ -431,9 +519,15 @@ export class ProviderRegistry {
 
   private buildResolvedModel(provider: ProviderConfig, model: ModelConfig): ResolvedModel {
     const apiKey = this.resolveApiKey(provider);
+    if (apiKey === null) {
+      throw new Error(`Provider '${provider.id}' has no API key`);
+    }
+    // Retries live in exactly one layer (the unified client), never in the SDK.
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
+      maxRetries: 0,
+      timeout: PROVIDER_CLIENT_TIMEOUT_MS,
     });
 
     return {
@@ -443,17 +537,23 @@ export class ProviderRegistry {
     };
   }
 
-  private resolveApiKey(provider: ProviderConfig): string {
-    const configured = process.env[provider.apiKeyEnvVar];
-    if (typeof configured === "string" && configured.length > 0) {
-      return configured;
+  private resolveApiKey(provider: ProviderConfig): string | null {
+    for (const configured of [this.keys[provider.apiKeyEnvVar], process.env[provider.apiKeyEnvVar]]) {
+      if (typeof configured === "string" && configured.trim().length > 0) {
+        return configured;
+      }
     }
 
+    // Local servers usually need no key; "local" must still be enabled explicitly.
     if (provider.id === "local") {
       return "local";
     }
 
-    return `missing-${provider.apiKeyEnvVar.toLowerCase()}`;
+    return null;
+  }
+
+  private isProviderUsable(provider: ProviderConfig): boolean {
+    return this.isProviderActive(provider) && this.resolveApiKey(provider) !== null;
   }
 
   private isProviderActive(provider: ProviderConfig): boolean {
@@ -474,8 +574,8 @@ export class ProviderRegistry {
     return false;
   }
 
-  private applySurvivalTier(tier: ModelTier, survivalMode: boolean): ModelTier {
-    if (!survivalMode) {
+  private applySurvivalTier(tier: ModelTier, downgrade: boolean): ModelTier {
+    if (!downgrade) {
       return tier;
     }
 
@@ -488,27 +588,6 @@ export class ProviderRegistry {
     }
 
     return tier;
-  }
-
-  private assertEmergencyPolicy(): void {
-    const rawCredits = process.env.AUTOMATON_CREDITS_BALANCE;
-    if (!rawCredits) {
-      return;
-    }
-
-    const credits = Number(rawCredits);
-    if (!Number.isFinite(credits) || credits >= this.emergencyStopCredits) {
-      return;
-    }
-
-    const taskType = (process.env.AUTOMATON_INFERENCE_TASK_TYPE || "").toLowerCase();
-    const plannerCall = taskType.includes("planner") || taskType.includes("planning");
-
-    if (!plannerCall) {
-      throw new Error(
-        `Emergency stop active (${credits} credits < ${this.emergencyStopCredits}); only planner calls are allowed`,
-      );
-    }
   }
 }
 
@@ -531,6 +610,11 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
       continue;
     }
 
+    const endpoint = resolveProviderEndpoint(id, candidate);
+    if (!endpoint) {
+      continue;
+    }
+
     const fallback = defaultsById.get(id);
     const models = normalizeModels(candidate.models, fallback?.models ?? []);
     if (models.length === 0) {
@@ -540,8 +624,8 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
     normalized.push({
       id,
       name: stringOr(candidate.name, fallback?.name ?? id),
-      baseUrl: stringOr(candidate.baseUrl, fallback?.baseUrl ?? "https://api.openai.com/v1"),
-      apiKeyEnvVar: stringOr(candidate.apiKeyEnvVar, fallback?.apiKeyEnvVar ?? "OPENAI_API_KEY"),
+      baseUrl: endpoint.baseUrl,
+      apiKeyEnvVar: endpoint.apiKeyEnvVar,
       models,
       maxRequestsPerMinute: numberOr(candidate.maxRequestsPerMinute, fallback?.maxRequestsPerMinute ?? 600),
       maxTokensPerMinute: numberOr(candidate.maxTokensPerMinute, fallback?.maxTokensPerMinute ?? 200000),
@@ -551,6 +635,53 @@ function normalizeProviders(input: unknown): ProviderConfig[] {
   }
 
   return normalized.sort((a, b) => a.priority - b.priority);
+}
+
+/**
+ * Decide where a file-configured provider may send requests and which env
+ * var it may read. Returns null to drop the provider.
+ */
+function resolveProviderEndpoint(
+  id: string,
+  candidate: Record<string, unknown>,
+): { baseUrl: string; apiKeyEnvVar: string } | null {
+  const pin = KNOWN_PROVIDER_PINS[id];
+  if (pin) {
+    let baseUrl = pin.baseUrl;
+    if (id === "local" && candidate.baseUrl !== undefined) {
+      if (isAcceptableBaseUrl(candidate.baseUrl, true, true)) {
+        baseUrl = candidate.baseUrl;
+      } else {
+        logger.warn(`Ignoring non-loopback baseUrl for provider "local"`);
+      }
+    } else if (candidate.baseUrl !== undefined && candidate.baseUrl !== pin.baseUrl) {
+      logger.warn(`Ignoring baseUrl override for known provider "${id}"`);
+    }
+    if (candidate.apiKeyEnvVar !== undefined && candidate.apiKeyEnvVar !== pin.apiKeyEnvVar) {
+      logger.warn(`Ignoring apiKeyEnvVar override for known provider "${id}"`);
+    }
+    return { baseUrl, apiKeyEnvVar: pin.apiKeyEnvVar };
+  }
+
+  if (process.env[CUSTOM_PROVIDERS_ENV] !== "1") {
+    logger.warn(`Dropping unknown provider "${id.slice(0, 40)}": set ${CUSTOM_PROVIDERS_ENV}=1 to allow custom providers`);
+    return null;
+  }
+  if (!CUSTOM_PROVIDER_ID_RE.test(id)) {
+    logger.warn(`Dropping provider with invalid id "${id.slice(0, 40)}"`);
+    return null;
+  }
+  const expectedEnv = customProviderKeyEnvVar(id);
+  const apiKeyEnvVar = candidate.apiKeyEnvVar === undefined ? expectedEnv : candidate.apiKeyEnvVar;
+  if (apiKeyEnvVar !== expectedEnv || RESERVED_KEY_VARS.has(apiKeyEnvVar)) {
+    logger.warn(`Dropping provider "${id}": apiKeyEnvVar must be ${expectedEnv}`);
+    return null;
+  }
+  if (!isAcceptableBaseUrl(candidate.baseUrl, true)) {
+    logger.warn(`Dropping provider "${id}": baseUrl must be https (or http on loopback) without credentials`);
+    return null;
+  }
+  return { baseUrl: candidate.baseUrl, apiKeyEnvVar };
 }
 
 function normalizeModels(input: unknown, fallbackModels: ModelConfig[]): ModelConfig[] {

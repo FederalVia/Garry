@@ -16,6 +16,8 @@ import type {
 } from "../types.js";
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import { createTokenCounter } from "../memory/context-manager.js";
+import { isIsolatedTurn } from "./inbox-isolation.js";
+import { isMutatingTool } from "./idle-only-tools.js";
 
 const MAX_CONTEXT_TURNS = 20;
 const SUMMARY_THRESHOLD = 15;
@@ -74,7 +76,10 @@ function estimateTurnTokens(turn: AgentTurn): number {
   }
   for (const tc of turn.toolCalls) {
     total += estimateTokens(JSON.stringify(tc.arguments));
-    total += estimateTokens(tc.error ? `Error: ${tc.error}` : tc.result);
+    // Count what is rendered: tool results are truncated before they are sent.
+    total += estimateTokens(
+      truncateToolResult(tc.error ? `Error: ${tc.error}` : tc.result),
+    );
   }
   return total;
 }
@@ -163,11 +168,13 @@ export function buildContextMessages(
       });
     }
 
-    // The agent's thinking as assistant message
-    if (turn.thinking) {
+    // The agent's thinking and tool calls as an assistant message. A turn
+    // that only made tool calls still renders them, so the model sees what
+    // it did (for example the reply it sent on an earlier inbox turn).
+    if (turn.thinking || turn.toolCalls.length > 0) {
       const msg: ChatMessage = {
         role: "assistant",
-        content: turn.thinking,
+        content: turn.thinking || "",
       };
 
       // If there were tool calls, include them
@@ -198,16 +205,18 @@ export function buildContextMessages(
   }
 
   // ── Anti-Repetition Warning ──
-  // Analyze the last 5 turns for repeated tool usage
+  // Counts the turns (not calls) in the last 5 that used each read-only
+  // tool. Mutating tools are real work, so a build sequence never trips it.
   const analysisWindow = recentTurns.slice(-5);
   if (analysisWindow.length >= 3) {
-    const toolFrequency: Record<string, number> = {};
+    const turnsWithTool: Record<string, number> = {};
     for (const turn of analysisWindow) {
-      for (const tc of turn.toolCalls) {
-        toolFrequency[tc.name] = (toolFrequency[tc.name] || 0) + 1;
+      for (const name of new Set(turn.toolCalls.map((tc) => tc.name))) {
+        if (isMutatingTool(name)) continue;
+        turnsWithTool[name] = (turnsWithTool[name] || 0) + 1;
       }
     }
-    const repeatedTools = Object.entries(toolFrequency)
+    const repeatedTools = Object.entries(turnsWithTool)
       .filter(([, count]) => count >= 3)
       .map(([name]) => name);
     if (repeatedTools.length > 0) {
@@ -302,9 +311,11 @@ export function formatMemoryBlock(memories: MemoryRetrievalResult): string {
  * Used when context grows too large.
  */
 export async function summarizeTurns(
-  turns: AgentTurn[],
+  allTurns: AgentTurn[],
   inference: InferenceClient,
 ): Promise<string> {
+  // A summary is read by privileged turns, so inbox turns never enter it.
+  const turns = allTurns.filter((t) => !isIsolatedTurn(t));
   if (turns.length === 0) return "No previous activity.";
 
   const turnSummaries = turns.map((t) => {

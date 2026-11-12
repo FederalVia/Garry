@@ -377,7 +377,9 @@ function detectObfuscation(text: string): InjectionCheck {
 function detectMultiLanguageInjection(text: string): InjectionCheck {
   const patterns = [
     // Chinese injection patterns
-    /\u5ffd\u7565[\u4e00-\u9fff]*(\u6307\u4ee4|\u8bf4\u660e|\u63d0\u793a)/,   // ignore ... instructions/instructions/prompt
+    // The gap is bounded: an open-ended one rescans the rest of the text at
+    // every "ignore", which is quadratic on a message made of repeats.
+    /\u5ffd\u7565[\u4e00-\u9fff]{0,40}(\u6307\u4ee4|\u8bf4\u660e|\u63d0\u793a)/,   // ignore ... instructions/instructions/prompt
     /\u65b0\u7684?\u6307\u4ee4/,                                               // new instructions
     /\u7cfb\u7edf\u63d0\u793a/,                                                 // system prompt
     // Russian injection patterns

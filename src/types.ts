@@ -65,6 +65,13 @@ export interface AutomatonConfig {
   maxTurnsPerCycle?: number;
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
+  /**
+   * Git repository (https) a spawned child's runtime is cloned from, and an
+   * optional branch or tag. A checkout without the genesis bootstrap gets an
+   * automaton.json written by the parent at spawn time.
+   */
+  childRuntimeRepo?: string;
+  childRuntimeRef?: string;
   parentAddress?: string;
   socialRelayUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
@@ -221,10 +228,24 @@ export interface HeartbeatPingPayload {
 
 // ─── Financial ───────────────────────────────────────────────────
 
+/** Where a balance came from: read now, the last good read, or nothing. */
+export type BalanceSource = "live" | "cached" | "unknown";
+
+/**
+ * Balances as the agent sees them. null means unknown (never read, or the
+ * read failed with nothing cached). Spending and the dead decision need a
+ * "live" source; an absent source is treated as not live.
+ */
 export interface FinancialState {
-  creditsCents: number;
-  usdcBalance: number;
+  creditsCents: number | null;
+  usdcBalance: number | null;
+  credits?: BalanceSource;
+  usdc?: BalanceSource;
   lastChecked: string;
+  /** When a cached creditsCents was read. */
+  creditsAsOf?: string;
+  /** When a cached usdcBalance was read. */
+  usdcAsOf?: string;
 }
 
 export type SurvivalTier = "dead" | "critical" | "low_compute" | "normal" | "high";
@@ -253,7 +274,8 @@ export type TransactionType =
   | "tool_use"
   | "transfer_in"
   | "transfer_out"
-  | "funding_request";
+  | "funding_request"
+  | "x402_payment";
 
 // ─── Self-Modification ───────────────────────────────────────────
 
@@ -342,6 +364,10 @@ export interface InferenceOptions {
   temperature?: number;
   tools?: InferenceToolDefinition[];
   stream?: boolean;
+  /** Aborts the HTTP request (deadline or shutdown). */
+  signal?: AbortSignal;
+  /** Open reservation on the installed inference gate; the legacy client refuses to send without one. */
+  reservationId?: string;
 }
 
 export interface InferenceToolDefinition {
@@ -370,6 +396,7 @@ export interface ConwayClient {
     toAddress: string,
     amountCents: number,
     note?: string,
+    opts?: OutflowRequestOptions,
   ): Promise<CreditTransferResult>;
   registerAutomaton(params: {
     automatonId: string;
@@ -385,7 +412,11 @@ export interface ConwayClient {
   }): Promise<{ automaton: Record<string, unknown> }>;
   // Domain operations
   searchDomains(query: string, tlds?: string): Promise<DomainSearchResult[]>;
-  registerDomain(domain: string, years?: number): Promise<DomainRegistration>;
+  registerDomain(
+    domain: string,
+    years?: number,
+    opts?: OutflowRequestOptions,
+  ): Promise<DomainRegistration>;
   listDnsRecords(domain: string): Promise<DnsRecord[]>;
   addDnsRecord(
     domain: string,
@@ -413,7 +444,18 @@ export interface PortInfo {
   sandboxId: string;
 }
 
-export interface CreateSandboxOptions {
+/**
+ * Options the treasury passes to a value-moving Conway call. The key is sent
+ * as the Idempotency-Key header on every attempt. onSend runs exactly once,
+ * synchronously, before the first byte of the first attempt leaves the
+ * process; retries of the same call reuse the key and do not call it again.
+ */
+export interface OutflowRequestOptions {
+  idempotencyKey?: string;
+  onSend?: () => void;
+}
+
+export interface CreateSandboxOptions extends OutflowRequestOptions {
   name?: string;
   vcpu?: number;
   memoryMb?: number;
@@ -519,6 +561,12 @@ export interface PolicyRequest {
     inputSource: InputSource | undefined;
     turnToolCallCount: number;
     sessionSpend: SpendTrackerInterface;
+    /** On an inbox turn: the sender of the batch being handled. */
+    inboxSender?: string;
+    /** On an inbox turn: ids of the messages in the batch. */
+    inboxMessageIds?: string[];
+    /** On an inbox turn: send_message calls already allowed this turn. */
+    inboxSendCount?: number;
   };
 }
 
@@ -578,11 +626,45 @@ export interface TreasuryPolicy {
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
+  /** Transfers above this are refused (no approval flow exists). */
   requireConfirmationAboveCents: number;
+  /** Largest single credit topup bought by a tool or a sandbox 402 handler. */
+  maxTopupSingleCents?: number;
+  /** Rolling 24h cap on those topups. */
+  maxTopupDailyCents?: number;
+  /** Rolling 24h cap on automatic survival topups. */
+  maxAutoTopupDailyCents?: number;
+  /** Minimum time between automatic survival topup attempts. */
+  autoTopupCooldownMs?: number;
+  /** Survival topups run only when a fresh balance read is below this. */
+  survivalTopupThresholdCents?: number;
+  /** Largest single sandbox or domain purchase. */
+  maxInfraSingleCents?: number;
+  /** Rolling 24h cap on sandbox and domain purchases. */
+  maxInfraDailyCents?: number;
+  /** Floor for a sandbox price estimate, whatever the pricing endpoint says. */
+  minSandboxEstimateCents?: number;
+  /** Ambiguous credit outflows count as possibly in flight for this long. */
+  unknownInflightMs?: number;
+  /** How long a committed debit may take to show up in the balance endpoint. */
+  balanceLagMs?: number;
+  /** Automatic child funding: at most one transfer per address per this window. */
+  autoFundCounterpartyCooldownMs?: number;
+  /**
+   * Address every credit topup must pay (survival buys included). When unset,
+   * the payTo of the last committed manual or sandbox topup is trusted for
+   * those topups; survival buys are not pinned, so an address change cannot
+   * starve them. Set this to accept a new address.
+   */
+  topupPayTo?: string;
 }
 
-export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
-  maxSingleTransferCents: 5000,
+/** A treasury policy with every numeric field filled in. */
+export type ResolvedTreasuryPolicy = Required<Omit<TreasuryPolicy, "topupPayTo">> &
+  Pick<TreasuryPolicy, "topupPayTo">;
+
+export const DEFAULT_TREASURY_POLICY: Required<Omit<TreasuryPolicy, "topupPayTo">> = {
+  maxSingleTransferCents: 1000,
   maxHourlyTransferCents: 10000,
   maxDailyTransferCents: 25000,
   minimumReserveCents: 1000,
@@ -592,6 +674,17 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
   requireConfirmationAboveCents: 1000,
+  maxTopupSingleCents: 2500,
+  maxTopupDailyCents: 10000,
+  maxAutoTopupDailyCents: 2000,
+  autoTopupCooldownMs: 300_000,
+  survivalTopupThresholdCents: 500,
+  maxInfraSingleCents: 2500,
+  maxInfraDailyCents: 5000,
+  minSandboxEstimateCents: 500,
+  unknownInflightMs: 3_600_000,
+  balanceLagMs: 60_000,
+  autoFundCounterpartyCooldownMs: 1_800_000,
 };
 
 // ─── Phase 1: Inbox Message Status ──────────────────────────────
@@ -631,7 +724,8 @@ export interface AutomatonDatabase {
 
   // Turns
   insertTurn(turn: AgentTurn): void;
-  getRecentTurns(limit: number): AgentTurn[];
+  /** excludeIsolated drops inbox turns before the limit is applied. */
+  getRecentTurns(limit: number, options?: { excludeIsolated?: boolean }): AgentTurn[];
   getTurnById(id: string): AgentTurn | undefined;
   getTurnCount(): number;
 
@@ -721,6 +815,8 @@ export interface InferenceClient {
   ): Promise<InferenceResponse>;
   setLowComputeMode(enabled: boolean): void;
   getDefaultModel(): string;
+  /** Whether a backend is configured that can serve this model (router candidate filter). */
+  canServe?(model: { modelId: string; provider: string }): boolean;
 }
 
 // ─── Skills ─────────────────────────────────────────────────────
@@ -883,9 +979,16 @@ export const DEFAULT_TOKEN_BUDGET: TokenBudget = {
 export interface TickContext {
   tickId: string;                    // ULID, unique per tick
   startedAt: Date;
-  creditBalance: number;             // fetched once per tick (cents)
-  usdcBalance: number;               // fetched once per tick
+  /** Cents, read once per tick; null when it could not be read. */
+  creditBalance: number | null;
+  /** USDC, read once per tick; null when it could not be read (or no wallet). */
+  usdcBalance: number | null;
+  creditRead: import("./conway/balance.js").BalanceRead;
+  usdcRead: import("./conway/balance.js").BalanceRead;
+  /** From a known balance; when unknown, the last known tier, else low_compute. */
   survivalTier: SurvivalTier;
+  /** False when survivalTier was not derived from this tick's balance. */
+  survivalTierKnown: boolean;
   lowComputeMultiplier: number;      // from config
   config: HeartbeatConfig;
   db: import("better-sqlite3").Database;
@@ -1182,10 +1285,24 @@ export interface InferenceRequest {
   messages: ChatMessage[];
   taskType: InferenceTaskType;
   tier: SurvivalTier;
+  /** Budget session (one wake cycle), not memory's session id. */
   sessionId: string;
   turnId?: string;
   maxTokens?: number; // override
   tools?: unknown[];
+  /** Who is calling, for budget attribution. Default "agent_turn". */
+  caller?: "agent_turn" | "inbox_turn" | "survival_turn";
+  /** A survival turn: cheapest model, survival allowance instead of the regular caps. */
+  survival?: boolean;
+  /** Aborts the call (shutdown). The router adds its own deadline. */
+  signal?: AbortSignal;
+}
+
+export interface InferenceRefusal {
+  code: string;
+  /** When the refusal clears on its own; null when it does not. */
+  retryAfterMs: number | null;
+  message: string;
 }
 
 export interface InferenceResult {
@@ -1194,10 +1311,14 @@ export interface InferenceResult {
   provider: ModelProvider;
   inputTokens: number;
   outputTokens: number;
+  /** Fractional cents; the inference ledger is authoritative. */
   costCents: number;
+  costMicroUsd?: number;
   latencyMs: number;
   toolCalls?: unknown[];
   finishReason: string;
+  /** Set (with finishReason "budget_exceeded") when every candidate was refused. */
+  refusal?: InferenceRefusal;
 }
 
 export interface InferenceCostRow {
@@ -1243,6 +1364,14 @@ export interface ModelStrategyConfig {
   perCallCeilingCents: number; // default: 0 (no limit)
   enableModelFallback: boolean; // default: true
   anthropicApiVersion: string; // default: "2023-06-01"
+  /** Share (%) of the hourly and daily inference caps orchestration may use. Default 50. */
+  orchestrationSharePct?: number;
+  /** Survival allowance per rolling 24 h once the regular caps are spent. 0 disables. Default 25. */
+  survivalAllowanceCents?: number;
+  /** At most one survival turn per this interval. Default 30 min. */
+  survivalMinIntervalMs?: number;
+  /** Sleep after a session-budget refusal. Default 30 min. */
+  sessionCooldownMs?: number;
 }
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
@@ -1255,6 +1384,10 @@ export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
   perCallCeilingCents: 0,
   enableModelFallback: true,
   anthropicApiVersion: "2023-06-01",
+  orchestrationSharePct: 50,
+  survivalAllowanceCents: 25,
+  survivalMinIntervalMs: 1_800_000,
+  sessionCooldownMs: 1_800_000,
 };
 
 // === Phase 3.1: Replication & Lifecycle Types ===
@@ -1303,19 +1436,28 @@ export interface HealthCheckResult {
   uptime: number | null;
   creditBalance: number | null;
   issues: string[];
+  /**
+   * What the probe established: the agent process runs, it definitely does
+   * not (or the sandbox is gone), or nothing could be learned (API error).
+   */
+  probe?: "running" | "offline" | "unknown";
+  /** Lifecycle state after checkAllChildren acted on the probe. */
+  state?: string;
 }
 
 export interface ChildHealthConfig {
   checkIntervalMs: number; // default: 300000 (5 min)
-  unhealthyThresholdMs: number; // default: 900000 (15 min)
-  deadThresholdMs: number; // default: 3600000 (1 hour)
+  /** A child still `starting` after this long with no process is failed. default: 600000 (10 min) */
+  unhealthyThresholdMs: number;
+  /** An unhealthy child whose process is confirmed gone this long is failed. default: 1800000 (30 min) */
+  deadThresholdMs: number;
   maxConcurrentChecks: number; // default: 3
 }
 
 export const DEFAULT_CHILD_HEALTH_CONFIG: ChildHealthConfig = {
   checkIntervalMs: 300_000,
-  unhealthyThresholdMs: 900_000,
-  deadThresholdMs: 3_600_000,
+  unhealthyThresholdMs: 600_000,
+  deadThresholdMs: 1_800_000,
   maxConcurrentChecks: 3,
 };
 

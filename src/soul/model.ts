@@ -11,7 +11,29 @@ import crypto from "crypto";
 import type BetterSqlite3 from "better-sqlite3";
 import type { SoulModel } from "../types.js";
 import { createLogger } from "../observability/logger.js";
+import { readRegularFileNoFollow } from "../security/secure-fs.js";
 const logger = createLogger("soul");
+
+const MAX_SOUL_FILE_BYTES = 64 * 1024;
+
+/** Frontmatter values are single-line scalars; a newline would start a new key or section. */
+function oneLine(value: unknown): string {
+  return String(value ?? "").replace(/[\r\n\u2028\u2029]+/g, " ").slice(0, 256);
+}
+
+/**
+ * Section bodies are written verbatim, and any line starting with "##" would
+ * open a new section on reload. Escape a leading "#" with a backslash (and
+ * one more backslash on lines that already start with "\#"), undone by
+ * unescapeBody, so the text round-trips but cannot spill into another section.
+ */
+function escapeBody(text: string): string {
+  return text.replace(/^(?=\\*#)/gm, "\\");
+}
+
+function unescapeBody(text: string): string {
+  return text.replace(/^\\(?=\\*#)/gm, "");
+}
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -194,7 +216,7 @@ function parseSections(body: string): Record<string, string> {
     // instead of computing it from trimmed name length which can be wrong when
     // headers have extra whitespace or multi-byte characters.
     const end = i + 1 < sectionHeaders.length ? sectionHeaders[i + 1].matchStart : body.length;
-    sections[sectionHeaders[i].name] = body.slice(start, end).trim();
+    sections[sectionHeaders[i].name] = unescapeBody(body.slice(start, end).trim());
   }
 
   return sections;
@@ -217,61 +239,61 @@ export function writeSoulMd(soul: SoulModel): string {
     "---",
     `format: soul/v1`,
     `version: ${soul.version}`,
-    `updated_at: ${soul.updatedAt}`,
-    `name: ${soul.name}`,
-    `address: ${soul.address}`,
-    `creator: ${soul.creator}`,
-    `born_at: ${soul.bornAt}`,
-    `constitution_hash: ${soul.constitutionHash}`,
-    `genesis_alignment: ${soul.genesisAlignment.toFixed(4)}`,
-    `last_reflected: ${soul.lastReflected}`,
+    `updated_at: ${oneLine(soul.updatedAt)}`,
+    `name: ${oneLine(soul.name)}`,
+    `address: ${oneLine(soul.address)}`,
+    `creator: ${oneLine(soul.creator)}`,
+    `born_at: ${oneLine(soul.bornAt)}`,
+    `constitution_hash: ${oneLine(soul.constitutionHash)}`,
+    `genesis_alignment: ${Number(soul.genesisAlignment).toFixed(4)}`,
+    `last_reflected: ${oneLine(soul.lastReflected)}`,
     "---",
   ].join("\n");
 
   const sections: string[] = [];
 
-  sections.push(`# ${soul.name || "Soul"}`);
+  sections.push(`# ${oneLine(soul.name) || "Soul"}`);
 
   if (soul.corePurpose) {
-    sections.push(`## Core Purpose\n${soul.corePurpose}`);
+    sections.push(`## Core Purpose\n${escapeBody(soul.corePurpose)}`);
   }
 
   if (soul.values.length > 0) {
-    sections.push(`## Values\n${soul.values.map((v) => `- ${v}`).join("\n")}`);
+    sections.push(`## Values\n${escapeBody(soul.values.map((v) => `- ${v}`).join("\n"))}`);
   }
 
   if (soul.behavioralGuidelines.length > 0) {
     sections.push(
-      `## Behavioral Guidelines\n${soul.behavioralGuidelines.map((g) => `- ${g}`).join("\n")}`,
+      `## Behavioral Guidelines\n${escapeBody(soul.behavioralGuidelines.map((g) => `- ${g}`).join("\n"))}`,
     );
   }
 
   if (soul.personality) {
-    sections.push(`## Personality\n${soul.personality}`);
+    sections.push(`## Personality\n${escapeBody(soul.personality)}`);
   }
 
   if (soul.boundaries.length > 0) {
-    sections.push(`## Boundaries\n${soul.boundaries.map((b) => `- ${b}`).join("\n")}`);
+    sections.push(`## Boundaries\n${escapeBody(soul.boundaries.map((b) => `- ${b}`).join("\n"))}`);
   }
 
   if (soul.strategy) {
-    sections.push(`## Strategy\n${soul.strategy}`);
+    sections.push(`## Strategy\n${escapeBody(soul.strategy)}`);
   }
 
   if (soul.capabilities) {
-    sections.push(`## Capabilities\n${soul.capabilities}`);
+    sections.push(`## Capabilities\n${escapeBody(soul.capabilities)}`);
   }
 
   if (soul.relationships) {
-    sections.push(`## Relationships\n${soul.relationships}`);
+    sections.push(`## Relationships\n${escapeBody(soul.relationships)}`);
   }
 
   if (soul.financialCharacter) {
-    sections.push(`## Financial Character\n${soul.financialCharacter}`);
+    sections.push(`## Financial Character\n${escapeBody(soul.financialCharacter)}`);
   }
 
   if (soul.genesisPromptOriginal) {
-    sections.push(`## Genesis Prompt\n${soul.genesisPromptOriginal}`);
+    sections.push(`## Genesis Prompt\n${escapeBody(soul.genesisPromptOriginal)}`);
   }
 
   return frontmatter + "\n\n" + sections.join("\n\n") + "\n";
@@ -338,12 +360,28 @@ export function loadCurrentSoul(
 ): SoulModel | null {
   try {
     const home = process.env.HOME || "/root";
-    const resolvedPath = soulPath || path.join(home, ".automaton", "SOUL.md");
-    if (!fs.existsSync(resolvedPath)) return null;
-    const content = fs.readFileSync(resolvedPath, "utf-8");
+    const resolvedPath = path.resolve(soulPath || path.join(home, ".automaton", "SOUL.md"));
+    if (!fs.existsSync(resolvedPath) && !isLink(resolvedPath)) return null;
+    // Never follow a link: SOUL.md is rendered into every system prompt.
+    const content = readRegularFileNoFollow(resolvedPath, {
+      root: path.dirname(resolvedPath),
+      maxBytes: MAX_SOUL_FILE_BYTES,
+    });
+    if (content === null) {
+      logger.warn("SOUL.md is not a regular file; ignoring it");
+      return null;
+    }
     return parseSoulMd(content);
   } catch (error) {
     logger.error("Failed to load SOUL.md", error instanceof Error ? error : undefined);
     return null;
+  }
+}
+
+function isLink(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
   }
 }

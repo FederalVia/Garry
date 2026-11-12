@@ -1,16 +1,66 @@
 import { createLogger } from "../../observability/logger.js";
-import type { ChatMessage, InferenceToolCall } from "../../types.js";
+import type {
+  AutomatonTool,
+  ChatMessage,
+  InferenceToolCall,
+  PolicyRequest,
+  SpendTrackerInterface,
+} from "../../types.js";
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
-import type {
-  AgentHarness,
-  HarnessContext,
-  HarnessTool,
+import { createBuiltinTools } from "../tools.js";
+import {
+  InferenceDeferredError,
+  TaskBudgetExceededError,
+  TaskOwnershipLostError,
+  type AgentHarness,
+  type HarnessContext,
+  type HarnessTool,
 } from "../harness-types.js";
+import { InferenceRefusedError } from "../../inference/errors.js";
 
 const logger = createLogger("harness.base");
 const MAX_CONSECUTIVE_INFERENCE_ERRORS = 3;
+const DEFAULT_INFERENCE_RETRY_BACKOFF_MS: readonly number[] = [1000, 2000];
 const MAX_TOOL_OUTPUT_LENGTH = 16_000;
+/** A text-only reply is answered with this once; the next one ends the task as a failure. */
+export const TEXT_ONLY_REPROMPT =
+  "You replied without calling a tool. Call task_done to finish: success true if the task is done, " +
+  "or success false with the reason if it cannot be done.";
+
+export const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
+  recordSpend: () => {},
+  getHourlySpend: () => 0,
+  getDailySpend: () => 0,
+  getTotalSpend: () => 0,
+  checkLimit: () => ({
+    allowed: true,
+    currentHourlySpend: 0,
+    currentDailySpend: 0,
+    limitHourly: Number.MAX_SAFE_INTEGER,
+    limitDaily: Number.MAX_SAFE_INTEGER,
+  }),
+  pruneOldRecords: () => 0,
+};
+
+/**
+ * Builtin tools whose policy rules govern the harness-local tools of the
+ * same purpose. Harness tools carry no category or risk level, and rules
+ * match by builtin name, so the builtin definition is what policy sees.
+ */
+export type PolicyGuardedTool = "exec" | "write_file" | "read_file";
+
+let builtinPolicyTools: Map<string, AutomatonTool> | undefined;
+
+function getBuiltinPolicyTool(name: PolicyGuardedTool): AutomatonTool | undefined {
+  if (!builtinPolicyTools) {
+    // Only name, category and riskLevel are used; execute is never called.
+    builtinPolicyTools = new Map(
+      createBuiltinTools("policy-lookup").map((tool) => [tool.name, tool]),
+    );
+  }
+  return builtinPolicyTools.get(name);
+}
 
 export abstract class BaseHarness implements AgentHarness {
   abstract readonly id: string;
@@ -29,6 +79,7 @@ export abstract class BaseHarness implements AgentHarness {
       maxIdenticalCalls: 3,
       maxIdleOnlyTurns: 3,
       windowSize: 10,
+      exemptTools: this.loopExemptTools(),
     });
     this.messages = [
       { role: "system", content: this.buildSystemPrompt() },
@@ -41,6 +92,60 @@ export abstract class BaseHarness implements AgentHarness {
   abstract buildSystemPrompt(): string;
 
   protected beforeTurn(): void {}
+
+  /** Tools expected to repeat with the same arguments (blocking waits). */
+  protected loopExemptTools(): string[] {
+    return [];
+  }
+
+  /** Stop as soon as the task is no longer ours (cancelled, reassigned, completed by the parent). */
+  protected assertTaskOwned(): void {
+    const isOwned = this.context.isTaskOwned;
+    if (isOwned && !isOwned()) {
+      throw new TaskOwnershipLostError(`Task ${this.task.id} is no longer owned by this worker`);
+    }
+  }
+
+  /** Count passed to policy as turnToolCallCount. */
+  protected policyTurnToolCallCount(): number {
+    return 0;
+  }
+
+  /**
+   * Run a harness-local tool call through the PolicyEngine as the builtin
+   * tool of the same purpose, with the worker's input source, and record
+   * the decision. Returns null when the call may run, or a "Blocked:"
+   * message. Without a policy engine or tool context the call is refused,
+   * so a worker can never run a shell command or write a file unchecked.
+   */
+  protected authorizeLocalTool(
+    builtinName: PolicyGuardedTool,
+    args: Record<string, unknown>,
+  ): string | null {
+    const policyEngine = this.context.policyEngine;
+    const toolContext = this.context.toolContext;
+    const tool = getBuiltinPolicyTool(builtinName);
+    if (!policyEngine || !toolContext || !tool) {
+      return `Blocked: ${builtinName} requires a policy check and no policy engine is configured for this worker`;
+    }
+
+    const request: PolicyRequest = {
+      tool,
+      args,
+      context: toolContext,
+      turnContext: {
+        inputSource: this.context.inputSource,
+        turnToolCallCount: this.policyTurnToolCallCount(),
+        sessionSpend: this.context.spendTracker ?? NOOP_SPEND_TRACKER,
+      },
+    };
+    const decision = policyEngine.evaluate(request);
+    policyEngine.logDecision(decision);
+    if (decision.action !== "allow") {
+      return `Blocked: policy denied ${builtinName} (${decision.reasonCode}): ${decision.humanMessage}`;
+    }
+    return null;
+  }
 
   buildTaskPrompt(): string {
     const lines = [
@@ -103,6 +208,7 @@ export abstract class BaseHarness implements AgentHarness {
     let consecutiveInferenceErrors = 0;
     let finalOutput = "";
     let finalSuccess = true;
+    let textOnlyReplies = 0;
 
     while (true) {
       this.checkBudget();
@@ -110,17 +216,34 @@ export abstract class BaseHarness implements AgentHarness {
       if (this.context.abortSignal.aborted) {
         throw new Error("Harness execution aborted by abort signal");
       }
+      this.assertTaskOwned();
 
-      let response: { content: string; toolCalls?: InferenceToolCall[] };
+      let response: { content: string; toolCalls?: InferenceToolCall[]; costCents?: number };
       try {
         response = await this.context.inference.chat({
           tier: "fast",
+          purpose: "worker_turn",
           messages: this.messages,
           tools: toolDefs,
           toolChoice: "auto",
+          signal: this.context.abortSignal,
         });
         consecutiveInferenceErrors = 0;
+        this.recordInferenceCost(response.costCents);
       } catch (error) {
+        // A budget refusal is not a provider failure: retrying now cannot help.
+        if (error instanceof InferenceRefusedError) {
+          if (error.code === "TASK_CAP") {
+            throw new TaskBudgetExceededError(
+              `Task "${this.task.title}" exhausted its inference budget: ${error.message}`,
+            );
+          }
+          throw new InferenceDeferredError(
+            `Inference refused (${error.code}): ${error.message}`,
+            error.code,
+            error.retryAfterMs,
+          );
+        }
         consecutiveInferenceErrors++;
         const message = error instanceof Error ? error.message : String(error);
         logger.error(
@@ -131,9 +254,14 @@ export abstract class BaseHarness implements AgentHarness {
             `${MAX_CONSECUTIVE_INFERENCE_ERRORS} consecutive inference failures. Last error: ${message}`,
           );
         }
+        await this.backoffAfterInferenceError(consecutiveInferenceErrors);
         continue;
       }
 
+      if (this.context.abortSignal.aborted) {
+        throw new Error("Harness execution aborted by abort signal");
+      }
+      this.assertTaskOwned();
       this.beforeTurn();
       this.context.budget.turnsUsed++;
       logger.info(
@@ -141,6 +269,7 @@ export abstract class BaseHarness implements AgentHarness {
       );
 
       if (response.toolCalls && response.toolCalls.length > 0) {
+        textOnlyReplies = 0;
         this.messages.push({
           role: "assistant",
           content: response.content || "",
@@ -239,12 +368,18 @@ export abstract class BaseHarness implements AgentHarness {
         continue;
       }
 
-      finalOutput = response.content || "Task completed.";
-      finalSuccess = true;
+      // Prose is not a result: ask once for task_done, then give up as a failure.
+      textOnlyReplies++;
       logger.info(
-        `[${this.id}] Text-only response on turn ${this.context.budget.turnsUsed}: ${finalOutput.slice(0, 200)}`,
+        `[${this.id}] Text-only response ${textOnlyReplies} on turn ${this.context.budget.turnsUsed}: ${(response.content || "").slice(0, 200)}`,
       );
-      break;
+      if (textOnlyReplies >= 2) {
+        finalOutput = `Worker ended without calling task_done: ${response.content || "(empty reply)"}`;
+        finalSuccess = false;
+        break;
+      }
+      this.messages.push({ role: "assistant", content: response.content || "" });
+      this.messages.push({ role: "system", content: TEXT_ONLY_REPROMPT });
     }
 
     return {
@@ -254,6 +389,32 @@ export abstract class BaseHarness implements AgentHarness {
       costCents: this.context.budget.costUsedCents,
       duration: Date.now() - this.context.budget.startedAt,
     };
+  }
+
+  /** Adds a call's committed cost; also used by subclasses that call inference directly. */
+  protected recordInferenceCost(costCents: number | undefined): void {
+    if (typeof costCents === "number" && Number.isFinite(costCents) && costCents > 0) {
+      this.context.budget.costUsedCents += costCents;
+    }
+  }
+
+  private async backoffAfterInferenceError(consecutiveErrors: number): Promise<void> {
+    const schedule = this.context.inferenceRetryBackoffMs ?? DEFAULT_INFERENCE_RETRY_BACKOFF_MS;
+    if (schedule.length === 0) return;
+    const delayMs = schedule[Math.min(consecutiveErrors - 1, schedule.length - 1)];
+    if (!(delayMs > 0)) return;
+    const signal = this.context.abortSignal;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private checkBudget(): void {
@@ -267,7 +428,7 @@ export abstract class BaseHarness implements AgentHarness {
     }
 
     if (budget.costUsedCents >= budget.maxCostCents) {
-      throw new Error(
+      throw new TaskBudgetExceededError(
         `Budget exhausted: cost limit reached ($${(budget.costUsedCents / 100).toFixed(2)} / $${(budget.maxCostCents / 100).toFixed(2)}). ` +
         `Task "${this.task.title}" exceeded its cost budget.`,
       );

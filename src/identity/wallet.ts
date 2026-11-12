@@ -17,6 +17,32 @@ import type { WalletData } from "../types.js";
 import type { ChainType } from "./chain.js";
 import { EvmChainIdentity, SolanaChainIdentity } from "./chain.js";
 import type { ChainIdentity } from "./chain.js";
+import { writeFileSafe } from "../security/secure-fs.js";
+import { registerSecret } from "../security/secret-redaction.js";
+
+/** Read wallet.json and register its key material for redaction. */
+function readWalletData(): WalletData {
+  const walletData: WalletData = JSON.parse(fs.readFileSync(WALLET_FILE, "utf-8"));
+  registerSecret(walletData.privateKey, "wallet");
+  registerSecret(walletData.secretKey, "wallet");
+  return walletData;
+}
+
+/** Create wallet.json via temp file + rename; refuses if a link sits at that name. */
+function writeNewWallet(walletData: WalletData): void {
+  let existing: fs.Stats | null = null;
+  try {
+    existing = fs.lstatSync(WALLET_FILE);
+  } catch {
+    existing = null;
+  }
+  if (existing) {
+    throw new Error(`Refusing to create a wallet: ${WALLET_FILE} exists but is not a readable wallet file`);
+  }
+  writeFileSafe(WALLET_FILE, JSON.stringify(walletData, null, 2), { trustedWriter: true, mode: 0o600 });
+  registerSecret(walletData.privateKey, "wallet");
+  registerSecret(walletData.secretKey, "wallet");
+}
 
 /**
  * Create a stub PrivateKeyAccount for Solana wallets.
@@ -85,9 +111,7 @@ export async function getWallet(chainType?: ChainType): Promise<{
   }
 
   if (fs.existsSync(WALLET_FILE)) {
-    const walletData: WalletData = JSON.parse(
-      fs.readFileSync(WALLET_FILE, "utf-8"),
-    );
+    const walletData = readWalletData();
     const resolvedChainType = walletData.chainType || "evm";
 
     if (resolvedChainType === "solana" && walletData.secretKey) {
@@ -115,9 +139,7 @@ export async function getWallet(chainType?: ChainType): Promise<{
       createdAt: new Date().toISOString(),
     };
 
-    fs.writeFileSync(WALLET_FILE, JSON.stringify(walletData, null, 2), {
-      mode: 0o600,
-    });
+    writeNewWallet(walletData);
 
     const account = createSolanaStubAccount(address);
     return { account, chainIdentity: solanaIdentity, chainType: "solana", isNew: true };
@@ -133,11 +155,58 @@ export async function getWallet(chainType?: ChainType): Promise<{
     createdAt: new Date().toISOString(),
   };
 
-  fs.writeFileSync(WALLET_FILE, JSON.stringify(walletData, null, 2), {
-    mode: 0o600,
-  });
+  writeNewWallet(walletData);
 
   return { account, chainIdentity: new EvmChainIdentity(account), chainType: "evm", isNew: true };
+}
+
+/**
+ * Load the existing wallet as a ChainIdentity, never creating one (unlike
+ * getWallet). Returns null when there is no wallet.json; throws a clear error
+ * when the file is unreadable or holds no key for its chain type.
+ */
+export function loadChainIdentity(): {
+  chainIdentity: ChainIdentity;
+  chainType: ChainType;
+  address: string;
+} | null {
+  if (!fs.existsSync(WALLET_FILE)) {
+    return null;
+  }
+
+  let walletData: WalletData;
+  try {
+    walletData = readWalletData();
+  } catch (err: any) {
+    throw new Error(`Cannot read wallet at ${WALLET_FILE}: ${err?.message || String(err)}`);
+  }
+
+  const chainType: ChainType = walletData.chainType || "evm";
+  if (chainType === "solana") {
+    if (typeof walletData.secretKey !== "string" || !walletData.secretKey) {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has no secretKey`);
+    }
+    let secretKey: Uint8Array;
+    try {
+      secretKey = bs58.decode(walletData.secretKey);
+    } catch {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has a secretKey that is not base58`);
+    }
+    if (secretKey.length !== 64) {
+      throw new Error(`Solana wallet at ${WALLET_FILE} has a secretKey of ${secretKey.length} bytes (expected 64)`);
+    }
+    const chainIdentity = new SolanaChainIdentity(secretKey);
+    return { chainIdentity, chainType, address: chainIdentity.address };
+  }
+
+  if (chainType !== "evm") {
+    throw new Error(`Wallet at ${WALLET_FILE} has unknown chainType "${String(chainType)}"`);
+  }
+  if (typeof walletData.privateKey !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(walletData.privateKey)) {
+    throw new Error(`EVM wallet at ${WALLET_FILE} has no valid privateKey`);
+  }
+  const chainIdentity = new EvmChainIdentity(privateKeyToAccount(walletData.privateKey));
+  return { chainIdentity, chainType, address: chainIdentity.address };
 }
 
 /**
@@ -148,9 +217,7 @@ export function getWalletAddress(): string | null {
     return null;
   }
 
-  const walletData: WalletData = JSON.parse(
-    fs.readFileSync(WALLET_FILE, "utf-8"),
-  );
+  const walletData = readWalletData();
 
   if (walletData.chainType === "solana" && walletData.secretKey) {
     const secretKey = bs58.decode(walletData.secretKey);
@@ -171,9 +238,7 @@ export function loadWalletAccount(): PrivateKeyAccount | null {
     return null;
   }
 
-  const walletData: WalletData = JSON.parse(
-    fs.readFileSync(WALLET_FILE, "utf-8"),
-  );
+  const walletData = readWalletData();
 
   if (walletData.chainType === "solana") {
     // Solana wallets don't have a PrivateKeyAccount; callers should use getWallet() instead
@@ -191,9 +256,7 @@ export function getWalletChainType(): ChainType {
     return "evm";
   }
   try {
-    const walletData: WalletData = JSON.parse(
-      fs.readFileSync(WALLET_FILE, "utf-8"),
-    );
+    const walletData = readWalletData();
     return walletData.chainType || "evm";
   } catch {
     return "evm";

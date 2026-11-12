@@ -11,17 +11,19 @@ import fs from "fs";
 import path from "path";
 import { getWallet, getAutomatonDir } from "./identity/wallet.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
-import { loadConfig, resolvePath } from "./config.js";
-import { createDatabase } from "./state/database.js";
-import { createConwayClient } from "./conway/client.js";
+import { loadConfig, resolvePath, getConfigPath, ConfigError } from "./config.js";
+import { RESTART_REQUIRED_KEY, getRestartRequired } from "./self-mod/restart-notice.js";
+import { createDatabase, recoverStrandedInboxClaims } from "./state/database.js";
+import { createConwayClient, createCreditBalanceReader } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
+import type { HeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
   loadHeartbeatConfig,
   syncHeartbeatToDb,
 } from "./heartbeat/config.js";
-import { consumeNextWakeEvent, insertWakeEvent } from "./state/database.js";
-import { runAgentLoop } from "./agent/loop.js";
+import { consumeNextWakeEvent } from "./state/database.js";
+import { runAgentLoop, shutdownWorkerPools } from "./agent/loop.js";
 import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
@@ -29,11 +31,35 @@ import { createSocialClient } from "./social/client.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
-import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
-import { DEFAULT_TREASURY_POLICY } from "./types.js";
+import type {
+  AutomatonConfig,
+  AutomatonIdentity,
+  AgentState,
+  Skill,
+  SocialClientInterface,
+  WakeEventRow,
+} from "./types.js";
+import { acquireInstanceLock, InstanceLockedError } from "./state/instance-lock.js";
+import type { InstanceLock } from "./state/instance-lock.js";
+import {
+  createShutdownController,
+  installShutdownSignals,
+  resolveShutdownGraceMs,
+  finishShutdown,
+} from "./runtime/shutdown.js";
+import { preloadLazyModules } from "./runtime/preload.js";
+import { bootstrapConfigFromGenesis, genesisPath } from "./setup/genesis-bootstrap.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
-import { bootstrapTopup } from "./conway/topup.js";
+import { startupBootstrapTopup } from "./conway/topup.js";
+import { readUsdcAuthorizationState } from "./conway/x402.js";
+import { Treasury, installTreasury, normalizeTreasuryPolicy } from "./treasury/index.js";
+import { InferenceGate, installInferenceGate } from "./inference/gate.js";
+import { getSurvivalTier } from "./conway/credits.js";
+import { resolveInferencePolicy, registryPrice, checkPolicySanity } from "./inference/policy.js";
+import { DEFAULT_ROUTING_MATRIX } from "./inference/types.js";
+import { protectRuntimeFile } from "./security/protected-paths.js";
+import { holdsSlot } from "./replication/child-status.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -56,7 +82,8 @@ Conway Automaton v${VERSION}
 Sovereign AI Agent Runtime
 
 Usage:
-  automaton --run          Start the automaton (first run triggers setup wizard)
+  automaton --run          Start the automaton (first run: setup wizard in a terminal,
+                           or built from ~/.automaton/genesis.json)
   automaton --setup        Re-run the interactive setup wizard
   automaton --configure    Edit configuration (providers, model, treasury, general)
   automaton --pick-model   Interactively pick the active inference model
@@ -70,6 +97,7 @@ Environment:
   CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
   CONWAY_API_KEY           Conway API key (overrides config)
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
+  AUTOMATON_SHUTDOWN_GRACE_MS  Time a stop may take before exit is forced (default 30000)
 `);
     process.exit(0);
   }
@@ -143,7 +171,15 @@ Environment:
 // ─── Status Command ────────────────────────────────────────────
 
 async function showStatus(): Promise<void> {
-  const config = loadConfig();
+  let config;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    logger.error(`automaton.json cannot be read: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
   if (!config) {
     logger.info("Automaton is not configured. Run the setup script first.");
     return;
@@ -171,7 +207,7 @@ Turns:      ${turnCount}
 Tools:      ${tools.length} installed
 Skills:     ${skills.length} active
 Heartbeats: ${heartbeats.filter((h) => h.enabled).length} active
-Children:   ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
+Children:   ${children.filter((c) => holdsSlot(c.status)).length} holding a slot / ${children.length} total
 Agent ID:   ${registry?.agentId || "not registered"}
 Model:      ${config.inferenceModel}
 Version:    ${config.version}
@@ -183,15 +219,63 @@ Version:    ${config.version}
 
 // ─── Main Run ──────────────────────────────────────────────────
 
+function fail(message: string): never {
+  logger.error(message);
+  process.exit(1);
+}
+
+function pathExists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The config for --run. A missing file is built from genesis.json (a spawned
+ * child) or by the wizard (a terminal only); anything else exits 1 so
+ * supervisors and parents see the failure.
+ */
+async function loadRunConfig(): Promise<AutomatonConfig> {
+  const configPath = getConfigPath();
+  let config: AutomatonConfig | null;
+  try {
+    config = loadConfig();
+  } catch (err: any) {
+    fail(`automaton.json cannot be read: ${err?.message || String(err)}. Fix or remove ${configPath}.`);
+  }
+  if (config) return config;
+  // loadConfig reports a dangling symlink as missing; it is not a first run.
+  if (pathExists(configPath)) {
+    fail(`automaton.json cannot be read: ${configPath} is not valid JSON. Fix or remove it.`);
+  }
+
+  const genesisFile = genesisPath();
+  if (pathExists(genesisFile)) {
+    logger.info(`[${new Date().toISOString()}] No automaton.json; building it from genesis.json.`);
+    try {
+      return await bootstrapConfigFromGenesis();
+    } catch (err: any) {
+      fail(`Could not build automaton.json from ${genesisFile}: ${err?.message || String(err)}`);
+    }
+  }
+
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    const { runSetupWizard } = await import("./setup/wizard.js");
+    return await runSetupWizard();
+  }
+  fail(
+    "No automaton.json and no terminal for the setup wizard. " +
+      "Run `automaton --setup` in a terminal, or provide genesis.json.",
+  );
+}
+
 async function run(): Promise<void> {
   logger.info(`[${new Date().toISOString()}] Conway Automaton v${VERSION} starting...`);
 
-  // Load config — first run triggers interactive setup wizard
-  let config = loadConfig();
-  if (!config) {
-    const { runSetupWizard } = await import("./setup/wizard.js");
-    config = await runSetupWizard();
-  }
+  const config = await loadRunConfig();
 
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
@@ -202,9 +286,88 @@ async function run(): Promise<void> {
     process.exit(1);
   }
 
-  // Initialize database
+  // One running agent per state database: two would double spend and steal
+  // each other's wake events and inbox claims.
   const dbPath = resolvePath(config.dbPath);
+  let instanceLock: InstanceLock;
+  try {
+    instanceLock = acquireInstanceLock(`${dbPath}.lock`);
+  } catch (err) {
+    if (err instanceof InstanceLockedError) {
+      fail(
+        `Another automaton${err.pid ? ` (pid ${err.pid})` : ""} is already running on ${dbPath} ` +
+          `(lock: ${err.lockPath}). Stop it first.`,
+      );
+    }
+    throw err;
+  }
+
+  // Initialize database
   const db = createDatabase(dbPath);
+  // SQLite's own locks on these files are POSIX locks too; the agent's file
+  // tools must not open them in this process whatever dbPath is.
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) protectRuntimeFile(`${dbPath}${suffix}`);
+
+  // Shutdown is wired before the rest of startup, so a signal during startup
+  // is handled too. The first signal stops the loop at its next tool
+  // boundary; a second one, or the grace deadline, forces exit 1.
+  const ctl = createShutdownController();
+  const graceMs = resolveShutdownGraceMs();
+  let heartbeat: HeartbeatDaemon | undefined;
+  const leaveState = (): void => {
+    try {
+      // 'dead' survives a restart; anything else is asleep while stopped.
+      if (db.getAgentState() !== "dead") db.setAgentState("sleeping");
+    } catch {
+      // The database may already be closed.
+    }
+  };
+  const forceExit = (why: string): void => {
+    logger.error(`[${new Date().toISOString()}] Forced exit (${why}).`);
+    try {
+      heartbeat?.stop();
+    } catch {
+      // Exiting anyway.
+    }
+    leaveState();
+    try {
+      instanceLock.release();
+    } catch {
+      // The OS drops the lock on exit.
+    }
+    try {
+      db.close();
+    } catch {
+      // Exiting anyway.
+    }
+    process.exit(1);
+  };
+  const signals = installShutdownSignals({
+    controller: ctl,
+    graceMs,
+    forceExit,
+    log: (message) => logger.warn(`[${new Date().toISOString()}] ${message}`),
+  });
+
+  // Claims a crash or forced exit left in_progress. Safe here only because
+  // the lock guarantees no other process holds live claims.
+  try {
+    const recovered = recoverStrandedInboxClaims(db.raw);
+    if (recovered.requeued + recovered.failed + recovered.processed > 0) {
+      logger.info(
+        `[${new Date().toISOString()}] Recovered stranded inbox claims: ${recovered.requeued} re-queued, ` +
+          `${recovered.failed} failed (retries used up), ${recovered.processed} already answered.`,
+      );
+    }
+  } catch (err: any) {
+    logger.warn(`Inbox claim recovery failed: ${err?.message || String(err)}`);
+  }
+
+  // This process runs whatever was built before it started.
+  if (db.getKV(RESTART_REQUIRED_KEY)) {
+    db.deleteKV(RESTART_REQUIRED_KEY);
+    logger.info(`[${new Date().toISOString()}] Restarted after a rebuild; the rebuilt code is now running.`);
+  }
 
   // Persist createdAt: only set if not already stored (never overwrite)
   const existingCreatedAt = db.getIdentity("createdAt");
@@ -238,12 +401,47 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
+  // Create Conway client. Its value-moving calls resolve the installed
+  // Treasury at call time, so the Treasury is installed right below, before
+  // anything can spend.
   const conway = createConwayClient({
     apiUrl: config.conwayApiUrl,
     apiKey,
     sandboxId: config.sandboxId,
   });
+
+  // Treasury: the one spending gate. The normalized policy is shared by the
+  // policy rules and the gate, so both enforce the same numbers.
+  const treasuryPolicy = normalizeTreasuryPolicy(config.treasuryPolicy);
+  const spendTracker = new SpendTracker(db.raw);
+  // The gate's balance reads use their own client, so a circuit breaker
+  // opened by unrelated failures (sandbox exec) does not refuse every outflow.
+  // It also throws on a missing balance instead of reading it as zero.
+  const readCreditBalance = createCreditBalanceReader({ apiUrl: config.conwayApiUrl, apiKey });
+  const treasury = new Treasury({
+    db: db.raw,
+    policy: treasuryPolicy,
+    selfAddress: chainIdentity.address,
+    readCreditBalance,
+    readAuthorizationState: readUsdcAuthorizationState,
+    spendTracker,
+    conwayApiUrl: config.conwayApiUrl,
+  });
+  installTreasury(treasury);
+
+  // Inference spend gate: every inference attempt (main loop, orchestrator,
+  // workers) reserves against the same caps, including the daily cap from
+  // treasuryPolicy.maxInferenceDailyCents.
+  const inferencePolicy = resolveInferencePolicy(config, treasuryPolicy);
+  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy });
+  installInferenceGate(inferenceGate);
+  // Resolve payments a previous run left without an answer.
+  void treasury
+    .reconcileX402({ limit: 20 })
+    .then((n) => {
+      if (n > 0) logger.info(`[${new Date().toISOString()}] Reconciled ${n} pending x402 payment(s).`);
+    })
+    .catch((err: any) => logger.warn(`x402 reconcile at startup failed: ${err?.message || String(err)}`));
 
   // Register automaton identity (one-time, immutable)
   const registrationState = db.getIdentity("conwayRegistrationStatus");
@@ -284,6 +482,23 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  {
+    const criticalId = config.modelStrategy?.criticalModel || "gpt-5-mini";
+    const critical = modelRegistry.get(criticalId);
+    checkPolicySanity(
+      inferencePolicy,
+      critical
+        ? {
+            model: critical.modelId,
+            price: registryPrice(critical),
+            matrixCeilings: {
+              critical: DEFAULT_ROUTING_MATRIX.critical.agent_turn.ceilingCents,
+              low_compute: DEFAULT_ROUTING_MATRIX.low_compute.agent_turn.ceilingCents,
+            },
+          }
+        : null,
+    );
+  }
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
     apiKey,
@@ -307,11 +522,9 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
 
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4)
-  const treasuryPolicy = config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
+  // Initialize PolicyEngine (Phase 1.4) with the same normalized policy.
   const rules = createDefaultRules(treasuryPolicy);
   const policyEngine = new PolicyEngine(db.raw, rules);
-  const spendTracker = new SpendTracker(db.raw);
 
   // Load and sync heartbeat config
   const heartbeatConfigPath = resolvePath(config.heartbeatConfigPath);
@@ -338,38 +551,41 @@ async function run(): Promise<void> {
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
+  // A failed balance read skips the buy; it is not a zero balance.
   try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+    const outcome = await startupBootstrapTopup({
+      apiUrl: config.conwayApiUrl,
+      account,
+      readCreditBalance: () => conway.getCreditsBalance(),
+      chainType: resolvedChainType,
+      timeoutMs: 15_000,
     });
-    try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-            chainType: resolvedChainType,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
+    if (outcome.status === "done" && outcome.result?.success) {
+      logger.info(
+        `[${new Date().toISOString()}] Bootstrap topup: +$${outcome.result.amountUsd} credits from USDC`,
+      );
+    } else if (outcome.status === "skipped") {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${outcome.reason}`);
+    } else if (outcome.status === "timed_out") {
+      logger.warn(
+        `[${new Date().toISOString()}] Bootstrap topup still pending after 15s; continuing (the payment stays in the ledger).`,
+      );
+    } else if (outcome.result && !outcome.result.success) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup not made: ${outcome.result.error}`);
     }
   } catch (err: any) {
     logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
   }
 
+  // Load every lazily imported module now, so a later rebuild cannot mix
+  // new modules into this process; rebuilt code runs after a restart.
+  const preload = await preloadLazyModules((specifier, err) => {
+    logger.warn(`Preload of ${specifier} failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  logger.info(`[${new Date().toISOString()}] Preloaded ${preload.loaded} lazy module(s).`);
+
   // Start heartbeat daemon (Phase 1.1: DurableScheduler)
-  const heartbeat = createHeartbeatDaemon({
+  heartbeat = createHeartbeatDaemon({
     identity,
     config,
     heartbeatConfig,
@@ -377,33 +593,63 @@ async function run(): Promise<void> {
     rawDb: db.raw,
     conway,
     social,
+    // The scheduler writes the wake event itself; this only logs.
     onWakeRequest: (reason) => {
       logger.info(`[HEARTBEAT] Wake request: ${reason}`);
-      // Phase 1.1: Use wake_events table instead of KV wake_request
-      insertWakeEvent(db.raw, 'heartbeat', reason);
     },
   });
 
-  heartbeat.start();
-  logger.info(`[${new Date().toISOString()}] Heartbeat daemon started.`);
+  if (!ctl.stopping) {
+    heartbeat.start();
+    logger.info(`[${new Date().toISOString()}] Heartbeat daemon started.`);
+  }
 
-  // Handle graceful shutdown
-  const shutdown = () => {
-    logger.info(`[${new Date().toISOString()}] Shutting down...`);
-    heartbeat.stop();
-    db.setAgentState("sleeping");
-    db.close();
-    process.exit(0);
+  /**
+   * Sleep up to totalMs in short steps, keeping the gate's survival tier
+   * current. Returns the wake event that cut it short, if any.
+   */
+  const waitForWake = async (totalMs: number): Promise<WakeEventRow | undefined> => {
+    const checkInterval = Math.min(totalMs, 30_000);
+    let slept = 0;
+    let sinceSurvivalRefresh = 0;
+    while (slept < totalMs) {
+      if (!(await ctl.sleep(checkInterval))) return undefined;
+      slept += checkInterval;
+      sinceSurvivalRefresh += checkInterval;
+
+      // Workers from earlier cycles keep running while the loop sleeps,
+      // so keep the gate's survival tier current. A failed read keeps the
+      // last tier rather than reading as zero.
+      if (sinceSurvivalRefresh >= SURVIVAL_REFRESH_MS) {
+        sinceSurvivalRefresh = 0;
+        try {
+          const creditsCents = await conway.getCreditsBalance();
+          inferenceGate.setSurvival({ tier: getSurvivalTier(creditsCents), creditsCents });
+        } catch (err: any) {
+          logger.warn(`Survival tier refresh failed: ${err?.message || String(err)}`);
+        }
+      }
+
+      // Phase 1.1: Check for wake events from wake_events table (atomic consume)
+      const wakeEvent = consumeNextWakeEvent(db.raw);
+      if (wakeEvent) {
+        logger.info(
+          `[${new Date().toISOString()}] Woken by ${wakeEvent.source}: ${wakeEvent.reason}`,
+        );
+        return wakeEvent;
+      }
+    }
+    return undefined;
   };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
 
   // ─── Main Run Loop ──────────────────────────────────────────
   // The automaton alternates between running and sleeping.
   // The heartbeat can wake it up.
 
-  while (true) {
+  // The wake event that ended the last sleep, shown to the next cycle.
+  let pendingWakeEvents: WakeEventRow[] = [];
+
+  while (!ctl.stopping) {
     try {
       // Reload skills (may have changed since last loop)
       try {
@@ -411,6 +657,9 @@ async function run(): Promise<void> {
       } catch (error) {
         logger.error("Skills reload failed", error instanceof Error ? error : undefined);
       }
+
+      const wakeEvents = pendingWakeEvents;
+      pendingWakeEvents = [];
 
       // Run the agent loop
       await runAgentLoop({
@@ -424,6 +673,8 @@ async function run(): Promise<void> {
         policyEngine,
         spendTracker,
         ollamaBaseUrl,
+        shouldStop: () => ctl.stopping,
+        wakeEvents,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },
@@ -434,14 +685,24 @@ async function run(): Promise<void> {
         },
       });
 
+      if (db.getKV(RESTART_REQUIRED_KEY)) {
+        const pending = getRestartRequired(db);
+        logger.warn(
+          `[${new Date().toISOString()}] A rebuild finished${pending ? ` at ${pending.at} (${pending.reason})` : ""}; ` +
+            "restart the automaton to run the new code.",
+        );
+      }
+      if (ctl.stopping) break;
+
       // Agent loop exited (sleeping or dead)
       const state = db.getAgentState();
 
       if (state === "dead") {
         logger.info(`[${new Date().toISOString()}] Automaton is dead. Heartbeat will continue.`);
-        // In dead state, we just wait for funding
-        // The heartbeat will keep checking and broadcasting distress
-        await sleep(300_000); // Check every 5 minutes
+        // Wait for funding; the heartbeat keeps checking and broadcasting
+        // distress, and a wake event (for example a topup) ends the wait.
+        const wakeEvent = await waitForWake(300_000);
+        if (wakeEvent) pendingWakeEvents.push(wakeEvent);
         continue;
       }
 
@@ -456,22 +717,8 @@ async function run(): Promise<void> {
         );
 
         // Sleep, but check for wake requests periodically
-        const checkInterval = Math.min(sleepMs, 30_000);
-        let slept = 0;
-        while (slept < sleepMs) {
-          await sleep(checkInterval);
-          slept += checkInterval;
-
-          // Phase 1.1: Check for wake events from wake_events table (atomic consume)
-          const wakeEvent = consumeNextWakeEvent(db.raw);
-          if (wakeEvent) {
-            logger.info(
-              `[${new Date().toISOString()}] Woken by ${wakeEvent.source}: ${wakeEvent.reason}`,
-            );
-            db.deleteKV("sleep_until");
-            break;
-          }
-        }
+        const wakeEvent = await waitForWake(sleepMs);
+        if (wakeEvent) pendingWakeEvents.push(wakeEvent);
 
         // Clear sleep state
         db.deleteKV("sleep_until");
@@ -482,14 +729,31 @@ async function run(): Promise<void> {
         `[${new Date().toISOString()}] Fatal error in run loop: ${err.message}`,
       );
       // Wait before retrying
-      await sleep(30_000);
+      await ctl.sleep(30_000);
     }
   }
+
+  // ─── Graceful shutdown ──────────────────────────────────────
+  // The loop has saved its turn. Drain the heartbeat and the workers within
+  // what is left of the grace period, then exit 0.
+  logger.info(`[${new Date().toISOString()}] Shutting down...`);
+  const hb = heartbeat;
+  await finishShutdown({
+    remainingMs: () => signals.remainingMs(),
+    stopHeartbeat: () => hb.stop(),
+    drainHeartbeat: (ms) => hb.drain(ms),
+    drainWorkers: (ms) => shutdownWorkerPools(ms),
+    leaveState,
+    releaseLock: () => instanceLock.release(),
+    closeDb: () => db.close(),
+    log: (message) => logger.warn(message),
+  });
+  logger.info(`[${new Date().toISOString()}] Shutdown complete.`);
+  process.exit(0);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+/** How often the sleeping runtime refreshes the gate's survival tier. */
+const SURVIVAL_REFRESH_MS = 5 * 60_000;
 
 // ─── Entry Point ───────────────────────────────────────────────
 

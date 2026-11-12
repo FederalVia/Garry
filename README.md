@@ -27,7 +27,8 @@ Update: development of Automaton has continued across Conway's internal RL envir
 ```bash
 git clone https://github.com/Conway-Research/automaton.git
 cd automaton
-npm install && npm run build
+npm install -g pnpm@10.28.1   # or: corepack enable pnpm
+pnpm install --frozen-lockfile && pnpm run build
 node dist/index.js --run
 ```
 
@@ -123,7 +124,7 @@ Creator CLI:
 ```bash
 node packages/cli/dist/index.js status
 node packages/cli/dist/index.js logs --tail 20
-node packages/cli/dist/index.js fund 5.00
+node packages/cli/dist/index.js fund 5 --to <address> --yes   # dollars; add --cents for cents
 ```
 
 ## Project Structure

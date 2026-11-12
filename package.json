@@ -17,6 +17,14 @@
     "./state/database.js": {
       "types": "./dist/state/database.d.ts",
       "default": "./dist/state/database.js"
+    },
+    "./operator/fund.js": {
+      "types": "./dist/operator/fund.d.ts",
+      "default": "./dist/operator/fund.js"
+    },
+    "./operator/send.js": {
+      "types": "./dist/operator/send.d.ts",
+      "default": "./dist/operator/send.js"
     }
   },
   "bin": {
@@ -42,9 +50,10 @@
     "dev": "tsx watch src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "test:coverage": "vitest run --coverage",
-    "test:security": "vitest run --grep 'security|injection|policy'",
-    "test:financial": "vitest run --grep 'financial|spend|treasury'",
+    "test:security": "vitest run -t 'security|injection|policy'",
+    "test:financial": "vitest run -t 'financial|spend|treasury'",
     "test:ci": "vitest run --reporter=verbose",
     "clean": "rm -rf dist && pnpm -r clean"
   },
@@ -53,32 +62,36 @@
     "better-sqlite3": "^11.0.0",
     "chalk": "^5.3.0",
     "cron-parser": "^4.9.0",
-    "gray-matter": "^4.0.3",
     "js-tiktoken": "^1.0.21",
     "openai": "^6.24.0",
     "ora": "^8.0.0",
-    "simple-git": "^3.24.0",
     "@solana/web3.js": "^1.98.0",
     "bs58": "^6.0.0",
     "siwe": "^2.3.0",
     "tweetnacl": "^1.0.3",
     "ulid": "^2.3.0",
     "viem": "^2.44.2",
-    "yaml": "^2.4.0"
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "tsx": "^4.7.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
-    "vitest": "^2.0.0"
+    "vite": "^6.4.6",
+    "vitest": "^4.1.12"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.18.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "better-sqlite3",
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "ws@>=8.0.0 <8.21.0": "^8.22.2",
+      "ws@>=7.0.0 <7.5.11": "^7.5.13",
+      "rpc-websockets>uuid": "^11.1.1"
+    }
   }
 }

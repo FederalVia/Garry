@@ -8,53 +8,122 @@
  * - Heartbeat: wakes the agent when USDC is available but credits are low.
  *
  * Endpoint: GET /pay/{amountUsd}/{walletAddress}
- * Payment: x402 (USDC on Base, signed TransferWithAuthorization)
+ * Payment: x402 (USDC on Base, an EIP-3009 authorization)
  *
  * Valid tiers: 5, 25, 100, 500, 1000, 2500 (USD)
+ *
+ * Every purchase is a Treasury outflow of kind credit_topup. The signed
+ * amount may not exceed the requested tier, the credits must be for this
+ * automaton, and the purpose picks the budget: "manual" (topup_credits),
+ * "sandbox_402" (spawn retries) or "survival" (automatic $5 buys, which the
+ * gate allows only when its own fresh balance read is low).
  */
 
 import type { PrivateKeyAccount, Address } from "viem";
-import { x402Fetch, getUsdcBalance } from "./x402.js";
+import { x402Fetch, getUsdcBalance, type X402PaymentResult } from "./x402.js";
 import { createLogger } from "../observability/logger.js";
 import type { ChainType } from "../identity/chain.js";
+import {
+  runWithTreasuryOrigin,
+  type TopupPurpose,
+  type TreasuryResolver,
+  type TreasuryResultFields,
+} from "../treasury/index.js";
 
 const logger = createLogger("topup");
 
 /** Valid topup tier amounts in USD. */
 export const TOPUP_TIERS = [5, 25, 100, 500, 1000, 2500];
 
-export interface TopupResult {
+export interface TopupResult extends TreasuryResultFields {
   success: boolean;
   amountUsd: number;
   creditsCentsAdded?: number;
   error?: string;
 }
 
+export interface TopupOptions {
+  /** Which topup budget the purchase draws on. Default "manual". */
+  topupPurpose?: TopupPurpose;
+  /** Explicit gate; default is the installed Treasury. */
+  treasury?: TreasuryResolver;
+}
+
+/** Gate refusals of an automatic topup that need no action from the agent. */
+export const ROUTINE_TOPUP_REFUSALS: readonly string[] = Object.freeze([
+  "TOPUP_NOT_NEEDED",
+  "TOPUP_COOLDOWN",
+  "TOPUP_IN_FLIGHT",
+  // The gate could not read the balance, so it does not buy; this clears
+  // when the balance endpoint answers again.
+  "BALANCE_UNAVAILABLE",
+  "PAYMENT_UNCONFIRMED",
+  "TOPUP_ALREADY_SETTLED",
+]);
+
+/**
+ * Gate refusals of an automatic topup the agent should hear about, but at
+ * most once a day: the survival daily cap and an untrusted payTo. Neither is
+ * fixed by retrying, and waking on every tick would cost a turn each time.
+ */
+export const DAILY_NOTICE_TOPUP_REFUSALS: readonly string[] = Object.freeze([
+  "SPEND_LIMIT_EXCEEDED",
+  "X402_PAYTO_NOT_TRUSTED",
+]);
+
+function treasuryFields(result: X402PaymentResult): TreasuryResultFields {
+  const fields: TreasuryResultFields = {};
+  if (result.paidCents !== undefined) fields.paidCents = result.paidCents;
+  if (result.reservationId !== undefined) fields.reservationId = result.reservationId;
+  if (result.settlement !== undefined) fields.settlement = result.settlement;
+  if (result.denied !== undefined) fields.denied = result.denied;
+  return fields;
+}
+
 /**
  * Execute a credit topup via x402 payment.
  *
  * Calls GET /pay/{amountUsd}/{address} which returns HTTP 402.
- * x402Fetch handles the payment signing and retry automatically.
+ * x402Fetch reserves the payment with the Treasury, signs at most
+ * amountUsd of USDC and records the outcome.
  */
 export async function topupCredits(
   apiUrl: string,
   account: PrivateKeyAccount,
   amountUsd: number,
   recipientAddress?: Address,
+  opts: TopupOptions = {},
 ): Promise<TopupResult> {
+  if (!Number.isSafeInteger(amountUsd) || amountUsd <= 0) {
+    return { success: false, amountUsd, error: `Invalid topup amount: ${String(amountUsd)}` };
+  }
   const address = recipientAddress || account.address;
   const url = `${apiUrl}/pay/${amountUsd}/${address}`;
+  const topupPurpose = opts.topupPurpose ?? "manual";
 
-  logger.info(`Attempting credit topup: $${amountUsd} USD for ${address}`);
+  logger.info(`Attempting credit topup: $${amountUsd} USD for ${address} (${topupPurpose})`);
 
-  const result = await x402Fetch(url, account, "GET");
+  const result = await x402Fetch(url, account, "GET", undefined, undefined, undefined, undefined, {
+    purpose: "topup",
+    topupPurpose,
+    maxAtomic: BigInt(amountUsd) * 1_000_000n,
+    recipient: address,
+    amountUsd,
+    treasury: opts.treasury,
+  });
+  const fields = treasuryFields(result);
 
   if (!result.success) {
-    logger.error(`Credit topup failed: ${result.error}`);
+    if (result.denied) {
+      logger.info(`Credit topup refused: ${result.denied.code} — ${result.denied.message}`);
+    } else {
+      logger.error(`Credit topup failed: ${result.error}`);
+    }
     return {
       success: false,
       amountUsd,
       error: result.error || `HTTP ${result.status}`,
+      ...fields,
     };
   }
 
@@ -68,6 +137,7 @@ export async function topupCredits(
     success: true,
     amountUsd,
     creditsCentsAdded,
+    ...fields,
   };
 }
 
@@ -76,13 +146,16 @@ export async function topupCredits(
  *
  * Parses the error response to determine the deficit, picks the smallest
  * tier that covers it, checks USDC balance, and calls topupCredits().
- * Returns null if the error isn't a 402 or topup can't proceed.
+ * Returns null if the error isn't a 402 or topup can't proceed, including
+ * when the details are unparseable or no tier covers the deficit: a buy
+ * that cannot make the retry succeed is not made.
  */
 export async function topupForSandbox(params: {
   apiUrl: string;
   account: PrivateKeyAccount;
   error: Error & { status?: number; responseText?: string };
   chainType?: ChainType;
+  treasury?: TreasuryResolver;
 }): Promise<TopupResult | null> {
   const { apiUrl, account, error, chainType } = params;
 
@@ -97,25 +170,49 @@ export async function topupForSandbox(params: {
   if (error.status !== 402 && !error.message?.includes("INSUFFICIENT_CREDITS")) return null;
 
   // Parse the 402 response body for credit details
-  let requiredCents: number | undefined;
-  let currentCents: number | undefined;
+  let details: Record<string, unknown> | undefined;
   try {
     const body = JSON.parse(error.responseText || "{}");
-    requiredCents = body.details?.required_cents;
-    currentCents = body.details?.current_balance_cents;
+    if (body && typeof body.details === "object" && body.details !== null) {
+      details = body.details as Record<string, unknown>;
+    }
   } catch {
     // If we can't parse the body, check for INSUFFICIENT_CREDITS in message
     if (!error.message?.includes("INSUFFICIENT_CREDITS")) return null;
   }
 
-  // Calculate deficit in cents; default to minimum tier if details missing
-  const deficitCents = (requiredCents != null && currentCents != null)
-    ? requiredCents - currentCents
-    : TOPUP_TIERS[0] * 100;
+  // Deficit in cents; the minimum tier when the 402 gives no details.
+  let deficitCents: number;
+  const hasDetails =
+    details !== undefined && (details.required_cents !== undefined || details.current_balance_cents !== undefined);
+  if (hasDetails) {
+    const requiredCents = parseCentsField(details!.required_cents);
+    const currentCents = parseCentsField(details!.current_balance_cents);
+    if (requiredCents === null || currentCents === null) {
+      logger.warn(
+        `Sandbox topup skipped: unparseable 402 details (required_cents=${JSON.stringify(details!.required_cents)}, ` +
+          `current_balance_cents=${JSON.stringify(details!.current_balance_cents)})`,
+      );
+      return null;
+    }
+    deficitCents = requiredCents - currentCents;
+  } else {
+    deficitCents = TOPUP_TIERS[0] * 100;
+  }
+  if (deficitCents <= 0) {
+    logger.info(`Sandbox topup skipped: no deficit (${deficitCents}c)`);
+    return null;
+  }
 
-  // Pick smallest tier that covers the deficit (tier is in USD, deficit in cents)
-  const selectedTier = TOPUP_TIERS.find((tier) => tier * 100 >= deficitCents)
-    ?? TOPUP_TIERS[TOPUP_TIERS.length - 1];
+  // Smallest tier that covers the deficit (tier is in USD, deficit in cents).
+  const selectedTier = TOPUP_TIERS.find((tier) => tier * 100 >= deficitCents);
+  if (selectedTier === undefined) {
+    logger.warn(
+      `Sandbox topup skipped: deficit $${(deficitCents / 100).toFixed(2)} exceeds the largest tier ` +
+        `($${TOPUP_TIERS[TOPUP_TIERS.length - 1]}); fund manually`,
+    );
+    return null;
+  }
 
   // Check USDC balance before attempting payment
   let usdcBalance: number;
@@ -134,7 +231,20 @@ export async function topupForSandbox(params: {
   }
 
   logger.info(`Sandbox topup: deficit=${deficitCents}c, buying $${selectedTier} tier`);
-  return topupCredits(apiUrl, account, selectedTier);
+  return topupCredits(apiUrl, account, selectedTier, undefined, {
+    topupPurpose: "sandbox_402",
+    treasury: params.treasury,
+  });
+}
+
+/** A cents field from a 402 body: a finite number >= 0, or a digit string. */
+function parseCentsField(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  if (typeof raw === "string" && /^\s*\d+\s*$/.test(raw)) {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 /**
@@ -143,7 +253,8 @@ export async function topupForSandbox(params: {
  * `topup_credits` tool.
  *
  * Only triggers when credits are below threshold AND USDC covers the
- * minimum tier.
+ * minimum tier. The caller's creditsCents may be stale; the Treasury makes
+ * its own balance read and refuses the buy when credits are not low.
  */
 export async function bootstrapTopup(params: {
   apiUrl: string;
@@ -151,6 +262,7 @@ export async function bootstrapTopup(params: {
   creditsCents: number;
   creditThresholdCents?: number;
   chainType?: ChainType;
+  treasury?: TreasuryResolver;
 }): Promise<TopupResult | null> {
   const { apiUrl, account, creditsCents, creditThresholdCents = 500, chainType } = params;
 
@@ -188,5 +300,65 @@ export async function bootstrapTopup(params: {
     `Bootstrap topup: credits=$${(creditsCents / 100).toFixed(2)}, USDC=$${usdcBalance.toFixed(2)}, buying $${minTier}`,
   );
 
-  return topupCredits(apiUrl, account, minTier);
+  return topupCredits(apiUrl, account, minTier, undefined, {
+    topupPurpose: "survival",
+    treasury: params.treasury,
+  });
+}
+
+export type StartupTopupOutcome =
+  | { status: "skipped"; reason: string }
+  | { status: "timed_out" }
+  | { status: "done"; result: TopupResult | null };
+
+/**
+ * The startup bootstrap topup. Runs with origin "startup.bootstrap", skips
+ * the buy when the credit balance cannot be read (a failed read is not a
+ * zero balance), and stops waiting after timeoutMs. A timeout only abandons
+ * the wait: the payment's ledger row stays open, so the heartbeat and the
+ * loop cannot buy alongside it.
+ */
+export async function startupBootstrapTopup(params: {
+  apiUrl: string;
+  account: PrivateKeyAccount;
+  readCreditBalance: () => Promise<number>;
+  chainType?: ChainType;
+  timeoutMs?: number;
+  treasury?: TreasuryResolver;
+}): Promise<StartupTopupOutcome> {
+  const timeoutMs = params.timeoutMs ?? 15_000;
+  const work = runWithTreasuryOrigin(
+    { type: "auto", name: "startup.bootstrap" },
+    async (): Promise<StartupTopupOutcome> => {
+      let creditsCents: number;
+      try {
+        creditsCents = await params.readCreditBalance();
+      } catch (err: any) {
+        return { status: "skipped", reason: `credit balance unavailable: ${err?.message || String(err)}` };
+      }
+      if (typeof creditsCents !== "number" || !Number.isFinite(creditsCents)) {
+        return { status: "skipped", reason: "credit balance unavailable" };
+      }
+      const result = await bootstrapTopup({
+        apiUrl: params.apiUrl,
+        account: params.account,
+        creditsCents,
+        chainType: params.chainType,
+        treasury: params.treasury,
+      });
+      return { status: "done", result };
+    },
+  );
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<StartupTopupOutcome>((resolve) => {
+    timer = setTimeout(() => resolve({ status: "timed_out" }), timeoutMs);
+  });
+  // Keep a late failure from surfacing as an unhandled rejection.
+  work.catch((err) => logger.warn(`Bootstrap topup failed: ${err?.message || String(err)}`));
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

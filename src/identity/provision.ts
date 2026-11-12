@@ -14,6 +14,8 @@ import type { ProvisionResult } from "../types.js";
 import { ResilientHttpClient } from "../conway/http-client.js";
 import type { ChainIdentity } from "./chain.js";
 import { buildSiwsMessage, signSiwsMessage } from "./siws.js";
+import { writeFileSafe } from "../security/secure-fs.js";
+import { registerSecret } from "../security/secret-redaction.js";
 
 const httpClient = new ResilientHttpClient();
 
@@ -27,6 +29,7 @@ export function loadApiKeyFromConfig(): string | null {
   if (!fs.existsSync(configPath)) return null;
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    registerSecret(config.apiKey, "conway-api-key");
     return config.apiKey || null;
   } catch {
     return null;
@@ -47,9 +50,8 @@ function saveConfig(apiKey: string, walletAddress: string): void {
     walletAddress,
     provisionedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), {
-    mode: 0o600,
-  });
+  writeFileSafe(configPath, JSON.stringify(config, null, 2), { trustedWriter: true, mode: 0o600 });
+  registerSecret(apiKey, "conway-api-key");
 }
 
 /**

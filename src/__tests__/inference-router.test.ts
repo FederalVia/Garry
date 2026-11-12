@@ -1,7 +1,7 @@
 /**
  * Inference Router Tests (Sub-phase 2.3)
  *
- * Tests: ModelRegistry, InferenceRouter, InferenceBudgetTracker,
+ * Tests: ModelRegistry, InferenceRouter (with the inference gate),
  * routing matrix, message transformation, schema migration.
  */
 
@@ -24,7 +24,9 @@ import {
 } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
 import { InferenceRouter } from "../inference/router.js";
-import { InferenceBudgetTracker } from "../inference/budget.js";
+import { InferenceGate } from "../inference/gate.js";
+import { resolveInferencePolicy } from "../inference/policy.js";
+import { InferenceCallError } from "../inference/errors.js";
 import {
   STATIC_MODEL_BASELINE,
   DEFAULT_ROUTING_MATRIX,
@@ -192,6 +194,21 @@ describe("ModelRegistry", () => {
     expect(entry!.costPer1kInput).toBe(15);
   });
 
+  it("refreshFromApi reads listModels' USD-per-1M prices and keeps a known price when the listing has none", () => {
+    const registry = new ModelRegistry(db);
+    registry.initialize();
+    const before = registry.get("gpt-5.2")!;
+    registry.refreshFromApi([
+      { id: "claude-opus-4-6", provider: "anthropic", pricing: { inputPerMillion: 5, outputPerMillion: 25 } },
+      { id: "gpt-5.2", provider: "openai", pricing: { inputPerMillion: 0, outputPerMillion: 0 } },
+    ]);
+    const opus = registry.get("claude-opus-4-6")!;
+    expect(opus.costPer1kInput).toBe(50);
+    expect(opus.costPer1kOutput).toBe(250);
+    expect(registry.get("gpt-5.2")!.costPer1kInput).toBe(before.costPer1kInput);
+    expect(registry.get("gpt-5.2")!.costPer1kOutput).toBe(before.costPer1kOutput);
+  });
+
   it("getCostPer1k returns correct pricing", () => {
     const registry = new ModelRegistry(db);
     registry.initialize();
@@ -213,14 +230,26 @@ describe("ModelRegistry", () => {
 
 describe("InferenceRouter", () => {
   let registry: ModelRegistry;
-  let budget: InferenceBudgetTracker;
+  let gate: InferenceGate;
   let router: InferenceRouter;
+  let strategy: ModelStrategyConfig;
+
+  const makeRouter = (policyOverrides: Partial<ModelStrategyConfig> = {}, daily = 50_000) => {
+    strategy = { ...DEFAULT_MODEL_STRATEGY_CONFIG, ...policyOverrides };
+    gate = new InferenceGate({
+      db,
+      policy: resolveInferencePolicy({ modelStrategy: strategy }, { maxInferenceDailyCents: daily }),
+    });
+    gate.setSurvival({ tier: "high", creditsCents: 100_000 });
+    return new InferenceRouter(db, registry, gate, () => strategy);
+  };
+  const ledger = () =>
+    db.prepare("SELECT * FROM inference_ledger ORDER BY created_at_ms, attempt").all() as any[];
 
   beforeEach(() => {
     registry = new ModelRegistry(db);
     registry.initialize();
-    budget = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-    router = new InferenceRouter(db, registry, budget);
+    router = makeRouter();
   });
 
   describe("selectModel", () => {
@@ -261,7 +290,7 @@ describe("InferenceRouter", () => {
   });
 
   describe("route", () => {
-    it("calls inference and records cost", async () => {
+    it("calls inference and records the attempt in the ledger", async () => {
       const mockChat = async (_msgs: any[], _opts: any) => ({
         message: { content: "Hello!", role: "assistant" },
         usage: { promptTokens: 100, completionTokens: 50 },
@@ -282,15 +311,19 @@ describe("InferenceRouter", () => {
       expect(result.model).toBe("gpt-5.2");
       expect(result.finishReason).toBe("stop");
 
-      // Verify cost was recorded
-      const costs = inferenceGetSessionCosts(db, "test-session");
-      expect(costs.length).toBe(1);
-      expect(costs[0].model).toBe("gpt-5.2");
+      const rows = ledger();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        model: "gpt-5.2",
+        status: "committed",
+        budget_class: "main",
+        caller: "agent_turn",
+        session_id: "test-session",
+      });
     });
 
-    it("computes actualCostCents accurately from token usage", async () => {
-      // gpt-5.2 has costPer1kInput=20, costPer1kOutput=80 (hundredths of cents)
-      // Formula: Math.ceil((input/1000)*costPer1kInput/100 + (output/1000)*costPer1kOutput/100)
+    it("computes the actual cost exactly, in micro-USD, from token usage", async () => {
+      // gpt-5.2 is 18 / 140 hundredths of a cent per 1k = $1.8 / $14 per M.
       const mockChat = async (_msgs: any[], _opts: any) => ({
         message: { content: "result", role: "assistant" },
         usage: { promptTokens: 1000, completionTokens: 500 },
@@ -307,90 +340,64 @@ describe("InferenceRouter", () => {
         mockChat,
       );
 
-      // Verify cost is computed correctly
-      // (1000/1000)*300/100 + (500/1000)*1500/100 = 3 + 7.5 = 10.5 => ceil = 11
-      expect(result.costCents).toBeGreaterThan(0);
-      expect(typeof result.costCents).toBe("number");
-      expect(Number.isInteger(result.costCents)).toBe(true);
-
-      // Verify the recorded cost matches
-      const costs = inferenceGetSessionCosts(db, "cost-accuracy-session");
-      expect(costs.length).toBe(1);
-      expect(costs[0].costCents).toBe(result.costCents);
-      expect(costs[0].inputTokens).toBe(1000);
-      expect(costs[0].outputTokens).toBe(500);
+      // 1000 * 1.8 + 500 * 14 = 8800 micro-USD = 0.88c (no whole-cent rounding).
+      expect(result.costMicroUsd).toBe(8800);
+      expect(result.costCents).toBeCloseTo(0.88, 10);
+      const [row] = ledger();
+      expect(row.cost_micro_usd).toBe(8800);
+      expect(row.input_tokens).toBe(1000);
+      expect(row.output_tokens).toBe(500);
     });
 
-    it("returns error when budget is exhausted", async () => {
-      const strictBudget = new InferenceBudgetTracker(db, {
-        ...DEFAULT_MODEL_STRATEGY_CONFIG,
-        perCallCeilingCents: 1, // Very low ceiling
-      });
-      const strictRouter = new InferenceRouter(db, registry, strictBudget);
-
-      // Insert a bunch of text to inflate the cost estimate
-      const longMessage = "x".repeat(100000);
+    it("returns a refusal, without calling inference, when the per-call ceiling cannot fit", async () => {
+      const strictRouter = makeRouter({ perCallCeilingCents: 1 });
+      let calls = 0;
       const result = await strictRouter.route(
         {
-          messages: [{ role: "user", content: longMessage }],
+          messages: [{ role: "user", content: "x".repeat(100000) }],
           taskType: "agent_turn",
           tier: "normal",
           sessionId: "test-session",
           maxTokens: 50000,
         },
-        async () => ({ message: { content: "" }, usage: { promptTokens: 0, completionTokens: 0 }, finishReason: "stop" }),
-      );
-
-      expect(result.finishReason).toBe("budget_exceeded");
-    });
-
-    it("enforces session budget when configured", async () => {
-      const sessionBudget = new InferenceBudgetTracker(db, {
-        ...DEFAULT_MODEL_STRATEGY_CONFIG,
-        sessionBudgetCents: 5,
-      });
-      const sessionRouter = new InferenceRouter(db, registry, sessionBudget);
-
-      // Record enough cost to nearly exhaust the session budget
-      sessionBudget.recordCost({
-        sessionId: "budget-session",
-        turnId: null,
-        model: "gpt-4.1",
-        provider: "openai",
-        inputTokens: 1000,
-        outputTokens: 500,
-        costCents: 4,
-        latencyMs: 100,
-        tier: "normal",
-        taskType: "agent_turn",
-        cacheHit: false,
-      });
-
-      // Use a long message so the estimated cost pushes past the 5c limit
-      const longMessage = "x".repeat(100000);
-      const result = await sessionRouter.route(
-        {
-          messages: [{ role: "user", content: longMessage }],
-          taskType: "agent_turn",
-          tier: "normal",
-          sessionId: "budget-session",
-          maxTokens: 50000,
+        async () => {
+          calls++;
+          return { message: { content: "" }, usage: { promptTokens: 0, completionTokens: 0 }, finishReason: "stop" };
         },
-        async () => ({
-          message: { content: "" },
-          usage: { promptTokens: 0, completionTokens: 0 },
-          finishReason: "stop",
-        }),
       );
 
       expect(result.finishReason).toBe("budget_exceeded");
-      expect(result.content).toContain("Session budget exceeded");
+      expect(result.refusal).toMatchObject({ code: "PER_CALL_CEILING", retryAfterMs: null });
+      expect(calls).toBe(0);
+      expect(ledger()).toHaveLength(0);
     });
 
-    it("passes abort signal to inference function", async () => {
+    it("enforces the session budget per budget session only", async () => {
+      // About 27k estimated input tokens: even gpt-5-mini needs ~3.5c.
+      const sessionRouter = makeRouter({ sessionBudgetCents: 2 });
+      const longMessage = "x".repeat(100000);
+      const chat = async () => ({
+        message: { content: "" },
+        usage: { promptTokens: 0, completionTokens: 0 },
+        finishReason: "stop",
+      });
+      const result = await sessionRouter.route(
+        { messages: [{ role: "user", content: longMessage }], taskType: "agent_turn", tier: "normal", sessionId: "budget-session" },
+        chat,
+      );
+      expect(result.finishReason).toBe("budget_exceeded");
+      expect(result.refusal?.code).toBe("SESSION_CAP");
+      expect(result.refusal?.retryAfterMs).toBe(30 * 60_000);
+    });
+
+    it("passes the call's deadline signal and a reservation id to the inference function", async () => {
       let receivedSignal: AbortSignal | undefined;
+      let reservationId: string | undefined;
+      let openDuringCall = false;
       const mockChat = async (_msgs: any[], opts: any) => {
         receivedSignal = opts.signal;
+        reservationId = opts.reservationId;
+        openDuringCall = gate.isOpen(opts.reservationId);
         return {
           message: { content: "ok", role: "assistant" },
           usage: { promptTokens: 10, completionTokens: 5 },
@@ -399,32 +406,45 @@ describe("InferenceRouter", () => {
       };
 
       await router.route(
-        {
-          messages: [{ role: "user", content: "test" }],
-          taskType: "agent_turn",
-          tier: "normal",
-          sessionId: "signal-test",
-        },
+        { messages: [{ role: "user", content: "test" }], taskType: "agent_turn", tier: "normal", sessionId: "signal-test" },
         mockChat,
       );
 
-      expect(receivedSignal).toBeDefined();
       expect(receivedSignal).toBeInstanceOf(AbortSignal);
+      expect(reservationId).toBeTruthy();
+      expect(openDuringCall).toBe(true);
+      expect(gate.isOpen(reservationId!)).toBe(false);
     });
 
-    it("returns empty result for dead tier", async () => {
+    it("returns a NO_MODEL refusal for the dead tier when no local model exists", async () => {
+      let calls = 0;
       const result = await router.route(
-        {
-          messages: [{ role: "user", content: "Hi" }],
-          taskType: "agent_turn",
-          tier: "dead",
-          sessionId: "test-session",
+        { messages: [{ role: "user", content: "Hi" }], taskType: "agent_turn", tier: "dead", sessionId: "test-session" },
+        async () => {
+          calls++;
+          return { message: { content: "" }, usage: {}, finishReason: "stop" };
         },
-        async () => ({ message: { content: "" }, usage: {}, finishReason: "stop" }),
       );
 
-      expect(result.model).toBe("none");
-      expect(result.finishReason).toBe("error");
+      expect(result.finishReason).toBe("budget_exceeded");
+      expect(result.refusal?.code).toBe("NO_MODEL");
+      expect(calls).toBe(0);
+    });
+
+    it("throws instead of returning an empty error turn when every attempt fails", async () => {
+      await expect(
+        router.route(
+          { messages: [{ role: "user", content: "Hi" }], taskType: "agent_turn", tier: "normal", sessionId: "s" },
+          async () => {
+            throw Object.assign(new Error("bad gateway"), { status: 502 });
+          },
+        ),
+      ).rejects.toBeInstanceOf(InferenceCallError);
+      // 502 fails over: gpt-5.2 then gpt-5-mini, both released.
+      expect(ledger().map((r) => [r.model, r.status])).toEqual([
+        ["gpt-5.2", "released"],
+        ["gpt-5-mini", "released"],
+      ]);
     });
   });
 
@@ -514,158 +534,7 @@ describe("InferenceRouter", () => {
   });
 });
 
-// ─── InferenceBudgetTracker Tests ─────────────────────────────────
-
-describe("InferenceBudgetTracker", () => {
-  it("checkBudget allows when within limits", () => {
-    const tracker = new InferenceBudgetTracker(db, {
-      ...DEFAULT_MODEL_STRATEGY_CONFIG,
-      hourlyBudgetCents: 1000,
-      perCallCeilingCents: 100,
-    });
-
-    const result = tracker.checkBudget(50, "gpt-4.1");
-    expect(result.allowed).toBe(true);
-  });
-
-  it("checkBudget denies when per-call ceiling exceeded", () => {
-    const tracker = new InferenceBudgetTracker(db, {
-      ...DEFAULT_MODEL_STRATEGY_CONFIG,
-      perCallCeilingCents: 10,
-    });
-
-    const result = tracker.checkBudget(50, "gpt-4.1");
-    expect(result.allowed).toBe(false);
-    expect(result.reason).toContain("Per-call cost");
-  });
-
-  it("checkBudget denies when hourly limit exceeded", () => {
-    const tracker = new InferenceBudgetTracker(db, {
-      ...DEFAULT_MODEL_STRATEGY_CONFIG,
-      hourlyBudgetCents: 100,
-    });
-
-    // Record some existing costs to push over the limit
-    for (let i = 0; i < 10; i++) {
-      tracker.recordCost({
-        sessionId: "test",
-        turnId: null,
-        model: "gpt-4.1",
-        provider: "openai",
-        inputTokens: 1000,
-        outputTokens: 500,
-        costCents: 15,
-        latencyMs: 100,
-        tier: "normal",
-        taskType: "agent_turn",
-        cacheHit: false,
-      });
-    }
-
-    // Now try to use 10 more cents (total would be 160)
-    const result = tracker.checkBudget(10, "gpt-4.1");
-    expect(result.allowed).toBe(false);
-    expect(result.reason).toContain("Hourly budget exhausted");
-  });
-
-  it("checkBudget allows when no limits are set (0 = unlimited)", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    const result = tracker.checkBudget(9999, "gpt-4.1");
-    expect(result.allowed).toBe(true);
-  });
-
-  it("recordCost stores to inference_costs table", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    tracker.recordCost({
-      sessionId: "session-1",
-      turnId: "turn-1",
-      model: "gpt-4.1",
-      provider: "openai",
-      inputTokens: 1000,
-      outputTokens: 500,
-      costCents: 5,
-      latencyMs: 200,
-      tier: "normal",
-      taskType: "agent_turn",
-      cacheHit: false,
-    });
-
-    const costs = inferenceGetSessionCosts(db, "session-1");
-    expect(costs.length).toBe(1);
-    expect(costs[0].model).toBe("gpt-4.1");
-    expect(costs[0].costCents).toBe(5);
-  });
-
-  it("getDailyCost sums correctly", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    tracker.recordCost({
-      sessionId: "s1", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 100, outputTokens: 50, costCents: 10,
-      latencyMs: 100, tier: "normal", taskType: "agent_turn", cacheHit: false,
-    });
-    tracker.recordCost({
-      sessionId: "s2", turnId: null, model: "gpt-4.1-mini", provider: "openai",
-      inputTokens: 100, outputTokens: 50, costCents: 5,
-      latencyMs: 100, tier: "low_compute", taskType: "heartbeat_triage", cacheHit: false,
-    });
-
-    const daily = tracker.getDailyCost();
-    expect(daily).toBe(15);
-  });
-
-  it("getHourlyCost sums current hour only", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    tracker.recordCost({
-      sessionId: "s1", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 100, outputTokens: 50, costCents: 7,
-      latencyMs: 100, tier: "normal", taskType: "agent_turn", cacheHit: false,
-    });
-
-    const hourly = tracker.getHourlyCost();
-    expect(hourly).toBe(7);
-  });
-
-  it("getSessionCost returns correct total", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    tracker.recordCost({
-      sessionId: "my-session", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 100, outputTokens: 50, costCents: 3,
-      latencyMs: 100, tier: "normal", taskType: "agent_turn", cacheHit: false,
-    });
-    tracker.recordCost({
-      sessionId: "my-session", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 200, outputTokens: 100, costCents: 6,
-      latencyMs: 200, tier: "normal", taskType: "planning", cacheHit: false,
-    });
-
-    const sessionCost = tracker.getSessionCost("my-session");
-    expect(sessionCost).toBe(9);
-  });
-
-  it("getModelCosts returns correct breakdown", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
-
-    tracker.recordCost({
-      sessionId: "s1", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 100, outputTokens: 50, costCents: 5,
-      latencyMs: 100, tier: "normal", taskType: "agent_turn", cacheHit: false,
-    });
-    tracker.recordCost({
-      sessionId: "s1", turnId: null, model: "gpt-4.1", provider: "openai",
-      inputTokens: 200, outputTokens: 100, costCents: 10,
-      latencyMs: 200, tier: "normal", taskType: "agent_turn", cacheHit: false,
-    });
-
-    const costs = tracker.getModelCosts("gpt-4.1");
-    expect(costs.totalCents).toBe(15);
-    expect(costs.callCount).toBe(2);
-  });
-});
+// Budget enforcement moved to the inference gate: see inference/gate.test.ts.
 
 // ─── Routing Matrix Tests ─────────────────────────────────────────
 

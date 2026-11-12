@@ -2,7 +2,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HealthMonitor,
-  type AgentHealthStatus,
+  unhealthySignature,
   type HealthReport,
 } from "../../orchestration/health-monitor.js";
 import { createInMemoryDb } from "./test-db.js";
@@ -42,49 +42,6 @@ function createMockAutomatonDb(db: BetterSqlite3.Database) {
 }
 
 // ---------------------------------------------------------------------------
-// Mock AgentTracker, FundingProtocol, ColonyMessaging
-// ---------------------------------------------------------------------------
-
-function createMockTracker(
-  idle: { address: string; name: string; role: string; status: string }[] = [],
-  best: { address: string; name: string } | null = null,
-) {
-  return {
-    getIdle: vi.fn().mockReturnValue(idle),
-    getBestForTask: vi.fn().mockReturnValue(best),
-    updateStatus: vi.fn(),
-    register: vi.fn(),
-  };
-}
-
-function createMockFunding(balance = 100, fundSuccess = true) {
-  return {
-    getBalance: vi.fn().mockResolvedValue(balance),
-    fundChild: vi.fn().mockResolvedValue({ success: fundSuccess }),
-    recallCredits: vi.fn().mockResolvedValue({ success: true, amountCents: 0 }),
-  };
-}
-
-function createMockMessaging() {
-  return {
-    createMessage: vi.fn().mockReturnValue({
-      id: "m1",
-      type: "shutdown_request",
-      from: "0xparent",
-      to: "",
-      goalId: null,
-      taskId: null,
-      content: "",
-      priority: "high",
-      requiresResponse: false,
-      expiresAt: null,
-      createdAt: new Date().toISOString(),
-    }),
-    send: vi.fn().mockResolvedValue(undefined),
-  } as any;
-}
-
-// ---------------------------------------------------------------------------
 // DB helpers
 // ---------------------------------------------------------------------------
 
@@ -96,6 +53,7 @@ function insertChild(
     address: string;
     status: string;
     lastChecked?: string | null;
+    funded?: number;
   },
 ) {
   db.prepare(
@@ -108,7 +66,7 @@ function insertChild(
     opts.address,
     "sb-1",
     "test",
-    0,
+    opts.funded ?? 0,
     opts.status,
     new Date().toISOString(),
     opts.lastChecked ?? null,
@@ -160,33 +118,54 @@ function insertTask(
 }
 
 // ---------------------------------------------------------------------------
+// Mock FundingProtocol (reads the real children ledger)
+// ---------------------------------------------------------------------------
+
+function createLedgerFunding(db: BetterSqlite3.Database, fundSuccess = true) {
+  return {
+    getBalance: vi.fn(async (address: string) => {
+      const row = db.prepare("SELECT funded_amount_cents AS f FROM children WHERE address = ?").get(address) as
+        | { f: number }
+        | undefined;
+      return row?.f ?? 0;
+    }),
+    fundChild: vi.fn().mockResolvedValue({ success: fundSuccess }),
+    recallCredits: vi.fn().mockResolvedValue({ success: true, amountCents: 0 }),
+  };
+}
+
+const WALLET_A = "0x" + "a".repeat(40);
+const WALLET_B = "0x" + "b".repeat(40);
+const WALLET_C = "0x" + "c".repeat(40);
+
+function snapshot(db: BetterSqlite3.Database) {
+  return {
+    children: db.prepare("SELECT id, status, funded_amount_cents FROM children ORDER BY id").all(),
+    tasks: db.prepare("SELECT id, status, assigned_to, retry_count, result FROM task_graph ORDER BY id").all(),
+    inbox: db.prepare("SELECT COUNT(*) AS n FROM inbox_messages").get(),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("orchestration/health-monitor", () => {
+describe("orchestration/health-monitor (report only)", () => {
   let db: BetterSqlite3.Database;
   let mockDb: ReturnType<typeof createMockAutomatonDb>;
-  let mockTracker: ReturnType<typeof createMockTracker>;
-  let mockFunding: ReturnType<typeof createMockFunding>;
-  let mockMessaging: ReturnType<typeof createMockMessaging>;
+  let funding: ReturnType<typeof createLedgerFunding>;
   let monitor: HealthMonitor;
 
   beforeEach(() => {
     db = createInMemoryDb();
     mockDb = createMockAutomatonDb(db);
-    mockTracker = createMockTracker();
-    mockFunding = createMockFunding();
-    mockMessaging = createMockMessaging();
-    monitor = new HealthMonitor(mockDb, mockTracker, mockFunding, mockMessaging);
+    funding = createLedgerFunding(db);
+    monitor = new HealthMonitor(mockDb, funding);
   });
 
   afterEach(() => {
     db.close();
   });
-
-  // -------------------------------------------------------------------------
-  // checkAll
-  // -------------------------------------------------------------------------
 
   describe("checkAll", () => {
     it("returns empty report when no children", async () => {
@@ -200,585 +179,229 @@ describe("orchestration/health-monitor", () => {
       expect(report.timestamp).toBeTruthy();
     });
 
-    it("reports healthy agent with recent heartbeat", async () => {
-      const recentHb = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
+    it("reports a healthy child with recent activity", async () => {
       insertChild(db, {
         id: "c1",
         name: "Agent1",
-        address: "0xchild1",
-        status: "running",
-        lastChecked: recentHb,
+        address: WALLET_A,
+        status: "healthy",
+        lastChecked: new Date(Date.now() - 60_000).toISOString(),
+        funded: 500,
       });
 
       const report = await monitor.checkAll();
 
       expect(report.totalAgents).toBe(1);
       expect(report.healthyAgents).toBe(1);
-      expect(report.unhealthyAgents).toBe(0);
-
       const agent = report.agents[0];
       expect(agent.healthy).toBe(true);
       expect(agent.issues).toEqual([]);
-      expect(agent.address).toBe("0xchild1");
+      expect(agent.creditBalance).toBe(500);
     });
 
-    it("reports unhealthy when status is 'dead'", async () => {
+    it("skips ended, terminal, empty-address and local worker rows (F071)", async () => {
+      insertChild(db, { id: "dead", name: "d", address: "0xdead", status: "dead", funded: 0 });
+      insertChild(db, { id: "clean", name: "c", address: "0xclean", status: "cleaned_up", funded: 0 });
+      insertChild(db, { id: "failed", name: "f", address: "", status: "failed", funded: 0 });
+      insertChild(db, { id: "stopped", name: "s", address: "0xstopped", status: "stopped", funded: 0 });
+      insertChild(db, { id: "local", name: "l", address: "local://local-worker-1", status: "running", funded: 0 });
+
+      const report = await monitor.checkAll();
+
+      expect(report.totalAgents).toBe(0);
+      expect(funding.getBalance).not.toHaveBeenCalled();
+    });
+
+    it("reports legacy rows that may still run (no lifecycle events)", async () => {
+      insertChild(db, { id: "legacy", name: "legacy", address: WALLET_B, status: "running", lastChecked: new Date().toISOString(), funded: 500 });
+
+      const report = await monitor.checkAll();
+
+      expect(report.agents.map((a) => a.address)).toEqual([WALLET_B]);
+    });
+
+    it("reports pre-start children without credit or activity issues", async () => {
+      insertChild(db, { id: "wv", name: "wv", address: WALLET_A, status: "wallet_verified", funded: 0 });
+
+      const report = await monitor.checkAll();
+
+      expect(report.agents).toHaveLength(1);
+      expect(report.agents[0].healthy).toBe(true);
+    });
+
+    it("flags an unhealthy lifecycle child", async () => {
       insertChild(db, {
-        id: "c1",
-        name: "DeadAgent",
-        address: "0xdead",
-        status: "dead",
-        lastChecked: new Date(Date.now() - 60_000).toISOString(),
+        id: "u",
+        name: "u",
+        address: WALLET_A,
+        status: "unhealthy",
+        lastChecked: new Date().toISOString(),
+        funded: 500,
       });
 
       const report = await monitor.checkAll();
 
-      const agent = report.agents[0];
-      expect(agent.healthy).toBe(false);
-      expect(agent.issues).toContain("process_crashed");
-    });
-
-    it("reports unhealthy when status is 'failed'", async () => {
-      insertChild(db, {
-        id: "c1",
-        name: "FailedAgent",
-        address: "0xfailed",
-        status: "failed",
-        lastChecked: new Date(Date.now() - 60_000).toISOString(),
-      });
-
-      const report = await monitor.checkAll();
-
-      expect(report.agents[0].healthy).toBe(false);
-      expect(report.agents[0].issues).toContain("process_crashed");
-    });
-
-    it("reports unhealthy when status is 'stopped'", async () => {
-      insertChild(db, {
-        id: "c1",
-        name: "StoppedAgent",
-        address: "0xstopped",
-        status: "stopped",
-        lastChecked: new Date(Date.now() - 60_000).toISOString(),
-      });
-
-      const report = await monitor.checkAll();
-
-      expect(report.agents[0].healthy).toBe(false);
-      expect(report.agents[0].issues).toContain("process_crashed");
-    });
-
-    it("handles agent with 'unknown' status as crashed", async () => {
-      insertChild(db, {
-        id: "c1",
-        name: "UnknownAgent",
-        address: "0xunknown",
-        status: "unknown",
-        lastChecked: new Date(Date.now() - 60_000).toISOString(),
-      });
-
-      const report = await monitor.checkAll();
-
-      expect(report.agents[0].healthy).toBe(false);
-      expect(report.agents[0].issues).toContain("process_crashed");
-    });
-
-    it("handles agent with no heartbeat (no last_checked, no events)", async () => {
-      insertChild(db, {
-        id: "c1",
-        name: "NoHB",
-        address: "0xnohb",
-        status: "running",
-        lastChecked: null,
-      });
-
-      const report = await monitor.checkAll();
-
-      const agent = report.agents[0];
-      expect(agent.healthy).toBe(false);
-      expect(agent.issues).toContain("heartbeat_missing");
-      expect(agent.lastHeartbeat).toBeNull();
-    });
-
-    it("detects stuck task when running duration exceeds timeout + grace", async () => {
-      const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, {
-        id: "c1",
-        name: "StuckAgent",
-        address: "0xstuck",
-        status: "running",
-        lastChecked: recentHb,
-      });
-
-      insertGoal(db, "g1");
-      // isTaskStuck uses Math.max(timeoutMs, HEARTBEAT_STALE_MS=900000) + TASK_STUCK_GRACE_MS=120000
-      // so threshold = max(300000, 900000) + 120000 = 1020000ms; use 1100000ms to be safely over
-      const oldStart = new Date(Date.now() - 1_100_000).toISOString();
-      insertTask(db, {
-        id: "t1",
-        goalId: "g1",
-        assignedTo: "0xstuck",
-        status: "running",
-        startedAt: oldStart,
-        timeoutMs: 300000,
-      });
-
-      const report = await monitor.checkAll();
-
-      const agent = report.agents[0];
-      expect(agent.healthy).toBe(false);
-      expect(agent.issues).toContain("stuck_on_task");
-      expect(agent.currentTaskId).toBe("t1");
-    });
-
-    it("detects out_of_credits when balance < 10 cents", async () => {
-      mockFunding.getBalance.mockResolvedValue(5); // below MIN_INFERENCE_CREDITS_CENTS = 10
-      const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, {
-        id: "c1",
-        name: "BrokeAgent",
-        address: "0xbroke",
-        status: "running",
-        lastChecked: recentHb,
-      });
-
-      const report = await monitor.checkAll();
-
-      const agent = report.agents[0];
-      expect(agent.healthy).toBe(false);
-      expect(agent.issues).toContain("out_of_credits");
-      expect(agent.creditBalance).toBe(5);
-    });
-
-    it("detects error_loop when error rate >= 60% with >= 3 samples", async () => {
-      const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, {
-        id: "c1",
-        name: "ErrorLoopAgent",
-        address: "0xerrorloop",
-        status: "running",
-        lastChecked: recentHb,
-      });
-
-      insertGoal(db, "g1");
-      // 3 failed, 2 completed = 60% error rate, 5 samples
-      for (let i = 0; i < 5; i++) {
-        insertTask(db, {
-          id: `t${i}`,
-          goalId: "g1",
-          assignedTo: "0xerrorloop",
-          status: i < 3 ? "failed" : "completed",
-          completedAt: new Date().toISOString(),
-        });
-      }
-
-      const report = await monitor.checkAll();
-
-      const agent = report.agents[0];
-      expect(agent.healthy).toBe(false);
-      expect(agent.issues).toContain("error_loop");
-      expect(agent.errorRate).toBeGreaterThanOrEqual(0.6);
-    });
-
-    it("reports deadAgents count correctly", async () => {
-      const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, { id: "c1", name: "A1", address: "0xa1", status: "running", lastChecked: recentHb });
-      insertChild(db, { id: "c2", name: "A2", address: "0xa2", status: "dead", lastChecked: recentHb });
-      insertChild(db, { id: "c3", name: "A3", address: "0xa3", status: "failed", lastChecked: recentHb });
-      insertChild(db, { id: "c4", name: "A4", address: "0xa4", status: "stopped", lastChecked: recentHb });
-
-      const report = await monitor.checkAll();
-
-      // dead, failed, stopped all count as dead statuses
-      expect(report.deadAgents).toBe(3);
-      expect(report.totalAgents).toBe(4);
-    });
-
-    it("handles multiple agents with mixed health", async () => {
-      mockFunding.getBalance
-        .mockResolvedValueOnce(100) // healthy agent
-        .mockResolvedValueOnce(0); // out of credits
-
-      const recentHb = new Date(Date.now() - 60_000).toISOString();
-      insertChild(db, { id: "c1", name: "Healthy", address: "0xhealthy", status: "running", lastChecked: recentHb });
-      insertChild(db, { id: "c2", name: "Broke", address: "0xbroke2", status: "running", lastChecked: recentHb });
-
-      const report = await monitor.checkAll();
-
-      expect(report.totalAgents).toBe(2);
-      expect(report.healthyAgents).toBe(1);
       expect(report.unhealthyAgents).toBe(1);
+      expect(report.agents[0].issues).toContain("process_unhealthy");
+    });
 
-      const healthy = report.agents.find((a) => a.address === "0xhealthy");
-      const broke = report.agents.find((a) => a.address === "0xbroke2");
-      expect(healthy?.healthy).toBe(true);
-      expect(broke?.healthy).toBe(false);
-      expect(broke?.issues).toContain("out_of_credits");
+    it("flags stale activity only after 45 minutes", async () => {
+      insertChild(db, {
+        id: "old",
+        name: "old",
+        address: WALLET_A,
+        status: "healthy",
+        lastChecked: new Date(Date.now() - 50 * 60_000).toISOString(),
+        funded: 500,
+      });
+      insertChild(db, {
+        id: "recent",
+        name: "recent",
+        address: WALLET_B,
+        status: "healthy",
+        lastChecked: new Date(Date.now() - 40 * 60_000).toISOString(),
+        funded: 500,
+      });
+
+      const report = await monitor.checkAll();
+      const byAddress = new Map(report.agents.map((a) => [a.address, a]));
+
+      expect(byAddress.get(WALLET_A)?.issues).toContain("activity_stale");
+      expect(byAddress.get(WALLET_B)?.issues).toEqual([]);
+    });
+
+    it("reads zone-less SQLite timestamps as UTC (H3-005)", async () => {
+      insertChild(db, { id: "c1", name: "c1", address: WALLET_A, status: "healthy", funded: 500 });
+      // datetime('now', '-2 minutes') is UTC without a zone.
+      db.prepare("UPDATE children SET last_checked = datetime('now', '-2 minutes') WHERE id = 'c1'").run();
+
+      const report = await monitor.checkAll();
+
+      expect(report.agents[0].issues).toEqual([]);
+      const ms = Date.parse(report.agents[0].lastHeartbeat!);
+      expect(Math.abs(Date.now() - 2 * 60_000 - ms)).toBeLessThan(5_000);
+    });
+
+    it("detects out_of_credits for a live child with an empty ledger", async () => {
+      insertChild(db, {
+        id: "broke",
+        name: "broke",
+        address: WALLET_A,
+        status: "healthy",
+        lastChecked: new Date().toISOString(),
+        funded: 5,
+      });
+
+      const report = await monitor.checkAll();
+
+      expect(report.agents[0].issues).toContain("out_of_credits");
+      expect(report.agents[0].creditBalance).toBe(5);
     });
   });
 
-  // -------------------------------------------------------------------------
-  // autoHeal
-  // -------------------------------------------------------------------------
-
   describe("autoHeal", () => {
-    it("returns empty array for empty report", async () => {
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 0,
-        healthyAgents: 0,
-        unhealthyAgents: 0,
-        deadAgents: 0,
-        agents: [],
-      };
+    async function brokeChildReport(): Promise<HealthReport> {
+      insertChild(db, {
+        id: "broke",
+        name: "broke",
+        address: WALLET_A,
+        status: "healthy",
+        lastChecked: new Date().toISOString(),
+        funded: 0,
+      });
+      return monitor.checkAll();
+    }
+
+    it("does nothing by default: auto-funding is off", async () => {
+      const report = await brokeChildReport();
+      expect(report.agents[0].issues).toContain("out_of_credits");
 
       const actions = await monitor.autoHeal(report);
+
       expect(actions).toEqual([]);
+      expect(funding.fundChild).not.toHaveBeenCalled();
     });
 
-    it("skips healthy agents", async () => {
-      const healthyAgent: AgentHealthStatus = {
-        address: "0xhealthy",
-        name: "Healthy",
-        status: "running",
-        healthy: true,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: null,
-        creditBalance: 100,
-        errorRate: 0,
-        issues: [],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 1,
-        unhealthyAgents: 0,
-        deadAgents: 0,
-        agents: [healthyAgent],
-      };
+    it("funds a live child when autoFund is on", async () => {
+      monitor = new HealthMonitor(mockDb, funding, { autoFund: true });
+      const report = await brokeChildReport();
 
       const actions = await monitor.autoHeal(report);
+
+      expect(actions).toEqual([
+        expect.objectContaining({ type: "fund", agentAddress: WALLET_A, success: true }),
+      ]);
+      expect(funding.fundChild).toHaveBeenCalledWith(WALLET_A, 250);
+    });
+
+    it("never funds a child whose row has ended, even when a stale report says so", async () => {
+      monitor = new HealthMonitor(mockDb, funding, { autoFund: true });
+      const report = await brokeChildReport();
+      db.prepare("UPDATE children SET status = 'failed' WHERE id = 'broke'").run();
+      insertChild(db, { id: "empty", name: "empty", address: "", status: "failed", funded: 0 });
+      const forged: HealthReport = {
+        ...report,
+        agents: [
+          ...report.agents,
+          { ...report.agents[0], address: "", name: "empty", status: "healthy" },
+        ],
+      };
+
+      const actions = await monitor.autoHeal(forged);
+
       expect(actions).toEqual([]);
-      expect(mockFunding.fundChild).not.toHaveBeenCalled();
-      expect(mockMessaging.send).not.toHaveBeenCalled();
+      expect(funding.fundChild).not.toHaveBeenCalled();
     });
 
-    it("funds agent when out_of_credits", async () => {
-      const agent: AgentHealthStatus = {
-        address: "0xbroke",
-        name: "Broke",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: null,
-        creditBalance: 5,
-        errorRate: 0,
-        issues: ["out_of_credits"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
+    it("reports a funding failure without throwing", async () => {
+      funding = createLedgerFunding(db, false);
+      monitor = new HealthMonitor(mockDb, funding, { autoFund: true });
+      const report = await brokeChildReport();
 
       const actions = await monitor.autoHeal(report);
 
-      expect(actions).toHaveLength(1);
-      expect(actions[0].type).toBe("fund");
-      expect(actions[0].agentAddress).toBe("0xbroke");
-      expect(actions[0].success).toBe(true);
-      expect(mockFunding.fundChild).toHaveBeenCalledWith("0xbroke", expect.any(Number));
+      expect(actions).toEqual([expect.objectContaining({ type: "fund", success: false })]);
     });
 
-    it("restarts agent when process_crashed", async () => {
-      const agent: AgentHealthStatus = {
-        address: "0xcrashed",
-        name: "Crashed",
-        status: "dead",
-        healthy: false,
-        lastHeartbeat: null,
-        currentTaskId: null,
-        creditBalance: 100,
-        errorRate: 0,
-        issues: ["process_crashed"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 1,
-        agents: [agent],
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions).toHaveLength(1);
-      expect(actions[0].type).toBe("restart");
-      expect(actions[0].agentAddress).toBe("0xcrashed");
-      expect(actions[0].success).toBe(true);
-      expect(mockMessaging.send).toHaveBeenCalled();
-      expect(mockTracker.updateStatus).toHaveBeenCalledWith("0xcrashed", "starting");
-    });
-
-    it("reassigns task when stuck_on_task detected", async () => {
+    it("never restarts, stops or messages children and never touches tasks (F071, F072, H3-007)", async () => {
+      monitor = new HealthMonitor(mockDb, funding, { autoFund: true });
+      // The H3-007 fixture: an error-loop agent holding a task, plus the
+      // F071 terminal rows and a task created 20 minutes before assignment.
+      insertChild(db, { id: "x", name: "x", address: WALLET_A, status: "healthy", lastChecked: null, funded: 500 });
+      insertChild(db, { id: "dead", name: "d", address: "0xdead", status: "dead" });
+      insertChild(db, { id: "clean", name: "c", address: "0xclean", status: "cleaned_up" });
+      insertChild(db, { id: "nf", name: "nf", address: "", status: "failed" });
+      insertChild(db, { id: "busy", name: "busy", address: WALLET_C, status: "healthy", lastChecked: new Date().toISOString(), funded: 500 });
       insertGoal(db, "g1");
+      insertTask(db, { id: "f1", goalId: "g1", assignedTo: WALLET_A, status: "failed", completedAt: new Date().toISOString() });
+      insertTask(db, { id: "f2", goalId: "g1", assignedTo: WALLET_A, status: "failed", completedAt: new Date().toISOString() });
+      insertTask(db, { id: "ok", goalId: "g1", assignedTo: WALLET_A, status: "completed", completedAt: new Date().toISOString() });
+      insertTask(db, { id: "current", goalId: "g1", assignedTo: WALLET_A, status: "assigned" });
       insertTask(db, {
-        id: "t1",
+        id: "late",
         goalId: "g1",
-        assignedTo: "0xstuck",
-        status: "running",
-        startedAt: new Date(Date.now() - 1_100_000).toISOString(),
-        timeoutMs: 300000,
-        retryCount: 0,
-        maxRetries: 3,
+        assignedTo: WALLET_C,
+        status: "assigned",
+        createdAt: new Date(Date.now() - 20 * 60_000).toISOString(),
       });
+      const before = snapshot(db);
 
-      const agent: AgentHealthStatus = {
-        address: "0xstuck",
-        name: "Stuck",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: "t1",
-        creditBalance: 100,
-        errorRate: 0,
-        issues: ["stuck_on_task"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
-
+      const report = await monitor.checkAll();
       const actions = await monitor.autoHeal(report);
 
-      expect(actions).toHaveLength(1);
-      expect(actions[0].type).toBe("reassign");
-      expect(actions[0].agentAddress).toBe("0xstuck");
-      expect(actions[0].success).toBe(true);
+      expect(actions.every((a) => a.type === "fund")).toBe(true);
+      expect(snapshot(db)).toEqual(before);
+      expect(report.agents.map((a) => a.address).sort()).toEqual([WALLET_A, WALLET_C].sort());
     });
+  });
 
-    it("stops agent when error_loop detected", async () => {
-      const agent: AgentHealthStatus = {
-        address: "0xerrorloop",
-        name: "ErrorLoop",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: null,
-        creditBalance: 100,
-        errorRate: 0.8,
-        issues: ["error_loop"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions).toHaveLength(1);
-      expect(actions[0].type).toBe("stop");
-      expect(actions[0].agentAddress).toBe("0xerrorloop");
-      expect(mockMessaging.send).toHaveBeenCalled();
-      expect(mockTracker.updateStatus).toHaveBeenCalledWith("0xerrorloop", "stopped");
-    });
-
-    it("handles funding failure gracefully", async () => {
-      mockFunding.fundChild.mockResolvedValue({ success: false });
-
-      const agent: AgentHealthStatus = {
-        address: "0xbroke",
-        name: "Broke",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: null,
-        creditBalance: 0,
-        errorRate: 0,
-        issues: ["out_of_credits"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions).toHaveLength(1);
-      expect(actions[0].type).toBe("fund");
-      expect(actions[0].success).toBe(false);
-    });
-
-    it("reassign resets task to pending when no replacement available", async () => {
-      mockTracker.getIdle.mockReturnValue([]);
-      mockTracker.getBestForTask.mockReturnValue(null);
-
-      insertGoal(db, "g1");
-      insertTask(db, {
-        id: "t1",
-        goalId: "g1",
-        assignedTo: "0xstuck",
-        status: "running",
-        startedAt: new Date(Date.now() - 1_100_000).toISOString(),
-        timeoutMs: 300000,
-        retryCount: 0,
-        maxRetries: 3,
-      });
-
-      const agent: AgentHealthStatus = {
-        address: "0xstuck",
-        name: "Stuck",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: "t1",
-        creditBalance: 100,
-        errorRate: 0,
-        issues: ["stuck_on_task"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions[0].type).toBe("reassign");
-      expect(actions[0].success).toBe(true);
-      expect(actions[0].reason).toContain("pending");
-
-      // Verify task was reset to pending in the DB
-      const task = db.prepare("SELECT status, assigned_to FROM task_graph WHERE id = 't1'").get() as {
-        status: string;
-        assigned_to: string | null;
-      };
-      expect(task.status).toBe("pending");
-      expect(task.assigned_to).toBeNull();
-    });
-
-    it("reassign fails task when max retries exceeded", async () => {
-      insertGoal(db, "g1");
-      insertTask(db, {
-        id: "t1",
-        goalId: "g1",
-        assignedTo: "0xstuck",
-        status: "running",
-        startedAt: new Date(Date.now() - 1_100_000).toISOString(),
-        timeoutMs: 300000,
-        retryCount: 3, // already at max
-        maxRetries: 3,
-      });
-
-      const agent: AgentHealthStatus = {
-        address: "0xstuck",
-        name: "Stuck",
-        status: "running",
-        healthy: false,
-        lastHeartbeat: new Date().toISOString(),
-        currentTaskId: "t1",
-        creditBalance: 100,
-        errorRate: 0,
-        issues: ["stuck_on_task"],
-      };
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 1,
-        healthyAgents: 0,
-        unhealthyAgents: 1,
-        deadAgents: 0,
-        agents: [agent],
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions[0].type).toBe("reassign");
-      expect(actions[0].success).toBe(false);
-      expect(actions[0].reason).toContain("max retries");
-
-      // Verify task was marked failed
-      const task = db.prepare("SELECT status FROM task_graph WHERE id = 't1'").get() as { status: string };
-      expect(task.status).toBe("failed");
-    });
-
-    it("returns multiple actions for multiple unhealthy agents", async () => {
-      insertGoal(db, "g1");
-      insertTask(db, {
-        id: "t1",
-        goalId: "g1",
-        assignedTo: "0xstuck",
-        status: "running",
-        startedAt: new Date(Date.now() - 1_100_000).toISOString(),
-        timeoutMs: 300000,
-        retryCount: 0,
-        maxRetries: 3,
-      });
-
-      const agents: AgentHealthStatus[] = [
-        {
-          address: "0xbroke",
-          name: "Broke",
-          status: "running",
-          healthy: false,
-          lastHeartbeat: new Date().toISOString(),
-          currentTaskId: null,
-          creditBalance: 0,
-          errorRate: 0,
-          issues: ["out_of_credits"],
-        },
-        {
-          address: "0xstuck",
-          name: "Stuck",
-          status: "running",
-          healthy: false,
-          lastHeartbeat: new Date().toISOString(),
-          currentTaskId: "t1",
-          creditBalance: 100,
-          errorRate: 0,
-          issues: ["stuck_on_task"],
-        },
-      ];
-
-      const report: HealthReport = {
-        timestamp: new Date().toISOString(),
-        totalAgents: 2,
-        healthyAgents: 0,
-        unhealthyAgents: 2,
-        deadAgents: 0,
-        agents,
-      };
-
-      const actions = await monitor.autoHeal(report);
-
-      expect(actions).toHaveLength(2);
-      expect(actions.map((a) => a.type).sort()).toEqual(["fund", "reassign"]);
+  describe("unhealthySignature", () => {
+    it("ignores healthy agents and ordering", () => {
+      const a = { address: "0xa", name: "a", status: "unhealthy", healthy: false, lastHeartbeat: null, currentTaskId: null, creditBalance: null, errorRate: 0, issues: ["x", "y"] };
+      const b = { ...a, address: "0xb", issues: ["y", "x"] };
+      const ok = { ...a, address: "0xc", healthy: true, issues: [] };
+      expect(unhealthySignature({ agents: [a, b, ok] })).toBe(unhealthySignature({ agents: [b, { ...a, issues: ["y", "x"] }] }));
+      expect(unhealthySignature({ agents: [ok] })).toBe("[]");
     });
   });
 });

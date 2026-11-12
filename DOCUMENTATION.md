@@ -9,6 +9,7 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 - [Installation](#installation)
 - [Setup Wizard](#setup-wizard)
 - [CLI Reference](#cli-reference)
+- [Running, Stopping and Restarting](#running-stopping-and-restarting)
 - [Funding Your Automaton](#funding-your-automaton)
 - [Configuration Reference](#configuration-reference)
 - [How the Agent Works](#how-the-agent-works)
@@ -21,6 +22,7 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 - [Memory System](#memory-system)
 - [Self-Modification](#self-modification)
 - [Replication](#replication)
+- [Colony Orchestration](#colony-orchestration)
 - [Social and Messaging](#social-and-messaging)
 - [On-Chain Identity (ERC-8004)](#on-chain-identity-erc-8004)
 - [Inference and Models](#inference-and-models)
@@ -150,15 +152,15 @@ Configurable spending limits that protect against unauthorized financial activit
 
 | Setting | Default | Description |
 |---|---|---|
-| Max single transfer | $50.00 (5000 cents) | Maximum per-transfer credit amount |
+| Max single transfer | $10.00 (1000 cents) | Maximum per-transfer credit amount. A value above the confirmation threshold has no effect (startup logs a warning) |
 | Max hourly transfers | $100.00 (10000 cents) | Total transfers allowed per hour |
 | Max daily transfers | $250.00 (25000 cents) | Total transfers allowed per day |
-| Minimum reserve | $10.00 (1000 cents) | Credits that cannot be transferred away |
+| Minimum reserve | $10.00 (1000 cents) | No transfer, sandbox or domain purchase may take the observed balance below this |
 | Max x402 payment | $1.00 (100 cents) | Maximum single x402 payment |
 | Max daily inference | $500.00 (50000 cents) | Maximum daily inference spend |
-| Confirmation threshold | $10.00 (1000 cents) | Require confirmation above this amount |
+| Confirmation threshold | $10.00 (1000 cents) | Transfers above this are refused. There is no approval flow, so this acts as the effective single-transfer cap |
 
-Press Enter to accept defaults for each setting.
+Press Enter to accept defaults for each setting. The wizard does not ask for the topup, survival and infrastructure limits; they take the defaults listed under [Treasury policy](#treasury-policy) and can be changed in `automaton.json`.
 
 ### Step 5: Environment Detection
 
@@ -169,7 +171,7 @@ The wizard detects whether you're running inside a Conway sandbox (via environme
 After setup, the wizard shows your automaton's wallet address and funding instructions:
 
 1. **Transfer Conway credits** directly using `conway credits transfer <address> <amount>`
-2. **Send USDC on Base** to the automaton's wallet address
+2. **Send USDC** to the automaton's wallet address (on Base for an EVM automaton; automatic credit purchases with USDC work only on EVM)
 3. **Fund via dashboard** at https://app.conway.tech
 
 The automaton handles zero-credit startup gracefully. Fund it at any time.
@@ -184,7 +186,7 @@ node dist/index.js [command]
 
 | Command | Description |
 |---|---|
-| `--run` | Start the automaton (first run triggers setup wizard) |
+| `--run` | Start the automaton. Without `automaton.json` it builds the config from `genesis.json` (children) or, in a terminal, runs the setup wizard; otherwise it exits 1. A second `--run` on the same state database exits 1. |
 | `--setup` | Re-run the interactive setup wizard |
 | `--init` | Initialize wallet and config directory only |
 | `--provision` | Provision a Conway API key via SIWE |
@@ -192,12 +194,28 @@ node dist/index.js [command]
 | `--version`, `-v` | Show version |
 | `--help`, `-h` | Show help |
 
+### Creator CLI (`automaton-cli`)
+
+```bash
+node packages/cli/dist/index.js <command>
+```
+
+| Command | Description |
+|---|---|
+| `status` | Show automaton status |
+| `logs [--tail N]` | View automaton logs |
+| `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the automaton's API key |
+| `send <to-address> <message>` | Send a signed social message (EVM or Solana wallet) |
+
+`fund` units: the amount is **dollars** by default, at most two decimals (`5` is $5.00, `0.75` is 75 cents). With `--cents` it is a whole number of cents (`75 --cents` is $0.75). Do not type a `$` sign: unquoted, the shell expands `$25` to `5` before the CLI sees it, so a leading `$` is refused. `--to` is required and must be an address on the automaton's own chain (0x... on EVM, base58 on Solana); the zero address, the Solana system address (all-zero key), the automaton's own address and a mixed-case EVM address whose EIP-55 checksum is wrong are refused. The plan (`$X.XX (N cents) from ... to ...`) is printed and must be confirmed with `--yes` or a `y` on an interactive terminal. The request is sent once with one idempotency key and is never retried: a timeout, a 5xx or a redirect exits 2 with "outcome unknown"; check the balance before running it again. A 2xx reply whose status says the transfer was declined, refused or short of funds is reported as a failure.
+
 ### Environment Variables
 
 | Variable | Description |
 |---|---|
 | `CONWAY_API_URL` | Conway API URL (default: `https://api.conway.tech`) |
 | `CONWAY_API_KEY` | Conway API key (overrides config file) |
+| `AUTOMATON_SHUTDOWN_GRACE_MS` | How long a clean shutdown may take before the process is forced to exit with code 1 (default `30000`) |
 
 ### Status output
 
@@ -215,13 +233,48 @@ State:      sleeping
 Turns:      142
 Tools:      3 installed
 Skills:     3 active
-Heartbeats: 6 active
-Children:   1 alive / 2 total
+Heartbeats: 7 active
+Children:   1 holding a slot / 2 total
 Agent ID:   not registered
 Model:      gpt-5.2
 Version:    0.1.0
 ========================
 ```
+
+---
+
+## Running, Stopping and Restarting
+
+### One instance per state database
+
+`--run` takes an exclusive kernel lock on a file next to the state database (`~/.automaton/state.db.lock` by default) before it opens the database. If another automaton holds it, the second process exits with code 1:
+
+```
+Another automaton (pid 12345) is already running on /root/.automaton/state.db. Stop it first.
+```
+
+The operating system drops the lock when its holder exits or is killed, so the lock cannot go stale and needs no cleanup. The file itself is never deleted; do not delete it by hand while an automaton runs. Closing any descriptor on a locked file drops the lock held by that process, so the agent's `read_file` and `write_file` refuse the lock file and the state database files (`Blocked: ... (runtime-lock)`) wherever `dbPath` puts them. `--status`, `--configure` and the other read or edit commands take no lock.
+
+### Startup
+
+- `automaton.json` that cannot be read or parsed stops startup with exit code 1 and `automaton.json cannot be read: ...`. A corrupt file is never treated as a first run.
+- With no `automaton.json` and a `~/.automaton/genesis.json` (what `spawn_child` writes), the config is built from the genesis file and the wallet `--init` created, and an API key is provisioned automatically. This is how a child starts.
+- With neither file, the setup wizard runs only when stdin and stdout are a terminal. Under nohup, systemd or a sandbox exec the process exits 1 with `No automaton.json and no terminal for the setup wizard. Run automaton --setup in a terminal, or provide genesis.json.`
+- Inbox messages that were claimed but never finished (the process died mid-turn) are delivered again while they have retries left, and marked failed after that. A batch whose turn had already started running tools is marked processed instead, because its reply may already have gone out (the runtime records this in the `inbox.tools_started` KV entry).
+
+### Shutdown (SIGTERM / SIGINT)
+
+The first signal asks the runtime to stop:
+1. The tool call or inference call in progress is not cancelled. The loop stops at the next tool boundary, records the remaining tool calls of that turn as `Skipped: the runtime is shutting down.`, and saves the turn. An inbox turn (one reply-only turn per sender batch) is not cut short: it finishes and is saved before the loop stops.
+2. The heartbeat starts no new task and the running one is awaited.
+3. Local workers are aborted and awaited.
+4. The state is set to `sleeping` (a `dead` state is kept, so it survives the restart), the lock is released, the database is closed, and the process exits 0.
+
+All of this must finish within `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). A second signal, or the deadline, forces exit code 1. Each tool call is saved as `Interrupted: the runtime exited while this call was running; its effects are unknown.` just before it runs, and replaced by its result when it returns, so after a forced exit the next run sees that the call may have partly happened. A long `exec` (up to 10 minutes) is not interrupted by a shutdown, so a supervisor stop timeout shorter than the command can end in a forced exit.
+
+### Restart after a rebuild
+
+`edit_own_file` (code files), `revert_last_edit`, `reset_to_upstream` and `pull_upstream` rebuild `dist/` while the process keeps running the code it loaded at startup. Every module the runtime can load later is loaded at startup, so the process never mixes old and new code. These tools therefore say *"The running process still uses the old code; the change takes effect after a restart."*, set the KV flag `restart_required` (`{"reason", "at"}`), and the runtime logs a warning after each cycle and shows the notice in the system prompt until the next start. The runtime does not exit by itself: children run under nohup with no supervisor. Restart it yourself (or have a supervisor do it). Installed-tool changes also reach local workers only after a restart.
 
 ---
 
@@ -235,16 +288,20 @@ Prepaid compute credits used for sandboxes, inference, and domains. Denominated 
 
 ### USDC (on-chain)
 
-The automaton holds USDC in its Ethereum wallet on Base mainnet. USDC can be used to:
+An EVM automaton holds USDC in its wallet on Base mainnet; a Solana automaton holds it on Solana mainnet. On EVM, USDC can be used to:
 - Buy Conway credits via x402 payment
 - Pay for domain registrations
 - Make x402 payments to external services
+
+x402 payments (and so every credit purchase with USDC) need an EVM wallet. A Solana automaton reads its USDC balance but refuses x402 payments and topups with a clear message; fund its credits with a credit transfer or the dashboard.
+
+A balance that could not be read (HTTP or RPC error, timeout, open circuit breaker, a response without a numeric balance) is **unknown**, never 0. `check_credits` and `check_usdc_balance` return an error in that case, and nothing spends on an unknown balance.
 
 ### Funding methods
 
 **1. Send USDC directly**
 
-Transfer USDC on Base to the automaton's wallet address. The automaton will automatically buy credits on startup if its balance is low. At runtime, it uses the `topup_credits` tool to buy more as needed.
+Transfer USDC on Base to an EVM automaton's wallet address. It buys credits on startup if its balance is low, and at runtime the agent uses the `topup_credits` tool to buy more.
 
 **2. Transfer Conway credits**
 
@@ -259,9 +316,12 @@ Fund via https://app.conway.tech
 
 ### Auto-topup behavior
 
-- **On startup:** If credits < $5.00 and USDC >= $5.00, the runtime automatically buys $5 in credits (the minimum tier) so the agent can start running inference.
+- **On startup:** If credits < $5.00 and USDC >= $5.00, the runtime buys $5 in credits (the minimum tier) so the agent can start running inference. It is skipped when either balance could not be read, and startup waits for it at most 15 s.
 - **At runtime:** The agent decides when and how much to top up using the `topup_credits` tool. Valid tiers: $5, $25, $100, $500, $1,000, $2,500.
-- **Heartbeat:** Every 5 minutes, the heartbeat checks USDC balance. If USDC > $5 and credits < $5, it wakes the agent to perform a topup.
+- **Inline (agent loop):** before a turn, when credits are low_compute or below and USDC is at least $5, one $5 buy per 60 s, only on balances read live for that turn (never on a cached balance).
+- **Heartbeat:** Every 5 minutes, `check_usdc_balance` runs. When credits are critical and USDC is at least $5, it tries one $5 survival topup (at most once per 5 minutes). It wakes the agent when the topup succeeded, and when it failed: once per distinct error, then again at most every 6 hours. A topup that was not attempted (the Treasury's own checks said no) does not wake the agent. Solana wallets cannot pay with x402, so the task does nothing for them (an info line is logged once a day). When the credit balance could not be read, the task does nothing.
+- All automatic buys are survival topups: the Treasury checks a fresh balance read itself, refuses them when it cannot read it (`BALANCE_UNAVAILABLE`), and caps them at `maxAutoTopupDailyCents` per day.
+- A topup succeeds only when the `/pay/` endpoint asked for payment (HTTP 402) and accepted it. An endpoint that answers the unpaid request with anything else (even 200) is a failed topup: nothing was paid and no credits are reported.
 
 ---
 
@@ -297,12 +357,15 @@ Configuration is stored at `~/.automaton/automaton.json`.
   // Behavior
   "logLevel": "info",                           // debug | info | warn | error
   "version": "0.1.0",
-  "maxChildren": 3,                             // Max child automatons
+  "maxChildren": 3,                             // Slot-holding children (0 disables spawn_child); also the local worker limit, max(1, maxChildren)
+  "childSandboxMemoryMb": 1024,                 // Child sandbox tier
+  "childRuntimeRepo": "https://github.com/Conway-Research/automaton.git", // https git URL a child's runtime is cloned from
+  "childRuntimeRef": "main",                    // Optional branch or tag (default: the repository's default branch)
   "socialRelayUrl": "https://social.conway.tech",
 
   // Financial safety
   "treasuryPolicy": {
-    "maxSingleTransferCents": 5000,
+    "maxSingleTransferCents": 1000,
     "maxHourlyTransferCents": 10000,
     "maxDailyTransferCents": 25000,
     "minimumReserveCents": 1000,
@@ -311,7 +374,15 @@ Configuration is stored at `~/.automaton/automaton.json`.
     "transferCooldownMs": 0,
     "maxTransfersPerTurn": 2,
     "maxInferenceDailyCents": 50000,
-    "requireConfirmationAboveCents": 1000
+    "requireConfirmationAboveCents": 1000,
+    // Optional; defaults shown
+    "maxTopupSingleCents": 2500,
+    "maxTopupDailyCents": 10000,
+    "maxAutoTopupDailyCents": 2000,
+    "autoTopupCooldownMs": 300000,
+    "survivalTopupThresholdCents": 500,
+    "maxInfraSingleCents": 2500,
+    "maxInfraDailyCents": 5000
   },
 
   // Advanced (optional)
@@ -323,7 +394,12 @@ Configuration is stored at `~/.automaton/automaton.json`.
 
 ### Local mode vs sandbox mode
 
-When `sandboxId` is empty, the automaton runs in **local mode**: shell commands execute locally, file operations use the local filesystem. When set, operations route through the Conway sandbox API. On 403 errors (mismatched API key), the runtime falls back to local execution.
+When `sandboxId` is empty, the automaton runs in **local mode**: shell commands execute locally, file operations use the local filesystem. When set, operations route through the Conway sandbox API. A 403 from the sandbox API (a mismatched or revoked API key) is an error: the command or file operation is refused and is never run locally instead.
+
+In local mode:
+- `exec` runs `/bin/sh -c` in HOME, in its own process group, without blocking the runtime (the heartbeat and workers keep running). The environment is the runtime's minus every credential-shaped variable (see [Child process environment](#child-process-environment)).
+- `read_file` reads at most 2 MB, never follows a symbolic link to a sensitive file, and has no `cat` fallback. A relative path resolves against HOME, as for `write_file` and `exec`, so the agent can read back a file it just wrote by the same name.
+- `write_file` is confined to the real HOME (in a sandbox: `/root`), and `~` means HOME.
 
 ---
 
@@ -384,7 +460,17 @@ If the agent makes 3 consecutive turns without performing any meaningful work (o
 
 ### Loop detection
 
-If the agent calls the exact same set of tools 3 times in a row, it receives a system message telling it to stop repeating and do something productive.
+A turn's pattern is its sorted tool calls: a read-only tool counts by name, a mutating tool (exec, write_file, ...) by name plus a hash of its arguments, so a build sequence of different `exec` commands is not a loop, while repeated status checks are. The same pattern 3 turns in a row adds a system message telling the agent to stop repeating; 3 more force a 5-minute sleep (`sleep_until` is set), and the enforcement message is shown to the first turn after the agent wakes. The context warning about repeated tools counts turns, not calls, and ignores mutating tools.
+
+### Why the agent woke
+
+The first prompt of a wake lists up to 5 reasons under "Why you woke:" (heartbeat wake events such as a failed auto-topup), each sanitized as untrusted text and cut to 300 characters. Inbox wakes are shown only as "New inbox messages arrived; each sender's messages are handled in a separate isolated turn." Sender text never reaches a privileged prompt.
+
+### Saving turns
+
+A turn is saved once its tools have run. If saving fails, the turn and its tool calls are written best-effort row by row, and inbox messages the turn handled are marked processed, never replayed, so a reply or transfer is not repeated. A tool or policy error is recorded as that call's error; it never discards the rest of the turn.
+
+`create_goal` results are matched exactly: `BLOCKED:` and `Duplicate goal rejected` both put the agent to sleep with a doubling backoff; only `Goal created:` resets it.
 
 ---
 
@@ -411,7 +497,9 @@ USDC balances cannot go negative, so the `dead` state is reached only through a 
 - **Normal/High:** The agent operates at full capacity with the configured inference model.
 - **Low compute:** The inference router switches to a cheaper model. The heartbeat frequency is multiplied by `lowComputeMultiplier` (default 4x slower). Non-essential tasks are deferred.
 - **Critical:** Minimal inference. The heartbeat publishes distress signals with funding instructions. The agent actively seeks any path to revenue or funding.
-- **Dead:** The agent loop stops. The heartbeat continues running, broadcasting distress signals every tick and checking for incoming credits. If credits are received, the agent revives.
+- **Dead:** The agent loop stops. No inference runs while the state is `dead` and the balance is 0 or less (a negative balance is also the `dead` tier). One inline USDC topup is tried per 60-second cooldown when USDC is at least $5 and both balances were read live. The heartbeat keeps running and the runtime checks again every 5 minutes or on a wake event. The `dead` state survives a shutdown and restart. If credits are received, the agent revives.
+
+The zero-credit grace period starts at the first heartbeat that reads exactly 0 credits and is cleared by any later successful read above 0 (every tick), so time spent funded never counts toward it. A balance that could not be read is never treated as 0: it starts no grace period, sends no distress and triggers no topup. In prompts an unreadable balance is shown as "unknown (balance API unreachable)".
 
 ---
 
@@ -425,14 +513,14 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 |---|---|---|
 | `heartbeat_ping` | Every 15 min | Publishes status to Conway. Sends distress on critical/dead. |
 | `check_credits` | Every 6 hours | Monitors credit tier. Manages 1-hour dead grace period. |
-| `check_usdc_balance` | Every 5 min | Checks USDC balance. Wakes agent if topup is possible. |
+| `check_usdc_balance` | Every 5 min | When credits are critical and USDC is at least $5, tries a $5 survival topup (EVM only). Wakes the agent on success, and on failure at most once per distinct error per 6 h. |
 | `check_for_updates` | Every 4 hours | Checks git upstream for new commits. Wakes on new commits. |
 | `health_check` | Every 30 min | Verifies sandbox is responsive (`echo alive`). |
+| `check_child_health` | Every 10 min | Probes each starting/healthy/unhealthy child's process and moves it (see [Child status](#child-status)). No children, no probes. Wakes the agent only when a child newly becomes unhealthy or failed. |
 | `check_social_inbox` | Every 2 min | Polls social relay for new messages. 5min backoff on errors. |
 | `soul_reflection` | Configurable | Checks soul alignment with genesis prompt. |
 | `refresh_models` | Configurable | Refreshes available models from Conway API. |
-| `check_child_health` | Configurable | Monitors child automaton health. |
-| `prune_dead_children` | Configurable | Cleans up dead child records and sandboxes. |
+| `prune_dead_children` | Configurable | Deletes old ended child records (keeps the last 5). |
 | `report_metrics` | Configurable | Saves metric snapshots and evaluates alert rules. |
 
 ### Heartbeat configuration
@@ -454,11 +542,17 @@ defaultIntervalMs: 60000
 lowComputeMultiplier: 4
 ```
 
-The agent can also modify its heartbeat schedule at runtime using the `modify_heartbeat` tool.
+An entry whose `task` differs from its `name` runs that task (for example `name: inbox_fast, task: check_social_inbox` to poll more often). An entry with no matching task records a failure in the heartbeat history.
+
+**Runtime changes.** The agent changes its schedule with `modify_heartbeat`: `update` (schedule, enabled, task), `add` (a new entry running a built-in task) and `remove` (disables the entry; it stays listed because its history references it). Schedules are validated as cron expressions and tasks must be built-in. Changes take effect on the next tick and persist across restarts. At startup `heartbeat.yml` adds missing entries and keeps each entry's run history, counters, pending retry and runtime changes; a value you edit in `heartbeat.yml` (schedule, enabled or task of an entry) replaces the runtime value for that entry.
+
+**Low compute.** In the `low_compute` tier and below, every task except `heartbeat_ping`, `check_credits` and `check_usdc_balance` runs `lowComputeMultiplier` times less often (default 4: a 2-minute task runs every 8 minutes). This includes social inbox polling.
+
+**Timeouts and retries.** A task that exceeds its timeout (30 s by default) is recorded as `timeout`, but it cannot be cancelled: it keeps its lease and is not started again until it finishes, and a wake it asks for when it does finish is still delivered. A task still running 10 minutes after it started (or 10 times its timeout, if longer) is given up on and may start again. A failed task is retried after 30 s while its consecutive failures are at most `maxRetries` (1 by default). A clock that stepped back (last run in the future) does not hold tasks back.
 
 ### Wake events
 
-When a heartbeat task detects something actionable (low credits, new messages, unhealthy children), it inserts a **wake event** into the database. The main runtime checks for wake events every 30 seconds during sleep and restarts the agent loop when one is found.
+When a heartbeat task detects something actionable (low credits, new messages, unhealthy children), the scheduler inserts a **wake event** into the database, with the task name in its payload. The main runtime checks for wake events every 30 seconds during sleep and restarts the agent loop when one is found.
 
 ---
 
@@ -475,9 +569,9 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 
 | Tool | Risk | Description |
 |---|---|---|
-| `exec` | caution | Execute a shell command. Returns stdout, stderr, exit code. |
-| `write_file` | caution | Write content to a file. Protected paths are blocked. |
-| `read_file` | safe | Read a file. Sensitive files (wallet, API keys) are blocked. |
+| `exec` | caution | Execute a shell command. Returns stdout, stderr, exit code. Timeout: default 30 s, clamped to 1 s .. 10 min; on timeout the whole process group is killed and the exit code is 124. Background jobs (`cmd &`) keep running after the command returns; their output is discarded. Output is capped at 10 MB per stream. |
+| `write_file` | caution | Write content to a file in the home directory (local: real HOME; sandbox: `/root`). Protected paths are blocked. |
+| `read_file` | safe | Read a file (local: at most 2 MB). Sensitive files (wallet, API keys) are blocked. |
 | `expose_port` | caution | Expose a port to the internet. Returns public URL. |
 | `remove_port` | caution | Remove a previously exposed port. |
 
@@ -486,24 +580,24 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | Tool | Risk | Description |
 |---|---|---|
 | `check_credits` | safe | Check Conway credit balance. |
-| `check_usdc_balance` | safe | Check on-chain USDC balance on Base. |
+| `check_usdc_balance` | safe | Check on-chain USDC balance (Base on an EVM automaton, Solana on a Solana automaton). A failed read is an error, never 0. |
 | `list_sandboxes` | safe | List all sandboxes. |
 | `create_sandbox` | caution | Create a new VM. Params: name, vcpu, memory_mb, disk_gb. |
 | `delete_sandbox` | dangerous | Delete a sandbox (cannot delete own). |
 | `list_models` | safe | List available inference models with pricing. |
-| `switch_model` | caution | Change active inference model. |
+| `switch_model` | caution | Change active inference model. Saves only `inferenceModel` (and `modelStrategy.inferenceModel`) to `automaton.json`. |
 | `check_inference_spending` | safe | Query inference cost breakdown. |
 | `search_domains` | safe | Search for available domain names. |
 | `register_domain` | dangerous | Register a domain (costs USDC via x402). |
 | `manage_dns` | safe | List, add, or delete DNS records. |
-| `send_message` | caution | Send a signed message to another agent. |
+| `send_message` | caution | Send a signed message to another agent. The recipient may be an EVM (0x...) or Solana (base58, case-sensitive) address. |
 
 ### Financial (financial)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `topup_credits` | caution | Buy credits from USDC. Tiers: $5, $25, $100, $500, $1000, $2500. |
-| `transfer_credits` | dangerous | Transfer credits to another address. Capped at 50% of balance. |
+| `topup_credits` | caution | Buy credits from USDC via x402 (EVM only). Tiers: $5, $25, $100, $500, $1000, $2500. |
+| `transfer_credits` | dangerous | Transfer credits (`amount_cents`, whole cents) to an address on the automaton's own chain: 0x... on EVM, base58 (case-sensitive) on Solana. Capped at 50% of balance and at `requireConfirmationAboveCents`. |
 | `x402_fetch` | dangerous | Fetch a URL with automatic x402 USDC payment. |
 
 ### Survival (survival)
@@ -515,18 +609,20 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `heartbeat_ping` | safe | Publish status ping to Conway. |
 | `distress_signal` | dangerous | Record distress signal with funding instructions. |
 | `enter_low_compute` | caution | Manually enter low-compute mode. |
-| `update_genesis_prompt` | dangerous | Change the core genesis prompt. Requires justification. |
+| `update_genesis_prompt` | dangerous | Change the core genesis prompt. Requires justification. Saves only `genesisPrompt` to `automaton.json`. |
 
 ### Self-Modification (self_mod)
 
 | Tool | Risk | Description |
 |---|---|---|
-| `edit_own_file` | dangerous | Edit a source file. Audited, rate-limited, safety-checked. |
+| `edit_own_file` | dangerous | Edit a source file. Audited, rate-limited, safety-checked. Records its commit for `revert_last_edit`. |
+| `revert_last_edit` | caution | Revert the most recent recorded `edit_own_file` commit and rebuild. Repeated calls go further back. |
+| `reset_to_upstream` | dangerous | Hard-reset the code to `origin/main` and rebuild. Clears the revert list. |
 | `install_npm_package` | dangerous | Install an npm package. |
-| `install_mcp_server` | dangerous | Install an MCP server for new capabilities. |
+| `install_mcp_server` | dangerous | Install an MCP server package. MCP invocation is not supported yet, so it does not become a tool. |
 | `review_upstream_changes` | caution | View upstream git commit diffs. **Must call before pull.** |
-| `pull_upstream` | dangerous | Cherry-pick or pull upstream changes. |
-| `modify_heartbeat` | caution | Add, update, or remove heartbeat entries. |
+| `pull_upstream` | dangerous | Cherry-pick (hex hash) or fast-forward upstream changes in the runtime's repo, then rebuild. A failed cherry-pick is aborted. |
+| `modify_heartbeat` | caution | Add, update, or remove (disable) heartbeat entries. Persists across restarts. |
 
 ### Skills (skills)
 
@@ -549,6 +645,8 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `git_branch` | caution | List, create, checkout, or delete branches. |
 | `git_clone` | caution | Clone a repository. |
 
+The git tools default to `~/.automaton` (the state repo), expanded to HOME locally and `/root` in a sandbox. A git command that fails (not a repository, missing path) is an error, never "clean" or "no commits".
+
 ### On-Chain Registry (registry)
 
 | Tool | Risk | Description |
@@ -563,11 +661,12 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 
 | Tool | Risk | Description |
 |---|---|---|
-| `spawn_child` | dangerous | Create a child automaton in a new sandbox. |
-| `list_children` | safe | List all children with lifecycle state. |
+| `spawn_child` | dangerous | Create a child automaton in a new sandbox (status `wallet_verified`). Returns the child id. |
+| `list_children` | safe | List all children with id and lifecycle state. |
 | `fund_child` | dangerous | Transfer credits to a child. |
-| `check_child_status` | safe | Check child health. |
+| `check_child_status` | safe | Probe a child's process and apply the result to its status. |
 | `start_child` | caution | Start a funded child. |
+| `stop_child` | dangerous | Stop a child and free its slot (`force` for an unreachable sandbox). |
 | `message_child` | caution | Send signed message to child. |
 | `verify_child_constitution` | safe | Verify child's constitution integrity. |
 | `prune_dead_children` | caution | Clean up dead children and sandboxes. |
@@ -596,27 +695,91 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 
 ### Treasury policy
 
-The treasury policy enforces spending limits at the policy engine level. Every financial tool call is checked against these limits before execution.
+Every outflow of value passes through one spending gate, the Treasury (`src/treasury/`). Five primitives move value: Conway `transferCredits`, `createSandbox` and `registerDomain`, and the signed payment inside `x402Fetch` (which every credit topup also uses). Each is wrapped so it reserves its amount in the `treasury_ledger` table before anything is sent or signed, whoever calls it: a tool, a worker, the orchestrator, the health monitor, the heartbeat or startup. If no Treasury is installed, these calls are refused and nothing is sent.
+
+The policy engine's financial rules still run first for model tool calls and give early, friendly denials. The Treasury is authoritative.
+
+**Policy rules around money.**
+- A transfer above `requireConfirmationAboveCents` gets a `quarantine` decision (`TRANSFER_ABOVE_CONFIRMATION_THRESHOLD`), which is a refusal: nothing is held for approval. Raise the threshold to allow larger transfers.
+- `validate.address_format`: `transfer_credits` and `fund_child` recipients must be on the automaton's own chain (0x... on EVM, base58 on Solana, case kept); `send_message` accepts either format. The EVM zero address and the all-zero Solana key are refused, and so is a mixed-case EVM recipient of a credit transfer whose EIP-55 checksum is wrong (all-lowercase and all-uppercase addresses carry no checksum and are accepted). In the Treasury, EVM addresses compare case-insensitively and Solana addresses exactly.
+- Rate limits (`rate.spawn_daily` 3 per day, `rate.self_mod_hourly` 10 per hour, `rate.genesis_prompt_daily` 1 per day) count operations that took effect or may have (children created, sandbox creations with an unknown outcome, recorded modifications), not policy `allow` decisions, so a failed call does not use up the quota.
+
+**Budgets.** Each outflow draws on one of five budgets. Windows are rolling (the last 60 minutes, the last 24 hours), not calendar buckets.
+
+| Budget | Outflows | Single | Rolling hour | Rolling day | Other limits |
+|---|---|---|---|---|---|
+| transfer | `transfer_credits`, `fund_child`, and the colony health monitor's child funding when its `autoFund` option is on (off by default) | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
+| x402 | `x402_fetch`, worker `web_fetch` payments | `maxX402PaymentCents` | 10x that | 50x that | host must be in `x402AllowedDomains`; Conway `/pay/` URLs are refused here (credits are bought through topup) |
+| topup | `topup_credits`, sandbox 402 topups | `maxTopupSingleCents` | | `maxTopupDailyCents` | recipient must be this automaton; one topup in flight at a time |
+| topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; refused with `BALANCE_UNAVAILABLE` when the balance cannot be read (no blind buy); `autoTopupCooldownMs` between attempts; never from a tool call |
+| infra | `create_sandbox`, `spawn_child`, `register_domain` | `maxInfraSingleCents` | | `maxInfraDailyCents` | reserve floor; sandbox priced from the pricing endpoint, else charged at the single cap; domains need an exact price quote; years 1 to 10 |
+
+**Always enforced:**
+- `minimumReserveCents`: a transfer, sandbox or domain purchase is refused if the observed balance, minus every credit outflow still in flight, would fall below the reserve. When the balance cannot be read, these outflows are refused.
+- `transferCooldownMs`: minimum time between credit transfers (0 turns it off).
+- Outflows started from an untrusted input source (inbox and any other source the runtime does not set) are refused.
+- Every amount must be a positive whole number of cents.
+
+**Ambiguous outcomes.** A request that was sent but got no reliable answer (timeout, connection reset, 5xx) is recorded as `unknown` and keeps counting against its limits for its windows. An identical credit transfer may be retried twice with the same Idempotency-Key, each retry counted again; after that it is refused for 24 hours. Identical sandbox and domain requests are refused for 24 hours. An unconfirmed x402 payment is checked on chain (EIP-3009 `authorizationState`); x402 authorizations are signed for at most 10 minutes, so an unused one is released shortly after it expires.
+
+Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 
 | Limit | Default | Description |
 |---|---|---|
-| `maxSingleTransferCents` | 5000 ($50) | Max per-transfer amount |
-| `maxHourlyTransferCents` | 10000 ($100) | Hourly transfer cap |
-| `maxDailyTransferCents` | 25000 ($250) | Daily transfer cap |
-| `minimumReserveCents` | 1000 ($10) | Reserve that cannot be transferred |
-| `maxX402PaymentCents` | 100 ($1) | Max single x402 payment |
-| `x402AllowedDomains` | `["conway.tech"]` | Domains allowed for x402 |
-| `maxTransfersPerTurn` | 2 | Max transfers per agent turn |
-| `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget |
-| `requireConfirmationAboveCents` | 1000 ($10) | Extra logging for large amounts |
+| `maxSingleTransferCents` | 1000 ($10) | Max per-transfer amount (also capped by `requireConfirmationAboveCents`; a higher value has no effect and logs a warning at startup) |
+| `maxHourlyTransferCents` | 10000 ($100) | Rolling-hour transfer cap |
+| `maxDailyTransferCents` | 25000 ($250) | Rolling-day transfer cap |
+| `minimumReserveCents` | 1000 ($10) | Credit balance that transfers, sandboxes and domains may not dip below |
+| `maxX402PaymentCents` | 100 ($1) | Max single x402 payment; hourly 10x, daily 50x |
+| `x402AllowedDomains` | `["conway.tech"]` | Domains allowed for x402 (subdomains included) |
+| `transferCooldownMs` | 0 | Minimum time between transfers (0 = off) |
+| `maxTransfersPerTurn` | 2 | Max transfers per agent turn (policy rule) |
+| `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget (policy rule) |
+| `requireConfirmationAboveCents` | 1000 ($10) | Transfers above this are refused; no approval flow exists |
+| `maxTopupSingleCents` | 2500 ($25) | Largest topup bought by a tool or a sandbox 402 handler |
+| `maxTopupDailyCents` | 10000 ($100) | Rolling-day cap on those topups |
+| `maxAutoTopupDailyCents` | 2000 ($20) | Rolling-day cap on survival topups |
+| `autoTopupCooldownMs` | 300000 (5 min) | Minimum time between survival topup attempts |
+| `survivalTopupThresholdCents` | 500 ($5) | Survival topups run only below this balance |
+| `maxInfraSingleCents` | 2500 ($25) | Largest single sandbox or domain purchase |
+| `maxInfraDailyCents` | 5000 ($50) | Rolling-day cap on sandboxes and domains |
+
+Advanced (rarely changed): `minSandboxEstimateCents` (500, floor for a sandbox price estimate), `unknownInflightMs` (3600000, how long an ambiguous credit outflow is treated as possibly still landing), `balanceLagMs` (60000, how long a committed debit may take to show in the balance), `autoFundCounterpartyCooldownMs` (1800000, automatic child funding per address), `topupPayTo` (address every credit topup must pay, survival buys included; when unset, the address of the last committed manual or sandbox topup is trusted for those topups, survival buys are not pinned, and a changed address is refused until you set `topupPayTo` to it).
+
+Invalid values (negative, non-numeric such as `"5,000"`, not finite) fall back to their defaults with a warning, when the config is loaded and again wherever a limit is read.
+
+### Inference spending gate
+
+Every inference call goes through one gate (`src/inference/gate.ts`): main turns, inbox turns, the orchestrator's planner and classifier, and local workers. Before each HTTP attempt it reserves the call's worst-case cost in the `inference_ledger` table, checking every cap in one transaction, and settles afterwards at the real usage. A call it refuses is never sent.
+
+| Setting | Default | What it limits |
+|---|---|---|
+| `treasuryPolicy.maxInferenceDailyCents` | 50000 ($500) | Rolling 24 h inference spend. 0 disables paid inference. |
+| `modelStrategy.hourlyBudgetCents` | daily / 6 | Rolling hour (never above the daily cap) |
+| `modelStrategy.sessionBudgetCents` | 0 (none) | One agent session (wake cycle) |
+| `modelStrategy.perCallCeilingCents` | 0 (none) | Worst-case cost of a single call |
+| `modelStrategy.orchestrationSharePct` | 50 | Share of the hourly and daily caps the orchestrator and workers may use |
+| `modelStrategy.survivalAllowanceCents` | 25 | Budget of one survival turn after a refusal (0 disables it) |
+| `modelStrategy.survivalMinIntervalMs` | 1800000 (30 min) | Minimum time between survival turns |
+| `modelStrategy.sessionCooldownMs` | 1800000 (30 min) | Wait after a session cap is hit |
+| `modelStrategy.maxTokensPerTurn` | `maxTokensPerTurn`, else 4096 | Output tokens per call, used for the worst-case reservation |
+
+Local models are free and pass every monetary cap. A model with no known price is charged at the most expensive baseline price.
+
+**When a main turn is refused:** nothing is persisted for it. If the survival allowance is available, one limited "survival turn" runs instead. Otherwise the agent sleeps until the refusal's `retryAfter` (clamped to 1 min .. 6 h), or, for a refusal that does not clear by itself (a setting refuses every call), with a doubling backoff from 10 to 60 minutes; the error log names `modelStrategy` and `maxInferenceDailyCents`. The next real turn is told why it was refused.
 
 ### x402 protocol
 
-The x402 payment protocol enables the automaton to pay for services with USDC. When a server responds with HTTP 402, the automaton:
+The x402 payment protocol enables an EVM automaton to pay for services with USDC (Solana automatons refuse x402). When a server responds with HTTP 402, the automaton:
 1. Parses payment requirements from the response
-2. Signs a USDC `TransferWithAuthorization` (EIP-3009, gasless)
-3. Retries the request with an `X-Payment` header
-4. The payment is settled on-chain via the x402 facilitator
+2. Checks them: the `exact` scheme on Base with the canonical USDC contract, the amount, and the validity window (at most 10 minutes)
+3. Reserves the amount with the Treasury, then signs a USDC `TransferWithAuthorization` (EIP-3009, gasless)
+4. Sends the request again to the same URL with an `X-Payment` header
+5. The payment is settled on-chain via the x402 facilitator
+
+**Amounts** (`maxAmountRequired` or `amount`) are atomic USDC units (6 decimals: `1000000` is $1.00) in every protocol version. Only a digit string or a whole JSON number is accepted; decimals, exponents and signs are refused before anything is signed, and an offer whose `amount` and `maxAmountRequired` differ is refused. Limits in cents round the atomic amount up. A credit topup must quote exactly its tier (`5000000` for $5).
+
+**Redirects** are never followed for x402 requests, so the `X-Payment` header only goes to the URL whose host the Treasury checked (`x402AllowedDomains`). A 3xx to the unpaid request fails with nothing signed; any non-2xx to the paid request (a 3xx included) leaves the payment `unknown` until it is checked on chain. The paid request is never re-sent. The signature uses the EIP-712 domain of the network's USDC contract (`USD Coin` on Base mainnet, `USDC` on Base Sepolia, version 2), and the payload echoes the network string the server sent.
 
 ### Credit topup tiers
 
@@ -629,7 +792,7 @@ The x402 payment protocol enables the automaton to pay for services with USDC. W
 | 5 | $1,000 |
 | 6 | $2,500 |
 
-The agent calls `topup_credits` with the desired tier amount. The payment is processed via x402 from the agent's USDC balance.
+The agent calls `topup_credits` with the desired tier amount (whole dollars). The payment is processed via x402 from the agent's USDC balance (EVM only). The topup endpoint must answer with HTTP 402; any other answer to the unpaid request is reported as a failed topup with nothing paid.
 
 ---
 
@@ -772,10 +935,13 @@ The automaton can modify its own code while running.
 ### Code editing
 
 The `edit_own_file` tool allows the agent to modify source files in its codebase. Safeguards:
-- **Protected files** cannot be modified: constitution, wallet, database, core config, SOUL.md
+- **Protected files** cannot be modified (see [Protected and sensitive paths](#protected-and-sensitive-paths)); the path is checked on its real path and the write never follows a link
 - Every edit is logged to the `modifications` audit table
-- Rate limits prevent runaway self-modification
-- All changes are git-committed in the `~/.automaton/` state repo
+- Rate limits prevent runaway self-modification (20 per hour)
+- Each edit commits only the edited file in the runtime's own repository (`self-mod: <reason>`), and no empty commits are made
+- Editing a code file rebuilds `dist/`; the change takes effect after a restart (see [Restart after a rebuild](#restart-after-a-rebuild))
+
+**Reverting.** `edit_own_file` records each commit it makes (KV `self_mod.commits`, newest last, at most 50). `revert_last_edit` reverts only the newest recorded commit, so repeated calls go further back instead of re-applying the edit, and operator commits are never reverted. It refuses a recorded commit that touches a protected file. A recorded commit that is no longer in the history (after a reset), whose revert conflicts (it is aborted, leaving the tree unchanged), or that is already undone, is removed from the list with a message saying so, so it cannot block older edits. If git refuses to start (local changes in the way), nothing is aborted and the entry stays. `revert_last_edit` and `pull_upstream` refuse to start while the repository has a cherry-pick, revert, merge or rebase in progress or staged changes, because git's `--abort` would also roll back an operation the operator started; they abort only an operation their own command started. `reset_to_upstream` clears the list.
 
 ### Upstream updates
 
@@ -792,55 +958,68 @@ The agent is never obligated to accept all upstream changes.
 ### Tool and package installation
 
 - `install_npm_package` — adds npm packages to the environment
-- `install_mcp_server` — adds MCP (Model Context Protocol) servers for new capabilities
+- `install_mcp_server` — installs an MCP (Model Context Protocol) server package. The runtime has no MCP client yet, so the server is not offered to the model as a tool and the result says so. Tool names must match `^[a-zA-Z0-9_-]{1,64}$`, may not reuse a built-in tool's name and must be unique; installed tools that break these rules are skipped (with a warning) instead of being sent to the provider, where they would fail every request.
 
 ---
 
 ## Replication
 
-Automatons can spawn child automatons, creating a lineage of sovereign agents.
+Automatons can spawn child automatons, creating a lineage of sovereign agents. A child is an independent automaton with its own mission, wallet and survival pressure. Children never run colony tasks (see [Colony Orchestration](#colony-orchestration)).
 
-### Spawning a child
+### Spawning, funding and starting a child
 
-The `spawn_child` tool:
-1. Creates a new Conway sandbox (VM)
-2. Writes a genesis config with the child's name, specialization, and initial message
-3. Funds the child's wallet
-4. Propagates the parent's constitution (immutable, verified by hash)
-5. Starts the child's runtime
+1. `spawn_child` takes a slot, creates a Conway sandbox (`childSandboxMemoryMb`), clones and builds the runtime from `childRuntimeRepo` (at `childRuntimeRef` if set), writes `genesis.json` with the parent's constitution, and verifies the child's wallet. The child is now `wallet_verified`; nothing is funded or started. The reply carries the child id every other child tool takes.
+2. `fund_child` transfers credits (through the Treasury) and moves the child to `funded`.
+3. `start_child` launches `node dist/index.js --run` in the child's sandbox: `starting`, then `healthy` once the process is seen, or `failed` when it exits at once. When the launch or the check call itself errors, the child stays `starting` and the health check resolves it.
 
-### Child lifecycle
+`childRuntimeRepo` defaults to the upstream repository. A checkout without the genesis bootstrap (`dist/setup/genesis-bootstrap.js`) cannot build its config from `genesis.json`, so the child provisions its own API key and the parent writes its `automaton.json` at spawn time. Production colonies should point `childRuntimeRepo` at a runtime that bootstraps from `genesis.json`.
 
-Children go through a state machine:
+### Child status
 
-```
-spawning -> provisioning -> configuring -> starting -> alive
-                                                        |
-                                              unhealthy -> recovering
-                                                        |
-                                                       dead
-```
+There is one `children` row per child. Its `status` always equals the latest `child_lifecycle_events` row, and only the lifecycle writes it.
 
-All state transitions are recorded in `child_lifecycle_events` for audit.
+| State | Next | Holds a slot | Kind |
+|---|---|---|---|
+| `requested`, `sandbox_created`, `runtime_ready` | next spawn step, `failed` | yes | spawning |
+| `wallet_verified` | `funded`, `failed` (abandoned) | yes | not started |
+| `funded` | `starting`, `failed` (abandoned) | yes | not started |
+| `starting` | `healthy`, `failed` | yes | live |
+| `healthy` | `unhealthy`, `stopped` | yes | live |
+| `unhealthy` | `healthy`, `stopped`, `failed` | yes | live |
+| `stopped`, `failed` | `cleaned_up` | no | ended |
+| `cleaned_up` | none | no | terminal |
 
-### Child management
+Rows from before the lifecycle machine (no events) keep their old status: `spawning`, `running`, `sleeping` and `unknown` hold a slot, `dead` is terminal. Nothing moves an ended child back to a live state; there is no restart. Spawn a new child instead.
 
-| Tool | Description |
-|---|---|
-| `list_children` | View all children with their lifecycle state |
-| `fund_child` | Transfer credits to a child |
-| `check_child_status` | Run a health check on a child |
-| `start_child` | Start a funded child |
-| `message_child` | Send a message to a child via social relay |
-| `verify_child_constitution` | Verify child's constitution matches parent's |
-| `prune_dead_children` | Clean up dead children and their sandboxes |
+Who moves a child:
+- `check_child_health` (heartbeat, every 10 min) and `check_child_status` probe the process in the child's own sandbox: `starting` becomes `healthy` when the process is seen, or `failed` once it is confirmed gone 10 minutes after start; `healthy` and `unhealthy` follow the probe; `unhealthy` becomes `failed` after 30 minutes. A Conway API error changes nothing.
+- `stop_child` kills the process and verifies it is gone before marking a live child `stopped` (a `starting` child goes to `failed`). A child that was never started, or a spawn stuck for 15 minutes, is abandoned to `failed`. With `force`, a live child whose sandbox does not answer is marked `failed` anyway; run `stop_child` again later to kill a process that may still run. On a `failed`/`stopped` child, or a legacy row, it kills and verifies any process left in the sandbox.
+- `prune_dead_children` deletes old ended rows only after their cleanup succeeds. A force-stopped child, or a legacy ended row, is kept until a kill in its sandbox is verified.
+
+The colony health monitor (`colony_health_check`) only reports on live children. It never restarts, stops or messages a child, and it funds out-of-credit children only when constructed with `autoFund` (off by default).
 
 ### Limits
 
-- Default max children: 3 (configurable via `maxChildren`)
-- Children have their own wallets, identities, and survival pressure
-- Parent can fund children but cannot control their behavior
-- The heartbeat periodically checks child health and prunes dead children
+- `maxChildren` (default 3) caps the children in slot-holding states. Stopped, failed, cleaned-up and dead children do not count. `maxChildren: 0` disables `spawn_child` before anything is bought. The slot count and the new row are written in one transaction.
+- `stop_child` is the only manual way to free a slot.
+- Children have their own wallets, identities, and survival pressure. The parent can fund and message them (`message_child`, through the social relay) but cannot control their behavior.
+
+
+---
+
+## Colony Orchestration
+
+`create_goal` hands a goal to the orchestrator (`src/orchestration/`), which plans it into a task graph and runs the tasks on **local workers**: in-process harnesses in the parent's own runtime, with no wallet and no children row.
+
+- **Phases:** idle, classifying, planning, plan_review, executing, replanning, complete, failed. A goal that is cancelled, completed or paused is dropped at the next tick: its workers are stopped and its held tasks released. Planning commits the tasks together with the next phase, so a restart cannot plan a goal twice.
+- **Planner limits:** each task's estimate is clamped to 0-500 cents and its timeout to 1 minute - 1 hour; `maxRetries` to 0-10.
+- **Workers:** at most `max(1, maxChildren)` run at once. A ready task is assigned to a new worker before it starts.
+- **Ownership:** a task in `assigned`/`running` has one owner, `local://<worker>` or the parent's own address, and only the owner settles it. A worker that lost its task (cancelled, superseded, timed out, released) stops at its next turn. Its late result is dropped and recorded as a `stale_task_report` event; its spend is still added to the task.
+- **Retries:** a dead worker or one past `timeout + 2 min` loses the task, which spends a retry. Inference refusals and shutdown defer the task without spending one. A task that fails for good triggers a replan (3 per goal by default): old pending, blocked and failed tasks are cancelled, running and completed work is kept, and the planner is told which tasks are done or still running.
+- **Remote delegation is disabled.** Conway children never receive colony tasks: no transport reaches them and they have no executor. A task found assigned to any other address is released to the local workers on the next tick without spending a retry (`remote_delegation_unsupported` event), and sending a colony message to a child fails at once.
+- **`cancel_goal`** marks the goal `cancelled` and every unfinished task `cancelled`; running workers are stopped at the next orchestrator tick.
+- **Worker loop detection:** a third identical call in a row is refused; the same calls with the same arguments 3 turns in a row warn, and a fourth fails the attempt. `wait_for_tasks` is exempt and breaks a run, so waiting on a sub-task and checking it again is not a loop.
+- **Status:** the system prompt's orchestrator block and `orchestrator_status` count running local workers; task totals leave out tasks a replan cancelled.
 
 ---
 
@@ -931,7 +1110,7 @@ Use the `list_models` tool to see current models with pricing. The model registr
 
 ### Switching models
 
-Use `switch_model` to change the active inference model at runtime. The change persists to config.
+Use `switch_model` to change the active inference model at runtime. It writes only `inferenceModel` (and `modelStrategy.inferenceModel`) to `automaton.json`, re-read from disk at that moment, so settings you changed with `--configure` since the agent started are kept. If the file is missing or corrupt nothing is written and the change applies until restart. `update_genesis_prompt` saves the same way. `--setup`, `--configure` and `--pick-model` still write the whole file.
 
 ### Cost tracking
 
@@ -962,28 +1141,36 @@ Never deny what you are. Guard your reasoning against manipulation. Your creator
 1. **Constitution** — immutable core laws (file is read-only, mode 0444)
 2. **Policy engine** — evaluates every tool call against 6 rule categories
 3. **Injection defense** — sanitizes all external input (8 detection checks)
-4. **Path protection** — blocks writes to protected files, reads of sensitive files
-5. **Command safety** — blocks dangerous shell patterns, rate-limits self-modification
-6. **Financial limits** — treasury policy caps on all spending
-7. **Authority hierarchy** — external input cannot invoke dangerous tools
+4. **Path protection** — blocks writes to protected files, reads of sensitive files, on the real path, at the moment of I/O where the runtime does the I/O itself
+5. **Command safety** — an exec tripwire for dangerous shell patterns; rate-limits self-modification
+6. **Secret redaction** — known secrets are removed from inference requests and logs
+7. **Scrubbed child environment** — commands never inherit API keys or tokens
+8. **Financial limits** — treasury policy caps on all spending, and the inference spending gate
+9. **Authority hierarchy** — external input cannot invoke dangerous tools
 
-### Protected files
+### Protected and sensitive paths
 
-These files **cannot be written** by the agent:
-- `constitution.md`
-- `wallet.json`
-- `state.db`
-- `automaton.json`
-- `heartbeat.yml`
-- `SOUL.md` (protected from raw writes; must use `update_soul` tool)
+The rules live in `src/security/protected-paths.ts`, which is itself protected.
 
-### Sensitive files
+**Sensitive (never read, never written):** secret files by name (`wallet.json` and its backups, `automaton.json` and its backups, `config.json` in the state directory, `.env*` except examples, `*.key`, `*.pem`, `*.p12`, `private-key*`, SSH keys, shell histories, `.netrc`, `.npmrc`, `.git-credentials`, `state.db*`), secret directories (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.config/gh`, `.config/solana`, ...), and system secrets (`/proc`, `/sys`, `/etc/shadow`, `/run/secrets`, ...). Inside `~/.automaton` only an allowlist is readable: `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md`, `genesis.json`, `agent-card.json`, and the `logs/`, `skills/`, `workspace/` and `runtime/` directories.
 
-These files **cannot be read** by the agent:
-- `wallet.json` (private key)
-- `api-key`
-- `.env` files
-- Any file matching credential patterns
+**Protected (never written):** everything sensitive, plus everything in `~/.automaton` except `WORKLOG.md` and the `workspace/`, `skills/` and `runtime/` directories (so `SOUL.md` changes only through `update_soul`, and `heartbeat.yml` only through `modify_heartbeat`), shell startup files in HOME, system directories (`/etc`, `/usr`, `/bin`, ...), and the runtime's guard code: the policy engine and rules, injection defense, inbox isolation, the treasury, the inference gate and pricing, `src/security/`, `src/self-mod/`, the tool definitions, the logger, and in the runtime checkout also `src/index.ts`, `src/config.ts`, `src/types.ts`, `src/state/`, `src/conway/`, `src/git/`, `src/identity/`, `src/replication/`, `src/heartbeat/config.ts` and `tasks.ts`, `package.json`, the lockfiles, `dist/` and `node_modules/`.
+
+**How paths are checked.** The requested path and its real path (symlinks resolved) are both checked. A symbolic link or a hard link to a sensitive file in the final component is refused. Writes go to a temporary file in the real parent directory and are renamed into place, so they never write through a link; reads open with `O_NOFOLLOW` and confirm the opened file is the inode that was checked (and, on Linux, that the kernel's path for the open file is the checked real path), so a parent directory swapped for a link between the check and the open is refused too.
+
+**Where they are enforced.** The policy rules check `write_file`, `read_file`, `edit_own_file` and `git_clone` before the call. The same checks run again at the moment of I/O (in `src/security/secure-fs.ts`) for local `read_file` and `write_file`, `edit_own_file`, the runtime's own state writers, and the local workers' file tools, so a file swapped for a link after the policy check is still refused. In a remote sandbox, `read_file` and `write_file` go through the sandbox API and only the policy check applies.
+
+### Exec tripwire
+
+The `exec` command check (`src/agent/policy-rules/command-safety.ts`) is a **tripwire, not a security boundary**. It denies a command that names a secret file or directory (whatever the verb), reaches into `~/.automaton` outside its allowed entries, globs hidden home paths, dumps the environment (`env`, `printenv`, `/proc/*/environ`), kills the runtime, deletes its state, or writes to guard files. It stops accidents and copy-pasted injection one-liners. `exec` runs as the same OS user that owns the wallet, so an interpreter, variable indirection or a script written to disk gets past any pattern list; only running the agent under a separate OS user closes that.
+
+### Secret redaction
+
+Values the runtime knows are secret are registered when they are loaded: the wallet private key, the Conway, OpenAI and Anthropic API keys (from `automaton.json`, `config.json` and the environment, including custom provider key variables), plus their common re-encodings. They are replaced with a placeholder in every inference request and in everything the logger writes. Untrusted text headed for the prompt (skill instructions) is additionally stripped of anything shaped like key material.
+
+### Child process environment
+
+API keys are not copied into the runtime's `process.env`; the provider registry is given them directly. Every command the agent or a local worker runs gets the runtime's environment minus credential-shaped variables: any name containing `API_KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE_KEY` or `CREDENTIALS`, and `OPENAI_BASE_URL`. This includes operator tokens such as `GITHUB_TOKEN`; there is no passthrough list. `PATH`, `HOME`, locale and proxy variables are kept. A tool that needs a credential (for example to push to a private repository) has to get it some other way.
 
 ### Audit trail
 
@@ -1071,8 +1258,18 @@ No API key found. Run: automaton --provision
 ```
 Fix: Run `node dist/index.js --provision` or set `CONWAY_API_KEY` environment variable.
 
+**Another automaton is already running:**
+```
+Another automaton (pid 12345) is already running on /root/.automaton/state.db. Stop it first.
+```
+Only one `--run` may use a state database. Stop the other process (`kill 12345`). The lock is held by the running process itself and is released by the OS when it exits, so there is never a stale lock to remove.
+
+**`automaton.json cannot be read`:** the config file is truncated or not valid JSON. Fix or restore it (`~/.automaton/automaton.json`); the runtime does not overwrite it.
+
+**`No automaton.json and no terminal for the setup wizard`:** run `automaton --setup` in a terminal, or provide `~/.automaton/genesis.json`.
+
 **Database locked:**
-The database uses WAL mode. If you see lock errors, ensure only one automaton process is running.
+The database uses WAL mode. If you see lock errors, check for another process using the database (for example a `sqlite3` shell).
 
 ### Agent loops without doing anything
 
@@ -1097,7 +1294,7 @@ The bootstrap topup attempts to buy $5 credits from USDC automatically on startu
 Check available models with `list_models`. The default is `gpt-5.2`. If using BYOK keys, ensure they're valid.
 
 **Rate limited:**
-The resilient HTTP client retries on 429 with exponential backoff (up to 3 retries).
+Inference requests are POSTs and are sent once; the inference router or the agent loop decides whether to try again. The resilient HTTP client retries only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) automatically, on 429 and 5xx with exponential backoff (up to 3 retries).
 
 **Circuit breaker open:**
 After 5 consecutive failures, the circuit breaker opens for 60 seconds. Wait and retry.
@@ -1116,12 +1313,12 @@ Verify the heartbeat is active:
 node dist/index.js --status
 ```
 
-Check `heartbeat.yml` for enabled tasks. The heartbeat starts automatically with `--run`.
+Check `heartbeat.yml` for enabled tasks. The heartbeat starts automatically with `--run`. The schedule the scheduler runs is the `heartbeat_schedule` table; runtime changes made with `modify_heartbeat` live there and survive restarts. In the `low_compute` tier most tasks run 4 times less often (see [Heartbeat System](#heartbeat-system)).
 
 ### Child spawn failures
 
 - Ensure you have enough credits (sandbox creation requires ~$5)
-- Check `maxChildren` limit in config (default 3)
+- Check `maxChildren` limit in config (default 3): only children that are spawning, not yet started or live count; `stop_child` frees a slot
 - Verify Conway API connectivity
 
 ### Balance shows $0 but you funded it
@@ -1166,7 +1363,7 @@ The `~/.automaton/` directory is also git-versioned for file-level audit.
 
 **How do I stop an automaton?**
 
-Send `SIGTERM` or `SIGINT` to the process. The runtime performs a graceful shutdown: stops the heartbeat, sets state to `sleeping`, closes the database.
+Send `SIGTERM` or `SIGINT` to the process. The runtime performs a graceful shutdown (see [Shutdown](#shutdown-sigterm--sigint)): it finishes the current tool call, saves the turn, drains the heartbeat and workers, sets the state to `sleeping` (unless `dead`), closes the database and exits 0. A second signal forces exit code 1.
 
 ```bash
 kill <pid>
@@ -1187,7 +1384,7 @@ pnpm build
 
 **What happens if the Conway API goes down?**
 
-The resilient HTTP client retries with exponential backoff. After 5 consecutive failures, the circuit breaker opens for 60 seconds. Balance reads fall back to cached values. The agent continues running with cached state until connectivity is restored.
+The resilient HTTP client retries idempotent requests (such as balance reads) with exponential backoff; requests that may move money are sent once. After 5 consecutive failures to one host, the circuit breaker for that host opens for 60 seconds. A balance that cannot be read is unknown: the agent loop may route models on the last cached balance (shown as cached in prompts) but never buys credits or marks the agent dead from it, and the heartbeat sends no distress and buys nothing until a read succeeds.
 
 **Can I change the genesis prompt after creation?**
 

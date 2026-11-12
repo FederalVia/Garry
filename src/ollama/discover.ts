@@ -86,7 +86,7 @@ export async function discoverOllamaModels(
       updatedAt: now,
     };
 
-    modelRegistryUpsert(db, row);
+    modelRegistryUpsert(db, row, "ollama");
     registered.push(modelId);
   }
 

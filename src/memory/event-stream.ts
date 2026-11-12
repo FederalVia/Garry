@@ -30,7 +30,11 @@ export type EventType =
   | "market_signal"
   | "revenue"
   | "error"
-  | "reflection";
+  | "reflection"
+  // Written by the orchestration layer: a worker's report arrived after it
+  // lost the task, and a task assigned to a remote child was released.
+  | "stale_task_report"
+  | "remote_delegation_unsupported";
 
 export interface StreamEvent {
   id: string;

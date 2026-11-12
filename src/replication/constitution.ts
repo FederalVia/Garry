@@ -11,6 +11,9 @@ import { createHash } from "crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { ConwayClient } from "../types.js";
 
+const NO_FOLLOW_READ =
+  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
 /**
  * Compute SHA-256 hash of content.
  */
@@ -33,7 +36,13 @@ export async function propagateConstitution(
     "constitution.md",
   );
 
-  const constitution = fs.readFileSync(constitutionPath, "utf-8");
+  // O_NOFOLLOW: a link planted at constitution.md must not copy the file it
+  // points at (wallet.json, say) into the child sandbox.
+  const constitution = fs.readFileSync(constitutionPath, {
+    encoding: "utf-8",
+    // Node accepts numeric open flags here; the typings list only strings.
+    flag: NO_FOLLOW_READ as unknown as string,
+  });
   const hash = sha256(constitution);
 
   // Write constitution to child sandbox

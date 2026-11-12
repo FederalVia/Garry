@@ -8,6 +8,12 @@
 
 import type { LogLevel, LogEntry } from "../types.js";
 import { LOG_LEVEL_PRIORITY } from "../types.js";
+import { redactKeyMaterial, redactSecrets, redactSecretsDeep } from "../security/secret-redaction.js";
+
+/** Log lines reach stdout/journald and files the agent can read back. */
+function scrub(text: string): string {
+  return redactKeyMaterial(redactSecrets(text), { keepHex64: true });
+}
 
 let globalLogLevel: LogLevel = "info";
 let customSink: ((entry: LogEntry) => void) | null = null;
@@ -77,17 +83,17 @@ export class StructuredLogger {
         timestamp: new Date().toISOString(),
         level,
         module: this.module,
-        message,
+        message: scrub(message),
       };
 
       if (context && Object.keys(context).length > 0) {
-        entry.context = context;
+        entry.context = redactSecretsDeep(context);
       }
 
       if (error) {
         entry.error = {
-          message: error.message,
-          stack: error.stack,
+          message: scrub(error.message),
+          stack: error.stack ? scrub(error.stack) : error.stack,
         };
         if ((error as any).code) {
           entry.error.code = (error as any).code;

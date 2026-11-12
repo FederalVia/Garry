@@ -16,11 +16,19 @@ export function createWorkerInferenceBridge(
         maxTokens: params.maxTokens,
         temperature: params.temperature,
         responseFormat: normalizeResponseFormat(params.responseFormat),
+        purpose: params.purpose,
+        signal: params.signal,
       });
 
+      // InferenceRefusedError propagates unchanged so the harness can tell a
+      // task-cap refusal from one that clears with time.
       return {
         content: response.content,
         toolCalls: response.toolCalls as InferenceToolCall[] | undefined,
+        costCents: response.cost?.totalCostCents,
+        usage: response.usage
+          ? { inputTokens: response.usage.inputTokens, outputTokens: response.usage.outputTokens }
+          : undefined,
       };
     },
   };

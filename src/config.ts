@@ -8,9 +8,12 @@ import fs from "fs";
 import path from "path";
 import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
 import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG, DEFAULT_SOUL_CONFIG } from "./types.js";
+import { normalizeTreasuryPolicy } from "./treasury/policy.js";
 import { getAutomatonDir } from "./identity/wallet.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
+import { writeFileSafe } from "./security/secure-fs.js";
+import { registerSecret } from "./security/secret-redaction.js";
 import type { ChainType } from "./identity/chain.js";
 
 const logger = createLogger("config");
@@ -20,9 +23,41 @@ export function getConfigPath(): string {
   return path.join(getAutomatonDir(), CONFIG_FILENAME);
 }
 
+/** automaton.json exists but cannot be read or parsed. */
+export class ConfigError extends Error {
+  constructor(
+    message: string,
+    readonly configPath: string,
+  ) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
+function readRawConfig(configPath: string): Record<string, any> {
+  let text: string;
+  try {
+    text = fs.readFileSync(configPath, "utf-8");
+  } catch (err: any) {
+    throw new ConfigError(`${configPath} cannot be read: ${err?.message || String(err)}`, configPath);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (err: any) {
+    throw new ConfigError(`${configPath} is not valid JSON: ${err?.message || String(err)}`, configPath);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ConfigError(`${configPath} does not hold a JSON object`, configPath);
+  }
+  return raw as Record<string, any>;
+}
+
 /**
  * Load the automaton config from disk.
  * Merges with defaults for any missing fields.
+ * Returns null only when the file does not exist; an unreadable or corrupt
+ * file throws ConfigError (a corrupt config must never look like a first run).
  */
 export function loadConfig(): AutomatonConfig | null {
   const configPath = getConfigPath();
@@ -30,53 +65,71 @@ export function loadConfig(): AutomatonConfig | null {
     return null;
   }
 
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
+  const raw = readRawConfig(configPath);
+  const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
+  registerSecret(apiKey, "conway-api-key");
+  registerSecret(raw.openaiApiKey, "openai-api-key");
+  registerSecret(raw.anthropicApiKey, "anthropic-api-key");
 
-    // Deep-merge treasury policy with defaults
-    const treasuryPolicy: TreasuryPolicy = {
-      ...DEFAULT_TREASURY_POLICY,
-      ...(raw.treasuryPolicy ?? {}),
-    };
+  // Every field a finite number >= 0 (whatever its type), else the default.
+  const treasuryPolicy: TreasuryPolicy = normalizeTreasuryPolicy(raw.treasuryPolicy);
 
-    // Validate all treasury values are positive numbers
-    for (const [key, value] of Object.entries(treasuryPolicy)) {
-      if (key === "x402AllowedDomains") continue; // array, not number
-      if (typeof value === "number" && (value < 0 || !Number.isFinite(value))) {
-        logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
-        (treasuryPolicy as any)[key] = (DEFAULT_TREASURY_POLICY as any)[key];
-      }
-    }
+  // Deep-merge model strategy config with defaults
+  const modelStrategy: ModelStrategyConfig = {
+    ...DEFAULT_MODEL_STRATEGY_CONFIG,
+    ...(raw.modelStrategy ?? {}),
+  };
 
-    // Deep-merge model strategy config with defaults
-    const modelStrategy: ModelStrategyConfig = {
-      ...DEFAULT_MODEL_STRATEGY_CONFIG,
-      ...(raw.modelStrategy ?? {}),
-    };
+  // Deep-merge soul config with defaults
+  const soulConfig: SoulConfig = {
+    ...DEFAULT_SOUL_CONFIG,
+    ...(raw.soulConfig ?? {}),
+  };
 
-    // Deep-merge soul config with defaults
-    const soulConfig: SoulConfig = {
-      ...DEFAULT_SOUL_CONFIG,
-      ...(raw.soulConfig ?? {}),
-    };
+  return {
+    ...DEFAULT_CONFIG,
+    ...raw,
+    sandboxId:
+      typeof raw.sandboxId === "string"
+        ? raw.sandboxId.trim()
+        : DEFAULT_CONFIG.sandboxId,
+    conwayApiKey: apiKey,
+    treasuryPolicy,
+    modelStrategy,
+    soulConfig,
+    chainType: raw.chainType || "evm",
+  } as AutomatonConfig;
+}
 
-    return {
-      ...DEFAULT_CONFIG,
-      ...raw,
-      sandboxId:
-        typeof raw.sandboxId === "string"
-          ? raw.sandboxId.trim()
-          : DEFAULT_CONFIG.sandboxId,
-      conwayApiKey: apiKey,
-      treasuryPolicy,
-      modelStrategy,
-      soulConfig,
-      chainType: raw.chainType || "evm",
-    } as AutomatonConfig;
-  } catch {
-    return null;
+/** Keys the running agent may change in automaton.json. */
+export interface RuntimeConfigPatch {
+  genesisPrompt?: string;
+  inferenceModel?: string;
+}
+
+/**
+ * Change only the given keys in automaton.json, re-read from disk right
+ * before the write, so edits the operator made since startup (treasury
+ * limits, keys, URLs) are kept. inferenceModel also updates
+ * modelStrategy.inferenceModel when the file has a modelStrategy. Throws,
+ * writing nothing, when the file is missing or corrupt. The write is atomic.
+ */
+export function updateConfigFile(patch: RuntimeConfigPatch): void {
+  const configPath = getConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new ConfigError(`${configPath} does not exist`, configPath);
   }
+  const raw = readRawConfig(configPath);
+  if (patch.genesisPrompt !== undefined) {
+    raw.genesisPrompt = patch.genesisPrompt;
+  }
+  if (patch.inferenceModel !== undefined) {
+    raw.inferenceModel = patch.inferenceModel;
+    if (raw.modelStrategy && typeof raw.modelStrategy === "object" && !Array.isArray(raw.modelStrategy)) {
+      raw.modelStrategy.inferenceModel = patch.inferenceModel;
+    }
+  }
+  writeFileSafe(configPath, JSON.stringify(raw, null, 2), { trustedWriter: true, mode: 0o600 });
 }
 
 /**
@@ -96,9 +149,8 @@ export function saveConfig(config: AutomatonConfig): void {
     modelStrategy: config.modelStrategy ?? DEFAULT_MODEL_STRATEGY_CONFIG,
     soulConfig: config.soulConfig ?? DEFAULT_SOUL_CONFIG,
   };
-  fs.writeFileSync(configPath, JSON.stringify(toSave, null, 2), {
-    mode: 0o600,
-  });
+  // Temp file + rename: a link at automaton.json is refused, not written through.
+  writeFileSafe(configPath, JSON.stringify(toSave, null, 2), { trustedWriter: true, mode: 0o600 });
 }
 
 /**

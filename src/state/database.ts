@@ -28,6 +28,12 @@ import type {
   InboxMessage,
 } from "../types.js";
 import {
+  ISOLATED_TURN_SQL,
+  inboxTurnPrefix,
+  isValidSenderAddress,
+} from "../agent/inbox-isolation.js";
+import { detectChainType } from "../identity/chain.js";
+import {
   SCHEMA_VERSION,
   CREATE_TABLES,
   MIGRATION_V2,
@@ -46,7 +52,13 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V13,
+  MIGRATION_V14,
+  MIGRATION_V15,
+  CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
+import { STATIC_MODEL_BASELINE } from "../inference/types.js";
+import { ensureTreasuryLedger } from "../treasury/ledger.js";
 import type {
   RiskLevel,
   PolicyAction,
@@ -103,6 +115,8 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   // Apply migrations
   applyMigrations(db);
+  repairPreV4InboxStatus(db);
+  ensureChildrenAddressIndex(db);
 
   // Ensure version is recorded
   const versionRow = db
@@ -149,10 +163,16 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     );
   };
 
-  const getRecentTurns = (limit: number): AgentTurn[] => {
+  const getRecentTurns = (
+    limit: number,
+    options?: { excludeIsolated?: boolean },
+  ): AgentTurn[] => {
+    // Filtering in SQL keeps a run of inbox turns from pushing every
+    // privileged turn out of the window.
+    const where = options?.excludeIsolated ? `WHERE NOT ${ISOLATED_TURN_SQL}` : "";
     const rows = db
       .prepare(
-        "SELECT * FROM turns ORDER BY timestamp DESC LIMIT ?",
+        `SELECT * FROM turns ${where} ORDER BY timestamp DESC LIMIT ?`,
       )
       .all(limit) as any[];
     return rows.map(deserializeTurn).reverse();
@@ -587,7 +607,14 @@ function applyMigrations(db: DatabaseType): void {
         db.exec(MIGRATION_V4);
         try { db.exec(MIGRATION_V4_ALTER); } catch { logger.debug("V4 ALTER (to_address) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER2); } catch { logger.debug("V4 ALTER (raw_content) skipped — column likely exists"); }
-        try { db.exec(MIGRATION_V4_ALTER_INBOX_STATUS); } catch { logger.debug("V4 ALTER (inbox status) skipped — column likely exists"); }
+        try {
+          db.exec(MIGRATION_V4_ALTER_INBOX_STATUS);
+          // The column is new, so every existing row just got 'received'.
+          // Rows the v3 runtime already handled carry processed_at; keep them
+          // out of the queue. Only here: after V4, processed_at is also set
+          // on unhandled social rows, so it is no proof of handling.
+          db.exec(INBOX_V4_BACKFILL_SQL);
+        } catch { logger.debug("V4 ALTER (inbox status) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_RETRY); } catch { logger.debug("V4 ALTER (inbox retry_count) skipped — column likely exists"); }
         try { db.exec(MIGRATION_V4_ALTER_INBOX_MAX_RETRIES); } catch { logger.debug("V4 ALTER (inbox max_retries) skipped — column likely exists"); }
       },
@@ -625,6 +652,31 @@ function applyMigrations(db: DatabaseType): void {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
     },
+    {
+      version: 12,
+      // Creates treasury_ledger (MIGRATION_V12) and, only when the table is
+      // new, copies the last day of legacy spend so the upgrade keeps today's
+      // usage against the caps.
+      apply: () => { ensureTreasuryLedger(db, Date.now()); },
+    },
+    {
+      version: 13,
+      // Creates inference_ledger and, only when the table is new, copies the
+      // last day of inference_costs so the upgrade keeps today's spend.
+      apply: () => { ensureInferenceLedger(db, Date.now()); },
+    },
+    {
+      version: 14,
+      // Removes duplicate children rows, resets each lifecycle child's status
+      // to its lifecycle state and retires self-sent colony messages.
+      apply: () => { db.exec(MIGRATION_V14); },
+    },
+    {
+      version: 15,
+      // Adds model_registry.origin so initialize() stops disabling models
+      // discovered from the Conway API or Ollama.
+      apply: () => { migrateModelRegistryOrigin(db); },
+    },
   ];
 
   for (const m of migrations) {
@@ -636,6 +688,96 @@ function applyMigrations(db: DatabaseType): void {
       migrate();
     }
   }
+}
+
+/**
+ * Baseline models removed in earlier releases. At the upgrade they may still
+ * be enabled (the old runtime disabled them at its own boot), so they must
+ * not be mistaken for API-discovered models.
+ */
+const RETIRED_BASELINE_MODEL_IDS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
+
+/**
+ * Version 15: add model_registry.origin (once), mark local models 'ollama',
+ * and mark as 'api' the rows the Conway API refresh added since the last
+ * boot. The old initialize() disabled every other non-baseline row at each
+ * boot, so an enabled non-baseline, non-local row was discovered from the
+ * API. Disabled rows stay 'baseline' and disabled: nothing is re-enabled.
+ */
+export function migrateModelRegistryOrigin(db: DatabaseType): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_registry'").get()) {
+    return;
+  }
+  if (!modelRegistryHasOrigin(db)) {
+    db.exec(MIGRATION_V15);
+  }
+  const known = [...STATIC_MODEL_BASELINE.map((m) => m.modelId), ...RETIRED_BASELINE_MODEL_IDS];
+  const placeholders = known.map(() => "?").join(", ");
+  db.prepare(
+    `UPDATE model_registry SET origin = 'api'
+      WHERE origin = 'baseline' AND enabled = 1
+        AND provider NOT IN ('ollama', 'other')
+        AND model_id NOT IN (${placeholders})`,
+  ).run(...known);
+}
+
+/**
+ * Add the unique index on children.address once no duplicate addresses
+ * remain. Checked on every open, so a database whose duplicates were cleared
+ * later still gets it. Returns whether the index exists.
+ */
+export function ensureChildrenAddressIndex(db: DatabaseType): boolean {
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_children_address'").get()) {
+      return true;
+    }
+    const dupes = db
+      .prepare("SELECT address, COUNT(*) AS n FROM children WHERE address <> '' GROUP BY address HAVING n > 1")
+      .all() as Array<{ address: string; n: number }>;
+    if (dupes.length > 0) {
+      logger.warn("children has duplicate addresses; unique address index not created", {
+        addresses: dupes.map((d) => d.address),
+      });
+      return false;
+    }
+    db.exec(CHILDREN_ADDRESS_INDEX);
+    return true;
+  } catch (error) {
+    logger.warn("Could not create the children address index", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+const INBOX_V4_BACKFILL_SQL =
+  "UPDATE inbox_messages SET status = 'processed' WHERE processed_at IS NOT NULL";
+
+/** KV marker: the pre-V4 inbox repair below has run on this database. */
+const INBOX_REPAIR_KEY = "schema.inbox_v4_status_repair";
+
+/**
+ * Databases upgraded by the earlier V4 migration got status 'received' on
+ * every row, including messages the v3 runtime had already handled. Mark as
+ * processed only rows handled before the V4 upgrade time; later processed_at
+ * values come from unhandled social rows and mean nothing. Runs once.
+ */
+export function repairPreV4InboxStatus(db: DatabaseType): number {
+  return db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM kv WHERE key = ?").get(INBOX_REPAIR_KEY)) return 0;
+    const info = db.prepare(
+      `UPDATE inbox_messages SET status = 'processed'
+       WHERE status = 'received' AND processed_at IS NOT NULL
+         AND processed_at < (SELECT applied_at FROM schema_version WHERE version = 4)`,
+    ).run();
+    db.prepare(
+      "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+    ).run(INBOX_REPAIR_KEY, JSON.stringify({ repaired: info.changes }));
+    if (info.changes > 0) {
+      logger.info(`Marked ${info.changes} inbox message(s) handled before the V4 upgrade as processed`);
+    }
+    return info.changes;
+  })();
 }
 
 // ─── Exported Helpers ───────────────────────────────────────────
@@ -675,7 +817,8 @@ export interface SpendTrackingRow {
   windowDay: string;        // ISO date: '2026-02-19'
 }
 
-export type GoalStatus = "active" | "completed" | "failed" | "paused";
+/** Goal statuses as stored. cancel_goal writes 'cancelled'. */
+export type GoalStatus = "active" | "completed" | "failed" | "paused" | "cancelled";
 export type TaskGraphStatus =
   | "pending"
   | "assigned"
@@ -1300,7 +1443,7 @@ export function acquireTaskLease(db: DatabaseType, taskName: string, owner: stri
     `UPDATE heartbeat_schedule
      SET lease_owner = ?, lease_expires_at = ?, updated_at = datetime('now')
      WHERE task_name = ?
-       AND (lease_owner IS NULL OR lease_expires_at < datetime('now'))`,
+       AND (lease_owner IS NULL OR julianday(lease_expires_at) < julianday('now'))`,
   ).run(owner, expiresAt, taskName);
   return result.changes > 0;
 }
@@ -1317,7 +1460,7 @@ export function clearExpiredLeases(db: DatabaseType): number {
   const result = db.prepare(
     `UPDATE heartbeat_schedule
      SET lease_owner = NULL, lease_expires_at = NULL, updated_at = datetime('now')
-     WHERE lease_expires_at IS NOT NULL AND lease_expires_at < datetime('now')`,
+     WHERE lease_expires_at IS NOT NULL AND julianday(lease_expires_at) < julianday('now')`,
   ).run();
   return result.changes;
 }
@@ -1431,6 +1574,86 @@ export function claimInboxMessages(db: DatabaseType, limit: number): InboxMessag
   return claimTx();
 }
 
+/**
+ * Claim one sender's messages: the oldest claimable row, then up to `limit`
+ * claimable rows from the same address. An inbox turn then only ever holds
+ * text from a single sender, so it can be limited to replying to that sender.
+ */
+export function claimInboxMessagesFromOneSender(
+  db: DatabaseType,
+  limit: number,
+): InboxMessageRow[] {
+  const claimTx = db.transaction(() => {
+    const first = db.prepare(
+      `SELECT from_address FROM inbox_messages
+       WHERE status = 'received' AND retry_count < max_retries
+       ORDER BY received_at ASC
+       LIMIT 1`,
+    ).get() as { from_address: string } | undefined;
+    if (!first) return [];
+
+    const rows = db.prepare(
+      `SELECT id, from_address, content, received_at, processed_at, reply_to, to_address, raw_content,
+              status, retry_count, max_retries
+       FROM inbox_messages
+       WHERE status = 'received' AND retry_count < max_retries AND from_address = ?
+       ORDER BY received_at ASC
+       LIMIT ?`,
+    ).all(first.from_address, limit) as any[];
+    if (rows.length === 0) return [];
+
+    const ids = rows.map((r: any) => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(
+      `UPDATE inbox_messages
+       SET status = 'in_progress', retry_count = retry_count + 1
+       WHERE id IN (${placeholders})`,
+    ).run(...ids);
+
+    return rows.map((row: any) => ({
+      id: row.id,
+      fromAddress: row.from_address,
+      content: row.content,
+      receivedAt: row.received_at,
+      processedAt: row.processed_at ?? null,
+      replyTo: row.reply_to ?? null,
+      toAddress: row.to_address ?? null,
+      rawContent: row.raw_content ?? null,
+      status: 'in_progress' as const,
+      retryCount: (row.retry_count ?? 0) + 1,
+      maxRetries: row.max_retries ?? 3,
+    }));
+  });
+
+  return claimTx();
+}
+
+/**
+ * Earlier inbox turns from one sender, oldest first, for continuity on that
+ * sender's next inbox turn. Only exact sender matches are returned, and only
+ * for a well-formed address, so one sender never sees another's exchange.
+ */
+export function getInboxTurnsFromSender(
+  db: DatabaseType,
+  sender: string,
+  limit: number,
+): AgentTurn[] {
+  if (!isValidSenderAddress(sender)) return [];
+  // EVM addresses match case-insensitively; Solana base58 addresses are
+  // case-sensitive and must match exactly.
+  const caseInsensitive = detectChainType(sender) === "evm";
+  const prefix = caseInsensitive
+    ? inboxTurnPrefix(sender).toLowerCase()
+    : inboxTurnPrefix(sender);
+  const head = caseInsensitive ? "lower(substr(input, 1, ?))" : "substr(input, 1, ?)";
+  const rows = db.prepare(
+    `SELECT * FROM turns
+     WHERE input_source = 'external' AND ${head} = ?
+     ORDER BY timestamp DESC LIMIT ?`,
+  ).all(prefix.length, prefix, limit) as any[];
+  return rows.map(deserializeTurn).reverse();
+}
+
 export function markInboxProcessed(db: DatabaseType, ids: string[]): void {
   if (ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
@@ -1447,12 +1670,83 @@ export function markInboxFailed(db: DatabaseType, ids: string[]): void {
   ).run(...ids);
 }
 
-export function resetInboxToReceived(db: DatabaseType, ids: string[]): void {
+/**
+ * Return claimed messages to the queue without using up a retry: the turn
+ * never ran (inference was refused), so the claim's retry_count increment is
+ * undone.
+ */
+export function unclaimInboxMessages(db: DatabaseType, ids: string[]): void {
   if (ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
   db.prepare(
-    `UPDATE inbox_messages SET status = 'received' WHERE id IN (${placeholders})`,
+    `UPDATE inbox_messages
+     SET status = 'received', retry_count = MAX(retry_count - 1, 0)
+     WHERE status = 'in_progress' AND id IN (${placeholders})`,
   ).run(...ids);
+}
+
+export function resetInboxToReceived(db: DatabaseType, ids: string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  // Only a live claim goes back; a processed or failed row stays as it is.
+  db.prepare(
+    `UPDATE inbox_messages SET status = 'received' WHERE status = 'in_progress' AND id IN (${placeholders})`,
+  ).run(...ids);
+}
+
+/**
+ * KV: ids of the inbox batch whose tools have started. Set before the first
+ * tool of an inbox turn runs and cleared when the turn is saved, so startup
+ * recovery can tell a batch that may already have been answered.
+ */
+export const INBOX_TOOLS_STARTED_KEY = "inbox.tools_started";
+
+/**
+ * Claims left in_progress by a crash or a forced exit. A batch whose tools
+ * had started is marked processed (its reply may have gone out); the rest go
+ * back to 'received' while retries remain, else to 'failed' (the claim
+ * already counted the retry). Safe only while no other process holds claims,
+ * so it runs at startup under the instance lock.
+ */
+export function recoverStrandedInboxClaims(
+  db: DatabaseType,
+): { requeued: number; failed: number; processed: number } {
+  return db.transaction(() => {
+    let processed = 0;
+    const marker = db.prepare("SELECT value FROM kv WHERE key = ?").get(INBOX_TOOLS_STARTED_KEY) as
+      | { value: string }
+      | undefined;
+    if (marker) {
+      let ids: string[] = [];
+      try {
+        const parsed = JSON.parse(marker.value);
+        if (Array.isArray(parsed?.ids)) ids = parsed.ids.filter((id: unknown) => typeof id === "string");
+      } catch {
+        // A corrupt marker is dropped; its rows are treated like any other.
+      }
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => "?").join(",");
+        processed = db.prepare(
+          `UPDATE inbox_messages SET status = 'processed', processed_at = datetime('now')
+           WHERE status = 'in_progress' AND id IN (${placeholders})`,
+        ).run(...ids).changes;
+      }
+      db.prepare("DELETE FROM kv WHERE key = ?").run(INBOX_TOOLS_STARTED_KEY);
+    }
+    const requeued = db.prepare(
+      `UPDATE inbox_messages SET status = 'received'
+       WHERE status = 'in_progress' AND retry_count < max_retries`,
+    ).run().changes;
+    const failed = db.prepare(
+      "UPDATE inbox_messages SET status = 'failed' WHERE status = 'in_progress'",
+    ).run().changes;
+    return { requeued, failed, processed };
+  })();
+}
+
+/** Rewrite a saved turn's tool-call list (the copy context is rebuilt from). */
+export function updateTurnToolCalls(db: DatabaseType, turnId: string, toolCalls: ToolCallResult[]): void {
+  db.prepare("UPDATE turns SET tool_calls = ? WHERE id = ?").run(JSON.stringify(toolCalls), turnId);
 }
 
 export function getUnprocessedInboxCount(db: DatabaseType): number {
@@ -2067,6 +2361,54 @@ function deserializeRelationshipRow(row: any): RelationshipMemoryEntry {
     notes: row.notes ?? null, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
+// ─── Inference spend ledger ─────────────────────────────────────
+
+/**
+ * Copy the last 24h of inference_costs as committed main-class rows, so an
+ * upgrade does not reset today's daily inference spend.
+ */
+const INFERENCE_LEGACY_COPY_SQL = `
+INSERT OR IGNORE INTO inference_ledger (id, call_id, attempt, status, budget_class, caller, session_id,
+  turn_id, provider, model, tier, price_in_usd_per_m, price_out_usd_per_m, est_input_tokens,
+  max_output_tokens, reserved_micro_usd, input_tokens, output_tokens, cost_micro_usd, latency_ms,
+  boot_id, created_at_ms, settled_at_ms)
+SELECT 'legacy:' || id, 'legacy:' || id, 1, 'committed', 'main', 'legacy:' || task_type, NULL,
+  turn_id, provider, model, tier, 0, 0, input_tokens, output_tokens, cost_cents * 10000,
+  input_tokens, output_tokens, cost_cents * 10000, latency_ms, 'legacy',
+  CAST(strftime('%s', created_at) AS INTEGER) * 1000,
+  CAST(strftime('%s', created_at) AS INTEGER) * 1000
+FROM inference_costs
+WHERE cost_cents > 0
+  AND created_at >= datetime(@nowSec, 'unixepoch', '-1 day')
+`;
+
+function sqliteTableExists(db: DatabaseType, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/**
+ * Create inference_ledger if needed and, only on first creation, copy the
+ * last day of legacy spend. One immediate transaction, so a crash cannot
+ * leave the table without its legacy rows.
+ */
+export function ensureInferenceLedger(
+  db: DatabaseType,
+  nowMs: number,
+): { created: boolean; legacyCopied: number } {
+  return db
+    .transaction(() => {
+      if (sqliteTableExists(db, "inference_ledger")) {
+        db.exec(MIGRATION_V13);
+        return { created: false, legacyCopied: 0 };
+      }
+      db.exec(MIGRATION_V13);
+      if (!sqliteTableExists(db, "inference_costs")) return { created: true, legacyCopied: 0 };
+      const info = db.prepare(INFERENCE_LEGACY_COPY_SQL).run({ nowSec: Math.floor(nowMs / 1000) });
+      return { created: true, legacyCopied: info.changes };
+    })
+    .immediate();
+}
+
 // ─── Phase 2.3: Inference Cost Helpers ──────────────────────────
 
 export function inferenceInsertCost(db: DatabaseType, row: Omit<InferenceCostRow, "id" | "createdAt">): string {
@@ -2147,13 +2489,22 @@ export function inferencePruneCosts(db: DatabaseType, retentionDays: number): nu
 
 // ─── Phase 2.3: Model Registry Helpers ──────────────────────────
 
-export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO model_registry
-     (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
-      max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+/** Where a model_registry row came from; initialize() disables only 'baseline' rows. */
+export type ModelOrigin = "baseline" | "api" | "ollama" | "manual";
+
+/** Whether model_registry has the origin column (schema version 15+). */
+export function modelRegistryHasOrigin(db: DatabaseType): boolean {
+  const cols = db.prepare("PRAGMA table_info(model_registry)").all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === "origin");
+}
+
+/**
+ * Insert or replace a model row. `origin` sets the row's origin; when it is
+ * omitted the stored origin is kept (INSERT OR REPLACE would otherwise reset
+ * it), and a new row gets 'api'.
+ */
+export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow, origin?: ModelOrigin): void {
+  const values = [
     entry.modelId,
     entry.provider,
     entry.displayName,
@@ -2168,7 +2519,32 @@ export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow): 
     entry.enabled ? 1 : 0,
     entry.createdAt,
     entry.updatedAt,
-  );
+  ];
+  if (!modelRegistryHasOrigin(db)) {
+    db.prepare(
+      `INSERT OR REPLACE INTO model_registry
+       (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
+        max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(...values);
+    return;
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO model_registry
+     (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
+      max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       COALESCE(?, (SELECT origin FROM model_registry WHERE model_id = ?), 'api'))`,
+  ).run(...values, origin ?? null, entry.modelId);
+}
+
+/** The stored origin of a model, or undefined (no row, or a pre-15 schema). */
+export function modelRegistryGetOrigin(db: DatabaseType, modelId: string): ModelOrigin | undefined {
+  if (!modelRegistryHasOrigin(db)) return undefined;
+  const row = db
+    .prepare("SELECT origin FROM model_registry WHERE model_id = ?")
+    .get(modelId) as { origin: ModelOrigin } | undefined;
+  return row?.origin;
 }
 
 export function modelRegistryGet(db: DatabaseType, modelId: string): ModelRegistryRow | undefined {
@@ -2333,14 +2709,14 @@ export function lifecycleInsertEvent(db: DatabaseType, row: ChildLifecycleEventR
 
 export function lifecycleGetEvents(db: DatabaseType, childId: string): ChildLifecycleEventRow[] {
   const rows = db
-    .prepare("SELECT * FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at ASC")
+    .prepare("SELECT * FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at ASC, rowid ASC")
     .all(childId) as any[];
   return rows.map(deserializeLifecycleEventRow);
 }
 
 export function lifecycleGetLatestState(db: DatabaseType, childId: string): ChildLifecycleState | null {
   const row = db
-    .prepare("SELECT to_state FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC LIMIT 1")
+    .prepare("SELECT to_state FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
     .get(childId) as { to_state: string } | undefined;
   return (row?.to_state as ChildLifecycleState) ?? null;
 }

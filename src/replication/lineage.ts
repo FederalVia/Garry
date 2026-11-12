@@ -19,6 +19,7 @@ import type { ChildLifecycle } from "./lifecycle.js";
 import type { ChildHealthMonitor } from "./health.js";
 import type { SandboxCleanup } from "./cleanup.js";
 import { deleteChild } from "../state/database.js";
+import { LEGACY_LIVE, LIVE, isEnded, parseDbTimestamp } from "./child-status.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("replication.lineage");
 
@@ -32,10 +33,8 @@ export function getLineage(db: AutomatonDatabase): {
   total: number;
 } {
   const children = db.getChildren();
-  const alive = children.filter(
-    (c) => c.status === "running" || c.status === "sleeping" || c.status === "healthy",
-  ).length;
-  const dead = children.filter((c) => c.status === "dead" || c.status === "failed" || c.status === "cleaned_up").length;
+  const alive = children.filter((c) => LIVE.has(c.status) || LEGACY_LIVE.has(c.status)).length;
+  const dead = children.filter((c) => isEnded(c.status)).length;
 
   return {
     children,
@@ -72,7 +71,7 @@ export function getLineageSummary(
     );
     for (const child of lineage.children) {
       parts.push(
-        `  - ${child.name} [${child.status}] sandbox:${child.sandboxId}`,
+        `  - ${child.name} (id: ${child.id}) [${child.status}] sandbox:${child.sandboxId}`,
       );
     }
   }
@@ -81,39 +80,40 @@ export function getLineageSummary(
 }
 
 /**
- * Prune dead children: actually delete from DB and clean up sandboxes.
- * Phase 3.1 fix: was previously a no-op.
+ * Prune dead children: delete old ended rows from the DB.
+ *
+ * Only rows whose lifecycle state (or legacy status) is ended are
+ * considered. With a cleanup, a row is deleted only after the cleanup
+ * succeeds or when it is already cleaned_up/dead; a failed cleanup keeps the
+ * row, so the record of a child that may still run is never lost.
  */
 export async function pruneDeadChildren(
   db: AutomatonDatabase,
   cleanup?: SandboxCleanup,
   keepLast: number = 5,
 ): Promise<number> {
-  const children = db.getChildren();
-  const dead = children.filter(
-    (c) => c.status === "dead" || c.status === "failed" || c.status === "stopped",
-  );
+  const children = db.getChildren().map((child) => ({ child, state: effectiveState(db, child) }));
+  const dead = children.filter((entry) => isEnded(entry.state));
 
   if (dead.length <= keepLast) return 0;
 
   // Sort by creation date, oldest first
-  dead.sort(
-    (a, b) =>
-      new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-  );
+  dead.sort((a, b) => createdMs(a.child) - createdMs(b.child));
 
   // Keep the most recent `keepLast` dead children
   const toRemove = dead.slice(0, dead.length - keepLast);
   let removed = 0;
 
-  for (const child of toRemove) {
+  for (const { child, state } of toRemove) {
     try {
-      // Clean up sandbox if cleanup is available and child is in cleanable state
-      if (cleanup && (child.status === "stopped" || child.status === "failed" || child.status === "dead")) {
+      if (cleanup && state !== "cleaned_up" && state !== "dead") {
         try {
           await cleanup.cleanup(child.id);
-        } catch {
-          // Cleanup may fail; still delete the record
+        } catch (error) {
+          logger.warn(`Keeping child ${child.id}: cleanup failed`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          continue;
         }
       }
 
@@ -126,6 +126,25 @@ export async function pruneDeadChildren(
   }
 
   return removed;
+}
+
+/** Lifecycle state when the child has events, else the stored status. */
+function effectiveState(db: AutomatonDatabase, child: ChildAutomaton): string {
+  try {
+    const row = db.raw
+      .prepare(
+        "SELECT to_state FROM child_lifecycle_events WHERE child_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      )
+      .get(child.id) as { to_state: string } | undefined;
+    return row?.to_state ?? child.status;
+  } catch {
+    return child.status;
+  }
+}
+
+function createdMs(child: ChildAutomaton): number {
+  const ms = parseDbTimestamp(child.createdAt);
+  return Number.isNaN(ms) ? 0 : ms;
 }
 
 /**
@@ -143,23 +162,9 @@ export async function refreshChildrenStatus(
     return;
   }
 
-  // Legacy path: sequential checks with concurrency limit of 3
-  const children = db.getChildren().filter((c) => c.status !== "dead" && c.status !== "cleaned_up");
-  const maxConcurrent = 3;
-
-  for (let i = 0; i < children.length; i += maxConcurrent) {
-    const batch = children.slice(i, i + maxConcurrent);
-    await Promise.all(
-      batch.map(async (child) => {
-        try {
-          const result = await conway.exec("echo alive", 10_000);
-          if (result.exitCode !== 0) {
-            db.updateChildStatus(child.id, "unknown" as any);
-          }
-        } catch {
-          db.updateChildStatus(child.id, "unknown" as any);
-        }
-      }),
-    );
-  }
+  // Without a monitor there is no probe that reaches the child's sandbox;
+  // writing statuses from a probe of our own sandbox would be wrong, and
+  // lifecycle rows are written only by ChildLifecycle.
+  void conway;
+  void db;
 }

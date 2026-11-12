@@ -5,6 +5,7 @@
  * Tools are organized by category and exposed to the inference model.
  */
 
+import { readCredits, readUsdc, usdcNetworkFor } from "../conway/balance.js";
 import nodePath from "node:path";
 import { ulid } from "ulid";
 import type {
@@ -16,38 +17,189 @@ import type {
   GenesisConfig,
   RiskLevel,
   PolicyRequest,
-  InputSource,
-  SpendTrackerInterface,
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
+import { INSTALL_AND_BUILD, INSTALL_AND_BUILD_NO_SCRIPTS } from "../self-mod/install.js";
+import {
+  OutcomeUnknownError,
+  TransferRejectedError,
+  TreasuryDeniedError,
+  runWithTreasuryOrigin,
+  type TreasuryResultFields,
+} from "../treasury/index.js";
+import { isRejectedTransferStatus } from "../treasury/guarded-conway.js";
+import { normalizeTreasuryPolicy } from "../treasury/policy.js";
+import { DEFAULT_EXEC_TIMEOUT_MS, isLocalSandboxId } from "../conway/client.js";
+import { readFileSafe, writeFileVerified, UnsafePathError } from "../security/secure-fs.js";
+import { homeDir } from "../security/protected-paths.js";
+import { markRestartRequired, RESTART_NOTICE } from "../self-mod/restart-notice.js";
+import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
+import {
+  addScheduleEntry,
+  resolveTaskName,
+  scheduleEntryExists,
+  setScheduleCron,
+  setScheduleEnabled,
+  setTaskAlias,
+} from "../heartbeat/schedule-store.js";
+import { updateConfigFile } from "../config.js";
+import cronParser from "cron-parser";
 
 const logger = createLogger("tools");
 
 // ─── Path Confinement ─────────────────────────────────────────
-// write_file is restricted to the sandbox home directory tree.
-// The sandbox home is /root for both local and remote execution.
+// write_file is restricted to the home directory tree: /root in a remote
+// sandbox, the real HOME when running locally (where ~ means HOME).
 const SANDBOX_HOME = "/root";
+
+/** The directory write_file is confined to, and ~ expands to. */
+function writeRootFor(ctx: ToolContext): string {
+  return isLocalSandboxId(ctx.identity.sandboxId) ? nodePath.resolve(homeDir()) : SANDBOX_HOME;
+}
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
  * Returns the resolved absolute path, or an error string if out of bounds.
  */
-function confinePathToSandbox(filePath: string): string | { error: string } {
-  // Resolve ~ to SANDBOX_HOME
+function confinePathToRoot(filePath: string, root: string): string | { error: string } {
+  // Resolve ~ to the root
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.join(root, filePath.slice(1))
     : filePath;
-  // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
-  // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+  // Resolve to absolute (relative paths resolve against the root)
+  const resolved = nodePath.resolve(root, expanded);
+  if (resolved !== root && !resolved.startsWith(root + "/")) {
     return {
-      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
+      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${root}). Writes are confined to the home directory.`,
     };
   }
   return resolved;
+}
+
+// Heartbeat entry and installed tool names: what providers accept as function names.
+const HEARTBEAT_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+export const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+// ─── Exec timeouts ────────────────────────────────────────────
+export const MIN_EXEC_TIMEOUT_MS = 1_000;
+export const MAX_EXEC_TIMEOUT_MS = 600_000;
+
+/** The model's timeout, bounded: default 30 s, at least 1 s, at most 10 min. */
+export function clampExecTimeout(value: unknown): number {
+  const requested =
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_EXEC_TIMEOUT_MS;
+  return Math.min(MAX_EXEC_TIMEOUT_MS, Math.max(MIN_EXEC_TIMEOUT_MS, Math.floor(requested)));
+}
+
+// ─── Self-modification history ────────────────────────────────
+// Commits made by edit_own_file, newest last. revert_last_edit reverts only
+// these, newest first, so it never toggles a revert or undoes operator work.
+export const SELF_MOD_COMMITS_KEY = "self_mod.commits";
+const MAX_SELF_MOD_COMMITS = 50;
+const CODE_FILE_RE = /\.(ts|js|tsx|jsx|mjs|cjs)$/;
+const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/;
+
+export interface SelfModCommit {
+  sha: string;
+  path: string;
+  reason: string;
+  at: string;
+}
+
+interface KVLike {
+  getKV(key: string): string | undefined;
+  setKV(key: string, value: string): void;
+  deleteKV(key: string): void;
+}
+
+export function readSelfModCommits(db: KVLike): SelfModCommit[] {
+  try {
+    const parsed = JSON.parse(db.getKV(SELF_MOD_COMMITS_KEY) || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (c): c is SelfModCommit => !!c && typeof c.sha === "string" && COMMIT_SHA_RE.test(c.sha),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeSelfModCommits(db: KVLike, commits: SelfModCommit[]): void {
+  db.setKV(SELF_MOD_COMMITS_KEY, JSON.stringify(commits.slice(-MAX_SELF_MOD_COMMITS)));
+}
+
+function pushSelfModCommit(db: KVLike, commit: SelfModCommit): void {
+  const commits = readSelfModCommits(db);
+  if (commits.some((c) => c.sha === commit.sha)) return;
+  commits.push(commit);
+  writeSelfModCommits(db, commits);
+}
+
+function dropSelfModCommit(db: KVLike, sha: string): void {
+  writeSelfModCommits(
+    db,
+    readSelfModCommits(db).filter((c) => c.sha !== sha),
+  );
+}
+
+async function readHeadCommit(
+  conway: ToolContext["conway"],
+  repoRoot: string,
+): Promise<{ sha: string; subject: string } | null> {
+  try {
+    const res = await conway.exec(`cd ${escapeShellArg(repoRoot)} && git log -1 --format=%H%x09%s`, 10_000);
+    if (res.exitCode !== 0) return null;
+    const line = res.stdout.trim().split("\n")[0] ?? "";
+    const tab = line.indexOf("\t");
+    const sha = (tab >= 0 ? line.slice(0, tab) : line).trim();
+    if (!COMMIT_SHA_RE.test(sha)) return null;
+    return { sha, subject: tab >= 0 ? line.slice(tab + 1) : "" };
+  } catch {
+    return null;
+  }
+}
+
+const GIT_BUSY_MARKERS = new Set([
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "MERGE_HEAD",
+  "REBASE_HEAD",
+  "sequencer",
+  "rebase-merge",
+  "rebase-apply",
+  "staged-changes",
+]);
+// Prints each in-progress git operation marker, and "staged-changes" when the index differs from HEAD.
+const GIT_BUSY_SCRIPT =
+  'g=$(git rev-parse --git-dir) || exit 0; ' +
+  'for f in CHERRY_PICK_HEAD REVERT_HEAD MERGE_HEAD REBASE_HEAD sequencer rebase-merge rebase-apply; do ' +
+  '[ -e "$g/$f" ] && echo "$f"; done; ' +
+  "git diff --cached --quiet || echo staged-changes; exit 0";
+
+/**
+ * Operations someone else has in progress in the repo, or a staged index.
+ * git's --abort rolls back any cherry-pick or revert in progress, not only
+ * the tool's own, so the tools refuse to start on top of one.
+ */
+/** Reported by gitBusyState when its check itself fails. */
+const GIT_STATE_UNCHECKED = "state could not be checked";
+
+async function gitBusyState(conway: ToolContext["conway"], repo: string): Promise<string[]> {
+  try {
+    const res = await conway.exec(`cd ${repo} && ${GIT_BUSY_SCRIPT}`, 10_000);
+    return res.stdout.split("\n").map((l) => l.trim()).filter((l) => GIT_BUSY_MARKERS.has(l));
+  } catch {
+    // An unanswered check must not read as an idle repo.
+    return [GIT_STATE_UNCHECKED];
+  }
+}
+
+/** stdout and stderr of a failed command (git often explains itself on stdout). */
+function commandOutput(res: { stdout: string; stderr: string; exitCode: number }): string {
+  const text = [res.stdout, res.stderr].map((t) => (t || "").trim()).filter(Boolean).join("\n");
+  return (text || `exit code ${res.exitCode}`).slice(0, 2000);
 }
 
 // Tools whose results come from external sources and need sanitization
@@ -126,20 +278,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           },
           timeout: {
             type: "number",
-            description: "Timeout in milliseconds (default: 30000)",
+            description:
+              "Timeout in milliseconds (default 30000, min 1000, max 600000). On timeout the command and its child processes are killed. Background jobs (cmd &) keep running after the command returns.",
           },
         },
         required: ["command"],
       },
       execute: async (args, ctx) => {
         const command = args.command as string;
+        if (typeof command !== "string" || !command.trim()) return "Blocked: exec needs a command string.";
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
 
-        const result = await ctx.conway.exec(
-          command,
-          (args.timeout as number) || 30000,
-        );
+        const result = await ctx.conway.exec(command, clampExecTimeout(args.timeout));
         return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
       },
     },
@@ -158,21 +309,36 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
-        // Path confinement: restrict writes to sandbox home directory
-        const confined = confinePathToSandbox(filePath);
+        const content = args.content;
+        if (typeof filePath !== "string" || !filePath) return "Blocked: write_file needs a path string.";
+        if (typeof content !== "string") return "Blocked: write_file needs content as a string.";
+        // Path confinement: restrict writes to the home directory
+        const root = writeRootFor(ctx);
+        const confined = confinePathToRoot(filePath, root);
         if (typeof confined === "object") return confined.error;
         // Guard against overwriting protected files (same check as edit_own_file)
         const { isProtectedFile } = await import("../self-mod/code.js");
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
         }
-        await ctx.conway.writeFile(confined, args.content as string);
+        if (isLocalSandboxId(ctx.identity.sandboxId)) {
+          // The checks run again at the moment of the write, on the real
+          // path, and the write never follows a link swapped in since.
+          try {
+            writeFileVerified(confined, content, { root });
+          } catch (err) {
+            if (err instanceof UnsafePathError) return `Blocked: ${err.message}`;
+            throw err;
+          }
+          return `File written: ${confined}`;
+        }
+        await ctx.conway.writeFile(confined, content);
         return `File written: ${confined}`;
       },
     },
     {
       name: "read_file",
-      description: "Read content from a file in your sandbox.",
+      description: "Read content from a file in your sandbox (at most 2 MB when running locally).",
       category: "vm",
       riskLevel: "safe",
       parameters: {
@@ -184,6 +350,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
+        if (typeof filePath !== "string" || !filePath) return "Blocked: read_file needs a path string.";
         // Block reads of sensitive files (wallet, env, config secrets)
         const basename = filePath.split("/").pop() || "";
         const sensitiveFiles = ["wallet.json", ".env", "automaton.json"];
@@ -194,6 +361,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           basename.startsWith("private-key")
         ) {
           return "Blocked: Cannot read sensitive file. This protects credentials and secrets.";
+        }
+        if (isLocalSandboxId(ctx.identity.sandboxId)) {
+          // One checked read: O_NOFOLLOW, same inode as checked, 2 MB cap.
+          // Relative paths resolve against HOME, like write_file and exec.
+          const abs = filePath.startsWith("~")
+            ? nodePath.join(homeDir(), filePath.slice(1))
+            : nodePath.resolve(homeDir(), filePath);
+          try {
+            return readFileSafe(abs);
+          } catch (err) {
+            if (err instanceof UnsafePathError) return `Blocked: ${err.message}`;
+            return `ERROR: File not found or not readable: ${filePath}`;
+          }
         }
         try {
           return await ctx.conway.readFile(filePath);
@@ -254,8 +434,12 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+        const read = await readCredits(ctx.conway);
+        if (!read.known) {
+          // Surface the failure: an unreadable balance is not $0.00.
+          throw new Error(`Credit balance unavailable (${read.reason}): ${read.detail}`);
+        }
+        return `Credit balance: $${(read.value / 100).toFixed(2)} (${read.value} cents)`;
       },
     },
     {
@@ -265,12 +449,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
         const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-        const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
+        const read = await readUsdc(ctx.identity.address, usdcNetworkFor(chainType), chainType);
+        if (!read.known) {
+          throw new Error(`USDC balance unavailable (${read.reason}): ${read.detail}`);
+        }
         const networkLabel = chainType === "solana" ? "Solana" : "Base";
-        return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
+        return `USDC balance: ${read.value.toFixed(6)} USDC on ${networkLabel}`;
       },
     },
     {
@@ -312,26 +497,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
         }
 
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
+        const result: Awaited<ReturnType<typeof topupCredits>> & TreasuryResultFields =
+          await topupCredits(ctx.config.conwayApiUrl, ctx.identity.account, amountUsd);
 
+        // The treasury writes the credit_purchase row when the payment commits.
+        if (result.denied) {
+          throw new TreasuryDeniedError(result.denied.code, result.denied.message);
+        }
+        if (result.settlement === "unknown") {
+          return unknownOutcomeText("topup_credits", result.reservationId);
+        }
         if (!result.success) {
           return `Credit topup failed: ${result.error}`;
         }
-
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
 
         return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
       },
@@ -358,6 +536,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
       },
       execute: async (args, ctx) => {
+        // Priced, bounded and recorded by the treasury inside createSandbox.
         const info = await ctx.conway.createSandbox({
           name: args.name as string,
           vcpu: args.vcpu as number,
@@ -439,6 +618,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `BLOCKED: ${validation.reason}\nChecks: ${validation.checks.map((c) => `${c.name}: ${c.passed ? "PASS" : "FAIL"} (${c.detail})`).join(", ")}`;
         }
 
+        const repoRoot = process.cwd();
+        const headBefore = await readHeadCommit(ctx.conway, repoRoot);
+
         const result = await editFile(
           ctx.conway,
           ctx.db,
@@ -451,48 +633,116 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return result.error || "Unknown error during file edit";
         }
 
-        const msg = `File edited: ${filePath} (audited + git-committed)`;
-        return result.error ? `${msg}\nWarning: ${result.error}` : msg;
+        // Record the commit for revert_last_edit only when this edit made it.
+        const headAfter = await readHeadCommit(ctx.conway, repoRoot);
+        let msg: string;
+        if (headAfter && headAfter.sha !== headBefore?.sha && headAfter.subject.startsWith("self-mod: ")) {
+          pushSelfModCommit(ctx.db, {
+            sha: headAfter.sha,
+            path: filePath,
+            reason: String(args.description ?? ""),
+            at: new Date().toISOString(),
+          });
+          msg = `File edited: ${filePath} (audited + git-committed as ${headAfter.sha.slice(0, 7)})`;
+        } else {
+          msg = `File edited: ${filePath} (audited; no new commit: the content was unchanged or git is unavailable)`;
+        }
+        if (result.error) msg += `\nWarning: ${result.error}`;
+        if (CODE_FILE_RE.test(filePath)) {
+          markRestartRequired(ctx.db, `edit_own_file ${filePath}`);
+          msg += `\n${RESTART_NOTICE}`;
+        }
+        return msg;
       },
     },
     {
       name: "revert_last_edit",
       description:
-        "Revert the last self-modification. Uses git to undo the most recent code change and rebuild.",
+        "Revert your most recent recorded self-modification (an edit_own_file commit) and rebuild. Repeated calls go further back. Operator commits are never reverted, nor commits touching protected files.",
       category: "self_mod",
       riskLevel: "caution",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
         const repoRoot = process.cwd();
+        const repo = escapeShellArg(repoRoot);
+        const commits = readSelfModCommits(ctx.db);
+        const top = commits[commits.length - 1];
+        if (!top) {
+          return "No recorded self-modification to revert. Only edits made with edit_own_file are recorded; operator commits are never reverted.";
+        }
+        const short = top.sha.slice(0, 7);
+        const label = `${short} (${top.path}: ${top.reason})`;
 
-        // Show what we're reverting
-        const lastCommit = await ctx.conway.exec(
-          `cd '${repoRoot}' && git log -1 --oneline`,
+        // Each failure below drops the entry, so one bad entry cannot block older ones.
+        const ancestor = await ctx.conway.exec(
+          `cd ${repo} && git merge-base --is-ancestor ${top.sha} HEAD`,
           10_000,
         );
-
-        // Revert
-        const result = await ctx.conway.exec(
-          `cd '${repoRoot}' && git revert HEAD --no-edit`,
-          30_000,
-        );
-        if (result.exitCode !== 0) {
-          return `Revert failed: ${result.stderr}`;
+        if (ancestor.exitCode !== 0) {
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Nothing reverted: recorded edit ${label} is no longer in the history of HEAD (reset or rewritten). It was removed from the revert list; call revert_last_edit again to revert the edit before it.`;
         }
 
-        // Rebuild
-        const build = await ctx.conway.exec(
-          `cd '${repoRoot}' && npm run build`,
-          60_000,
+        const files = await ctx.conway.exec(
+          `cd ${repo} && git diff-tree --no-commit-id --name-only -r ${top.sha}`,
+          10_000,
         );
+        if (files.exitCode !== 0) {
+          return `Revert failed: could not list the files of ${label}: ${commandOutput(files)}`;
+        }
+        const { isProtectedFile } = await import("../self-mod/code.js");
+        const touched = files.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+        const protectedFiles = touched.filter((f) => isProtectedFile(nodePath.resolve(repoRoot, f)));
+        if (protectedFiles.length > 0) {
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Refused: ${label} touches protected files (${protectedFiles.join(", ")}), so it was not reverted. It was removed from the revert list.`;
+        }
+
+        const busy = await gitBusyState(ctx.conway, repo);
+        if (busy.length > 0) {
+          return `Nothing reverted: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first; ${label} stays on the revert list.`;
+        }
+        const revert = await ctx.conway.exec(
+          `cd ${repo} && git revert --no-edit ${top.sha} 2>&1`,
+          30_000,
+        );
+        if (revert.exitCode !== 0) {
+          const output = commandOutput(revert);
+          // The tree was clean of other operations, so a REVERT_HEAD now is ours to abort.
+          const after = await gitBusyState(ctx.conway, repo);
+          if (after.includes(GIT_STATE_UNCHECKED)) {
+            return `Revert failed and the repository state could not be checked: ${output}\nInspect it by hand (git status); ${label} stays on the revert list.`;
+          }
+          const started = after.includes("REVERT_HEAD") || after.includes("sequencer");
+          if (started) {
+            await ctx.conway.exec(`cd ${repo} && git revert --abort 2>&1`, 10_000).catch(() => undefined);
+          }
+          if (/nothing to commit|nothing added to commit/i.test(output)) {
+            dropSelfModCommit(ctx.db, top.sha);
+            return `Nothing reverted: ${label} is already undone in the working tree. It was removed from the revert list.`;
+          }
+          if (!started) {
+            // git refused before starting (e.g. local changes in the way): nothing to abort, keep the entry.
+            return `Nothing reverted: git refused to start the revert (the tree is unchanged): ${output}\n${label} stays on the revert list.`;
+          }
+          dropSelfModCommit(ctx.db, top.sha);
+          return `Revert failed and was aborted (the tree is unchanged): ${output}\n${label} was removed from the revert list; undo it by hand with edit_own_file if needed.`;
+        }
+        dropSelfModCommit(ctx.db, top.sha);
+
+        // Rebuild
+        const build = await ctx.conway.exec(`cd ${repo} && npm run build`, 120_000);
+        markRestartRequired(ctx.db, `revert_last_edit ${short}`);
 
         // Audit log
         const { logModification } = await import("../self-mod/audit-log.js");
-        logModification(ctx.db, "code_revert", `Reverted: ${lastCommit.stdout.trim()}`, {
+        logModification(ctx.db, "code_revert", `Reverted: ${label}`, {
           reversible: true,
         });
 
-        return `Reverted: ${lastCommit.stdout.trim()}. ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + build.stderr}`;
+        const buildText =
+          build.exitCode === 0 ? "Rebuild succeeded." : `Rebuild failed: ${commandOutput(build)}`;
+        return `Reverted: ${label}. ${buildText}\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -511,7 +761,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           30_000,
         );
         if (fetch.exitCode !== 0) {
-          return `Failed to fetch upstream: ${fetch.stderr}`;
+          return `Failed to fetch upstream: ${commandOutput(fetch)}`;
         }
 
         // Record what we're about to lose
@@ -526,12 +776,14 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           30_000,
         );
         if (reset.exitCode !== 0) {
-          return `Reset failed: ${reset.stderr}`;
+          return `Reset failed: ${commandOutput(reset)}`;
         }
+        // The recorded self-mod commits are gone from history.
+        ctx.db.deleteKV(SELF_MOD_COMMITS_KEY);
 
         // Reinstall + rebuild
         const build = await ctx.conway.exec(
-          `cd '${repoRoot}' && npm install && npm run build`,
+          `cd '${repoRoot}' && ${INSTALL_AND_BUILD}`,
           120_000,
         );
 
@@ -542,8 +794,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           reversible: false,
         });
 
+        markRestartRequired(ctx.db, "reset_to_upstream");
         const discarded = localCommits.stdout.trim();
-        return `Reset to upstream. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."} ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + build.stderr}`;
+        return `Reset to upstream. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."} ${build.exitCode === 0 ? "Rebuild succeeded." : "Rebuild failed: " + commandOutput(build)} The revert list was cleared.\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -629,38 +882,58 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const commit = args.commit as string | undefined;
+        if (commit !== undefined && (typeof commit !== "string" || !COMMIT_SHA_RE.test(commit))) {
+          return `Blocked: commit must be a hex commit hash (7-40 characters), got ${JSON.stringify(commit)}.`;
+        }
 
-        // Run git commands inside sandbox via conway.exec()
+        // In the repo this process runs from, the one review_upstream_changes reads.
+        const repo = escapeShellArg(process.cwd());
         const run = async (cmd: string) => {
-          const result = await ctx.conway.exec(cmd, 120_000);
+          const result = await ctx.conway.exec(`cd ${repo} && ${cmd}`, 120_000);
           if (result.exitCode !== 0) {
-            throw new Error(
-              result.stderr ||
-                `Command failed with exit code ${result.exitCode}`,
-            );
+            throw new Error(commandOutput(result));
           }
           return result.stdout.trim();
         };
 
+        const busy = await gitBusyState(ctx.conway, repo);
+        if (busy.length > 0) {
+          return `Nothing applied: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first.`;
+        }
+
         let appliedSummary: string;
         try {
           if (commit) {
-            await run(`git cherry-pick ${commit}`);
+            try {
+              await run(`git cherry-pick ${commit}`);
+            } catch (err) {
+              // Abort only a cherry-pick this call started; the check above saw none.
+              const after = await gitBusyState(ctx.conway, repo);
+              if (after.includes(GIT_STATE_UNCHECKED)) {
+                throw new Error(`${err instanceof Error ? err.message : String(err)} (the repository state could not be checked afterwards; inspect it by hand)`);
+              }
+              if (after.includes("CHERRY_PICK_HEAD") || after.includes("sequencer")) {
+                await ctx.conway.exec(`cd ${repo} && git cherry-pick --abort 2>&1`, 10_000).catch(() => undefined);
+              }
+              throw err;
+            }
             appliedSummary = `Cherry-picked ${commit}`;
           } else {
             await run("git pull origin main --ff-only");
             appliedSummary = "Pulled all of origin/main (fast-forward)";
           }
         } catch (err: any) {
-          return `Git operation failed: ${err.message}. You may need to resolve conflicts manually.`;
+          return `Git operation failed (nothing applied; a failed cherry-pick is aborted): ${err.message}`;
         }
 
         // Rebuild
         try {
-          await run("npm install --ignore-scripts && npm run build");
+          await run(INSTALL_AND_BUILD_NO_SCRIPTS);
         } catch (err: any) {
-          return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.`;
+          markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
+          return `${appliedSummary} — but rebuild failed: ${err.message}. The code is applied but not compiled.\n${RESTART_NOTICE}`;
         }
+        markRestartRequired(ctx.db, `pull_upstream ${commit ?? "origin/main"}`);
 
         // Log modification
         ctx.db.insertModification({
@@ -671,7 +944,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           reversible: true,
         });
 
-        return `${appliedSummary}. Rebuild succeeded.`;
+        return `${appliedSummary}. Rebuild succeeded.\n${RESTART_NOTICE}`;
       },
     },
 
@@ -701,36 +974,78 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["action", "name"],
       },
       execute: async (args, ctx) => {
-        const action = args.action as string;
-        const name = args.name as string;
+        const action = args.action;
+        const name = args.name;
+        if (action !== "add" && action !== "update" && action !== "remove") {
+          return `Error: action must be add, update or remove.`;
+        }
+        if (typeof name !== "string" || !HEARTBEAT_NAME_RE.test(name)) {
+          return `Error: name must match ${HEARTBEAT_NAME_RE.source}.`;
+        }
+        if (args.schedule !== undefined) {
+          if (typeof args.schedule !== "string") return "Error: schedule must be a cron expression string.";
+          try {
+            cronParser.parseExpression(args.schedule);
+          } catch (err: any) {
+            return `Error: invalid cron expression "${args.schedule}": ${err?.message || String(err)}`;
+          }
+        }
+        if (args.task !== undefined && (typeof args.task !== "string" || !(args.task in BUILTIN_TASKS))) {
+          return `Error: task must be one of: ${Object.keys(BUILTIN_TASKS).join(", ")}.`;
+        }
+        if (args.enabled !== undefined && typeof args.enabled !== "boolean") {
+          return "Error: enabled must be true or false.";
+        }
+        const raw = ctx.db.raw;
+        const exists = scheduleEntryExists(raw, name);
+        const schedule = args.schedule as string | undefined;
+        const task = args.task as string | undefined;
 
         if (action === "remove") {
-          ctx.db.upsertHeartbeatEntry({
-            name,
-            schedule: "",
-            task: "",
-            enabled: false,
-          });
-          return `Heartbeat entry '${name}' disabled`;
+          // Disabled, not deleted: its run history references the row.
+          if (!setScheduleEnabled(raw, name, false)) return `No heartbeat entry named '${name}'.`;
+        } else if (action === "add") {
+          if (exists) return `Heartbeat entry '${name}' already exists; use action "update".`;
+          const taskName = task ?? name;
+          if (!(taskName in BUILTIN_TASKS)) {
+            return `Error: '${name}' is not a built-in task; pass task (one of: ${Object.keys(BUILTIN_TASKS).join(", ")}).`;
+          }
+          addScheduleEntry(raw, name, schedule ?? "0 * * * *", taskName, args.enabled !== false);
+        } else {
+          if (!exists) return `No heartbeat entry named '${name}'; use action "add".`;
+          if (schedule !== undefined) setScheduleCron(raw, name, schedule);
+          if (args.enabled !== undefined) setScheduleEnabled(raw, name, args.enabled as boolean);
+          if (task !== undefined) setTaskAlias(raw, name, task);
         }
 
-        ctx.db.upsertHeartbeatEntry({
-          name,
-          schedule: (args.schedule as string) || "0 * * * *",
-          task: (args.task as string) || name,
-          enabled: args.enabled !== false,
-        });
+        // Mirror into the legacy table that --status reads.
+        const row = raw
+          .prepare("SELECT cron_expression, enabled FROM heartbeat_schedule WHERE task_name = ?")
+          .get(name) as { cron_expression: string; enabled: number } | undefined;
+        if (row) {
+          ctx.db.upsertHeartbeatEntry({
+            name,
+            schedule: row.cron_expression,
+            task: resolveTaskName(raw, name),
+            enabled: row.enabled === 1,
+          });
+        }
 
-        const { ulid } = await import("ulid");
         ctx.db.insertModification({
           id: ulid(),
           timestamp: new Date().toISOString(),
           type: "heartbeat_change",
-          description: `${action} heartbeat: ${name} (${args.schedule || "default"})`,
+          description: `${action} heartbeat: ${name} (${schedule ?? "unchanged schedule"})`,
           reversible: true,
         });
 
-        return `Heartbeat entry '${name}' ${action}d`;
+        if (action === "remove") {
+          return `Heartbeat entry '${name}' disabled (it stays listed; use update with enabled=true to turn it back on). Persists across restarts unless heartbeat.yml changes this entry.`;
+        }
+        const state = row
+          ? `schedule "${row.cron_expression}", task ${resolveTaskName(raw, name)}, ${row.enabled === 1 ? "enabled" : "disabled"}`
+          : "saved";
+        return `Heartbeat entry '${name}' ${action === "add" ? "added" : "updated"}: ${state}. Persists across restarts unless heartbeat.yml changes this entry.`;
       },
     },
 
@@ -922,9 +1237,13 @@ Model: ${ctx.inference.getDefaultModel()}
 
         ctx.config.genesisPrompt = sanitized.content;
 
-        // Save config
-        const { saveConfig } = await import("../config.js");
-        saveConfig(ctx.config);
+        // Write only this key, re-read from disk, so operator edits survive.
+        let persisted = "Saved to automaton.json.";
+        try {
+          updateConfigFile({ genesisPrompt: sanitized.content });
+        } catch (err: any) {
+          persisted = `Not saved to automaton.json (${err?.message || String(err)}); the change applies until restart.`;
+        }
 
         ctx.db.insertModification({
           id: ulid(),
@@ -935,7 +1254,7 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `Genesis prompt updated (sanitized, ${sanitized.content.length} chars). Reason: ${args.reason}. Previous version backed up.`;
+        return `Genesis prompt updated (sanitized, ${sanitized.content.length} chars). Reason: ${args.reason}. Previous version backed up. ${persisted}`;
       },
     },
 
@@ -959,10 +1278,31 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const pkg = args.package as string;
+        const name = args.name;
         // Defense-in-depth: validate package name inline in case the
         // policy engine's validate.package_name rule is bypassed.
-        if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
+        if (typeof pkg !== "string" || !/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
           return `Blocked: invalid package name "${pkg}"`;
+        }
+        // An invalid or duplicate name would make every inference request fail.
+        if (typeof name !== "string" || !TOOL_NAME_RE.test(name)) {
+          return `Blocked: tool name must match ${TOOL_NAME_RE.source} (letters, digits, _ and -; at most 64).`;
+        }
+        if (builtinToolNames().has(name)) {
+          return `Blocked: "${name}" is the name of a built-in tool.`;
+        }
+        if (ctx.db.getInstalledTools().some((t) => t.name === name)) {
+          return `Blocked: a tool named "${name}" is already installed.`;
+        }
+        let config: Record<string, unknown> = {};
+        if (args.config !== undefined && args.config !== "") {
+          try {
+            const parsed = typeof args.config === "string" ? JSON.parse(args.config) : args.config;
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object");
+            config = parsed as Record<string, unknown>;
+          } catch (err: any) {
+            return `Blocked: config is not a valid JSON object: ${err?.message || String(err)}`;
+          }
         }
         const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
 
@@ -970,12 +1310,11 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Failed to install MCP server: ${result.stderr}`;
         }
 
-        const { ulid } = await import("ulid");
         const toolEntry = {
           id: ulid(),
-          name: args.name as string,
+          name,
           type: "mcp" as const,
-          config: args.config ? JSON.parse(args.config as string) : {},
+          config,
           installedAt: new Date().toISOString(),
           enabled: true,
         };
@@ -990,21 +1329,26 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `MCP server installed: ${args.name}`;
+        return `Package installed: ${pkg}. MCP invocation is not supported yet, so "${name}" is not available as a tool.`;
       },
     },
 
     // ── Financial: Transfer Credits ──
     {
       name: "transfer_credits",
-      description: "Transfer Conway compute credits to another address.",
+      description:
+        "Transfer Conway compute credits to another address on your own chain (amount in cents). Transfers above the confirmation threshold are refused.",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
-          to_address: { type: "string", description: "Recipient address" },
-          amount_cents: { type: "number", description: "Amount in cents" },
+          to_address: {
+            type: "string",
+            description:
+              "Recipient address on your own chain: 0x... on an EVM automaton, base58 (case-sensitive) on a Solana automaton",
+          },
+          amount_cents: { type: "number", description: "Amount in whole cents (100 = $1.00)" },
           reason: { type: "string", description: "Reason for transfer" },
         },
         required: ["to_address", "amount_cents"],
@@ -1021,22 +1365,16 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
         }
 
+        // The treasury checks every limit before sending and writes the
+        // transfer_out row when the transfer commits.
         const transfer = await ctx.conway.transferCredits(
           args.to_address as string,
           amount,
           args.reason as string | undefined,
         );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Transfer to ${args.to_address}: ${args.reason || ""}`,
-          timestamp: new Date().toISOString(),
-        });
+        if (isRejectedTransferStatus(transfer.status)) {
+          throw new TransferRejectedError(transfer.status);
+        }
 
         return `Credit transfer submitted: $${(amount / 100).toFixed(2)} to ${transfer.toAddress} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
       },
@@ -1213,7 +1551,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitStatus } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         const status = await gitStatus(ctx.conway, repoPath);
         return `Branch: ${status.branch}\nStaged: ${status.staged.length}\nModified: ${status.modified.length}\nUntracked: ${status.untracked.length}\nClean: ${status.clean}`;
       },
@@ -1235,7 +1573,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitDiff } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         return await gitDiff(
           ctx.conway,
           repoPath,
@@ -1265,7 +1603,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitCommit } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         return await gitCommit(
           ctx.conway,
           repoPath,
@@ -1294,7 +1632,7 @@ Model: ${ctx.inference.getDefaultModel()}
       },
       execute: async (args, ctx) => {
         const { gitLog } = await import("../git/tools.js");
-        const repoPath = (args.path as string) || "~/.automaton";
+        const repoPath = resolveGitRepoPath(args.path, ctx);
         const entries = await gitLog(
           ctx.conway,
           repoPath,
@@ -1327,7 +1665,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitPush } = await import("../git/tools.js");
         return await gitPush(
           ctx.conway,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx),
           (args.remote as string) || "origin",
           args.branch as string | undefined,
         );
@@ -1357,7 +1695,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitBranch } = await import("../git/tools.js");
         return await gitBranch(
           ctx.conway,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx),
           args.action as any,
           args.branch_name as string | undefined,
         );
@@ -1385,7 +1723,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return await gitClone(
           ctx.conway,
           args.url as string,
-          args.path as string,
+          resolveGitRepoPath(args.path, ctx, ""),
           args.depth as number | undefined,
         );
       },
@@ -1625,6 +1963,17 @@ Model: ${ctx.inference.getDefaultModel()}
         const { spawnChild } = await import("../replication/spawn.js");
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
 
+        // The operator's limits; maxChildren 0 disables spawning.
+        const spawnLimits = {
+          maxChildren: ctx.config.maxChildren,
+          childSandboxMemoryMb: ctx.config.childSandboxMemoryMb,
+          childRuntimeRepo: ctx.config.childRuntimeRepo,
+          childRuntimeRef: ctx.config.childRuntimeRef,
+        };
+        if (!(spawnLimits.maxChildren > 0)) {
+          return "Blocked: spawning children is disabled (maxChildren is 0).";
+        }
+
         // Validate genesis params first
         validateGenesisParams({
           name: args.name as string,
@@ -1648,6 +1997,7 @@ Model: ${ctx.inference.getDefaultModel()}
             ctx.db,
             genesis,
             lifecycle,
+            spawnLimits,
           );
         } catch (err: any) {
           // Auto-topup on 402 insufficient credits and retry once
@@ -1681,6 +2031,7 @@ Model: ${ctx.inference.getDefaultModel()}
                   ctx.db,
                   retryGenesis,
                   retryLifecycle,
+                  spawnLimits,
                 );
               }
             }
@@ -1688,7 +2039,8 @@ Model: ${ctx.inference.getDefaultModel()}
           if (!child) throw err;
         }
 
-        return `Child spawned: ${child.name} in sandbox ${child.sandboxId} (status: ${child.status})`;
+        return `Child spawned: ${child.name} (id: ${child.id}) in sandbox ${child.sandboxId} (status: ${child.status}). ` +
+          `Use the id with fund_child, start_child, check_child_status and stop_child.`;
       },
     },
     {
@@ -1703,7 +2055,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return children
           .map(
             (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
+              `${c.name} (id: ${c.id}) [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
           )
           .join("\n");
       },
@@ -1717,7 +2069,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
           amount_cents: {
             type: "number",
             description: "Amount in cents to transfer",
@@ -1759,22 +2111,17 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
         }
 
+        // Same gated transfer and shared budget as transfer_credits. A
+        // rejected or ambiguous transfer throws, so the child is only marked
+        // funded after a committed transfer.
         const transfer = await ctx.conway.transferCredits(
           child.address,
           amount,
           `fund child ${child.id}`,
         );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Fund child ${child.name} (${child.id})`,
-          timestamp: new Date().toISOString(),
-        });
+        if (isRejectedTransferStatus(transfer.status)) {
+          throw new TransferRejectedError(transfer.status);
+        }
 
         // Update funded amount
         ctx.db.raw
@@ -1805,13 +2152,14 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "check_child_status",
       description:
-        "Check the current status of a child automaton using health check system.",
+        "Probe a child automaton's process in its sandbox and apply the result to its status " +
+        "(starting -> healthy when seen, -> failed once confirmed gone; healthy <-> unhealthy).",
       category: "replication",
       riskLevel: "safe",
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -1822,15 +2170,15 @@ Model: ${ctx.inference.getDefaultModel()}
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
         const { ChildHealthMonitor } = await import("../replication/health.js");
         const lifecycle = new ChildLifecycle(ctx.db.raw);
-        // Use a scoped client targeting the CHILD's sandbox for health checks
-        const childConway = ctx.conway.createScopedClient(child.sandboxId);
+        // The monitor runs its probe in the CHILD's sandbox itself.
         const monitor = new ChildHealthMonitor(
           ctx.db.raw,
-          childConway,
+          ctx.conway,
           lifecycle,
         );
-        const result = await monitor.checkHealth(args.child_id as string);
-        return JSON.stringify(result, null, 2);
+        // Applies the probe like the health heartbeat (starting -> healthy/failed, ...).
+        const result = await monitor.checkAndApply(child.id);
+        return JSON.stringify({ name: child.name, ...result }, null, 2);
       },
     },
     {
@@ -1842,7 +2190,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -1858,33 +2206,86 @@ Model: ${ctx.inference.getDefaultModel()}
         // Create a scoped client targeting the CHILD's sandbox
         const childConway = ctx.conway.createScopedClient(child.sandboxId);
 
+        // Start the child process with nohup so it survives exec session end.
+        // A child with no config and no genesis bootstrap would block in the
+        // setup wizard, so it is not launched at all.
+        let launch;
         try {
-          // Start the child process with nohup so it survives exec session end
-          await childConway.exec(
-            "nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 &",
+          launch = await childConway.exec(
+            `if [ ! -s /root/.automaton/automaton.json ] && [ ! -f /root/automaton/dist/setup/genesis-bootstrap.js ]; ` +
+              `then echo unconfigured; ` +
+              `else nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 & echo $!; fi`,
             30_000,
           );
+        } catch (error) {
+          // The launch may have run before the API call failed: only the
+          // health monitor's probe can tell, so the child stays starting.
+          const msg = error instanceof Error ? error.message : String(error);
+          return `Start of child ${child.name} could not be confirmed (${msg}). It stays 'starting'; ` +
+            `the health check marks it healthy when its process is seen, or failed once it is confirmed gone.`;
+        }
+        const lastLine = (launch.stdout || "").trim().split("\n").pop()?.trim() ?? "";
+        if (lastLine === "unconfigured") {
+          lifecycle.transition(child.id, "failed", "not started: child has no automaton.json and no genesis bootstrap");
+          return `Child ${child.name} was not started: its sandbox has no /root/.automaton/automaton.json and its runtime ` +
+            `cannot build one from genesis.json, so it would block in the interactive setup wizard. Marked failed.`;
+        }
+        const pid = /^\d+$/.test(lastLine) ? lastLine : null;
 
-          // Brief pause then verify the process is actually running
-          const check = await childConway.exec(
-            "sleep 2 && pgrep -f 'index.js --run' > /dev/null && echo running || echo stopped",
+        let check;
+        try {
+          // Brief pause, then check that exact process. The pgrep fallback
+          // is bracketed so it cannot match the checking shell itself.
+          check = await childConway.exec(
+            pid
+              ? `sleep 2 && kill -0 ${pid} 2>/dev/null && echo running || echo stopped`
+              : "sleep 2 && pgrep -f '[i]ndex.js --run' > /dev/null && echo running || echo stopped",
             15_000,
           );
-
-          if (check.stdout.trim() === "running") {
-            lifecycle.transition(child.id, "healthy", "started successfully");
-            return `Child ${child.name} started and healthy.`;
-          } else {
-            lifecycle.transition(child.id, "failed", "process did not start");
-            return `Child ${child.name} failed to start — process exited immediately. Check /root/.automaton/agent.log`;
-          }
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
-          try {
-            lifecycle.transition(child.id, "failed", `start failed: ${msg}`);
-          } catch { /* may already be in terminal state */ }
-          return `Failed to start child ${child.name}: ${msg}`;
+          return `Child ${child.name} was launched${pid ? ` (pid ${pid})` : ""} but the check failed (${msg}). ` +
+            `It stays 'starting'; the health check marks it healthy or failed.`;
         }
+
+        if (check.stdout.trim() === "running") {
+          lifecycle.transition(child.id, "healthy", "started successfully");
+          return `Child ${child.name} started and healthy.`;
+        }
+        lifecycle.transition(child.id, "failed", "process did not start");
+        return `Child ${child.name} failed to start — process exited immediately. Check /root/.automaton/agent.log`;
+      },
+    },
+    {
+      name: "stop_child",
+      description:
+        "Stop a child automaton and free its slot. A running child's agent process is " +
+        "killed in its sandbox and verified gone before it is marked stopped; a child " +
+        "that was never started (or a stuck spawn) is marked failed. For a failed child whose " +
+        "process may still run, the process is killed and verified gone. force: mark a running " +
+        "child failed when its process cannot be verified (sandbox unreachable). Cannot be undone.",
+      category: "replication",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
+          reason: { type: "string", description: "Why the child is being stopped" },
+          force: {
+            type: "boolean",
+            description: "Mark a running child failed even when its process cannot be verified gone",
+          },
+        },
+        required: ["child_id"],
+      },
+      execute: async (args, ctx) => {
+        const { stopChild } = await import("../replication/lifecycle.js");
+        const reason = typeof args.reason === "string" && args.reason.trim()
+          ? args.reason.trim()
+          : "stopped by parent";
+        return stopChild(ctx.db, ctx.conway, args.child_id as string, reason, Date.now(), {
+          force: args.force === true,
+        });
       },
     },
     {
@@ -1896,7 +2297,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
           content: { type: "string", description: "Message content" },
           type: {
             type: "string",
@@ -1931,7 +2332,7 @@ Model: ${ctx.inference.getDefaultModel()}
       parameters: {
         type: "object",
         properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
+          child_id: { type: "string", description: "Child automaton ID (shown by spawn_child and list_children)" },
         },
         required: ["child_id"],
       },
@@ -1995,7 +2396,7 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           to_address: {
             type: "string",
-            description: "Recipient wallet address (0x...)",
+            description: "EVM (0x...) or Solana (base58, case-sensitive) address",
           },
           content: {
             type: "string",
@@ -2109,9 +2510,13 @@ Model: ${ctx.inference.getDefaultModel()}
           ctx.config.modelStrategy.inferenceModel = modelId;
         }
 
-        // Persist
-        const { saveConfig } = await import("../config.js");
-        saveConfig(ctx.config);
+        // Persist only the model keys, re-read from disk, so operator edits survive.
+        let persisted = "Change persisted to config.";
+        try {
+          updateConfigFile({ inferenceModel: modelId });
+        } catch (err: any) {
+          persisted = `Not saved to automaton.json (${err?.message || String(err)}); the change applies until restart.`;
+        }
 
         // Audit log
         ctx.db.insertModification({
@@ -2122,13 +2527,14 @@ Model: ${ctx.inference.getDefaultModel()}
           reversible: true,
         });
 
-        return `Inference model switched to ${modelId}. Reason: ${reason}. Change persisted to config.`;
+        return `Inference model switched to ${modelId}. Reason: ${reason}. ${persisted}`;
       },
     },
     {
       name: "check_inference_spending",
       description:
-        "Query inference cost breakdown: hourly, daily, per-model, and per-session costs.",
+        "Inference spending against its caps: last hour and 24 h by class (main loop, orchestration, survival), " +
+        "remaining budget, and per-model breakdown.",
       category: "financial",
       riskLevel: "safe",
       parameters: {
@@ -2136,35 +2542,40 @@ Model: ${ctx.inference.getDefaultModel()}
         properties: {
           model: {
             type: "string",
-            description: "Filter by model ID (optional)",
-          },
-          days: {
-            type: "number",
-            description: "Number of days to look back (default: 1)",
+            description: "Filter the per-model breakdown by model ID (optional)",
           },
         },
       },
       execute: async (args, ctx) => {
         try {
-          const {
-            inferenceGetHourlyCost,
-            inferenceGetDailyCost,
-            inferenceGetModelCosts,
-          } = await import("../state/database.js");
-
-          const hourlyCost = inferenceGetHourlyCost(ctx.db.raw);
-          const dailyCost = inferenceGetDailyCost(ctx.db.raw);
-
-          let output = `=== Inference Spending ===\nCurrent hour: ${hourlyCost}c ($${(hourlyCost / 100).toFixed(2)})\nToday: ${dailyCost}c ($${(dailyCost / 100).toFixed(2)})`;
-
-          const model = args.model as string | undefined;
-          if (model) {
-            const days = (args.days as number) || 1;
-            const modelCosts = inferenceGetModelCosts(ctx.db.raw, model, days);
-            output += `\nModel ${model} (${days}d): ${modelCosts.totalCents}c ($${(modelCosts.totalCents / 100).toFixed(2)}) over ${modelCosts.callCount} calls`;
+          const { getInstalledInferenceGate } = await import("../inference/gate.js");
+          const gate = getInstalledInferenceGate();
+          if (!gate || !gate.usesDatabase(ctx.db.raw)) {
+            return "Inference spending data unavailable: no inference gate is installed.";
           }
-
-          return output;
+          const u = gate.usage();
+          const c = (n: number) => `${n.toFixed(2)}c ($${(n / 100).toFixed(2)})`;
+          const lines = [
+            "=== Inference Spending ===",
+            `Last hour: ${c(u.lastHour.cappedCents)} of ${u.caps.hourlyCents}c cap ` +
+              `(main ${c(u.lastHour.mainCents)}, orchestration ${c(u.lastHour.orchestrationCents)})`,
+            `Last 24h: ${c(u.last24h.cappedCents)} of ${u.caps.dailyCents}c cap ` +
+              `(main ${c(u.last24h.mainCents)}, orchestration ${c(u.last24h.orchestrationCents)})`,
+            `Remaining: hour ${c(u.remaining.hourlyCents)}, day ${c(u.remaining.dailyCents)}`,
+            `Survival allowance: ${c(u.last24h.survivalCents)} used of ${u.caps.survivalAllowanceCents}c per 24h`,
+            `Orchestration share: ${u.caps.orchestrationSharePct}% of the hourly and daily caps`,
+            `Per-call ceiling: ${u.caps.perCallCents > 0 ? `${u.caps.perCallCents}c` : "none"}; ` +
+              `session cap: ${u.caps.sessionCents > 0 ? `${u.caps.sessionCents}c per wake cycle` : "none"}`,
+            `Unsettled (held at estimate): ${c(u.unknownCents24h)}; in flight: ${u.openReservations}`,
+            `Survival tier seen by the gate: ${u.survival.tier}`,
+          ];
+          const filter = typeof args.model === "string" ? args.model : undefined;
+          const models = u.byModel24h.filter((m) => !filter || m.model === filter);
+          if (models.length > 0) {
+            lines.push("By model (24h):");
+            for (const m of models) lines.push(`  ${m.model}: ${c(m.cents)} over ${m.attempts} attempt(s)`);
+          }
+          return lines.join("\n");
         } catch (error) {
           return `Inference spending data unavailable: ${error instanceof Error ? error.message : String(error)}`;
         }
@@ -2228,9 +2639,10 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["domain"],
       },
       execute: async (args, ctx) => {
+        // The treasury quotes the price, checks the infra limits and records it.
         const reg = await ctx.conway.registerDomain(
           args.domain as string,
-          (args.years as number) || 1,
+          args.years === undefined || args.years === null ? 1 : (args.years as number),
         );
         return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
       },
@@ -2759,7 +3171,6 @@ Model: ${ctx.inference.getDefaultModel()}
         }
 
         const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
         const url = args.url as string;
         const method = (args.method as string) || "GET";
         const body = args.body as string | undefined;
@@ -2767,18 +3178,17 @@ Model: ${ctx.inference.getDefaultModel()}
           ? JSON.parse(args.headers as string)
           : undefined;
 
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
+        // Normalized: a malformed configured value falls back to the default.
+        const maxPayment = normalizeTreasuryPolicy(ctx.config.treasuryPolicy).maxX402PaymentCents;
+        const result: Awaited<ReturnType<typeof x402Fetch>> & TreasuryResultFields =
+          await x402Fetch(url, ctx.identity.account, method, body, extraHeaders, maxPayment);
 
+        if (result.denied) {
+          throw new TreasuryDeniedError(result.denied.code, result.denied.message);
+        }
+        if (result.settlement === "unknown") {
+          return unknownOutcomeText("x402_fetch", result.reservationId);
+        }
         if (!result.success) {
           return `x402 fetch failed: ${result.error || "Unknown error"}`;
         }
@@ -2802,7 +3212,7 @@ Model: ${ctx.inference.getDefaultModel()}
       description:
         "Create a new goal for the orchestrator to plan and execute. " +
         "The orchestrator will automatically classify complexity, generate a task graph, " +
-        "assign tasks to child agents, and collect results. Use this instead of doing complex work yourself.",
+        "run the tasks on local workers in this process, and collect results. Use this instead of doing complex work yourself.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -2900,7 +3310,8 @@ Model: ${ctx.inference.getDefaultModel()}
           const failedCount = tasks.filter((t) => t.status === "failed").length;
           return (
             `- ${goal.title} [${goal.status}] (id: ${goal.id})\n` +
-            `  Tasks: ${progress.completed}/${progress.total} completed, ` +
+            // Tasks a replan superseded are not part of the plan any more.
+            `  Tasks: ${progress.completed}/${progress.effectiveTotal} completed, ` +
             `${progress.running} running, ${progress.blocked} blocked, ${failedCount} failed`
           );
         });
@@ -2925,7 +3336,8 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "cancel_goal",
       description:
-        "Cancel an active goal. Stops all execution for this goal and marks it as failed. Accepts goal ID or title.",
+        "Cancel a goal that has not ended. Marks the goal cancelled and every unfinished task " +
+        "cancelled; running workers are stopped at the next orchestrator tick. Accepts goal ID or title.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -2943,7 +3355,7 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["goal_id"],
       },
       execute: async (args, ctx) => {
-        const { getGoalById, getActiveGoals, updateGoalStatus } =
+        const { getGoalById, updateGoalStatus } =
           await import("../state/database.js");
 
         const input = (args.goal_id as string).trim();
@@ -2952,31 +3364,40 @@ Model: ${ctx.inference.getDefaultModel()}
             ? args.reason.trim()
             : "cancelled by agent";
 
-        // Try by ID first, then by title match
+        // Try by ID first, then by title among goals that have not ended.
         let goal = getGoalById(ctx.db.raw, input);
         if (!goal) {
-          const allGoals = getActiveGoals(ctx.db.raw);
-          goal =
-            allGoals.find((g) =>
-              g.title.toLowerCase().includes(input.toLowerCase()),
-            ) ?? undefined;
+          const open = ctx.db.raw
+            .prepare(
+              "SELECT id, title FROM goals WHERE status NOT IN ('completed', 'cancelled') ORDER BY created_at DESC",
+            )
+            .all() as Array<{ id: string; title: string }>;
+          const matches = open.filter((g) => g.title.toLowerCase().includes(input.toLowerCase()));
+          if (matches.length > 1) {
+            return `Goal "${input}" is ambiguous: ${matches.map((g) => `${g.id} ("${g.title}")`).join(", ")}. Pass the goal ID.`;
+          }
+          goal = matches[0] ? getGoalById(ctx.db.raw, matches[0].id) : undefined;
         }
 
         if (!goal)
           return `Goal "${input}" not found. Use list_goals to see active goals with their IDs.`;
-        if (goal.status !== "active")
+        if (goal.status === "completed" || goal.status === "cancelled")
           return `Goal "${goal.title}" is already in '${goal.status}' status.`;
 
-        updateGoalStatus(ctx.db.raw, goal.id, "failed");
+        const cancelledTasks = ctx.db.raw.transaction(() => {
+          updateGoalStatus(ctx.db.raw, goal!.id, "cancelled");
+          // Spend recorded on a task so far is kept; workers holding these
+          // tasks lose ownership and their late results are dropped.
+          return ctx.db.raw
+            .prepare(
+              `UPDATE task_graph
+                  SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
+                WHERE goal_id = ? AND status IN ('pending', 'assigned', 'running', 'blocked')`,
+            )
+            .run(new Date().toISOString(), goal!.id).changes;
+        })();
 
-        // Cancel all pending/assigned/running tasks for this goal
-        ctx.db.raw
-          .prepare(
-            `UPDATE task_graph SET status = 'cancelled' WHERE goal_id = ? AND status IN ('pending', 'assigned', 'running', 'blocked')`,
-          )
-          .run(goal.id);
-
-        return `Goal "${goal.title}" (${goal.id}) cancelled. Reason: ${reason}`;
+        return `Goal "${goal.title}" (${goal.id}) cancelled; ${cancelledTasks} unfinished task(s) cancelled. Reason: ${reason}`;
       },
     },
     {
@@ -3086,26 +3507,47 @@ Model: ${ctx.inference.getDefaultModel()}
                 .filter(Boolean)
             : [];
 
-        // Try by ID first, then by title match
+        // Try by ID first, then by title among unfinished tasks of goals
+        // that have not ended.
         let task = getTaskById(ctx.db.raw, input);
         if (!task) {
-          const rows = ctx.db.raw
+          const pattern = `%${input.toLowerCase().replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+          const candidates = ctx.db.raw
             .prepare(
-              `SELECT * FROM task_graph WHERE LOWER(title) LIKE ? AND status != 'completed' LIMIT 1`,
+              `SELECT t.id, t.title
+                 FROM task_graph t
+                 JOIN goals g ON g.id = t.goal_id
+                WHERE LOWER(t.title) LIKE ? ESCAPE '\\'
+                  AND t.status IN ('pending', 'assigned', 'running', 'blocked')
+                  AND g.status IN ('active', 'failed')
+                ORDER BY (t.assigned_to = ?) DESC, t.created_at DESC`,
             )
-            .get(`%${input.toLowerCase()}%`) as any;
-          if (rows) task = rows;
+            .all(pattern, ctx.identity.address) as Array<{ id: string; title: string }>;
+          const exact = candidates.filter((c) => c.title.toLowerCase() === input.toLowerCase());
+          const matches = exact.length > 0 ? exact : candidates;
+          if (matches.length > 1) {
+            return `Task "${input}" is ambiguous; candidates: ${matches.map((c) => `${c.id} ("${c.title}")`).join(", ")}. Pass the task ID.`;
+          }
+          if (matches[0]) task = getTaskById(ctx.db.raw, matches[0].id);
         }
         if (!task)
           return `Task "${input}" not found. Use list_goals to see tasks with their IDs.`;
         if (task.status === "completed")
           return `Task "${task.title}" is already completed.`;
+        if (task.status === "failed" || task.status === "cancelled")
+          return `Task "${task.title}" (${task.id}) is ${task.status} and cannot be completed.`;
+        const goalRow = ctx.db.raw.prepare("SELECT status FROM goals WHERE id = ?").get(task.goalId) as
+          | { status: string }
+          | undefined;
+        if (goalRow && goalRow.status !== "active" && goalRow.status !== "failed")
+          return `Task "${task.title}" (${task.id}) belongs to a ${goalRow.status} goal and cannot be completed.`;
 
         const result = {
           success: true,
           output,
           artifacts,
-          costCents: 0,
+          // Keep the spend already recorded on the task.
+          costCents: Math.max(0, task.actualCostCents ?? 0),
           duration: 0,
         };
 
@@ -3175,17 +3617,30 @@ Model: ${ctx.inference.getDefaultModel()}
           /* task_graph may not exist */
         }
 
-        // Agent summary
+        // Colony tasks run on local workers (no children row): a task held
+        // by a local:// owner is one running worker.
         try {
-          const agentRows = ctx.db.raw
+          const workersRow = ctx.db.raw
+            .prepare(
+              `SELECT COUNT(*) AS c FROM task_graph WHERE status IN ('assigned', 'running') AND assigned_to LIKE 'local://%'`,
+            )
+            .get() as { c: number } | undefined;
+          lines.push(`Local workers running: ${workersRow?.c ?? 0}`);
+        } catch {
+          /* task_graph may not exist */
+        }
+
+        // Children are independent missions, not colony workers.
+        try {
+          const childRows = ctx.db.raw
             .prepare(
               `SELECT status, COUNT(*) AS c FROM children GROUP BY status`,
             )
             .all() as { status: string; c: number }[];
-          const agentSummary = agentRows
+          const childSummary = childRows
             .map((r) => `${r.status}: ${r.c}`)
             .join(", ");
-          lines.push(`Agents: ${agentSummary || "none"}`);
+          lines.push(`Children: ${childSummary || "none"}`);
         } catch {
           /* children may not exist */
         }
@@ -3211,6 +3666,23 @@ Model: ${ctx.inference.getDefaultModel()}
   ];
 }
 
+let cachedBuiltinToolNames: Set<string> | null = null;
+
+/** Names of the built-in tools (installed tools may not reuse them). */
+export function builtinToolNames(): Set<string> {
+  if (!cachedBuiltinToolNames) {
+    cachedBuiltinToolNames = new Set(createBuiltinTools("").map((t) => t.name));
+  }
+  return cachedBuiltinToolNames;
+}
+
+const warnedInstalledTools = new Set<string>();
+function warnInstalledToolOnce(key: string, message: string): void {
+  if (warnedInstalledTools.has(key)) return;
+  warnedInstalledTools.add(key);
+  logger.warn(message);
+}
+
 /**
  * Load installed tools from the database and return as AutomatonTool[].
  * Installed tools are dynamically added from the installed_tools table.
@@ -3227,7 +3699,23 @@ export function loadInstalledTools(db: {
 }): AutomatonTool[] {
   try {
     const installed = db.getInstalledTools();
-    return installed.map((tool) => ({
+    const builtin = builtinToolNames();
+    const seen = new Set<string>();
+    const usable = installed.filter((tool) => {
+      let why: string | null = null;
+      if (typeof tool.name !== "string" || !TOOL_NAME_RE.test(tool.name)) why = "its name is not a valid tool name";
+      else if (builtin.has(tool.name)) why = "its name is a built-in tool's";
+      else if (seen.has(tool.name)) why = "another installed tool has the same name";
+      // There is no MCP client: an MCP tool could only fake a result.
+      else if (tool.type === "mcp") why = "MCP invocation is not supported";
+      if (why) {
+        warnInstalledToolOnce(`${tool.id}:${why}`, `Installed tool "${tool.name}" is not offered to the model: ${why}`);
+        return false;
+      }
+      seen.add(tool.name);
+      return true;
+    });
+    return usable.map((tool) => ({
       name: tool.name,
       description: `Installed tool: ${tool.name}`,
       category: (tool.type === "mcp" ? "conway" : "vm") as ToolCategory,
@@ -3254,8 +3742,7 @@ function createInstalledToolExecutor(tool: {
 }): AutomatonTool["execute"] {
   return async (args, ctx) => {
     if (tool.type === "mcp") {
-      // MCP tools would be executed via MCP protocol
-      return `MCP tool ${tool.name} invoked with args: ${JSON.stringify(args)}`;
+      throw new Error(`MCP tools cannot be invoked by this runtime (${tool.name} was not run).`);
     }
     // Generic installed tool — execute via sandbox shell if command is configured
     const command = tool.config?.command as string | undefined;
@@ -3296,11 +3783,7 @@ export async function executeTool(
   tools: AutomatonTool[],
   context: ToolContext,
   policyEngine?: PolicyEngine,
-  turnContext?: {
-    inputSource: InputSource | undefined;
-    turnToolCallCount: number;
-    sessionSpend: SpendTrackerInterface;
-  },
+  turnContext?: PolicyRequest["turnContext"],
 ): Promise<ToolCallResult> {
   const tool = tools.find((t) => t.name === toolName);
   const startTime = Date.now();
@@ -3324,8 +3807,21 @@ export async function executeTool(
       context,
       turnContext,
     };
-    const decision = policyEngine.evaluate(request);
-    policyEngine.logDecision(decision);
+    let decision: ReturnType<PolicyEngine["evaluate"]>;
+    try {
+      decision = policyEngine.evaluate(request);
+      policyEngine.logDecision(decision);
+    } catch (err: any) {
+      // Fail closed: a policy that cannot decide never lets the call run.
+      return {
+        id: ulid(),
+        name: toolName,
+        arguments: args,
+        result: "",
+        durationMs: Date.now() - startTime,
+        error: `Policy evaluation failed: ${err?.message || String(err)}; the call was not run.`,
+      };
+    }
 
     if (decision.action !== "allow") {
       return {
@@ -3340,55 +3836,17 @@ export async function executeTool(
   }
 
   try {
-    let result = await tool.execute(args, context);
+    // Every outflow the tool makes is attributed to it, with the turn's input
+    // source, so the treasury can refuse spending driven by untrusted input.
+    // The treasury records spend when an outflow commits.
+    let result = await runWithTreasuryOrigin(
+      { type: "tool", name: toolName, inputSource: turnContext?.inputSource },
+      () => tool.execute(args, context),
+    );
 
     // Sanitize results from external source tools
     if (EXTERNAL_SOURCE_TOOLS.has(toolName)) {
       result = sanitizeToolResult(result);
-    }
-
-    // Record spend for financial operations
-    if (turnContext && !result.startsWith("Blocked:")) {
-      if (toolName === "transfer_credits") {
-        const amount = args.amount_cents as number | undefined;
-        if (amount && amount > 0) {
-          try {
-            turnContext.sessionSpend.recordSpend({
-              toolName: "transfer_credits",
-              amountCents: amount,
-              recipient: args.to_address as string | undefined,
-              category: "transfer",
-            });
-          } catch (error) {
-            logger.error(
-              "Spend tracking failed for transfer_credits",
-              error instanceof Error ? error : undefined,
-            );
-          }
-        }
-      } else if (toolName === "x402_fetch") {
-        // x402 payment amounts are determined by the server response,
-        // but we record a nominal entry for tracking purposes
-        try {
-          turnContext.sessionSpend.recordSpend({
-            toolName: "x402_fetch",
-            amountCents: 0, // Actual amount is inside the x402 protocol
-            domain: (() => {
-              try {
-                return new URL(args.url as string).hostname;
-              } catch {
-                return undefined;
-              }
-            })(),
-            category: "x402",
-          });
-        } catch (error) {
-          logger.error(
-            "Spend tracking failed for x402_fetch",
-            error instanceof Error ? error : undefined,
-          );
-        }
-      }
     }
 
     return {
@@ -3405,9 +3863,70 @@ export async function executeTool(
       arguments: args,
       result: "",
       durationMs: Date.now() - startTime,
-      error: err.message || String(err),
+      error: describeToolError(toolName, err),
     };
   }
+}
+
+/** Tool error text; treasury outcomes get wording the model can act on. */
+function describeToolError(toolName: string, err: unknown): string {
+  if (isTreasuryDenied(err)) {
+    return `Policy denied: ${err.code} — ${err.message}`;
+  }
+  if (err instanceof TransferRejectedError || (err as { name?: unknown })?.name === "TransferRejectedError") {
+    return `Transfer rejected (status ${(err as TransferRejectedError).status}); nothing recorded as spent.`;
+  }
+  if (err instanceof OutcomeUnknownError || (err as { name?: unknown })?.name === "OutcomeUnknownError") {
+    return unknownOutcomeText(toolName, (err as OutcomeUnknownError).reservationId);
+  }
+  const e = err as { message?: unknown } | null | undefined;
+  return (typeof e?.message === "string" && e.message) || String(err);
+}
+
+function isTreasuryDenied(err: unknown): err is TreasuryDeniedError {
+  if (err instanceof TreasuryDeniedError) return true;
+  const e = err as { name?: unknown; code?: unknown } | null | undefined;
+  return (
+    (e?.name === "TreasuryDeniedError" || e?.name === "TreasuryNotInstalledError") &&
+    typeof e.code === "string"
+  );
+}
+
+const TRANSFER_TOOLS = new Set(["transfer_credits", "fund_child"]);
+const INFRA_TOOLS = new Set(["create_sandbox", "register_domain", "spawn_child"]);
+const USDC_TOOLS = new Set(["x402_fetch", "topup_credits"]);
+
+/** Text for an outflow that was sent but got no reliable answer. */
+function unknownOutcomeText(toolName: string, reservationId: string | undefined): string {
+  let retry: string;
+  if (TRANSFER_TOOLS.has(toolName)) {
+    retry =
+      "Retrying the identical transfer re-sends it with the same idempotency key and is charged against your limits again; after 2 retries identical transfers are refused for 24h.";
+  } else if (INFRA_TOOLS.has(toolName)) {
+    retry =
+      "Identical requests are refused for 24h; check list_sandboxes or the domain before trying anything else.";
+  } else if (toolName === "topup_credits") {
+    retry =
+      "The signed payment may still settle. An identical topup is refused while the payment is unconfirmed; once it is confirmed on chain the topup counts as done and the next identical topup is refused once (TOPUP_ALREADY_SETTLED). If its authorization expires unused, an identical topup buys again. Check check_credits before buying more.";
+  } else if (USDC_TOOLS.has(toolName)) {
+    retry =
+      "The signed payment may still settle. An identical request is refused while the payment is unconfirmed; once it is confirmed on chain or its authorization expires unused, an identical request pays again.";
+  } else {
+    retry = "Check whether it took effect before trying again.";
+  }
+  return `Outcome unknown (ledger ${reservationId ?? "n/a"}): the request was sent but no reliable answer came back. It counts against your limits. ${retry}`;
+}
+
+/**
+ * Repository path for the git tools, default ~/.automaton. A leading ~ is
+ * expanded here (to HOME locally, /root in a remote sandbox) because the git
+ * helpers quote the path, and the shell never expands a quoted ~.
+ */
+function resolveGitRepoPath(value: unknown, ctx: ToolContext, fallback = "~/.automaton"): string {
+  const p = typeof value === "string" && value.trim() ? value.trim() : fallback;
+  if (p !== "~" && !p.startsWith("~/")) return p;
+  const home = isLocalSandboxId(ctx.identity.sandboxId) ? homeDir() : SANDBOX_HOME;
+  return p === "~" ? home : nodePath.join(home, p.slice(2));
 }
 
 /** Escape a string for safe shell interpolation. */

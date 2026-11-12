@@ -4,13 +4,17 @@ import {
   getGoalById,
   getReadyTasks as getReadyTaskRows,
   getTaskById,
+  insertEvent,
   insertGoal,
   insertTask,
   updateGoalStatus,
   updateTaskStatus,
   withTransaction,
 } from "../state/database.js";
-import type { GoalRow, TaskGraphRow } from "../state/database.js";
+import type { GoalRow, GoalStatus as DbGoalStatus, TaskGraphRow } from "../state/database.js";
+import { createLogger } from "../observability/logger.js";
+
+const logger = createLogger("orchestration.task-graph");
 
 export type TaskStatus =
   | "pending"
@@ -21,7 +25,8 @@ export type TaskStatus =
   | "blocked"
   | "cancelled";
 
-export type GoalStatus = "active" | "completed" | "failed" | "paused";
+// One definition with the row type, so a new goal status needs no change here.
+export type GoalStatus = DbGoalStatus;
 
 export interface TaskResult {
   success: boolean;
@@ -68,7 +73,38 @@ export interface Goal {
   deadline: string | null;
 }
 
-type DecomposeTaskInput = Omit<TaskNode, "id" | "metadata">;
+export type DecomposeTaskInput = Omit<TaskNode, "id" | "metadata"> & {
+  estimatedCostCents?: number;
+  timeoutMs?: number;
+  maxRetries?: number;
+};
+
+/** Planner estimates are clamped so the per-task inference cap (2x estimate) stays at most 1000c. */
+export const MAX_TASK_ESTIMATE_CENTS = 500;
+export const MIN_TASK_TIMEOUT_MS = 60_000;
+export const MAX_TASK_TIMEOUT_MS = 60 * 60_000;
+export const DEFAULT_TASK_TIMEOUT_MS = 300_000;
+/** Grace past a task's own timeout before the orchestrator reclaims it. */
+export const TASK_DEADLINE_GRACE_MS = 2 * 60_000;
+
+export function clampTaskEstimateCents(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return Math.max(0, Math.min(MAX_TASK_ESTIMATE_CENTS, Math.round(n)));
+}
+
+export function clampTaskTimeoutMs(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_TASK_TIMEOUT_MS;
+  return Math.max(MIN_TASK_TIMEOUT_MS, Math.min(MAX_TASK_TIMEOUT_MS, Math.round(n)));
+}
+
+/** What a task's owner reports when it settles the task. */
+export type TaskOutcome =
+  | { kind: "complete"; result: TaskResult }
+  | { kind: "fail"; error: string; retry: boolean; costCents?: number }
+  | { kind: "defer"; reason: string; costCents?: number };
+
+/** "stale": the caller no longer owns the task, so nothing but its spend was recorded. */
+export type SettleResult = "applied" | "stale";
 
 type CycleTask = {
   id?: string;
@@ -76,6 +112,14 @@ type CycleTask = {
   parentId?: string | null;
   dependencies: string[];
 };
+
+/** KV key set when worker inference was refused; the orchestrator assigns nothing before it passes. */
+export const ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY = "orchestrator.inference_blocked_until";
+/** Longest such block; a later value means the clock moved backwards and is ignored. */
+export const MAX_INFERENCE_BLOCK_MS = 60 * 60_000;
+
+/** SQL on alias `t`: the task's parent (an orchestrator task) is still assigned or running. */
+const LIVE_PARENT = `EXISTS (SELECT 1 FROM task_graph p WHERE p.id = t.parent_id AND p.status IN ('assigned', 'running'))`;
 
 const TERMINAL_TASK_STATUSES = new Set<TaskStatus>([
   "completed",
@@ -117,7 +161,7 @@ export function createGoal(
 export function decomposeGoal(
   db: Database,
   goalId: string,
-  tasks: Omit<TaskNode, "id" | "metadata">[],
+  tasks: DecomposeTaskInput[],
 ): void {
   if (!getGoalById(db, goalId)) {
     throw new Error(`Goal not found: ${goalId}`);
@@ -192,6 +236,15 @@ export function decomposeGoal(
         priority: planned.task.priority,
         dependencies: dependencyRefs,
         result: planned.task.result,
+        ...(planned.task.estimatedCostCents !== undefined
+          ? { estimatedCostCents: clampTaskEstimateCents(planned.task.estimatedCostCents) }
+          : {}),
+        ...(planned.task.timeoutMs !== undefined
+          ? { timeoutMs: clampTaskTimeoutMs(planned.task.timeoutMs) }
+          : {}),
+        ...(typeof planned.task.maxRetries === "number" && Number.isInteger(planned.task.maxRetries)
+          ? { maxRetries: Math.max(0, Math.min(10, planned.task.maxRetries)) }
+          : {}),
       });
 
       localToPersisted.set(planned.localId, taskId);
@@ -232,6 +285,12 @@ export function decomposeGoal(
   });
 }
 
+/** The task as a TaskNode, or null when it does not exist. */
+export function getTaskNode(db: Database, taskId: string): TaskNode | null {
+  const row = getTaskById(db, taskId);
+  return row ? taskRowToTaskNode(row) : null;
+}
+
 export function getReadyTasks(db: Database): TaskNode[] {
   return getReadyTaskRows(db).map(taskRowToTaskNode);
 }
@@ -257,6 +316,7 @@ export function assignTask(db: Database, taskId: string, agentAddress: string): 
   });
 }
 
+/** Admin completion (tools, tests): no owner check. Workers use settleTask. */
 export function completeTask(db: Database, taskId: string, result: TaskResult): void {
   withTransaction(db, () => {
     const task = getTaskById(db, taskId);
@@ -268,17 +328,22 @@ export function completeTask(db: Database, taskId: string, result: TaskResult): 
       throw new Error(`Task ${taskId} is already in terminal status '${task.status}'`);
     }
 
-    updateTaskStatus(db, taskId, "completed");
-    db.prepare(
-      "UPDATE task_graph SET result = ?, actual_cost_cents = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-    ).run(JSON.stringify(result), result.costCents, new Date().toISOString(), taskId);
-
-    unblockReadyBlockedTasks(db);
-    refreshGoalStatus(db, task.goalId);
+    applyComplete(db, task, result);
   });
 }
 
-export function failTask(db: Database, taskId: string, error: string, shouldRetry: boolean): void {
+/**
+ * Admin failure (tools, tests): no owner check. Workers use settleTask.
+ * `costCents`, when given, is the task's cumulative inference spend and is
+ * written to actual_cost_cents.
+ */
+export function failTask(
+  db: Database,
+  taskId: string,
+  error: string,
+  shouldRetry: boolean,
+  costCents?: number,
+): void {
   withTransaction(db, () => {
     const task = getTaskById(db, taskId);
     if (!task) {
@@ -289,71 +354,352 @@ export function failTask(db: Database, taskId: string, error: string, shouldRetr
       throw new Error(`Task ${taskId} is already in terminal status '${task.status}'`);
     }
 
-    const failureResult: TaskResult = {
-      success: false,
-      output: error,
-      artifacts: [],
-      costCents: task.actualCostCents,
-      duration: 0,
-    };
-
-    const canRetry = shouldRetry && task.retryCount < task.maxRetries;
-    if (canRetry) {
-      const nextStatus: TaskStatus = areDependenciesSatisfied(db, task.dependencies)
-        ? "pending"
-        : "blocked";
-
-      db.prepare(
-        `UPDATE task_graph
-         SET status = ?, retry_count = ?, assigned_to = NULL, started_at = NULL, completed_at = NULL, result = ?
-         WHERE id = ?`,
-      ).run(nextStatus, task.retryCount + 1, JSON.stringify(failureResult), taskId);
-
-      return;
-    }
-
-    updateTaskStatus(db, taskId, "failed");
-    db.prepare(
-      "UPDATE task_graph SET result = ?, assigned_to = NULL WHERE id = ?",
-    ).run(JSON.stringify(failureResult), taskId);
-
-    blockDependentsForFailedTask(db, taskId);
-    refreshGoalStatus(db, task.goalId);
+    applyFail(db, task, error, shouldRetry, costCents);
   });
 }
 
-export function getGoalProgress(
+/**
+ * Put a task back in the queue without consuming a retry: used when
+ * inference was refused for a reason that clears with time. Returns false
+ * when the task is missing or already terminal.
+ */
+export function deferTask(db: Database, taskId: string, reason: string, costCents?: number): boolean {
+  return withTransaction(db, () => {
+    const task = getTaskById(db, taskId);
+    if (!task || TERMINAL_TASK_STATUSES.has(task.status)) {
+      return false;
+    }
+    applyDefer(db, task, reason, costCents);
+    return true;
+  });
+}
+
+/** True while `owner` holds the task (assigned or running to it). */
+export function isTaskOwnedBy(db: Database, taskId: string, owner: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM task_graph WHERE id = ? AND assigned_to = ? AND status IN ('assigned', 'running')")
+    .get(taskId, owner);
+  return row !== undefined;
+}
+
+/**
+ * The owner starts work: assigned -> running with started_at set now.
+ * False when the task is no longer assigned to it (nothing to do).
+ */
+export function claimTaskStart(db: Database, taskId: string, owner: string): boolean {
+  const info = db
+    .prepare(
+      `UPDATE task_graph SET status = 'running', started_at = ?
+       WHERE id = ? AND assigned_to = ? AND status = 'assigned'`,
+    )
+    .run(new Date().toISOString(), taskId, owner);
+  return info.changes > 0;
+}
+
+/**
+ * Apply an owner's report. Only the current owner of an assigned or
+ * running task can settle it; any other report is stale: it is dropped and
+ * logged, and only its spend is kept (actual_cost_cents never goes down).
+ */
+export function settleTask(db: Database, taskId: string, owner: string, outcome: TaskOutcome): SettleResult {
+  return withTransaction(db, () => {
+    const task = getTaskById(db, taskId);
+    if (!task || task.assignedTo !== owner || (task.status !== "assigned" && task.status !== "running")) {
+      const cost = outcome.kind === "complete" ? outcome.result.costCents : outcome.costCents;
+      recordStaleReport(db, taskId, owner, task, outcome.kind, cost);
+      return "stale";
+    }
+
+    if (outcome.kind === "complete") {
+      applyComplete(db, task, outcome.result);
+    } else if (outcome.kind === "fail") {
+      applyFail(db, task, outcome.error, outcome.retry, outcome.costCents);
+    } else {
+      applyDefer(db, task, outcome.reason, outcome.costCents);
+    }
+    return "applied";
+  });
+}
+
+/**
+ * Take a task back from its owner. With retry, the release counts as a
+ * failed attempt (dead owner, timeout) and fails the task for good once its
+ * retries are spent; without, it is a deferral that spends nothing.
+ */
+export function releaseTask(
+  db: Database,
+  taskId: string,
+  owner: string,
+  reason: string,
+  options: { retry: boolean },
+): SettleResult {
+  return settleTask(
+    db,
+    taskId,
+    owner,
+    options.retry ? { kind: "fail", error: reason, retry: true } : { kind: "defer", reason },
+  );
+}
+
+/** Raise a task's recorded spend; spend is a fact even when a report is dropped. */
+export function recordTaskSpend(db: Database, taskId: string, costCents: number | undefined): void {
+  if (typeof costCents !== "number" || !Number.isFinite(costCents) || costCents <= 0) return;
+  db.prepare("UPDATE task_graph SET actual_cost_cents = MAX(COALESCE(actual_cost_cents, 0), ?) WHERE id = ?")
+    .run(costCents, taskId);
+}
+
+/**
+ * Supersede every pending, blocked or failed task of a goal (a replan
+ * replaces them), except keepIds. Assigned, running and completed tasks are
+ * left alone.
+ */
+export function supersedeOpenTasks(
   db: Database,
   goalId: string,
-): { total: number; completed: number; failed: number; blocked: number; running: number } {
+  replanNumber: number,
+  keepIds: ReadonlySet<string> = new Set(),
+): number {
+  const result: TaskResult & { superseded_by_replan: number } = {
+    success: false,
+    output: `Superseded by replan ${replanNumber}`,
+    artifacts: [],
+    costCents: 0,
+    duration: 0,
+    superseded_by_replan: replanNumber,
+  };
+  // Sub-tasks of a still-running orchestrator task belong to it and are left alone.
+  const info = db
+    .prepare(
+      `UPDATE task_graph AS t SET status = 'cancelled', completed_at = ?, result = ?
+       WHERE goal_id = ? AND status IN ('pending', 'blocked', 'failed') AND NOT ${LIVE_PARENT}
+         AND id NOT IN (SELECT value FROM json_each(?))`,
+    )
+    .run(new Date().toISOString(), JSON.stringify(result), goalId, JSON.stringify([...keepIds]));
+  return info.changes;
+}
+
+/**
+ * Cancel the given failed tasks and every pending or blocked task that
+ * depends on them, directly or transitively: a dependent of replaced work
+ * could never become ready. Returns the ids cancelled.
+ */
+export function supersedeFailedWithDependents(
+  db: Database,
+  failedIds: string[],
+  marker: Record<string, unknown>,
+  output: string,
+): string[] {
+  const result = JSON.stringify({ success: false, output, artifacts: [], costCents: 0, duration: 0, ...marker });
+  const now = new Date().toISOString();
+  const cancelRoot = db.prepare(
+    "UPDATE task_graph SET status = 'cancelled', completed_at = ?, result = ? WHERE id = ? AND status = 'failed'",
+  );
+  const cancelDependent = db.prepare(
+    "UPDATE task_graph SET status = 'cancelled', completed_at = ?, result = ? WHERE id = ? AND status IN ('pending', 'blocked')",
+  );
+  const dependentsOf = db.prepare(
+    `SELECT t.id FROM task_graph t
+      WHERE t.status IN ('pending', 'blocked')
+        AND EXISTS (SELECT 1 FROM json_each(COALESCE(NULLIF(t.dependencies, ''), '[]')) dep WHERE dep.value = ?)`,
+  );
+
+  const cancelled: string[] = [];
+  const queue: string[] = [];
+  for (const id of failedIds) {
+    if (cancelRoot.run(now, result, id).changes > 0) cancelled.push(id);
+    // A root cancelled earlier may still have waiting dependents.
+    const status = getTaskById(db, id)?.status;
+    if (status === "cancelled" || status === "failed") queue.push(id);
+  }
+  const seen = new Set<string>(queue);
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    for (const row of dependentsOf.all(id) as Array<{ id: string }>) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      if (cancelDependent.run(now, result, row.id).changes > 0) {
+        cancelled.push(row.id);
+        queue.push(row.id);
+      }
+    }
+  }
+  return cancelled;
+}
+
+function recordStaleReport(
+  db: Database,
+  taskId: string,
+  owner: string,
+  task: TaskGraphRow | undefined,
+  kind: TaskOutcome["kind"],
+  costCents: number | undefined,
+): void {
+  if (task) recordTaskSpend(db, taskId, costCents);
+  logger.warn("Dropped a stale task report", {
+    taskId,
+    reporter: owner,
+    kind,
+    currentStatus: task?.status ?? "missing",
+    currentOwner: task?.assignedTo ?? null,
+  });
+  try {
+    insertEvent(db, {
+      type: "stale_task_report",
+      agentAddress: owner,
+      goalId: task?.goalId ?? null,
+      taskId,
+      content: JSON.stringify({ kind, currentStatus: task?.status ?? "missing", currentOwner: task?.assignedTo ?? null }),
+      tokenCount: 0,
+    });
+  } catch {
+    // The event stream is best effort; the report is dropped either way.
+  }
+}
+
+function applyComplete(db: Database, task: TaskGraphRow, result: TaskResult): void {
+  updateTaskStatus(db, task.id, "completed");
+  db.prepare(
+    `UPDATE task_graph
+     SET result = ?, actual_cost_cents = MAX(COALESCE(actual_cost_cents, 0), ?), started_at = COALESCE(started_at, ?)
+     WHERE id = ?`,
+  ).run(JSON.stringify(result), result.costCents, new Date().toISOString(), task.id);
+
+  // An orchestrator task that succeeds has dealt with its failed sub-tasks;
+  // they must not fail the goal once it is no longer running.
+  const failedSubTasks = db
+    .prepare("SELECT id FROM task_graph WHERE parent_id = ? AND status = 'failed'")
+    .all(task.id) as Array<{ id: string }>;
+  if (failedSubTasks.length > 0) {
+    supersedeFailedWithDependents(
+      db,
+      failedSubTasks.map((row) => row.id),
+      { superseded_by_parent: task.id },
+      "Superseded: its orchestrator task completed",
+    );
+  }
+
+  unblockReadyBlockedTasks(db);
+  refreshGoalStatus(db, task.goalId);
+}
+
+function applyFail(
+  db: Database,
+  task: TaskGraphRow,
+  error: string,
+  shouldRetry: boolean,
+  costCents?: number,
+): void {
+  const hasCost = typeof costCents === "number" && Number.isFinite(costCents) && costCents >= 0;
+  if (hasCost) recordTaskSpend(db, task.id, costCents);
+
+  const failureResult: TaskResult & { failedBy?: string } = {
+    success: false,
+    output: error,
+    artifacts: [],
+    costCents: hasCost ? costCents : task.actualCostCents,
+    duration: 0,
+  };
+
+  const canRetry = shouldRetry && task.retryCount < task.maxRetries;
+  if (canRetry) {
+    // The next attempt clears assigned_to, so the failing owner goes in the result.
+    if (task.assignedTo) failureResult.failedBy = task.assignedTo;
+    const nextStatus: TaskStatus = areDependenciesSatisfied(db, task.dependencies)
+      ? "pending"
+      : "blocked";
+
+    db.prepare(
+      `UPDATE task_graph
+       SET status = ?, retry_count = ?, assigned_to = NULL, started_at = NULL, completed_at = NULL, result = ?
+       WHERE id = ?`,
+    ).run(nextStatus, task.retryCount + 1, JSON.stringify(failureResult), task.id);
+
+    return;
+  }
+
+  // A permanent failure keeps assigned_to so the failure stays attributed.
+  updateTaskStatus(db, task.id, "failed");
+  db.prepare("UPDATE task_graph SET result = ? WHERE id = ?").run(JSON.stringify(failureResult), task.id);
+
+  blockDependentsForFailedTask(db, task.id);
+  refreshGoalStatus(db, task.goalId);
+}
+
+function applyDefer(db: Database, task: TaskGraphRow, reason: string, costCents?: number): void {
+  const nextStatus: TaskStatus = areDependenciesSatisfied(db, task.dependencies) ? "pending" : "blocked";
+  const hasCost = typeof costCents === "number" && Number.isFinite(costCents) && costCents >= 0;
+  const deferredResult: TaskResult = {
+    success: false,
+    output: `Deferred: ${reason}`,
+    artifacts: [],
+    costCents: hasCost ? costCents : task.actualCostCents,
+    duration: 0,
+  };
+
+  db.prepare(
+    `UPDATE task_graph
+     SET status = ?, assigned_to = NULL, started_at = NULL, completed_at = NULL, result = ?,
+         actual_cost_cents = MAX(COALESCE(actual_cost_cents, 0), ?)
+     WHERE id = ?`,
+  ).run(nextStatus, JSON.stringify(deferredResult), deferredResult.costCents, task.id);
+}
+
+export interface GoalProgress {
+  total: number;
+  completed: number;
+  /** Failed tasks nobody is handling: the goal needs a replan. */
+  failed: number;
+  /** Failed sub-tasks whose orchestrator task is still running and handles them. */
+  failedUnderLiveParent: number;
+  blocked: number;
+  /** Assigned or running. */
+  running: number;
+  pending: number;
+  cancelled: number;
+  /** Pending, assigned or running. */
+  active: number;
+  /** Total minus cancelled: what must complete for the goal to complete. */
+  effectiveTotal: number;
+}
+
+export function getGoalProgress(db: Database, goalId: string): GoalProgress {
   const row = db
     .prepare(
       `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN status = 'failed' AND NOT ${LIVE_PARENT} THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN status = 'failed' AND ${LIVE_PARENT} THEN 1 ELSE 0 END) AS failedUnderLiveParent,
          SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-         SUM(CASE WHEN status IN ('assigned', 'running') THEN 1 ELSE 0 END) AS running
-       FROM task_graph
+         SUM(CASE WHEN status IN ('assigned', 'running') THEN 1 ELSE 0 END) AS running,
+         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
+       FROM task_graph t
        WHERE goal_id = ?`,
     )
-    .get(goalId) as
-    | {
-        total: number;
-        completed: number | null;
-        failed: number | null;
-        blocked: number | null;
-        running: number | null;
-      }
-    | undefined;
+    .get(goalId) as Record<string, number | null> | undefined;
 
+  const total = row?.total ?? 0;
+  const running = row?.running ?? 0;
+  const pending = row?.pending ?? 0;
+  const cancelled = row?.cancelled ?? 0;
   return {
-    total: row?.total ?? 0,
+    total,
     completed: row?.completed ?? 0,
     failed: row?.failed ?? 0,
+    failedUnderLiveParent: row?.failedUnderLiveParent ?? 0,
     blocked: row?.blocked ?? 0,
-    running: row?.running ?? 0,
+    running,
+    pending,
+    cancelled,
+    active: running + pending,
+    effectiveTotal: total - cancelled,
   };
+}
+
+/** Every task that has to complete has completed (cancelled tasks do not count). */
+export function isGoalProgressComplete(progress: GoalProgress): boolean {
+  return progress.effectiveTotal > 0 && progress.completed === progress.effectiveTotal;
 }
 
 export function pruneCompletedGoals(db: Database, olderThan: string): void {
@@ -631,23 +977,20 @@ function unblockReadyBlockedTasks(db: Database): void {
 
 function refreshGoalStatus(db: Database, goalId: string): void {
   const goal = getGoalById(db, goalId);
-  if (!goal || goal.status === "paused") {
+  // Only active and failed goals follow their tasks; paused, completed and
+  // cancelled goals are set by their owner and never overwritten here.
+  if (!goal || (goal.status !== "active" && goal.status !== "failed")) {
     return;
   }
 
   const progress = getGoalProgress(db, goalId);
 
-  if (progress.total === 0) {
-    updateGoalStatus(db, goalId, "active");
-    return;
-  }
-
   if (progress.failed > 0) {
-    updateGoalStatus(db, goalId, "failed");
+    if (goal.status !== "failed") updateGoalStatus(db, goalId, "failed");
     return;
   }
 
-  if (progress.completed === progress.total) {
+  if (isGoalProgressComplete(progress)) {
     updateGoalStatus(db, goalId, "completed");
     return;
   }

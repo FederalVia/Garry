@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 15;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -678,4 +678,226 @@ export const MIGRATION_V10 = `
 
   CREATE INDEX idx_knowledge_category ON knowledge_store(category);
   CREATE INDEX idx_knowledge_key ON knowledge_store(key);
+`;
+
+// === Treasury: spending gate ledger ===
+// Applied through ensureTreasuryLedger, which also copies the last day of
+// transfer and x402 spend from spend_tracking when it first creates the table.
+
+export const MIGRATION_V12 = `
+  -- Schema version: 12
+  -- Tables: treasury_ledger
+
+  CREATE TABLE IF NOT EXISTS treasury_ledger (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    replay_of TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('credit_transfer','x402_payment','credit_topup','sandbox_create','domain_register','legacy')),
+    budget TEXT NOT NULL CHECK(budget IN ('transfer','x402','topup','topup_auto','infra')),
+    status TEXT NOT NULL CHECK(status IN ('denied','reserved','sent','committed','released','unknown')),
+    amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0 AND typeof(amount_cents) = 'integer'),
+    committed_cents INTEGER CHECK(committed_cents IS NULL OR (committed_cents >= 0 AND typeof(committed_cents) = 'integer')),
+    amount_atomic INTEGER CHECK(amount_atomic IS NULL OR (amount_atomic >= 0 AND typeof(amount_atomic) = 'integer')),
+    amount_basis TEXT NOT NULL DEFAULT 'exact' CHECK(amount_basis IN ('exact','quote','estimate','ceiling')),
+    debits_credits INTEGER NOT NULL CHECK(debits_credits IN (0,1)),
+    counterparty TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    origin_type TEXT NOT NULL,
+    origin_name TEXT,
+    input_source TEXT,
+    boot_id TEXT,
+    topup_purpose TEXT,
+    url TEXT,
+    description TEXT,
+    deny_code TEXT,
+    deny_count INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    external_ref TEXT,
+    x402_nonce TEXT,
+    x402_valid_before INTEGER,
+    x402_from TEXT,
+    x402_network TEXT,
+    x402_asset TEXT,
+    balance_observed_cents INTEGER,
+    balance_read_started_ms INTEGER,
+    balance_unknown INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    sent_at_ms INTEGER,
+    settled_at_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_treasury_budget_time ON treasury_ledger(budget, created_at_ms);
+  CREATE INDEX IF NOT EXISTS idx_treasury_open ON treasury_ledger(status, debits_credits);
+  CREATE INDEX IF NOT EXISTS idx_treasury_dedupe ON treasury_ledger(dedupe_key, status);
+  CREATE INDEX IF NOT EXISTS idx_treasury_replay ON treasury_ledger(replay_of);
+`;
+
+// === Inference spend gate ledger ===
+// Applied through ensureInferenceLedger, which also copies the last day of
+// inference_costs when it first creates the table. One row per HTTP attempt;
+// amounts are integer micro-USD (1 cent = 10,000).
+
+export const MIGRATION_V13 = `
+  -- Schema version: 13
+  -- Tables: inference_ledger
+
+  CREATE TABLE IF NOT EXISTS inference_ledger (
+    id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('reserved','committed','released','unknown')),
+    budget_class TEXT NOT NULL CHECK(budget_class IN ('main','orchestration','survival')),
+    caller TEXT NOT NULL,
+    session_id TEXT,
+    task_id TEXT,
+    goal_id TEXT,
+    worker_id TEXT,
+    turn_id TEXT,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    tier TEXT,
+    survival_tier TEXT,
+    price_in_usd_per_m REAL NOT NULL,
+    price_out_usd_per_m REAL NOT NULL,
+    est_input_tokens INTEGER NOT NULL,
+    max_output_tokens INTEGER NOT NULL,
+    reserved_micro_usd INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_micro_usd INTEGER,
+    error_class TEXT,
+    latency_ms INTEGER,
+    boot_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    settled_at_ms INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_infl_created ON inference_ledger(created_at_ms);
+  CREATE INDEX IF NOT EXISTS idx_infl_task ON inference_ledger(task_id) WHERE task_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_infl_session ON inference_ledger(session_id) WHERE session_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_infl_open ON inference_ledger(status) WHERE status IN ('reserved','unknown');
+`;
+
+// === Colony bookkeeping repair ===
+// Applied by the version 14 entry of applyMigrations (database.ts);
+// ensureChildrenAddressIndex then adds the unique address index once no
+// duplicates remain. Idempotent.
+
+export const MIGRATION_V14 = `
+  -- Schema version: 14
+  -- Local workers are in-process and never survive a restart: retire every
+  -- row the orchestrator registered for one.
+  UPDATE children SET status = 'cleaned_up'
+   WHERE address LIKE 'local://%' AND status NOT IN ('cleaned_up', 'dead');
+
+  -- The orchestrator never started the Conway children it spawned. One still
+  -- before start (its twin marks it) has no process: fail it, which frees
+  -- its slot. Lifecycle timestamps are ISO, so the repair events are
+  -- stamped that way to sort after the existing ones.
+  INSERT INTO child_lifecycle_events (id, child_id, from_state, to_state, reason, metadata, created_at)
+  SELECT lower(hex(randomblob(16))), c.id, latest.to_state, 'failed',
+         'orchestrator spawn never started (upgrade repair)', '{}',
+         MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), latest.created_at)
+    FROM children c
+    JOIN (SELECT e.child_id, e.to_state, e.created_at FROM child_lifecycle_events e
+           WHERE e.rowid = (SELECT e2.rowid FROM child_lifecycle_events e2
+                             WHERE e2.child_id = e.child_id
+                             ORDER BY e2.created_at DESC, e2.rowid DESC LIMIT 1)) latest
+      ON latest.child_id = c.id
+   WHERE latest.to_state IN ('wallet_verified', 'funded')
+     AND c.address <> ''
+     AND EXISTS (
+       SELECT 1 FROM children twin
+        WHERE twin.address = c.address AND twin.id <> c.id
+          AND twin.creator_message = 'registered by orchestrator'
+          AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e3 WHERE e3.child_id = twin.id)
+     );
+
+  -- A row the orchestrator registered for a Conway child duplicates that
+  -- child's lifecycle row (same address, same ledger updates): drop it.
+  DELETE FROM children
+   WHERE creator_message = 'registered by orchestrator'
+     AND address <> '' AND address NOT LIKE 'local://%'
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id)
+     AND EXISTS (
+       SELECT 1 FROM children c2
+        WHERE c2.address = children.address AND c2.id <> children.id
+          AND EXISTS (SELECT 1 FROM child_lifecycle_events e2 WHERE e2.child_id = c2.id)
+     );
+
+  -- A registered row whose lifecycle row is gone outlived a pruned (ended)
+  -- child; the orchestrator never started a process for it.
+  UPDATE children SET status = 'dead'
+   WHERE creator_message = 'registered by orchestrator'
+     AND address NOT LIKE 'local://%'
+     AND status NOT IN ('cleaned_up', 'dead')
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- Rows retired to cleaned_up without an event (a reused sandbox) get the
+  -- event, so the reconciliation below keeps them terminal.
+  INSERT INTO child_lifecycle_events (id, child_id, from_state, to_state, reason, metadata, created_at)
+  SELECT lower(hex(randomblob(16))), c.id, latest.to_state, 'cleaned_up',
+         'retired before upgrade (upgrade repair)', '{}',
+         MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), latest.created_at)
+    FROM children c
+    JOIN (SELECT e.child_id, e.to_state, e.created_at FROM child_lifecycle_events e
+           WHERE e.rowid = (SELECT e2.rowid FROM child_lifecycle_events e2
+                             WHERE e2.child_id = e.child_id
+                             ORDER BY e2.created_at DESC, e2.rowid DESC LIMIT 1)) latest
+      ON latest.child_id = c.id
+   WHERE c.status = 'cleaned_up' AND latest.to_state IN ('stopped', 'failed');
+
+  -- Lifecycle children: status is the latest lifecycle state. Undoes the
+  -- running/starting/stopped writes of the tracker, health monitor and pool
+  -- optimizer.
+  UPDATE children SET status = (
+      SELECT e.to_state FROM child_lifecycle_events e
+       WHERE e.child_id = children.id
+       ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1)
+   WHERE EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- Legacy runtimes wrote 'starting' without an event only when their health
+  -- monitor "restarted" a dead child, which started nothing. Nothing can
+  -- move such a row, and it would hold a slot forever.
+  UPDATE children SET status = 'dead'
+   WHERE status = 'starting'
+     AND NOT EXISTS (SELECT 1 FROM child_lifecycle_events e WHERE e.child_id = children.id);
+
+  -- An ended row sharing its address with a live or newer row (a wallet
+  -- inherited through a reused sandbox) gives the address up, so the unique
+  -- address index can be created.
+  UPDATE children SET address = ''
+   WHERE address <> ''
+     AND status IN ('stopped', 'failed', 'dead', 'cleaned_up')
+     AND EXISTS (
+       SELECT 1 FROM children other
+        WHERE other.address = children.address AND other.id <> children.id
+          AND (other.status NOT IN ('stopped', 'failed', 'dead', 'cleaned_up')
+               OR other.created_at > children.created_at
+               OR (other.created_at = children.created_at AND other.rowid > children.rowid))
+     );
+
+  -- Colony messages the old LocalDBTransport wrote into our own inbox are
+  -- our outbound messages, not inbound ones.
+  UPDATE inbox_messages
+     SET status = 'processed', processed_at = COALESCE(processed_at, datetime('now'))
+   WHERE status IN ('received', 'in_progress') AND to_address IS NOT NULL
+     AND from_address = (SELECT value FROM identity WHERE key = 'address');
+`;
+
+/** One row per child address (failed spawns keep an empty address). */
+export const CHILDREN_ADDRESS_INDEX = `
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_children_address ON children(address) WHERE address <> '';
+`;
+
+// === Model registry origin ===
+// Applied by the version 15 entry of applyMigrations (database.ts), which
+// adds the column only when it is missing and then marks models discovered
+// from the Conway API before the upgrade. initialize() disables only
+// 'baseline' rows that left the static baseline.
+
+export const MIGRATION_V15 = `
+  -- Schema version: 15
+  ALTER TABLE model_registry ADD COLUMN origin TEXT NOT NULL DEFAULT 'baseline'
+    CHECK(origin IN ('baseline','api','ollama','manual'));
+  UPDATE model_registry SET origin = 'ollama' WHERE provider IN ('ollama','other');
 `;

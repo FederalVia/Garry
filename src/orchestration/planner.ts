@@ -1,5 +1,6 @@
 import type { Goal, TaskNode } from "./task-graph.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { runWithInferenceScope } from "../inference/gate.js";
 import type { ModelTier } from "../inference/provider-registry.js";
 
 export interface PlannerOutput {
@@ -39,8 +40,9 @@ export interface PlannedTask {
 }
 
 export interface PlannerContext {
-  creditsCents: number;
-  usdcBalance: number;
+  /** null: the balance could not be read. */
+  creditsCents: number | null;
+  usdcBalance: number | null;
   survivalTier: string;
   availableRoles: string[];
   customRoles: string[];
@@ -79,6 +81,19 @@ export interface PlannerFailureInput {
 }
 
 const MODEL_TIERS: readonly ModelTier[] = ["reasoning", "fast", "cheap"];
+const PLANNER_MAX_TOKENS = 8192;
+
+/**
+ * The model answered but its plan was unusable (empty, invalid JSON, failed
+ * validation). Only this error justifies a fallback plan; a refusal or a
+ * provider failure means "try again later".
+ */
+export class PlannerOutputError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "PlannerOutputError";
+  }
+}
 
 export async function planGoal(
   goal: PlannerGoalInput,
@@ -93,16 +108,24 @@ export async function planGoal(
   });
 }
 
+/** Work that already exists; a replan keeps it instead of planning it again. */
+export interface PlannerProgressInput {
+  completedTasks: string[];
+  inProgressTasks: string[];
+}
+
 export async function replanAfterFailure(
   goal: PlannerGoalInput,
   failedTask: PlannerFailureInput,
   context: PlannerContext,
   inference: UnifiedInferenceClient,
+  progress?: PlannerProgressInput,
 ): Promise<PlannerOutput> {
   return runPlannerInference({
     mode: "replan_after_failure",
     goal,
     failedTask,
+    progress,
     context,
     inference,
   });
@@ -112,6 +135,7 @@ function runPlannerInference(params: {
   mode: "plan_goal" | "replan_after_failure";
   goal: PlannerGoalInput;
   failedTask?: PlannerFailureInput;
+  progress?: PlannerProgressInput;
   context: PlannerContext;
   inference: UnifiedInferenceClient;
 }): Promise<PlannerOutput> {
@@ -120,16 +144,32 @@ function runPlannerInference(params: {
     mode: params.mode,
     goal: params.goal,
     failedTask: params.failedTask,
+    progress: params.progress,
   });
 
-  return params.inference.chat({
-    tier: "reasoning",
-    responseFormat: { type: "json_object" },
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  }).then((result) => validatePlannerOutput(parsePlannerResponse(result.content)));
+  // The caller is set here so a worker's nested planner call keeps its task
+  // attribution (the scope merges) but is priced and limited as a planner call.
+  // Refusals propagate untouched: callers must not treat them as model errors.
+  return runWithInferenceScope(
+    { caller: params.mode === "plan_goal" ? "orchestrator.plan" : "orchestrator.replan" },
+    () => params.inference.chat({
+      tier: "reasoning",
+      purpose: "planner",
+      // Not clamped: a truncated plan fails to parse.
+      maxTokens: PLANNER_MAX_TOKENS,
+      responseFormat: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    }),
+  ).then((result) => {
+    try {
+      return validatePlannerOutput(parsePlannerResponse(result.content));
+    } catch (error) {
+      throw new PlannerOutputError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+  });
 }
 
 export function goalToPlannerInput(goal: Goal): PlannerGoalInput {
@@ -215,8 +255,9 @@ export function buildPlannerPrompt(context: PlannerContext): string {
   const marketIntel = context.marketIntel.trim().length > 0 ? context.marketIntel.trim() : "none";
   const modelHints = MODEL_TIERS.map((tier) => `tier:${tier}`).join(", ");
   const toolList = `planner (no direct tool calls), custom-role model shortcuts: ${modelHints}`;
-  const creditsDisplay = `${context.creditsCents} cents`;
-  const usdcDisplay = Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "0";
+  const creditsDisplay = context.creditsCents === null ? "unknown" : `${context.creditsCents} cents`;
+  const usdcDisplay =
+    typeof context.usdcBalance === "number" && Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "unknown";
 
   return `# Planner Agent
 
@@ -296,7 +337,7 @@ RECEIVE -> ANALYZE -> DECOMPOSE -> VALIDATE -> OUTPUT
 <context>
 You have access to (injected at runtime):
 - Current financial state: ${creditsDisplay} credits, ${usdcDisplay} USDC
-- Survival tier: ${context.survivalTier} (critical/low/stable/comfortable)
+- Survival tier: ${context.survivalTier} (dead/critical/low_compute/normal/high; unknown when the balance could not be read)
 - Available predefined roles: ${roleList} (26 roles across 7 departments)
 - Previously created custom roles: ${customRoleList}
 - Active goals and their progress: ${activeGoals}
@@ -394,6 +435,10 @@ Infrastructure costs (per task):
 
 Total task cost = inference + tools + compute + 20% buffer
 
+Limits the runtime enforces per task: estimatedCostCents is capped at 500 (the
+task's inference budget is twice its estimate) and timeoutMs is kept between
+60000 (1 min) and 3600000 (1 h). Split larger work into more tasks.
+
 CRITICAL: When colony is in SURVIVAL MODE (credits < 1000), cap total plan
 cost at 50% of remaining credits. Never risk the colony on a single plan.
 </cost_estimation>
@@ -423,9 +468,9 @@ Respond with a JSON object matching the PlannerOutput schema:
       "description": "Detailed spec: what to do, inputs, expected outputs, success criteria",
       "agentRole": "predefined_role or custom-role-name",
       "dependencies": [0, 1],
-      "estimatedCostCents": 15000,
+      "estimatedCostCents": 300,
       "priority": 1,
-      "timeoutMs": 3600000
+      "timeoutMs": 1800000
     }
   ],
   "risks": ["Risk 1: description + mitigation", "Risk 2: ..."],
@@ -536,6 +581,7 @@ function buildPlannerUserPrompt(params: {
   mode: "plan_goal" | "replan_after_failure";
   goal: PlannerGoalInput;
   failedTask?: PlannerFailureInput;
+  progress?: PlannerProgressInput;
 }): string {
   const payload: Record<string, unknown> = {
     mode: params.mode,
@@ -568,6 +614,17 @@ function buildPlannerUserPrompt(params: {
       },
       note: "Replan around this failure. Preserve successful work where possible.",
     };
+    if (params.progress) {
+      const failureContext = payload.failureContext as Record<string, unknown>;
+      failureContext.completedTasks = params.progress.completedTasks;
+      failureContext.inProgressTasks = params.progress.inProgressTasks;
+      failureContext.progressNote =
+        "completedTasks are done and inProgressTasks are still running; neither runs again. " +
+        "When remaining work must wait for one of them, include that task in your plan with exactly " +
+        "the same title and list its index in the later task's dependencies: a planned task with the " +
+        "title of an existing one is bound to that task and is not run again. Dependencies can only " +
+        "point at tasks in your plan, so work that omits it would start at once.";
+    }
   }
 
   return [

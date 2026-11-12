@@ -20,83 +20,17 @@ import type {
   AutomatonDatabase,
 } from "../types.js";
 import { logModification } from "./audit-log.js";
+import {
+  checkWrite,
+  expandHome,
+  matchProtected,
+  type PathDecision,
+} from "../security/protected-paths.js";
+import { readFileSafe, writeFileVerified } from "../security/secure-fs.js";
 
 // ─── IMMUTABLE SAFETY INVARIANTS ─────────────────────────────
-// These are hard-coded and CANNOT be changed by the agent.
-// The agent cannot modify this file (it's in PROTECTED_FILES).
-// Even if it modifies a copy, the runtime loads from the original.
-
-/**
- * Files that the automaton cannot modify under any circumstances.
- * This list protects:
- * - Identity (wallet, config)
- * - Defense systems (injection defense, this file)
- * - State database
- * - The audit log itself
- */
-const PROTECTED_FILES: readonly string[] = Object.freeze([
-  // Identity
-  "wallet.json",
-  "config.json",
-  // Database
-  "state.db",
-  "state.db-wal",
-  "state.db-shm",
-  // Constitution (immutable, propagated to children)
-  "constitution.md",
-  // Defense infrastructure (the agent must not modify its own guardrails)
-  "injection-defense.ts",
-  "injection-defense.js",
-  "injection-defense.d.ts",
-  // Self-modification safety (this file and its compiled output)
-  "self-mod/code.ts",
-  "self-mod/code.js",
-  "self-mod/code.d.ts",
-  "self-mod/audit-log.ts",
-  "self-mod/audit-log.js",
-  // Tool guard definitions
-  "agent/tools.ts",
-  "agent/tools.js",
-  // Upstream and tools-manager infrastructure
-  "self-mod/upstream.ts",
-  "self-mod/upstream.js",
-  "self-mod/tools-manager.ts",
-  "self-mod/tools-manager.js",
-  // Skills infrastructure
-  "skills/loader.ts",
-  "skills/loader.js",
-  "skills/registry.ts",
-  "skills/registry.js",
-  // Configuration and identity
-  "automaton.json",
-  "package.json",
-  "SOUL.md",
-  // Policy engine (protect from self-modification)
-  "agent/policy-engine.ts",
-  "agent/policy-engine.js",
-  "agent/policy-rules/index.ts",
-  "agent/policy-rules/index.js",
-]);
-
-/**
- * Directory patterns that are completely off-limits.
- * The agent cannot write to these locations.
- */
-const BLOCKED_DIRECTORY_PATTERNS: readonly string[] = Object.freeze([
-  ".ssh",
-  ".gnupg",
-  ".gpg",
-  ".aws",
-  ".azure",
-  ".gcloud",
-  ".kube",
-  ".docker",
-  "/etc/systemd",
-  "/etc/passwd",
-  "/etc/shadow",
-  "/proc",
-  "/sys",
-]);
+// The protected and sensitive path rules live in security/protected-paths.ts,
+// which is itself protected. This module only applies them.
 
 /**
  * Maximum number of self-modifications per hour.
@@ -114,76 +48,33 @@ const MAX_MODIFICATION_SIZE = 100_000; // 100KB
  */
 const MAX_DIFF_SIZE = 10_000;
 
+export interface EditFileOptions {
+  /** Repository the edit is confined to. Defaults to process.cwd(). */
+  repoRoot?: string;
+}
+
 // ─── Path Validation ─────────────────────────────────────────
 
-/**
- * Resolve a file path, following symlinks, to prevent traversal attacks.
- * Returns null if the path cannot be resolved or is suspicious.
- */
-function resolveAndValidatePath(filePath: string): string | null {
-  try {
-    // Step 1: Resolve ~ to home
-    let resolved = filePath;
-    if (resolved.startsWith("~")) {
-      resolved = path.join(process.env.HOME || "/root", resolved.slice(1));
-    }
-
-    // Step 2: Resolve to absolute path (handles .. and relative paths)
-    resolved = path.resolve(resolved);
-
-    // Step 3: Check resolved path is within the base directory (cwd)
-    const baseDir = path.resolve(process.cwd());
-    if (!resolved.startsWith(baseDir + path.sep) && resolved !== baseDir) {
-      return null;
-    }
-
-    // Step 4: If the path exists, resolve symlinks and re-check
-    if (fs.existsSync(resolved)) {
-      const realPath = fs.realpathSync(resolved);
-      if (!realPath.startsWith(baseDir + path.sep) && realPath !== baseDir) {
-        return null;
-      }
-      resolved = realPath;
-    }
-
-    return resolved;
-  } catch {
-    return null;
-  }
+function resolveRepoRoot(opts?: EditFileOptions): string {
+  return path.resolve(expandHome(opts?.repoRoot ?? process.cwd()));
 }
 
 /**
- * Check if a file path is protected from modification.
+ * Decide whether filePath may be edited: resolved against the repo root,
+ * checked on its real path, no symlink or hard link in the final component,
+ * and confined to the repo.
+ */
+function checkEditPath(filePath: string, repoRoot: string): PathDecision {
+  const abs = path.resolve(repoRoot, expandHome(filePath));
+  return checkWrite(abs, { root: repoRoot });
+}
+
+/**
+ * Check if a file path is protected from modification (lexical rules only;
+ * editFile and the policy rules also check the real path).
  */
 export function isProtectedFile(filePath: string): boolean {
-  const resolved = path.resolve(filePath);
-
-  // Check against protected file patterns using path-segment matching
-  for (const pattern of PROTECTED_FILES) {
-    const patternResolved = path.resolve(pattern);
-    // Exact match on resolved paths
-    if (resolved === patternResolved) return true;
-    // Match by path suffix: the resolved path ends with /pattern
-    if (resolved.endsWith(path.sep + pattern)) return true;
-    // Also check multi-segment patterns (e.g., "self-mod/code.ts")
-    if (pattern.includes("/") && resolved.endsWith(path.sep + pattern.replace(/\//g, path.sep))) return true;
-  }
-
-  // Check against blocked directory patterns using path-segment matching
-  for (const pattern of BLOCKED_DIRECTORY_PATTERNS) {
-    // Check if any path segment matches the blocked directory
-    if (resolved.includes(path.sep + pattern + path.sep) ||
-        resolved.endsWith(path.sep + pattern) ||
-        resolved === pattern) {
-      return true;
-    }
-    // Handle absolute patterns like /etc/systemd
-    if (pattern.startsWith("/") && resolved.startsWith(pattern)) {
-      return true;
-    }
-  }
-
-  return false;
+  return matchProtected(path.resolve(expandHome(filePath))) !== null;
 }
 
 /**
@@ -204,17 +95,16 @@ function isRateLimited(db: AutomatonDatabase): boolean {
 // ─── Self-Modification API ───────────────────────────────────
 
 /**
- * Edit a file in the automaton's environment.
- * Records the change in the audit log.
- * Commits a git snapshot before modification.
+ * Edit a file in the automaton's own repository.
+ * Records the change in the audit log and commits only that file.
  *
  * Safety checks:
- * 1. Protected file check (hard-coded invariant)
- * 2. Blocked directory check
- * 3. Path traversal check (symlink resolution)
- * 4. Rate limiting
- * 5. File size limit
- * 6. Pre-modification git snapshot
+ * 1. Protected and sensitive paths, on the lexical and the real path
+ * 2. No symlink or hard link in the final component; confined to the repo
+ * 3. Rate limiting
+ * 4. File size limit
+ * 5. Pre-modification git snapshot of the file (only when it is dirty)
+ * 6. Write via temp file and rename (never follows a link)
  * 7. Audit log entry
  */
 export async function editFile(
@@ -223,23 +113,19 @@ export async function editFile(
   filePath: string,
   newContent: string,
   reason: string,
+  opts?: EditFileOptions,
 ): Promise<{ success: boolean; error?: string }> {
-  // 1. Protected file check
-  if (isProtectedFile(filePath)) {
-    return {
-      success: false,
-      error: `BLOCKED: Cannot modify protected file: ${filePath}. This is a hard-coded safety invariant.`,
-    };
-  }
+  const repoRoot = resolveRepoRoot(opts);
 
-  // 2. Path validation (symlink resolution + traversal check)
-  const resolvedPath = resolveAndValidatePath(filePath);
-  if (!resolvedPath) {
+  // 1-2. Path decision on the real path
+  const decision = checkEditPath(filePath, repoRoot);
+  if (!decision.ok || !decision.real) {
     return {
       success: false,
-      error: `BLOCKED: Invalid or suspicious file path: ${filePath}`,
+      error: `BLOCKED: Cannot modify ${filePath}: ${decision.code}: ${decision.reason}. This is a hard-coded safety invariant.`,
     };
   }
+  const target = decision.real;
 
   // 3. Rate limiting
   if (isRateLimited(db)) {
@@ -258,24 +144,39 @@ export async function editFile(
   }
 
   // 5. Read current content for diff
-  let oldContent = "";
+  let oldContent = "(new file)";
   try {
-    oldContent = await conway.readFile(filePath);
+    oldContent = readFileSafe(target, { root: repoRoot });
   } catch {
     oldContent = "(new file)";
   }
 
-  // 6. Pre-modification git snapshot (in repo root, not ~/.automaton/)
+  // Path of the file inside the repo, for pathspec-limited commits.
+  let realRepoRoot = repoRoot;
   try {
-    const { gitCommit } = await import("../git/tools.js");
-    await gitCommit(conway, process.cwd(), `pre-modify: ${reason}`);
+    realRepoRoot = fs.realpathSync(repoRoot);
+  } catch {
+    // keep the lexical root
+  }
+  const relPath = path.relative(realRepoRoot, target);
+
+  // 6. Pre-modification snapshot of this file only, when it is tracked and dirty
+  const { gitCommitPaths } = await import("../git/tools.js");
+  try {
+    const tracked = await conway.exec(
+      `cd ${shellQuote(repoRoot)} && git ls-files -- ${shellQuote(relPath)}`,
+      10_000,
+    );
+    if (tracked.exitCode === 0 && tracked.stdout.trim()) {
+      await gitCommitPaths(conway, repoRoot, `pre-modify: ${reason}`, [relPath]);
+    }
   } catch {
     // Git not available -- proceed without snapshot
   }
 
-  // 7. Write new content
+  // 7. Write new content (own code is local by definition)
   try {
-    await conway.writeFile(filePath, newContent);
+    writeFileVerified(target, newContent, { root: repoRoot });
   } catch (err: any) {
     return {
       success: false,
@@ -287,64 +188,75 @@ export async function editFile(
   const diff = generateSimpleDiff(oldContent, newContent);
 
   logModification(db, "code_edit", reason, {
-    filePath,
+    filePath: relPath,
     diff: diff.slice(0, MAX_DIFF_SIZE),
     reversible: true,
   });
 
-  // 9. Post-modification git commit (in repo root)
+  // 9. Post-modification commit of this file only
   try {
-    const { gitCommit } = await import("../git/tools.js");
-    await gitCommit(conway, process.cwd(), `self-mod: ${reason}`);
+    await gitCommitPaths(conway, repoRoot, `self-mod: ${reason}`, [relPath]);
   } catch {
     // Git not available -- proceed without commit
   }
 
-  // 10. Rebuild if source file was edited
-  if (/\.(ts|js|tsx|jsx)$/.test(filePath)) {
+  // 10. Rebuild in the repo, and report a failed build
+  if (/\.(ts|js|tsx|jsx)$/.test(target)) {
     try {
-      await conway.exec("npm run build", 60_000);
-    } catch {
-      return { success: true, error: "File edited but rebuild failed. Run 'npm run build' manually." };
+      const build = await conway.exec(`cd ${shellQuote(repoRoot)} && npm run build`, 60_000);
+      if (build.exitCode !== 0) {
+        const output = (build.stderr || build.stdout || "").slice(0, 500);
+        return { success: true, error: `rebuild failed: ${output}` };
+      }
+    } catch (err: any) {
+      return { success: true, error: `rebuild failed: ${String(err?.message ?? err).slice(0, 500)}` };
     }
   }
 
   return { success: true };
 }
 
+function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Validate a proposed modification without executing it.
- * Returns safety analysis results.
+ * Uses the same path decision as editFile.
  */
 export function validateModification(
   db: AutomatonDatabase,
   filePath: string,
   contentSize: number,
+  opts?: EditFileOptions,
 ): {
   allowed: boolean;
   reason: string;
   checks: { name: string; passed: boolean; detail: string }[];
 } {
   const checks: { name: string; passed: boolean; detail: string }[] = [];
+  const decision = checkEditPath(filePath, resolveRepoRoot(opts));
+  const isProtected = decision.code === "PROTECTED_FILE" || decision.code === "SENSITIVE_FILE";
 
   // Protected file check
-  const isProtected = isProtectedFile(filePath);
   checks.push({
     name: "protected_file",
     passed: !isProtected,
     detail: isProtected
-      ? `File matches protected pattern`
+      ? `File matches protected pattern (${decision.rule ?? decision.code})`
       : "File is not protected",
   });
 
   // Path validation
-  const resolved = resolveAndValidatePath(filePath);
+  const pathOk = decision.ok || isProtected;
   checks.push({
     name: "path_valid",
-    passed: !!resolved,
-    detail: resolved
-      ? `Resolved to: ${resolved}`
-      : "Path is invalid or suspicious",
+    passed: pathOk,
+    detail: decision.ok
+      ? `Resolved to: ${decision.real}`
+      : isProtected
+        ? "See protected_file"
+        : `Path is invalid or unsafe (${decision.code}: ${decision.reason})`,
   });
 
   // Rate limit

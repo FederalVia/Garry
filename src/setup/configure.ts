@@ -10,7 +10,7 @@
 
 import readline from "readline";
 import chalk from "chalk";
-import { loadConfig, saveConfig, resolvePath } from "../config.js";
+import { loadConfig, saveConfig, resolvePath, ConfigError } from "../config.js";
 import { DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { AutomatonConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
 import { closePrompts } from "./prompts.js";
@@ -247,12 +247,20 @@ async function configureModelStrategy(config: AutomatonConfig): Promise<void> {
   config.maxTokensPerTurn = maxTokens;
 
   s.hourlyBudgetCents = await askNumber(
-    "Hourly inference budget (cents, 0 = unlimited)",
+    "Hourly inference budget (cents, 0 = derived from the daily cap: daily / 6)",
     s.hourlyBudgetCents,
   );
   s.sessionBudgetCents = await askNumber(
-    "Session inference budget (cents, 0 = unlimited)",
+    "Inference budget per wake cycle (cents, 0 = unlimited)",
     s.sessionBudgetCents,
+  );
+  s.orchestrationSharePct = await askNumber(
+    "Share of the hourly and daily inference caps workers and planning may use (%)",
+    s.orchestrationSharePct ?? 50,
+  );
+  s.survivalAllowanceCents = await askNumber(
+    "Survival allowance once the caps are spent (cents per 24h, 0 = off)",
+    s.survivalAllowanceCents ?? 25,
   );
   s.perCallCeilingCents = await askNumber(
     "Per-call ceiling (cents, 0 = unlimited)",
@@ -280,7 +288,10 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
   t.maxDailyTransferCents = await askNumber("Max daily transfers", t.maxDailyTransferCents);
   t.minimumReserveCents = await askNumber("Minimum reserve", t.minimumReserveCents);
   t.maxX402PaymentCents = await askNumber("Max x402 payment", t.maxX402PaymentCents);
-  t.maxInferenceDailyCents = await askNumber("Max daily inference spend", t.maxInferenceDailyCents);
+  t.maxInferenceDailyCents = await askNumber(
+    "Max inference spend per rolling 24h (0 = paid inference off)",
+    t.maxInferenceDailyCents,
+  );
   t.requireConfirmationAboveCents = await askNumber(
     "Require confirmation above",
     t.requireConfirmationAboveCents,
@@ -311,7 +322,15 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
 // ─── Entry point ──────────────────────────────────────────────────
 
 export async function runConfigure(): Promise<void> {
-  const config = loadConfig();
+  let config: AutomatonConfig | null;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    console.log(chalk.red(`  automaton.json cannot be read: ${err.message}\n  Fix or restore it, then try again.\n`));
+    process.exitCode = 1;
+    return;
+  }
   if (!config) {
     console.log(chalk.red("  Automaton is not configured. Run: automaton --setup\n"));
     return;

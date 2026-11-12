@@ -1,9 +1,11 @@
 /**
  * Inference Router
  *
- * Routes inference requests through the model registry using
- * tier-based selection, budget enforcement, and provider-specific
- * message transformation.
+ * Routes main-loop inference (agent, inbox and survival turns) through the
+ * model registry. Every HTTP attempt first reserves its worst case on the
+ * process-wide InferenceGate and is settled afterwards; candidates honour the
+ * selected model and free local models, fall back in order, and share one
+ * deadline and a hard limit on HTTP attempts.
  */
 
 import type BetterSqlite3 from "better-sqlite3";
@@ -11,222 +13,432 @@ import { ulid } from "ulid";
 import type {
   InferenceRequest,
   InferenceResult,
+  InferenceRefusal,
   ModelEntry,
   SurvivalTier,
   InferenceTaskType,
   ModelProvider,
   ChatMessage,
   ModelPreference,
+  ModelStrategyConfig,
 } from "../types.js";
 import { ModelRegistry } from "./registry.js";
-import { InferenceBudgetTracker } from "./budget.js";
-import { DEFAULT_ROUTING_MATRIX, TASK_TIMEOUTS } from "./types.js";
+import {
+  DEFAULT_ROUTING_MATRIX,
+  INFERENCE_DEADLINES,
+  MAX_ATTEMPT_MS,
+  MAX_ATTEMPTS_PER_CALL,
+  MAX_RETRY_AFTER_MS,
+} from "./types.js";
+import {
+  InferenceGate,
+  currentInferenceScope,
+  runWithInferenceScope,
+  type InferenceCaller,
+  type InferenceScope,
+} from "./gate.js";
+import { registryPrice } from "./policy.js";
+import {
+  InferenceCallError,
+  InferenceRefusedError,
+  classifyInferenceError,
+  isInferenceRefusal,
+  type ErrorClassification,
+} from "./errors.js";
+import { createLogger } from "../observability/logger.js";
 
 type Database = BetterSqlite3.Database;
+
+const logger = createLogger("inference.router");
+
+const TIER_ORDER: Record<string, number> = {
+  dead: 0, critical: 1, low_compute: 2, normal: 3, high: 4,
+};
+
+/** Retry delay when the provider gave no Retry-After. */
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+/** A NO_MODEL refusal is retried after this long. */
+const NO_MODEL_RETRY_MS = 10 * 60_000;
+const SURVIVAL_MAX_TOKENS = 1024;
+const SURVIVAL_MIN_TOKENS = 512;
+const TURN_MIN_TOKENS = 1024;
+
+type ChatFn = (messages: any[], options: any) => Promise<any>;
+
+export interface InferenceRouterOptions {
+  /** Whether a backend can serve a model (legacy client's canServe). Default: all. */
+  canServe?: (model: ModelEntry) => boolean;
+  /** Overrides the per-caller deadline (tests). */
+  deadlineMs?: number;
+  now?: () => number;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function timeoutError(ms: number): Error {
+  const err = new Error(`Inference deadline of ${ms}ms reached`);
+  err.name = "TimeoutError";
+  return err;
+}
+
+/** Latest clear time wins; a refusal that never clears on its own beats any time. */
+function mostRestrictive(a: InferenceRefusedError, b: InferenceRefusedError): InferenceRefusedError {
+  if (a.retryAfterMs === null) return a;
+  if (b.retryAfterMs === null) return b;
+  return b.retryAfterMs > a.retryAfterMs ? b : a;
+}
 
 export class InferenceRouter {
   private db: Database;
   private registry: ModelRegistry;
-  private budget: InferenceBudgetTracker;
+  private gate: InferenceGate;
+  private getStrategy: () => ModelStrategyConfig;
+  private opts: InferenceRouterOptions;
+  private unpricedWarned = new Set<string>();
 
-  constructor(db: Database, registry: ModelRegistry, budget: InferenceBudgetTracker) {
+  constructor(
+    db: Database,
+    registry: ModelRegistry,
+    gate: InferenceGate,
+    getStrategy: () => ModelStrategyConfig,
+    opts: InferenceRouterOptions = {},
+  ) {
     this.db = db;
     this.registry = registry;
-    this.budget = budget;
+    this.gate = gate;
+    this.getStrategy = getStrategy;
+    this.opts = opts;
   }
 
   /**
-   * Route an inference request: select model, check budget,
-   * transform messages, call inference, record cost.
+   * Route one logical call. Returns the completion, or a result with
+   * finishReason "budget_exceeded" and `refusal` when the gate refused every
+   * candidate. Throws InferenceCallError when the attempts failed with errors.
    */
-  async route(
-    request: InferenceRequest,
-    inferenceChat: (messages: any[], options: any) => Promise<any>,
-  ): Promise<InferenceResult> {
-    const { messages, taskType, tier, sessionId, turnId, tools } = request;
-
-    // 1. Select model from routing matrix
-    const model = this.selectModel(tier, taskType);
-    if (!model) {
-      return {
-        content: "",
-        model: "none",
-        provider: "other",
-        inputTokens: 0,
-        outputTokens: 0,
-        costCents: 0,
-        latencyMs: 0,
-        finishReason: "error",
-        toolCalls: undefined,
-      };
-    }
-
-    // 2. Estimate cost and check budget
-    const estimatedTokens = messages.reduce((sum, m) => sum + (m.content?.length || 0) / 4, 0);
-    const estimatedCostCents = Math.ceil(
-      (estimatedTokens / 1000) * model.costPer1kInput / 100 +
-      (request.maxTokens || 1000) / 1000 * model.costPer1kOutput / 100,
-    );
-
-    const budgetCheck = this.budget.checkBudget(estimatedCostCents, model.modelId);
-    if (!budgetCheck.allowed) {
-      return {
-        content: `Budget exceeded: ${budgetCheck.reason}`,
-        model: model.modelId,
-        provider: model.provider,
-        inputTokens: 0,
-        outputTokens: 0,
-        costCents: 0,
-        latencyMs: 0,
-        finishReason: "budget_exceeded",
-      };
-    }
-
-    // 3. Check session budget
-    if (request.sessionId && this.budget.config.sessionBudgetCents > 0) {
-      const sessionCost = this.budget.getSessionCost(request.sessionId);
-      if (sessionCost + estimatedCostCents > this.budget.config.sessionBudgetCents) {
-        return {
-          content: `Session budget exceeded: ${sessionCost}c spent + ${estimatedCostCents}c estimated > ${this.budget.config.sessionBudgetCents}c limit`,
-          model: model.modelId,
-          provider: model.provider,
-          inputTokens: 0,
-          outputTokens: 0,
-          costCents: 0,
-          latencyMs: 0,
-          finishReason: "budget_exceeded",
-        };
-      }
-    }
-
-    // 4. Transform messages for provider
-    const transformedMessages = this.transformMessagesForProvider(messages, model.provider);
-
-    // 5. Build inference options
-    const preference = this.getPreference(tier, taskType);
-    const maxTokens = request.maxTokens || preference?.maxTokens || model.maxTokens;
-    const timeout = TASK_TIMEOUTS[taskType] || 120_000;
-
-    const inferenceOptions: any = {
-      model: model.modelId,
-      maxTokens,
-      tools: tools,
+  async route(request: InferenceRequest, inferenceChat: ChatFn): Promise<InferenceResult> {
+    const { messages, taskType, tier, tools } = request;
+    const survival = request.survival === true;
+    const caller: InferenceCaller = survival ? "survival_turn" : request.caller ?? "agent_turn";
+    const outer = currentInferenceScope();
+    const scope: InferenceScope = {
+      ...outer,
+      caller,
+      sessionId: request.sessionId ?? outer.sessionId,
+      turnId: request.turnId ?? outer.turnId,
     };
+    if (messages.length === 0) throw new Error("Cannot route inference with empty message array");
+    if (request.signal?.aborted) {
+      throw new InferenceCallError("Inference aborted before routing", { attempts: 0, cause: request.signal.reason });
+    }
 
-    // 6. Call inference with timeout
-    const startTime = Date.now();
-    let response: any;
+    const candidates = survival ? this.survivalCandidates(tier) : this.candidates(tier, taskType);
+    if (candidates.length === 0) {
+      return this.refusalResult(
+        new InferenceRefusedError("NO_MODEL", `No servable model for tier ${tier}`, {
+          retryAfterMs: NO_MODEL_RETRY_MS,
+          budgetClass: survival ? "survival" : "main",
+        }),
+      );
+    }
+    const strategy = this.getStrategy();
+    const policy = this.gate.policy;
+    const tried = policy.enableModelFallback && strategy.enableModelFallback !== false ? candidates : candidates.slice(0, 1);
+    const preference = this.getPreference(tier, taskType);
+
+    const now = this.opts.now ?? Date.now;
+    const deadlineMs = this.opts.deadlineMs ?? (survival ? INFERENCE_DEADLINES.survival_turn : INFERENCE_DEADLINES.agent_turn);
+    const startedAt = now();
+    const deadline = new AbortController();
+    const deadlineTimer = setTimeout(() => deadline.abort(timeoutError(deadlineMs)), deadlineMs);
+    const onCallerAbort = () => deadline.abort(request.signal?.reason);
+    request.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const sleep = this.opts.sleep ?? abortableSleep;
+
+    const callId = ulid();
+    let attempts = 0;
+    let refusal: InferenceRefusedError | undefined;
+    let lastError: unknown;
+    let lastClass: ErrorClassification | undefined;
+
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-      try {
-        inferenceOptions.signal = controller.signal;
-        response = await inferenceChat(transformedMessages, inferenceOptions);
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (error: any) {
-      const latencyMs = Date.now() - startTime;
-      // If fallback is enabled, try next candidate
-      if (error.name === "AbortError") {
-        return {
-          content: `Inference timeout after ${timeout}ms`,
-          model: model.modelId,
-          provider: model.provider,
-          inputTokens: 0,
-          outputTokens: 0,
-          costCents: 0,
-          latencyMs,
-          finishReason: "timeout",
-        };
-      }
-      throw error;
-    }
-    const latencyMs = Date.now() - startTime;
+      candidateLoop: for (const model of tried) {
+        let retried = false;
+        while (true) {
+          if (attempts >= MAX_ATTEMPTS_PER_CALL || deadline.signal.aborted) break candidateLoop;
 
-    // 7. Calculate actual cost
-    const inputTokens = response.usage?.promptTokens || 0;
-    const outputTokens = response.usage?.completionTokens || 0;
-    const actualCostCents = Math.ceil(
-      (inputTokens / 1000) * model.costPer1kInput / 100 +
-      (outputTokens / 1000) * model.costPer1kOutput / 100,
-    );
+          const desired = survival
+            ? SURVIVAL_MAX_TOKENS
+            : request.maxTokens || preference?.maxTokens || model.maxTokens;
+          const maxTokens = Math.max(1, Math.min(desired, policy.maxTokensPerTurn, model.maxTokens || desired));
+          const minTokens = Math.min(survival ? SURVIVAL_MIN_TOKENS : TURN_MIN_TOKENS, maxTokens);
+          const transformed = this.transformMessagesForProvider(messages, model.provider);
 
-    // 8. Record cost
-    this.budget.recordCost({
-      sessionId,
-      turnId: turnId || null,
-      model: model.modelId,
-      provider: model.provider,
-      inputTokens,
-      outputTokens,
-      costCents: actualCostCents,
-      latencyMs,
-      tier,
-      taskType,
-      cacheHit: false,
-    });
+          let reservation;
+          try {
+            reservation = this.gate.reserve({
+              callId,
+              attempt: attempts + 1,
+              provider: model.provider,
+              model: model.modelId,
+              tier,
+              price: registryPrice(model),
+              estInputTokens: this.gate.estimateInputTokens(transformed, tools),
+              maxOutputTokens: maxTokens,
+              minOutputTokens: minTokens,
+              extraCeilingCents:
+                !survival && preference && preference.ceilingCents >= 0 ? preference.ceilingCents : undefined,
+              scope,
+            });
+          } catch (err) {
+            if (!isInferenceRefusal(err)) throw err;
+            refusal = refusal ? mostRestrictive(refusal, err) : err;
+            continue candidateLoop;
+          }
 
-    // 9. Build result
-    return {
-      content: response.message?.content || "",
-      model: model.modelId,
-      provider: model.provider,
-      inputTokens,
-      outputTokens,
-      costCents: actualCostCents,
-      latencyMs,
-      toolCalls: response.toolCalls,
-      finishReason: response.finishReason || "stop",
-    };
-  }
-
-  /**
-   * Select the best model for a given tier and task type.
-   *
-   * Priority:
-   *   1. First routing-matrix candidate present in the registry
-   *   2. User-configured model(s) from ModelStrategyConfig
-   *      (free/Ollama models are allowed at any tier, including dead)
-   */
-  selectModel(tier: SurvivalTier, taskType: InferenceTaskType): ModelEntry | null {
-    const TIER_ORDER: Record<string, number> = {
-      dead: 0, critical: 1, low_compute: 2, normal: 3, high: 4,
-    };
-
-    const tierRank = TIER_ORDER[tier] ?? 0;
-
-    // 1. Try routing-matrix candidates
-    const preference = this.getPreference(tier, taskType);
-    if (preference && preference.candidates.length > 0) {
-      for (const candidateId of preference.candidates) {
-        const entry = this.registry.get(candidateId);
-        if (entry && entry.enabled) {
-          return entry;
+          attempts++;
+          const attemptStart = now();
+          const remaining = Math.max(1, deadlineMs - (attemptStart - startedAt));
+          // A second timer for the remaining deadline could fire first, look
+          // like a plain attempt timeout and start a doomed failover attempt.
+          const attemptSignal =
+            remaining > MAX_ATTEMPT_MS
+              ? AbortSignal.any([deadline.signal, AbortSignal.timeout(MAX_ATTEMPT_MS)])
+              : deadline.signal;
+          try {
+            // Raced as well as signalled: once headers arrive the transport
+            // may no longer watch the signal, and a trickling body would hold
+            // the turn past its deadline.
+            const response = await raceAbort(
+              runWithInferenceScope(scope, () =>
+                inferenceChat(transformed, {
+                  model: model.modelId,
+                  maxTokens: reservation.maxOutputTokens,
+                  tools,
+                  signal: attemptSignal,
+                  reservationId: reservation.id,
+                }),
+              ),
+              attemptSignal,
+            );
+            const inputTokens = response?.usage?.promptTokens || 0;
+            const outputTokens = response?.usage?.completionTokens || 0;
+            const usage = response?.usage ? { inputTokens, outputTokens } : null;
+            const outputText =
+              (response?.message?.content || "") +
+              (response?.toolCalls ?? []).map((tc: any) => String(tc?.function?.arguments ?? "")).join("");
+            const { costMicroUsd } = this.gate.commit(reservation.id, usage, now() - attemptStart, { outputText });
+            return {
+              content: response?.message?.content || "",
+              model: model.modelId,
+              provider: model.provider,
+              inputTokens,
+              outputTokens,
+              costCents: costMicroUsd / 10_000,
+              costMicroUsd,
+              latencyMs: now() - startedAt,
+              toolCalls: response?.toolCalls,
+              finishReason: response?.finishReason || "stop",
+            };
+          } catch (err) {
+            const callerAborted = request.signal?.aborted === true;
+            const cls = classifyInferenceError(err, { callerAborted });
+            this.settle(reservation.id, err, cls);
+            lastError = err;
+            lastClass = cls;
+            logger.warn(`Inference attempt failed on ${model.modelId}: ${cls.kind}${cls.status ? ` ${cls.status}` : ""}`);
+            if (cls.kind === "refused") {
+              refusal = refusal ? mostRestrictive(refusal, err as InferenceRefusedError) : (err as InferenceRefusedError);
+              continue candidateLoop;
+            }
+            if (cls.kind === "aborted" || cls.kind === "caller") break candidateLoop;
+            if (cls.retrySameProvider && !retried && attempts < MAX_ATTEMPTS_PER_CALL) {
+              const wait = cls.retryAfterMs ?? DEFAULT_RETRY_DELAY_MS;
+              const left = deadlineMs - (now() - startedAt);
+              if (wait <= MAX_RETRY_AFTER_MS && wait < left) {
+                retried = true;
+                try {
+                  await sleep(wait, deadline.signal);
+                } catch {
+                  break candidateLoop;
+                }
+                continue;
+              }
+            }
+            if (!cls.failover) break candidateLoop;
+            continue candidateLoop;
+          }
         }
       }
+    } finally {
+      clearTimeout(deadlineTimer);
+      request.signal?.removeEventListener("abort", onCallerAbort);
     }
 
-    // 2. Fall back to user-configured models.
-    //    This handles local/Ollama setups where routing-matrix models are absent.
-    const strategy = this.budget.config;
-    const fallbackIds: (string | undefined)[] =
-      tier === "critical" || tier === "dead"
-        ? [strategy.criticalModel, strategy.inferenceModel, strategy.lowComputeModel]
-        : [strategy.inferenceModel, strategy.lowComputeModel, strategy.criticalModel];
+    // Every viable candidate was refused by the gate (possibly after others
+    // failed): report the refusal so the loop sleeps instead of erroring.
+    if (refusal && (!lastClass || (lastClass.kind !== "caller" && lastClass.kind !== "aborted"))) {
+      return this.refusalResult(refusal);
+    }
+    const reason = deadline.signal.aborted && !request.signal?.aborted
+      ? `deadline of ${deadlineMs}ms reached`
+      : lastError instanceof Error
+        ? lastError.message
+        : String(lastError ?? "no attempt made");
+    throw new InferenceCallError(`Inference failed after ${attempts} attempt(s): ${reason}`, {
+      attempts,
+      cause: lastError,
+      classification: lastClass,
+    });
+  }
 
-    for (const modelId of fallbackIds) {
-      if (!modelId) continue;
-      const entry = this.registry.get(modelId);
-      if (!entry || !entry.enabled) continue;
-      const isFree = entry.costPer1kInput === 0 && entry.costPer1kOutput === 0;
-      const tierOk = tierRank >= (TIER_ORDER[entry.tierMinimum] ?? 0);
-      if (isFree || tierOk) {
-        return entry;
+  private settle(reservationId: string, err: unknown, cls: ErrorClassification): void {
+    const usage = (err as any)?.usage;
+    if (cls.settle === "release") {
+      this.gate.release(reservationId, cls.kind + (cls.status ? `:${cls.status}` : ""));
+    } else if (cls.settle === "unknown") {
+      if (usage && typeof usage.inputTokens === "number") {
+        // A 2xx with usage but no usable completion: billed at its usage.
+        this.gate.commit(reservationId, usage, 0);
+      } else {
+        this.gate.markUnknown(reservationId, cls.kind + (cls.status ? `:${cls.status}` : ""));
       }
     }
+  }
 
-    return null;
+  private refusalResult(r: InferenceRefusedError): InferenceResult {
+    const refusal: InferenceRefusal = { code: r.code, retryAfterMs: r.retryAfterMs, message: r.message };
+    return {
+      content: `Inference refused (${r.code}): ${r.message}`,
+      model: "none",
+      provider: "other",
+      inputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
+      costMicroUsd: 0,
+      latencyMs: 0,
+      finishReason: "budget_exceeded",
+      refusal,
+    };
+  }
+
+  private servable(entry: ModelEntry | undefined): entry is ModelEntry {
+    if (!entry || !entry.enabled) return false;
+    // A paid model without a known price cannot be capped: any assumed price
+    // may be below the real one.
+    if (!this.isLocal(entry) && !hasKnownPrice(entry)) {
+      if (!this.unpricedWarned.has(entry.modelId)) {
+        this.unpricedWarned.add(entry.modelId);
+        logger.warn(`Skipping ${entry.modelId}: no known price, so its spend cannot be capped`);
+      }
+      return false;
+    }
+    return this.opts.canServe ? this.opts.canServe(entry) : true;
+  }
+
+  private isLocal(entry: ModelEntry): boolean {
+    return registryPrice(entry).local;
+  }
+
+  /**
+   * Candidate order for (tier, taskType):
+   *   1. the configured model for the tier when it is a free local model
+   *      (below normal, any configured local model; nothing else at dead)
+   *   2. the configured model for the tier, if allowed at this tier
+   *   3. the routing-matrix candidates
+   *   4. the other configured models (free ones at any tier)
+   * Disabled and unservable models are skipped; duplicates removed.
+   */
+  candidates(tier: SurvivalTier, taskType: InferenceTaskType): ModelEntry[] {
+    const strategy = this.getStrategy();
+    const tierRank = TIER_ORDER[tier] ?? 0;
+    const configured =
+      tier === "high" || tier === "normal"
+        ? strategy.inferenceModel
+        : tier === "low_compute"
+          ? strategy.lowComputeModel
+          : strategy.criticalModel;
+    const others = [strategy.inferenceModel, strategy.lowComputeModel, strategy.criticalModel];
+    const out: ModelEntry[] = [];
+    const seen = new Set<string>();
+    const push = (e: ModelEntry) => {
+      if (seen.has(e.modelId)) return;
+      seen.add(e.modelId);
+      out.push(e);
+    };
+    const tierOk = (e: ModelEntry) => tierRank >= (TIER_ORDER[e.tierMinimum] ?? 0);
+
+    // Below normal money is scarce: any configured free local model beats
+    // the tier's paid default (the picker sets only inferenceModel).
+    const scarce = tier !== "high" && tier !== "normal";
+    for (const id of scarce ? [configured, ...others] : [configured]) {
+      if (!id) continue;
+      const e = this.registry.get(id);
+      if (this.servable(e) && this.isLocal(e)) push(e);
+    }
+    if (tier === "dead") return out;
+
+    if (configured) {
+      const e = this.registry.get(configured);
+      if (this.servable(e) && (tierOk(e) || this.isLocal(e))) push(e);
+    }
+
+    const preference = this.getPreference(tier, taskType);
+    for (const id of preference?.candidates ?? []) {
+      const e = this.registry.get(id);
+      if (this.servable(e)) push(e);
+    }
+
+    for (const id of others) {
+      if (!id) continue;
+      const e = this.registry.get(id);
+      if (this.servable(e) && (tierOk(e) || this.isLocal(e))) push(e);
+    }
+    return out;
+  }
+
+  /** Survival turn: configured local models, then criticalModel, then the cheapest paid model. */
+  survivalCandidates(tier: SurvivalTier): ModelEntry[] {
+    const strategy = this.getStrategy();
+    const out: ModelEntry[] = [];
+    const seen = new Set<string>();
+    const push = (e: ModelEntry) => {
+      if (!seen.has(e.modelId)) {
+        seen.add(e.modelId);
+        out.push(e);
+      }
+    };
+    for (const id of [strategy.inferenceModel, strategy.lowComputeModel, strategy.criticalModel]) {
+      const e = id ? this.registry.get(id) : undefined;
+      if (this.servable(e) && this.isLocal(e)) push(e);
+    }
+    if (tier === "dead") return out;
+    const critical = strategy.criticalModel ? this.registry.get(strategy.criticalModel) : undefined;
+    if (this.servable(critical)) push(critical);
+    const cheapest = this.registry
+      .getAll()
+      .filter((e) => this.servable(e) && !this.isLocal(e) && e.costPer1kOutput > 0)
+      .sort((a, b) => a.costPer1kOutput - b.costPer1kOutput || a.costPer1kInput - b.costPer1kInput)[0];
+    if (cheapest) push(cheapest);
+    return out;
+  }
+
+  /** First candidate for (tier, taskType), or null. */
+  selectModel(tier: SurvivalTier, taskType: InferenceTaskType): ModelEntry | null {
+    return this.candidates(tier, taskType)[0] ?? null;
   }
 
   /**
@@ -327,4 +539,38 @@ export class InferenceRouter {
   private getPreference(tier: SurvivalTier, taskType: InferenceTaskType): ModelPreference | undefined {
     return DEFAULT_ROUTING_MATRIX[tier]?.[taskType];
   }
+}
+
+function hasKnownPrice(entry: ModelEntry): boolean {
+  const ok = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  return ok(Number(entry.costPer1kInput)) && ok(Number(entry.costPer1kOutput));
+}
+
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  const aborted = () => {
+    const err = new Error("Inference attempt aborted");
+    err.name = "AbortError";
+    return err;
+  };
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(aborted());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      promise.catch(() => {});
+      reject(aborted());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

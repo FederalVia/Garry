@@ -18,6 +18,7 @@ import {
 } from "./prompts.js";
 import { detectEnvironment } from "./environment.js";
 import { generateSoulMd, installDefaultSkills } from "./defaults.js";
+import { writeIfMissing } from "./genesis-bootstrap.js";
 import type { ChainType } from "../identity/chain.js";
 
 export async function runSetupWizard(): Promise<AutomatonConfig> {
@@ -193,10 +194,13 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     console.log(chalk.green("  constitution.md installed (read-only)"));
   }
 
-  // SOUL.md
+  // SOUL.md: an existing (possibly evolved) soul is kept.
   const soulPath = path.join(automatonDir, "SOUL.md");
-  fs.writeFileSync(soulPath, generateSoulMd(name, walletAddress, creatorAddress, genesisPrompt), { mode: 0o600 });
-  console.log(chalk.green("  SOUL.md written"));
+  if (writeIfMissing(soulPath, generateSoulMd(name, walletAddress, creatorAddress, genesisPrompt))) {
+    console.log(chalk.green("  SOUL.md written"));
+  } else {
+    console.log(chalk.dim("  SOUL.md already exists; kept"));
+  }
 
   // Default skills
   const skillsDir = config.skillsDir || "~/.automaton/skills";

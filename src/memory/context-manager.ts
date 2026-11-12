@@ -128,6 +128,129 @@ function formatCacheKey(text: string, model?: string): string {
   return `${model ?? "default"}::${text}`;
 }
 
+/**
+ * Largest single-class run, in UTF-8 bytes, that is handed to the encoder
+ * whole.
+ *
+ * js-tiktoken merges byte pairs in quadratic time within one pre-tokenizer
+ * piece, and a piece is a run of a single class: letters, whitespace, or
+ * other symbols (digits are already split every three). An unbroken run of
+ * 20,000 letters takes about 34 seconds. Runs larger than this are cut out
+ * and encoded in slices, which keeps the work linear in the text length.
+ * Ordinary words and identifiers are far shorter, so text without such runs
+ * is encoded exactly as before.
+ */
+export const MAX_BPE_RUN_BYTES = 64;
+
+/**
+ * Longest prefix that is tokenized. Beyond it, every remaining UTF-8 byte
+ * counts as one token, which is the most a tokenizer can produce. A text
+ * this large is over every budget already, and an under-estimate could let
+ * an oversized request through. The cap bounds how long one call can block
+ * the event loop.
+ */
+export const MAX_EXACT_TOKENIZE_CHARS = 64_000;
+
+const FALLBACK_CHARS_PER_TOKEN = 3.5;
+
+// A code point is at most 4 UTF-8 bytes, so a run must have more than this
+// many code points before it can exceed MAX_BPE_RUN_BYTES.
+const MIN_LONG_RUN_CODE_POINTS = Math.floor(MAX_BPE_RUN_BYTES / 4) + 1;
+
+const LONG_RUN_CANDIDATE = new RegExp(
+  [
+    `\\p{L}{${MIN_LONG_RUN_CODE_POINTS},}`,
+    `\\s{${MIN_LONG_RUN_CODE_POINTS},}`,
+    `[^\\s\\p{L}\\p{N}]{${MIN_LONG_RUN_CODE_POINTS},}`,
+  ].join("|"),
+  "gu",
+);
+
+/**
+ * Token count of one piece of text. Special-token markers such as
+ * "<|endoftext|>" are counted as the plain text they are. With the encoder's
+ * default they make encode() throw, and the caller's fallback then
+ * under-counted the whole text several times over.
+ */
+function encodeAsText(encoder: Tiktoken, text: string): number {
+  return encoder.encode(text, [], []).length;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function utf8Width(codePoint: number): number {
+  if (codePoint < 0x80) return 1;
+  if (codePoint < 0x800) return 2;
+  if (codePoint < 0x10000) return 3;
+  return 4;
+}
+
+/** Encode one long single-class run in slices of MAX_BPE_RUN_BYTES. */
+function countRunInSlices(run: string, encoder: Tiktoken): number {
+  let total = 0;
+  let sliceStart = 0;
+  let sliceBytes = 0;
+  let index = 0;
+  while (index < run.length) {
+    const codePoint = run.codePointAt(index) ?? 0;
+    const bytes = utf8Width(codePoint);
+    if (sliceBytes + bytes > MAX_BPE_RUN_BYTES && index > sliceStart) {
+      total += encodeAsText(encoder, run.slice(sliceStart, index));
+      sliceStart = index;
+      sliceBytes = 0;
+    }
+    sliceBytes += bytes;
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+  if (sliceStart < run.length) {
+    total += encodeAsText(encoder, run.slice(sliceStart));
+  }
+  return total;
+}
+
+/**
+ * Token count with every oversized single-class run sliced before encoding.
+ * Runs within the byte limit stay in their surrounding text, so they are
+ * tokenized in context exactly as the encoder would on its own.
+ */
+function countWithBoundedRuns(text: string, encoder: Tiktoken): number {
+  let total = 0;
+  let cursor = 0;
+  for (const match of text.matchAll(LONG_RUN_CANDIDATE)) {
+    const run = match[0];
+    if (Buffer.byteLength(run, "utf8") <= MAX_BPE_RUN_BYTES) continue;
+    const runStart = match.index ?? 0;
+    if (runStart > cursor) {
+      total += encodeAsText(encoder, text.slice(cursor, runStart));
+    }
+    total += countRunInSlices(run, encoder);
+    cursor = runStart + run.length;
+  }
+  if (cursor < text.length) {
+    total += encodeAsText(encoder, text.slice(cursor));
+  }
+  return total;
+}
+
+/**
+ * Count tokens in time linear in the text length, with a fixed upper bound
+ * on the amount of text that is tokenized.
+ */
+function countTokensBounded(text: string, encoder: Tiktoken): number {
+  if (text.length <= MAX_EXACT_TOKENIZE_CHARS) {
+    return countWithBoundedRuns(text, encoder);
+  }
+
+  let prefixEnd = MAX_EXACT_TOKENIZE_CHARS;
+  if (isHighSurrogate(text.charCodeAt(prefixEnd - 1))) {
+    prefixEnd += 1;
+  }
+  const prefixTokens = countWithBoundedRuns(text.slice(0, prefixEnd), encoder);
+  return prefixTokens + Buffer.byteLength(text.slice(prefixEnd), "utf8");
+}
+
 export function createTokenCounter(): TokenCounter {
   const cache = new Map<string, number>();
   let encoder: Tiktoken | null = null;
@@ -152,12 +275,12 @@ export function createTokenCounter(): TokenCounter {
     let count: number;
     if (encoder) {
       try {
-        count = encoder.encode(normalizedText).length;
+        count = countTokensBounded(normalizedText, encoder);
       } catch {
-        count = Math.ceil(normalizedText.length / 3.5);
+        count = Math.ceil(normalizedText.length / FALLBACK_CHARS_PER_TOKEN);
       }
     } else {
-      count = Math.ceil(normalizedText.length / 3.5);
+      count = Math.ceil(normalizedText.length / FALLBACK_CHARS_PER_TOKEN);
     }
 
     cache.set(key, count);

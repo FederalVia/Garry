@@ -8,20 +8,27 @@
 
 import type { SkillFrontmatter, Skill, SkillSource } from "../types.js";
 
+const MAX_PARSED_DESCRIPTION_LENGTH = 500;
+
 /**
  * Parse a SKILL.md file content into frontmatter + body.
  * Handles YAML frontmatter delimited by --- markers.
+ *
+ * `opts.name` is the validated install/directory name. When given it is the
+ * skill's identity and the untrusted frontmatter `name` is ignored, so a
+ * skill cannot rename itself onto another skill's record or forge markers.
  */
 export function parseSkillMd(
   content: string,
   filePath: string,
   source: SkillSource = "builtin",
+  opts: { name?: string } = {},
 ): Skill | null {
   const trimmed = content.trim();
   if (!trimmed.startsWith("---")) {
     // No frontmatter -- treat entire content as instructions
     // with a name derived from the directory
-    const name = extractNameFromPath(filePath);
+    const name = opts.name ?? extractNameFromPath(filePath);
     return {
       name,
       description: "",
@@ -34,14 +41,20 @@ export function parseSkillMd(
     };
   }
 
-  // Find the closing ---
-  const endIndex = trimmed.indexOf("---", 3);
-  if (endIndex === -1) {
+  // The closing delimiter is a line that is exactly "---"; a value that
+  // merely contains "---" must not end the frontmatter early.
+  const firstLineEnd = trimmed.indexOf("\n");
+  if (firstLineEnd === -1) {
     return null;
   }
+  const closing = /\r?\n---[ \t]*(?:\r?\n|$)/.exec(trimmed.slice(firstLineEnd));
+  if (!closing) {
+    return null;
+  }
+  const endIndex = firstLineEnd + closing.index;
 
   const frontmatterRaw = trimmed.slice(3, endIndex).trim();
-  const body = trimmed.slice(endIndex + 3).trim();
+  const body = trimmed.slice(endIndex + closing[0].length).trim();
 
   // Parse YAML frontmatter manually (avoid requiring gray-matter at runtime)
   const frontmatter = parseYamlFrontmatter(frontmatterRaw);
@@ -49,9 +62,14 @@ export function parseSkillMd(
     return null;
   }
 
+  const description =
+    typeof frontmatter.description === "string"
+      ? frontmatter.description.slice(0, MAX_PARSED_DESCRIPTION_LENGTH)
+      : "";
+
   return {
-    name: frontmatter.name || extractNameFromPath(filePath),
-    description: frontmatter.description || "",
+    name: opts.name ?? (frontmatter.name || extractNameFromPath(filePath)),
+    description,
     autoActivate: frontmatter["auto-activate"] !== false,
     requires: frontmatter.requires,
     instructions: body,

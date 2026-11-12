@@ -1,30 +1,38 @@
 import type { Database } from "better-sqlite3";
-import { ulid } from "ulid";
 import type { AutomatonIdentity } from "../types.js";
 import { createLogger } from "../observability/logger.js";
 import {
+  MAX_INFERENCE_BLOCK_MS,
+  ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY,
+  TASK_DEADLINE_GRACE_MS,
   assignTask,
-  completeTask,
   decomposeGoal,
   failTask,
   getGoalProgress,
   getReadyTasks,
+  isGoalProgressComplete,
+  releaseTask,
+  supersedeOpenTasks,
+  type DecomposeTaskInput,
   type Goal,
+  type GoalProgress,
   type TaskNode,
-  type TaskResult,
   normalizeTaskResult,
 } from "./task-graph.js";
 import {
+  PlannerOutputError,
   goalToPlannerInput,
   planGoal,
   replanAfterFailure,
+  type PlannerFailureInput,
   type PlannerOutput,
-  type PlannedTask,
   taskToPlannerFailureInput,
 } from "./planner.js";
-import { ColonyMessaging, type AgentMessage } from "./messaging.js";
+import { ColonyMessaging } from "./messaging.js";
 import { generateTodoMd } from "./attention.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { getInstalledInferenceGate, runWithInferenceScope } from "../inference/gate.js";
+import { InferenceRefusedError } from "../inference/errors.js";
 import { reviewPlan } from "./plan-mode.js";
 import { buildPlannerContext, getNextPlannerVersion, persistPlannerArtifacts } from "./planner-context.js";
 import { AgentWorkspace } from "./workspace.js";
@@ -33,12 +41,13 @@ import {
   getGoalById,
   getTaskById,
   getTasksByGoal,
+  insertEvent,
   updateGoalStatus,
+  withTransaction,
   type GoalRow,
   type TaskGraphRow,
 } from "../state/database.js";
 import type {
-  AgentAssignment,
   AgentTracker,
   FundingProtocol,
   OrchestratorTickResult,
@@ -50,6 +59,8 @@ const ORCHESTRATOR_STATE_KEY = "orchestrator.state";
 const ORCHESTRATOR_TODO_KEY = "orchestrator.todo_md";
 const DEFAULT_TASK_FUNDING_CENTS = 25;
 const DEFAULT_MAX_REPLANS = 3;
+/** Survival tiers at which orchestration inference is paused (owner decision D8). */
+const PAUSED_SURVIVAL_TIERS = new Set(["low_compute", "critical", "dead", "unknown"]);
 
 type ExecutionPhase =
   | "idle"
@@ -67,19 +78,31 @@ interface OrchestratorState {
   replanCount: number;
   failedTaskId: string | null;
   failedError: string | null;
-}
-
-interface TaskResultEnvelope {
-  taskId: string;
-  goalId: string | null;
-  result: TaskResult;
-  error?: string;
+  /** Completed tasks of the goal seen by the last executing tick (for the tick's completion count). */
+  completedSeen?: number;
 }
 
 interface TickCounters {
   tasksAssigned: number;
   tasksCompleted: number;
   tasksFailed: number;
+}
+
+/**
+ * Why a worker is stopped by the orchestrator. Mirrors the pool's reasons
+ * (the pool adds "shutdown", which only the runtime uses).
+ */
+export type OrchestratorAbortReason = "cancelled" | "superseded" | "timeout";
+
+/** The local worker pool as the orchestrator uses it. */
+export interface OrchestratorWorkerPool {
+  /** Assigns the pending task to a new worker and starts it; null when full or not pending. */
+  spawn(task: TaskNode): { address: string; name: string; sandboxId: string } | null;
+  hasWorker(address: string): boolean;
+  abortWorker(address: string, reason: OrchestratorAbortReason): boolean;
+  /** Aborts workers whose task row no longer names them as owner. */
+  reapOrphans(): number;
+  getActiveCount(): number;
 }
 
 const DEFAULT_STATE: OrchestratorState = {
@@ -90,18 +113,26 @@ const DEFAULT_STATE: OrchestratorState = {
   failedError: null,
 };
 
+/**
+ * Tasks run on local in-process workers, or on the parent itself when
+ * spawning is disabled or there is no pool. Conway children are never sent
+ * colony tasks: no transport reaches them and they have no executor, so a
+ * task left assigned to one is released back to the local workers.
+ */
 export class Orchestrator {
-  private pendingTaskResults: TaskResultEnvelope[] = [];
-
   constructor(private readonly params: {
     db: Database;
+    /** Unused by the orchestrator; kept so callers need not change. */
     agentTracker: AgentTracker;
     funding: FundingProtocol;
+    /** Unused by the orchestrator; kept so callers need not change. */
     messaging: ColonyMessaging;
     inference: UnifiedInferenceClient;
     identity: AutomatonIdentity;
     config: any;
-    /** Check if a worker agent is still alive. Used to recover stale tasks. */
+    /** Local workers. Without a pool (or with config.disableSpawn) tasks are self-assigned. */
+    workerPool?: OrchestratorWorkerPool;
+    /** Liveness of a local worker address when no pool is given. */
     isWorkerAlive?: (address: string) => boolean;
   }) {}
 
@@ -147,7 +178,7 @@ export class Orchestrator {
         }
 
         case "complete": {
-          state = await this.handleCompletePhase(state);
+          state = this.handleCompletePhase();
           break;
         }
 
@@ -162,13 +193,24 @@ export class Orchestrator {
         }
       }
     } catch (error) {
+      if (error instanceof InferenceRefusedError) {
+        // Budget refusals clear with time; the goal is not at fault.
+        logger.warn("Orchestrator inference refused; staying in phase", {
+          phase: state.phase,
+          code: error.code,
+        });
+        this.saveState(state);
+        this.persistTodo();
+        return this.tickResult(state, counters);
+      }
+
       const err = normalizeError(error);
       logger.error("Orchestrator tick failed", err, {
         phase: state.phase,
         goalId: state.goalId,
       });
 
-      if (state.goalId) {
+      if (state.goalId && this.isGoalLive(state.goalId)) {
         updateGoalStatus(this.params.db, state.goalId, "failed");
       }
 
@@ -182,70 +224,13 @@ export class Orchestrator {
     this.saveState(state);
     this.persistTodo();
 
-    return {
-      phase: state.phase,
-      tasksAssigned: counters.tasksAssigned,
-      tasksCompleted: counters.tasksCompleted,
-      tasksFailed: counters.tasksFailed,
-      goalsActive: getActiveGoals(this.params.db).length,
-      agentsActive: this.getActiveAgentCount(),
-    };
+    return this.tickResult(state, counters);
   }
 
-  async matchTaskToAgent(task: TaskNode): Promise<AgentAssignment> {
-    const requestedRole = task.agentRole?.trim() || "generalist";
-
-    const idleAgents = this.params.agentTracker.getIdle();
-    const directRoleMatch = idleAgents.find((agent) => agent.role === requestedRole);
-    if (directRoleMatch) {
-      return {
-        agentAddress: directRoleMatch.address,
-        agentName: directRoleMatch.name,
-        spawned: false,
-      };
-    }
-
-    const bestIdle = this.params.agentTracker.getBestForTask(requestedRole);
-    if (bestIdle) {
-      return {
-        agentAddress: bestIdle.address,
-        agentName: bestIdle.name,
-        spawned: false,
-      };
-    }
-
-    const spawned = await this.trySpawnAgent(task);
-    if (spawned) {
-      return spawned;
-    }
-
-    const reassigned = this.findBusyAgentForReassign();
-    if (reassigned) {
-      return {
-        agentAddress: reassigned.address,
-        agentName: reassigned.name,
-        spawned: false,
-      };
-    }
-
-    // Fallback: assign to the parent agent itself (self-execution mode).
-    // This handles local dev environments where spawning child sandboxes
-    // is not available, and ensures goals still make progress.
-    if (this.params.identity?.address) {
-      logger.warn("No child agents available, self-assigning task to parent", {
-        taskId: task.id,
-        role: requestedRole,
-      });
-      return {
-        agentAddress: this.params.identity.address,
-        agentName: this.params.identity.name ?? "parent",
-        spawned: false,
-      };
-    }
-
-    throw new Error(`No available agent for task ${task.id}`);
-  }
-
+  /**
+   * Explicit funding of a child for a task. The tick never calls it: colony
+   * tasks are not delegated to children. It goes through the treasury gate.
+   */
   async fundAgentForTask(addr: string, task: TaskNode): Promise<void> {
     const estimated = Math.max(0, task.metadata.estimatedCostCents);
     const configuredDefault = Number(this.params.config?.defaultTaskFundingCents ?? DEFAULT_TASK_FUNDING_CENTS);
@@ -261,26 +246,7 @@ export class Orchestrator {
     }
   }
 
-  async collectResults(): Promise<TaskResult[]> {
-    this.pendingTaskResults = [];
-
-    const processed = await this.params.messaging.processInbox();
-    for (const entry of processed) {
-      if (!entry.success || entry.message.type !== "task_result") {
-        continue;
-      }
-
-      const parsed = parseTaskResultMessage(entry.message);
-      if (!parsed) {
-        continue;
-      }
-
-      this.pendingTaskResults.push(parsed);
-    }
-
-    return this.pendingTaskResults.map((entry) => entry.result);
-  }
-
+  /** Admin failure of a task (no owner check), then move the goal on if it failed for good. */
   async handleFailure(task: TaskNode, error: string): Promise<void> {
     failTask(this.params.db, task.id, error, true);
 
@@ -291,8 +257,10 @@ export class Orchestrator {
 
     const state = this.loadState();
     const maxReplans = this.getMaxReplans();
+    const goal = getGoalById(this.params.db, task.goalId);
 
-    if (state.replanCount < maxReplans) {
+    // Reactivation is failed -> active only; a cancelled or paused goal stays so.
+    if (state.replanCount < maxReplans && goal?.status === "failed") {
       updateGoalStatus(this.params.db, task.goalId, "active");
     }
 
@@ -305,42 +273,79 @@ export class Orchestrator {
     });
   }
 
+  private tickResult(state: OrchestratorState, counters: TickCounters): OrchestratorTickResult {
+    return {
+      phase: state.phase,
+      tasksAssigned: counters.tasksAssigned,
+      tasksCompleted: counters.tasksCompleted,
+      tasksFailed: counters.tasksFailed,
+      goalsActive: getActiveGoals(this.params.db).length,
+      agentsActive: this.params.workerPool?.getActiveCount() ?? 0,
+    };
+  }
+
+  private isGoalLive(goalId: string): boolean {
+    const status = getGoalById(this.params.db, goalId)?.status;
+    return status === "active" || status === "failed";
+  }
+
+  /**
+   * The goal guard, run at the top of every phase that works on a goal. A
+   * goal that is gone, or neither active nor failed (cancelled, completed,
+   * paused), has its workers stopped and its held tasks released, and the
+   * orchestrator returns to idle so other goals can run.
+   */
+  private guardGoal(state: OrchestratorState): { goal: GoalRow } | { idle: OrchestratorState } {
+    if (!state.goalId) {
+      return { idle: { ...DEFAULT_STATE } };
+    }
+    const goal = getGoalById(this.params.db, state.goalId);
+    if (goal && (goal.status === "active" || goal.status === "failed")) {
+      return { goal };
+    }
+
+    logger.info("Goal is no longer active; stopping its work", {
+      goalId: state.goalId,
+      status: goal?.status ?? "missing",
+    });
+    this.stopGoalWork(state.goalId);
+    return { idle: { ...DEFAULT_STATE } };
+  }
+
+  private stopGoalWork(goalId: string, reason = "goal is no longer active"): void {
+    const pool = this.params.workerPool;
+    for (const task of getTasksByGoal(this.params.db, goalId)) {
+      if (task.status !== "assigned" && task.status !== "running") continue;
+      if (!task.assignedTo) continue;
+      if (task.assignedTo.startsWith("local://")) {
+        pool?.abortWorker(task.assignedTo, "cancelled");
+      }
+      releaseTask(this.params.db, task.id, task.assignedTo, reason, { retry: false });
+    }
+    // Cancelled tasks are no longer owned, so their workers are aborted here.
+    pool?.reapOrphans();
+  }
+
   private handleIdlePhase(state: OrchestratorState): OrchestratorState {
     const activeGoals = getActiveGoals(this.params.db);
     if (activeGoals.length === 0) {
       return {
-        ...state,
-        phase: "idle",
-        goalId: null,
+        ...DEFAULT_STATE,
       };
     }
 
     const goal = pickGoal(activeGoals, state.goalId);
     return {
-      ...state,
+      ...DEFAULT_STATE,
       phase: "classifying",
       goalId: goal.id,
-      failedTaskId: null,
-      failedError: null,
     };
   }
 
   private async handleClassifyingPhase(state: OrchestratorState): Promise<OrchestratorState> {
-    if (!state.goalId) {
-      return {
-        ...state,
-        phase: "idle",
-      };
-    }
-
-    const goal = getGoalById(this.params.db, state.goalId);
-    if (!goal) {
-      return {
-        ...state,
-        phase: "idle",
-        goalId: null,
-      };
-    }
+    const guard = this.guardGoal(state);
+    if ("idle" in guard) return guard.idle;
+    const goal = guard.goal;
 
     const tasks = getTasksByGoal(this.params.db, goal.id);
     if (tasks.length > 0) {
@@ -380,95 +385,66 @@ export class Orchestrator {
   }
 
   private async handlePlanningPhase(state: OrchestratorState): Promise<OrchestratorState> {
-    if (!state.goalId) {
-      return {
-        ...state,
-        phase: "idle",
-      };
-    }
+    const guard = this.guardGoal(state);
+    if ("idle" in guard) return guard.idle;
+    const goal = guard.goal;
 
-    const goal = getGoalById(this.params.db, state.goalId);
-    if (!goal) {
-      return {
-        ...state,
-        phase: "idle",
-        goalId: null,
-      };
+    const pause = this.orchestrationPauseReason();
+    if (pause) {
+      logger.info("Planning deferred: orchestration inference paused", { goalId: goal.id, reason: pause });
+      return state;
     }
 
     let output: PlannerOutput;
     try {
       output = await planGoal(
         goalToPlannerInput(goalRowToGoal(goal)),
-        await buildPlannerContext({
-          db: this.params.db,
-          workspace: new AgentWorkspace(goal.id),
-          funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
-          idleAgents: this.params.agentTracker.getIdle().length,
-          busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
-          maxAgents: Number(this.params.config?.maxChildren ?? 3),
-        }),
+        await this.plannerContext(goal.id),
         this.params.inference,
       );
     } catch (error) {
       const err = normalizeError(error);
-      logger.warn("Planner inference failed, falling back to single-task plan", {
+      if (!(error instanceof PlannerOutputError)) {
+        // A refusal or provider failure: no fallback plan (it would spawn a
+        // worker that spends the same budget); plan again on a later tick.
+        logger.warn("Planner inference unavailable, will retry planning later", {
+          goalId: goal.id,
+          error: err.message,
+          code: error instanceof InferenceRefusedError ? error.code : undefined,
+        });
+        return state;
+      }
+      logger.warn("Planner returned an unusable plan, falling back to single-task plan", {
         goalId: goal.id,
         error: err.message,
       });
-      output = {
-        analysis: `Planner fallback: ${err.message}`,
-        strategy: "Execute goal as a single generalist task",
-        customRoles: [],
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-        risks: ["Planner unavailable — executing without decomposition"],
-        estimatedTotalCostCents: 200,
-        estimatedTimeMinutes: 30,
-      };
+      output = singleTaskPlan(goal, `Planner fallback: ${err.message}`, "Execute goal as a single generalist task",
+        "Planner unavailable — executing without decomposition");
     }
 
     if (output.tasks.length === 0) {
       // Planner returned valid JSON but empty tasks — use fallback single task
       logger.warn("Planner returned no tasks, falling back to single-task plan", { goalId: goal.id });
-      output = {
-        ...output,
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-      };
+      output = { ...output, tasks: singleTaskPlan(goal, "", "", "").tasks };
     }
 
-    decomposeGoal(this.params.db, goal.id, plannerOutputToTasks(goal.id, output));
+    // The tasks and the phase that says they exist commit together, so a
+    // restart in between cannot plan the goal a second time.
+    const next: OrchestratorState = { ...state, phase: "plan_review" };
+    withTransaction(this.params.db, () => {
+      decomposeGoal(this.params.db, goal.id, plannerOutputToTasks(goal.id, output));
+      this.saveState(next);
+    });
     await this.persistPlannerOutput(goal.id, output, "plan");
 
-    return {
-      ...state,
-      phase: "plan_review",
-    };
+    return next;
   }
 
   private async handlePlanReviewPhase(state: OrchestratorState): Promise<OrchestratorState> {
-    if (!state.goalId) {
-      return { ...state, phase: "idle" };
-    }
+    const guard = this.guardGoal(state);
+    if ("idle" in guard) return guard.idle;
 
-    const planKey = `orchestrator.plan.${state.goalId}`;
+    const planKey = `orchestrator.plan.${guard.goal.id}`;
     const planRow = this.params.db
       .prepare("SELECT value FROM kv WHERE key = ?")
       .get(planKey) as { value: string } | undefined;
@@ -496,7 +472,7 @@ export class Orchestrator {
 
       this.params.db.prepare(
         "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-      ).run(`orchestrator.review_feedback.${state.goalId}`, result.feedback ?? "Plan rejected");
+      ).run(`orchestrator.review_feedback.${guard.goal.id}`, result.feedback ?? "Plan rejected");
 
       return { ...state, phase: "planning" };
     } catch (error) {
@@ -512,142 +488,33 @@ export class Orchestrator {
     state: OrchestratorState,
     counters: TickCounters,
   ): Promise<OrchestratorState> {
-    if (!state.goalId) {
-      return {
-        ...state,
-        phase: "idle",
-      };
+    // 1. Goal guard.
+    const guard = this.guardGoal(state);
+    if ("idle" in guard) return guard.idle;
+    const goal = guard.goal;
+
+    // 2-4. Take back tasks nobody will finish: remote owners, dead local
+    // owners, and owners past their deadline.
+    this.releaseRemoteAssignments(goal.id);
+    this.releaseDeadOwners(goal.id, counters);
+    this.enforceDeadlines(goal.id, counters);
+
+    // 5. Stop workers whose task was taken from them (cancelled, completed by the parent).
+    this.params.workerPool?.reapOrphans();
+
+    // 6. Assign ready tasks. A goal that has already failed gets no new work.
+    if (goal.status === "active") {
+      this.assignReadyTasks(goal.id, counters);
     }
 
-    const goal = getGoalById(this.params.db, state.goalId);
-    if (!goal) {
-      return {
-        ...state,
-        phase: "idle",
-        goalId: null,
-      };
-    }
-
-    // Recover stale tasks: workers that died (process restart, sandbox crash)
-    // leave tasks stuck in 'assigned' forever. Detect and reset them.
-    if (this.params.isWorkerAlive) {
-      const assignedTasks = getTasksByGoal(this.params.db, goal.id)
-        .filter((t) => t.status === "assigned" && t.assignedTo);
-      for (const task of assignedTasks) {
-        const alive = this.params.isWorkerAlive(task.assignedTo!);
-        if (!alive) {
-          logger.warn("Recovering stale task from dead worker", {
-            taskId: task.id,
-            worker: task.assignedTo,
-          });
-          this.params.db.prepare(
-            "UPDATE task_graph SET status = 'pending', assigned_to = NULL, started_at = NULL WHERE id = ?",
-          ).run(task.id);
-        }
-      }
-    }
-
-    const ready = getReadyTasks(this.params.db)
-      .filter((task) => task.goalId === goal.id);
-
-    for (const task of ready) {
-      try {
-        const assignment = await this.matchTaskToAgent(task);
-        assignTask(this.params.db, task.id, assignment.agentAddress);
-
-        const isLocalWorker = assignment.agentAddress.startsWith("local://");
-        const isSelfAssigned = assignment.agentAddress === this.params.identity?.address;
-
-        // Local workers receive their task directly at spawn time and run
-        // their own inference loop. Self-assigned tasks are handled by the
-        // parent agent via its normal turn. Neither needs funding or messaging.
-        if (!isLocalWorker && !isSelfAssigned) {
-          await this.fundAgentForTask(assignment.agentAddress, task);
-
-          const message = this.params.messaging.createMessage({
-            type: "task_assignment",
-            to: assignment.agentAddress,
-            goalId: task.goalId,
-            taskId: task.id,
-            priority: "high",
-            requiresResponse: true,
-            content: JSON.stringify({
-              taskId: task.id,
-              title: task.title,
-              description: task.description,
-              agentRole: task.agentRole,
-              dependencies: task.dependencies,
-              timeoutMs: task.metadata.timeoutMs,
-            }),
-          });
-
-          await this.params.messaging.send(message);
-        }
-
-        this.params.agentTracker.updateStatus(assignment.agentAddress, "running");
-        counters.tasksAssigned += 1;
-      } catch (error) {
-        const err = normalizeError(error);
-
-        // If no agent is available, skip this task — it stays pending and will
-        // be retried on the next tick when an agent becomes available or is spawned.
-        if (err.message.startsWith("No available agent")) {
-          logger.warn("No agent available for task, will retry next tick", {
-            taskId: task.id,
-            role: task.agentRole,
-          });
-          continue;
-        }
-
-        const previous = getTaskById(this.params.db, task.id);
-        await this.handleFailure(task, err.message);
-        const latest = getTaskById(this.params.db, task.id);
-        if (previous?.status !== "failed" && latest?.status === "failed") {
-          counters.tasksFailed += 1;
-        }
-      }
-    }
-
-    await this.collectResults();
-
-    for (const event of this.pendingTaskResults) {
-      const taskRow = getTaskById(this.params.db, event.taskId);
-      if (!taskRow) {
-        continue;
-      }
-
-      if (event.result.success) {
-        try {
-          completeTask(this.params.db, taskRow.id, event.result);
-          counters.tasksCompleted += 1;
-
-          if (taskRow.assignedTo) {
-            this.params.agentTracker.updateStatus(taskRow.assignedTo, "healthy");
-          }
-        } catch (error) {
-          const err = normalizeError(error);
-          const taskNode = taskRowToTaskNode(taskRow);
-          await this.handleFailure(taskNode, err.message);
-          const latest = getTaskById(this.params.db, taskNode.id);
-          if (taskRow.status !== "failed" && latest?.status === "failed") {
-            counters.tasksFailed += 1;
-          }
-        }
-
-        continue;
-      }
-
-      const taskNode = taskRowToTaskNode(taskRow);
-      await this.handleFailure(taskNode, event.error ?? event.result.output);
-      const latest = getTaskById(this.params.db, taskNode.id);
-      if (taskRow.status !== "failed" && latest?.status === "failed") {
-        counters.tasksFailed += 1;
-      }
-    }
-
+    // 7. Evaluate.
     const progress = getGoalProgress(this.params.db, goal.id);
+    const maxReplans = this.getMaxReplans();
+    // Workers settle tasks between ticks; count what finished since the last look.
+    counters.tasksCompleted += Math.max(0, progress.completed - (state.completedSeen ?? progress.completed));
+    state = { ...state, completedSeen: progress.completed };
 
-    if (progress.total > 0 && progress.completed === progress.total) {
+    if (isGoalProgressComplete(progress)) {
       updateGoalStatus(this.params.db, goal.id, "completed");
       return {
         ...state,
@@ -656,132 +523,314 @@ export class Orchestrator {
     }
 
     if (progress.failed > 0) {
-      const maxReplans = this.getMaxReplans();
       return {
         ...state,
         phase: state.replanCount < maxReplans ? "replanning" : "failed",
-        failedTaskId: state.failedTaskId ?? this.findFirstFailedTaskId(goal.id),
+        failedTaskId: this.findFirstFailedTaskId(goal.id),
         failedError: state.failedError ?? "Task execution failed",
+      };
+    }
+
+    if (goal.status === "failed") {
+      // Failed with no failed task left (e.g. all cancelled): nothing to replan around.
+      return { ...state, phase: "failed", failedError: state.failedError ?? "Goal failed" };
+    }
+
+    const stall = this.describeStall(goal.id, progress);
+    if (stall) {
+      logger.warn("Goal cannot make progress", { goalId: goal.id, reason: stall });
+      return {
+        ...state,
+        phase: state.replanCount < maxReplans ? "replanning" : "failed",
+        failedTaskId: null,
+        failedError: `Goal stalled: ${stall}`,
       };
     }
 
     return state;
   }
 
+  /**
+   * Why the goal can make no further progress, or null. That is: nothing
+   * is assigned, running or ready, and the goal is not complete. Left-over
+   * work is blocked behind a failed or cancelled task, or nothing is left
+   * at all (every task cancelled).
+   */
+  private describeStall(goalId: string, progress: GoalProgress): string | null {
+    if (isGoalProgressComplete(progress) || progress.running > 0) return null;
+    const ready = getReadyTasks(this.params.db).some((task) => task.goalId === goalId);
+    if (ready) return null;
+    if (progress.effectiveTotal === 0) {
+      return progress.total === 0 ? "the goal has no tasks" : "every task of the goal was cancelled";
+    }
+    const waiting = progress.blocked + progress.pending;
+    return `${waiting} task(s) wait on work that can no longer complete`;
+  }
+
+  private releaseRemoteAssignments(goalId: string): void {
+    for (const task of getTasksByGoal(this.params.db, goalId)) {
+      if (task.status !== "assigned" && task.status !== "running") continue;
+      const owner = task.assignedTo;
+      if (!owner || owner.startsWith("local://") || owner === this.params.identity.address) continue;
+
+      // No transport reaches a remote child and it has no colony executor:
+      // waiting would wait forever. Run the task locally instead.
+      logger.warn("Releasing a task assigned to a remote agent: remote children do not execute colony tasks", {
+        taskId: task.id,
+        owner,
+      });
+      if (releaseTask(this.params.db, task.id, owner, "remote children do not execute colony tasks", { retry: false }) === "applied") {
+        try {
+          insertEvent(this.params.db, {
+            type: "remote_delegation_unsupported",
+            agentAddress: owner,
+            goalId,
+            taskId: task.id,
+            content: "Task was assigned to a remote child; released to local workers without spending a retry.",
+            tokenCount: 0,
+          });
+        } catch {
+          // Best effort.
+        }
+      }
+    }
+  }
+
+  private releaseDeadOwners(goalId: string, counters: TickCounters): void {
+    for (const task of getTasksByGoal(this.params.db, goalId)) {
+      if (task.status !== "assigned" && task.status !== "running") continue;
+      const owner = task.assignedTo;
+      // The parent works on its own tasks in its turns; it is never "dead".
+      if (!owner || !owner.startsWith("local://")) continue;
+      const alive = this.isLocalWorkerAlive(owner);
+      if (alive !== false) continue;
+
+      logger.warn("Releasing task from a dead worker", { taskId: task.id, worker: owner });
+      releaseTask(this.params.db, task.id, owner, "worker ended without reporting a result", { retry: true });
+      if (getTaskById(this.params.db, task.id)?.status === "failed") {
+        counters.tasksFailed += 1;
+      }
+    }
+  }
+
+  private enforceDeadlines(goalId: string, counters: TickCounters): void {
+    const now = Date.now();
+    for (const task of getTasksByGoal(this.params.db, goalId)) {
+      if (task.status !== "assigned" && task.status !== "running") continue;
+      const owner = task.assignedTo;
+      // Self-assigned tasks have no deadline: the parent completes or cancels them.
+      if (!owner || !owner.startsWith("local://") || !task.startedAt) continue;
+      const startedMs = parseTimestamp(task.startedAt);
+      if (!Number.isFinite(startedMs)) continue;
+      const deadline = startedMs + task.timeoutMs + TASK_DEADLINE_GRACE_MS;
+      if (deadline >= now) continue;
+
+      logger.warn("Task is past its deadline; stopping its worker", {
+        taskId: task.id,
+        worker: owner,
+        startedAt: task.startedAt,
+        timeoutMs: task.timeoutMs,
+      });
+      this.params.workerPool?.abortWorker(owner, "timeout");
+      releaseTask(this.params.db, task.id, owner, `Task exceeded its deadline (${task.timeoutMs} ms plus grace)`, { retry: true });
+      if (getTaskById(this.params.db, task.id)?.status === "failed") {
+        counters.tasksFailed += 1;
+      }
+    }
+  }
+
+  private assignReadyTasks(goalId: string, counters: TickCounters): void {
+    const ready = getReadyTasks(this.params.db).filter((task) => task.goalId === goalId);
+    if (ready.length === 0) return;
+
+    // No assignment while orchestration inference cannot run: a self-assigned
+    // task would run as main-loop turns outside the orchestration share.
+    const assignmentBlock = this.assignmentBlockReason();
+    if (assignmentBlock) {
+      logger.info("Task assignment deferred: orchestration inference unavailable", {
+        goalId,
+        readyTasks: ready.length,
+        reason: assignmentBlock,
+      });
+      return;
+    }
+
+    const pool = this.params.workerPool;
+    const useWorkers = pool !== undefined && this.params.config?.disableSpawn !== true;
+
+    for (const task of ready) {
+      if (useWorkers) {
+        // Null: the pool is full or the task is held; it waits pending.
+        if (pool.spawn(task)) counters.tasksAssigned += 1;
+        continue;
+      }
+
+      try {
+        assignTask(this.params.db, task.id, this.params.identity.address);
+        counters.tasksAssigned += 1;
+        logger.info("Self-assigning task to the parent agent", { taskId: task.id, role: task.agentRole });
+      } catch (error) {
+        logger.warn("Could not self-assign task", { taskId: task.id, error: normalizeError(error).message });
+      }
+    }
+  }
+
+  /** True/false for a local worker address, or null when liveness cannot be known. */
+  private isLocalWorkerAlive(address: string): boolean | null {
+    if (this.params.workerPool) return this.params.workerPool.hasWorker(address);
+    if (this.params.isWorkerAlive) return this.params.isWorkerAlive(address);
+    return null;
+  }
+
   private async handleReplanningPhase(state: OrchestratorState): Promise<OrchestratorState> {
-    if (!state.goalId) {
-      return {
-        ...state,
-        phase: "idle",
-      };
+    const guard = this.guardGoal(state);
+    if ("idle" in guard) return guard.idle;
+    const goal = guard.goal;
+
+    const stateFailed = state.failedTaskId ? getTaskById(this.params.db, state.failedTaskId) : undefined;
+    const fallbackId = this.findFirstFailedTaskId(goal.id);
+    const failedTaskRow = stateFailed?.status === "failed" && stateFailed.goalId === goal.id
+      ? stateFailed
+      : fallbackId ? getTaskById(this.params.db, fallbackId) : undefined;
+
+    let failureInput: PlannerFailureInput;
+    if (failedTaskRow) {
+      failureInput = taskToPlannerFailureInput(taskRowToTaskNode(failedTaskRow));
+    } else {
+      // No failed task: replan only if the goal is stalled, else carry on.
+      const stall = this.describeStall(goal.id, getGoalProgress(this.params.db, goal.id));
+      if (!stall) {
+        return { ...state, phase: "executing", failedTaskId: null, failedError: null };
+      }
+      failureInput = this.stallFailureInput(goal, stall);
     }
 
-    const goal = getGoalById(this.params.db, state.goalId);
-    if (!goal) {
-      return {
-        ...state,
-        phase: "idle",
-        goalId: null,
-      };
+    const pause = this.orchestrationPauseReason();
+    if (pause) {
+      logger.info("Replanning deferred: orchestration inference paused", { goalId: goal.id, reason: pause });
+      return state;
     }
 
-    const failedTaskRow = state.failedTaskId
-      ? getTaskById(this.params.db, state.failedTaskId)
-      : getTasksByGoal(this.params.db, goal.id).find((task) => task.status === "failed");
-
-    if (!failedTaskRow) {
-      return {
-        ...state,
-        phase: "executing",
-      };
-    }
+    const goalTasks = getTasksByGoal(this.params.db, goal.id);
+    const completedTitles = goalTasks.filter((task) => task.status === "completed").map((task) => task.title);
+    const inProgressTitles = goalTasks
+      .filter((task) => task.status === "assigned" || task.status === "running")
+      .map((task) => task.title);
 
     let output: PlannerOutput;
     try {
       output = await replanAfterFailure(
         goalToPlannerInput(goalRowToGoal(goal)),
-        taskToPlannerFailureInput(taskRowToTaskNode(failedTaskRow)),
-        await buildPlannerContext({
-          db: this.params.db,
-          workspace: new AgentWorkspace(goal.id),
-          funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
-          idleAgents: this.params.agentTracker.getIdle().length,
-          busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
-          maxAgents: Number(this.params.config?.maxChildren ?? 3),
-        }),
+        failureInput,
+        await this.plannerContext(goal.id),
         this.params.inference,
+        { completedTasks: completedTitles, inProgressTasks: inProgressTitles },
       );
     } catch (error) {
       const err = normalizeError(error);
-      logger.warn("Replanner inference failed, falling back to single-task plan", {
+      if (!(error instanceof PlannerOutputError)) {
+        logger.warn("Replanner inference unavailable, will retry replanning later", {
+          goalId: goal.id,
+          error: err.message,
+          code: error instanceof InferenceRefusedError ? error.code : undefined,
+        });
+        return state;
+      }
+      logger.warn("Replanner returned an unusable plan, falling back to single-task plan", {
         goalId: goal.id,
         error: err.message,
       });
-      output = {
-        analysis: `Replanner fallback: ${err.message}`,
-        strategy: "Re-execute goal as a single generalist task",
-        customRoles: [],
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-        risks: ["Replanner unavailable — re-executing without decomposition"],
-        estimatedTotalCostCents: 200,
-        estimatedTimeMinutes: 30,
-      };
+      output = singleTaskPlan(goal, `Replanner fallback: ${err.message}`, "Re-execute goal as a single generalist task",
+        "Replanner unavailable — re-executing without decomposition");
     }
 
     if (output.tasks.length === 0) {
       logger.warn("Replanner returned no tasks, falling back to single-task plan", { goalId: goal.id });
-      output = {
-        ...output,
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-      };
+      output = { ...output, tasks: singleTaskPlan(goal, "", "", "").tasks };
     }
 
-    this.params.db.prepare(
-      `UPDATE task_graph
-       SET status = 'pending',
-           assigned_to = NULL,
-           started_at = NULL,
-           completed_at = NULL,
-           result = NULL
-       WHERE goal_id = ?
-         AND status IN ('failed', 'blocked')`,
-    ).run(goal.id);
+    const replanNumber = state.replanCount + 1;
+    const plannedTasks = plannerOutputToTasks(goal.id, output);
+    const inFlightIds = new Set(
+      goalTasks.filter((task) => task.status === "assigned" || task.status === "running").map((task) => task.id),
+    );
 
-    updateGoalStatus(this.params.db, goal.id, "active");
-
-    decomposeGoal(this.params.db, goal.id, plannerOutputToTasks(goal.id, output));
-    await this.persistPlannerOutput(goal.id, output, "replan");
-
-    return {
+    const next: OrchestratorState = {
       ...state,
       phase: "plan_review",
-      replanCount: state.replanCount + 1,
+      replanCount: replanNumber,
       failedTaskId: null,
       failedError: null,
     };
+    withTransaction(this.params.db, () => {
+      // Workers settled tasks while the replanner ran: decide on the tasks as
+      // they are now, not on the snapshot the planner was given.
+      const liveTasks = getTasksByGoal(this.params.db, goal.id);
+      const plannedTitles = new Set(plannedTasks.map((task) => normalizeTitle(task.title)));
+      const keep = new Set<string>();
+      for (const task of liveTasks) {
+        if (!inFlightIds.has(task.id)) continue;
+        // The planner was told this runs. A retry queued meanwhile is still
+        // that work; a failure it never saw stays for the next replan unless
+        // the new plan redoes it.
+        if (task.status === "pending" || task.status === "blocked") keep.add(task.id);
+        if (task.status === "failed" && !plannedTitles.has(normalizeTitle(task.title))) keep.add(task.id);
+      }
+      // Work that is done, running or kept is not planned a second time.
+      const covering = liveTasks.filter((task) =>
+        task.status === "completed" || task.status === "assigned" || task.status === "running"
+        || (keep.has(task.id) && task.status !== "failed"));
+      const newTasks = dedupeAgainstExisting(plannedTasks, covering);
+
+      // The new plan replaces every other open task; running work is left alone.
+      supersedeOpenTasks(this.params.db, goal.id, replanNumber, keep);
+      if (getGoalById(this.params.db, goal.id)?.status === "failed") {
+        updateGoalStatus(this.params.db, goal.id, "active");
+      }
+      decomposeGoal(this.params.db, goal.id, newTasks);
+      this.saveState(next);
+    });
+    this.params.workerPool?.reapOrphans();
+    await this.persistPlannerOutput(goal.id, output, "replan");
+
+    return next;
   }
 
-  private async handleCompletePhase(state: OrchestratorState): Promise<OrchestratorState> {
-    await this.recallAgentCredits();
+  /** A failure input for a stalled goal: the first task that waits on dead work, or the goal itself. */
+  private stallFailureInput(goal: GoalRow, stall: string): PlannerFailureInput {
+    const waiting = getTasksByGoal(this.params.db, goal.id).find((task) => task.status === "blocked" || task.status === "pending");
+    if (waiting) {
+      const input = taskToPlannerFailureInput(taskRowToTaskNode(waiting));
+      return {
+        ...input,
+        status: "failed",
+        result: { success: false, output: `Stalled: ${stall}`, artifacts: [], costCents: 0, duration: 0 },
+      };
+    }
+    const now = new Date().toISOString();
+    return {
+      id: goal.id,
+      title: goal.title,
+      description: goal.description,
+      status: "failed",
+      agentRole: null,
+      dependencies: [],
+      assignedTo: null,
+      result: { success: false, output: `Stalled: ${stall}`, artifacts: [], costCents: 0, duration: 0 },
+      metadata: {
+        estimatedCostCents: 0,
+        actualCostCents: 0,
+        maxRetries: 0,
+        retryCount: 0,
+        timeoutMs: 0,
+        createdAt: goal.createdAt ?? now,
+        startedAt: null,
+        completedAt: null,
+      },
+    };
+  }
 
+  private handleCompletePhase(): OrchestratorState {
     return {
       ...DEFAULT_STATE,
       phase: "idle",
@@ -799,17 +848,44 @@ export class Orchestrator {
       return { ...DEFAULT_STATE };
     }
 
-    updateGoalStatus(this.params.db, state.goalId, "failed");
+    // Never overwrite a goal the operator cancelled or paused meanwhile.
+    if (this.isGoalLive(state.goalId)) {
+      updateGoalStatus(this.params.db, state.goalId, "failed");
+    }
+    // The orchestrator moves on and no longer watches this goal's workers
+    // (deadlines, dead owners), so they stop here and free their slots.
+    this.stopGoalWork(state.goalId, "goal was given up");
 
     // Reset to idle so the orchestrator can pick up other active goals
     // instead of being stuck in "failed" forever.
     return { ...DEFAULT_STATE };
   }
 
+  private async plannerContext(goalId: string) {
+    const pool = this.params.workerPool;
+    const maxAgents = Math.max(1, Number(this.params.config?.maxChildren ?? 3) || 1);
+    const busy = pool?.getActiveCount() ?? 0;
+    return buildPlannerContext({
+      db: this.params.db,
+      workspace: new AgentWorkspace(goalId),
+      idleAgents: Math.max(0, maxAgents - busy),
+      busyAgents: busy,
+      maxAgents,
+    });
+  }
+
   private async classifyComplexity(goal: GoalRow): Promise<{ requiresPlanMode: boolean; estimatedSteps: number }> {
+    if (this.orchestrationPauseReason()) {
+      const estimatedSteps = heuristicStepEstimate(goal);
+      return { estimatedSteps, requiresPlanMode: estimatedSteps > 3 };
+    }
+
     try {
-      const result = await this.params.inference.chat({
+      // A refusal lands in the catch and uses the free heuristic.
+      const result = await runWithInferenceScope({ caller: "orchestrator.classify" }, () => this.params.inference.chat({
         tier: "cheap",
+        purpose: "classify",
+        maxTokens: 512,
         responseFormat: { type: "json_object" },
         messages: [
           {
@@ -825,7 +901,7 @@ export class Orchestrator {
             content: `Goal title: ${goal.title}\nGoal description: ${goal.description}`,
           },
         ],
-      });
+      }));
 
       const parsed = safeJsonParse(result.content);
       const estimatedSteps = clampSteps(
@@ -845,73 +921,40 @@ export class Orchestrator {
     }
   }
 
-  private findBusyAgentForReassign(): { address: string; name: string } | null {
-    const idleAddresses = new Set(this.params.agentTracker.getIdle().map((agent) => agent.address));
-
-    const rows = this.params.db.prepare(
-      `SELECT name, address, status
-       FROM children
-       WHERE status IN ('running', 'healthy')
-       ORDER BY created_at ASC`,
-    ).all() as { name: string; address: string; status: string }[];
-
-    const candidate = rows.find((row) => !idleAddresses.has(row.address));
-    if (!candidate) {
-      return null;
+  /** Why orchestration inference is paused by survival tier, or null. Without a gate the client decides. */
+  private orchestrationPauseReason(): string | null {
+    const gate = getInstalledInferenceGate();
+    if (!gate) return null;
+    try {
+      const { tier } = gate.survival();
+      return PAUSED_SURVIVAL_TIERS.has(tier) ? `survival tier ${tier}` : null;
+    } catch {
+      return "inference gate unavailable";
     }
-
-    return {
-      address: candidate.address,
-      name: candidate.name,
-    };
   }
 
-  private async trySpawnAgent(task: TaskNode): Promise<AgentAssignment | null> {
-    if (this.params.config?.disableSpawn === true) {
-      return null;
+  /** Why ready tasks must stay pending this tick, or null when they may be assigned. */
+  private assignmentBlockReason(): string | null {
+    const pause = this.orchestrationPauseReason();
+    if (pause) return pause;
+
+    const blockedUntil = this.params.db
+      .prepare("SELECT value FROM kv WHERE key = ?")
+      .get(ORCHESTRATOR_INFERENCE_BLOCKED_UNTIL_KEY) as { value: string } | undefined;
+    const untilMs = blockedUntil ? Date.parse(blockedUntil.value) : NaN;
+    // Writers clamp to an hour; anything further out means the clock moved back.
+    if (Number.isFinite(untilMs) && untilMs > Date.now() && untilMs - Date.now() <= MAX_INFERENCE_BLOCK_MS) {
+      return `worker inference refused until ${new Date(untilMs).toISOString()}`;
     }
 
-    const spawn = this.params.config?.spawnAgent;
-    if (typeof spawn !== "function") {
-      return null;
-    }
-
-    const spawned = await spawn(task);
-    if (!spawned || typeof spawned.address !== "string" || typeof spawned.name !== "string") {
-      return null;
-    }
-
-    this.params.agentTracker.register({
-      address: spawned.address,
-      name: spawned.name,
-      role: task.agentRole ?? "generalist",
-      sandboxId: typeof spawned.sandboxId === "string" ? spawned.sandboxId : ulid(),
-    });
-
-    this.params.agentTracker.updateStatus(spawned.address, "running");
-
-    return {
-      agentAddress: spawned.address,
-      agentName: spawned.name,
-      spawned: true,
-    };
-  }
-
-  private async recallAgentCredits(): Promise<void> {
-    const children = this.params.db.prepare(
-      `SELECT address FROM children WHERE status IN ('running', 'healthy')`,
-    ).all() as { address: string }[];
-
-    for (const child of children) {
-      try {
-        await this.params.funding.recallCredits(child.address);
-      } catch (error) {
-        const err = normalizeError(error);
-        logger.warn("Failed to recall credits", {
-          address: child.address,
-          error: err.message,
-        });
-      }
+    const gate = getInstalledInferenceGate();
+    if (!gate) return null;
+    try {
+      // Workers carry a task, not a session: check as a worker would be checked.
+      const headroom = gate.headroom("orchestration", { caller: "worker" });
+      return headroom.allowed ? null : `no orchestration headroom (${headroom.code ?? "refused"})`;
+    } catch {
+      return "inference gate unavailable";
     }
   }
 
@@ -978,6 +1021,7 @@ export class Orchestrator {
       replanCount: typeof parsed.replanCount === "number" ? Math.max(0, Math.floor(parsed.replanCount)) : 0,
       failedTaskId: typeof parsed.failedTaskId === "string" ? parsed.failedTaskId : null,
       failedError: typeof parsed.failedError === "string" ? parsed.failedError : null,
+      ...(typeof parsed.completedSeen === "number" ? { completedSeen: parsed.completedSeen } : {}),
     };
   }
 
@@ -987,20 +1031,16 @@ export class Orchestrator {
     ).run(ORCHESTRATOR_STATE_KEY, JSON.stringify(state));
   }
 
+  /** The oldest failure nobody handles (a running orchestrator task handles its own sub-tasks'). */
   private findFirstFailedTaskId(goalId: string): string | null {
     const row = this.params.db.prepare(
-      `SELECT id FROM task_graph WHERE goal_id = ? AND status = 'failed' ORDER BY created_at ASC LIMIT 1`,
+      `SELECT t.id FROM task_graph t
+       WHERE t.goal_id = ? AND t.status = 'failed'
+         AND NOT EXISTS (SELECT 1 FROM task_graph p WHERE p.id = t.parent_id AND p.status IN ('assigned', 'running'))
+       ORDER BY t.created_at ASC LIMIT 1`,
     ).get(goalId) as { id: string } | undefined;
 
     return row?.id ?? null;
-  }
-
-  private getActiveAgentCount(): number {
-    const row = this.params.db.prepare(
-      `SELECT COUNT(*) AS count FROM children WHERE status IN ('running', 'healthy')`,
-    ).get() as { count: number } | undefined;
-
-    return row?.count ?? 0;
   }
 
   private getMaxReplans(): number {
@@ -1013,7 +1053,8 @@ export class Orchestrator {
   }
 }
 
-function plannerOutputToTasks(goalId: string, output: PlannerOutput): Omit<TaskNode, "id" | "metadata">[] {
+
+function plannerOutputToTasks(goalId: string, output: PlannerOutput): DecomposeTaskInput[] {
   return output.tasks.map((task, index) => ({
     parentId: null,
     goalId,
@@ -1025,7 +1066,79 @@ function plannerOutputToTasks(goalId: string, output: PlannerOutput): Omit<TaskN
     priority: clampPriority(task.priority, index),
     dependencies: task.dependencies.map((dep) => String(dep)),
     result: null,
+    // decomposeGoal clamps these to the per-task limits.
+    estimatedCostCents: task.estimatedCostCents,
+    timeoutMs: task.timeoutMs,
   }));
+}
+
+/**
+ * Drop planned tasks that repeat work a covering task (completed, running,
+ * or kept) already does (same title), and point their dependents at the
+ * existing task instead.
+ */
+function dedupeAgainstExisting(planned: DecomposeTaskInput[], covering: TaskGraphRow[]): DecomposeTaskInput[] {
+  const keepByTitle = new Map<string, string>();
+  for (const task of covering) {
+    const key = normalizeTitle(task.title);
+    if (!keepByTitle.has(key) || task.status !== "completed") keepByTitle.set(key, task.id);
+  }
+  if (keepByTitle.size === 0) return planned;
+
+  const replacement = new Map<number, string>();
+  const newIndex = new Map<number, number>();
+  const kept: DecomposeTaskInput[] = [];
+  planned.forEach((task, index) => {
+    const existingId = keepByTitle.get(normalizeTitle(task.title));
+    if (existingId) {
+      replacement.set(index, existingId);
+    } else {
+      newIndex.set(index, kept.length);
+      kept.push(task);
+    }
+  });
+  if (replacement.size === 0) return planned;
+
+  return kept.map((task) => ({
+    ...task,
+    dependencies: task.dependencies.map((dep) => {
+      const index = Number(dep);
+      if (!Number.isInteger(index) || String(index) !== dep) return dep;
+      return replacement.get(index) ?? String(newIndex.get(index) ?? dep);
+    }),
+  }));
+}
+
+function normalizeTitle(title: string): string {
+  return title.replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function singleTaskPlan(goal: GoalRow, analysis: string, strategy: string, risk: string): PlannerOutput {
+  return {
+    analysis,
+    strategy,
+    customRoles: [],
+    tasks: [{
+      title: goal.title,
+      description: goal.description,
+      agentRole: "generalist",
+      dependencies: [],
+      estimatedCostCents: 200,
+      priority: 50,
+      timeoutMs: 300_000,
+    }],
+    risks: risk ? [risk] : [],
+    estimatedTotalCostCents: 200,
+    estimatedTimeMinutes: 30,
+  };
+}
+
+/** ISO timestamps as written by the task graph; a zone-less SQLite value is UTC. */
+function parseTimestamp(value: string): number {
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/u.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  return Date.parse(normalized);
 }
 
 function goalRowToGoal(goal: GoalRow): Goal {
@@ -1066,57 +1179,6 @@ function taskRowToTaskNode(task: TaskGraphRow): TaskNode {
       startedAt: task.startedAt,
       completedAt: task.completedAt,
     },
-  };
-}
-
-function parseTaskResultMessage(message: AgentMessage): TaskResultEnvelope | null {
-  const payload = safeJsonParse(message.content);
-  const fallbackTaskId = typeof message.taskId === "string" ? message.taskId : null;
-
-  if (!payload || typeof payload !== "object") {
-    if (!fallbackTaskId) {
-      return null;
-    }
-
-    return {
-      taskId: fallbackTaskId,
-      goalId: message.goalId,
-      result: {
-        success: true,
-        output: message.content,
-        artifacts: [],
-        costCents: 0,
-        duration: 0,
-      },
-    };
-  }
-
-  const obj = payload as Record<string, unknown>;
-  const nested = obj.result && typeof obj.result === "object"
-    ? obj.result as Record<string, unknown>
-    : obj;
-
-  const taskId = firstString(obj.taskId, fallbackTaskId);
-  if (!taskId) {
-    return null;
-  }
-
-  const success = firstBoolean(nested.success, obj.success, true);
-  const output = firstString(nested.output, obj.output, success ? "ok" : "task failed") ?? "";
-
-  const result: TaskResult = {
-    success,
-    output,
-    artifacts: normalizeArtifacts(nested.artifacts ?? obj.artifacts),
-    costCents: firstNumber(nested.costCents, obj.costCents, 0),
-    duration: firstNumber(nested.duration, obj.duration, 0),
-  };
-
-  return {
-    taskId,
-    goalId: message.goalId,
-    result,
-    error: success ? undefined : (firstString(obj.error, output) ?? undefined),
   };
 }
 
@@ -1166,44 +1228,6 @@ function safeJsonParse(raw: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-function normalizeArtifacts(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function firstString(...values: unknown[]): string | null {
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-
-  return null;
-}
-
-function firstBoolean(...values: unknown[]): boolean {
-  for (const value of values) {
-    if (typeof value === "boolean") {
-      return value;
-    }
-  }
-
-  return false;
-}
-
-function firstNumber(...values: unknown[]): number {
-  for (const value of values) {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-  }
-
-  return 0;
 }
 
 function asPhase(value: unknown): ExecutionPhase | null {

@@ -47,7 +47,20 @@ export class PolicyEngine {
 
     for (const rule of applicableRules) {
       rulesEvaluated.push(rule.id);
-      const result = rule.evaluate(request);
+      let result: PolicyRuleResult | null;
+      try {
+        result = rule.evaluate(request);
+      } catch (err) {
+        // Fail closed: a rule that cannot read the arguments must not let
+        // the call through, and must not abort the caller's turn either.
+        const message = err instanceof Error ? err.message : String(err);
+        result = {
+          rule: rule.id,
+          action: "deny",
+          reasonCode: "POLICY_RULE_ERROR",
+          humanMessage: `Policy rule ${rule.id} could not evaluate these arguments (${message}); the call was not run.`,
+        };
+      }
 
       if (result === null) {
         continue;
@@ -69,9 +82,15 @@ export class PolicyEngine {
       }
     }
 
-    const argsHash = createHash("sha256")
-      .update(JSON.stringify(request.args))
-      .digest("hex");
+    let argsHash: string;
+    try {
+      argsHash = createHash("sha256")
+        .update(JSON.stringify(request.args) ?? "")
+        .digest("hex");
+    } catch {
+      // Unserializable arguments (a cycle or a BigInt) still get a decision.
+      argsHash = "unhashable";
+    }
 
     const authorityLevel = PolicyEngine.deriveAuthorityLevel(
       request.turnContext.inputSource,

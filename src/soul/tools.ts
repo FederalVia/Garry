@@ -7,7 +7,6 @@
  * Phase 2.1: Soul System Redesign
  */
 
-import fs from "fs";
 import path from "path";
 import type BetterSqlite3 from "better-sqlite3";
 import type { SoulModel, SoulHistoryRow } from "../types.js";
@@ -16,7 +15,68 @@ import { validateSoul } from "./validator.js";
 import { insertSoulHistory, getCurrentSoulVersion, getLatestSoulHistory, getSoulHistory } from "../state/database.js";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
+import { writeFileSafe } from "../security/secure-fs.js";
 const logger = createLogger("soul");
+
+type SoulKey = keyof SoulModel;
+type ChangeSource = SoulHistoryRow["changeSource"];
+
+const TEXT_KEYS: SoulKey[] = [
+  "name", "address", "creator", "bornAt", "constitutionHash", "genesisPromptOriginal",
+  "lastReflected", "corePurpose", "personality", "strategy", "capabilities",
+  "relationships", "financialCharacter", "updatedAt",
+];
+const LIST_KEYS: SoulKey[] = ["values", "behavioralGuidelines", "boundaries"];
+const NUMBER_KEYS: SoulKey[] = ["genesisAlignment"];
+const ALL_CONTENT_KEYS = new Set<SoulKey>([...TEXT_KEYS, ...LIST_KEYS, ...NUMBER_KEYS]);
+
+/**
+ * Which soul sections each change source may write. The agent edits only its
+ * mutable self-description; reflection only its auto-derived sections;
+ * identity and genesis fields belong to the creator and setup paths.
+ */
+const ALLOWED_KEYS_BY_SOURCE: Record<ChangeSource, ReadonlySet<SoulKey>> = {
+  agent: new Set<SoulKey>([
+    "corePurpose", "values", "behavioralGuidelines", "personality", "boundaries", "strategy",
+  ]),
+  reflection: new Set<SoulKey>([
+    "capabilities", "relationships", "financialCharacter", "genesisAlignment", "lastReflected",
+  ]),
+  human: ALL_CONTENT_KEYS,
+  system: ALL_CONTENT_KEYS,
+  genesis: ALL_CONTENT_KEYS,
+};
+
+/** Sources whose text must not carry a section heading ("## Capabilities"). */
+const UNTRUSTED_SOURCES = new Set<ChangeSource>(["agent", "reflection"]);
+const SECTION_HEADING = /^##/m;
+
+function checkUpdateKeys(updates: Record<string, unknown>, source: ChangeSource): string[] {
+  const errors: string[] = [];
+  const allowed = ALLOWED_KEYS_BY_SOURCE[source] ?? new Set<SoulKey>();
+  for (const [key, value] of Object.entries(updates)) {
+    if (!allowed.has(key as SoulKey)) {
+      errors.push(`Section "${key}" cannot be changed by ${source}`);
+      continue;
+    }
+    if (TEXT_KEYS.includes(key as SoulKey) && typeof value !== "string") {
+      errors.push(`Section "${key}" must be text`);
+    } else if (
+      LIST_KEYS.includes(key as SoulKey) &&
+      !(Array.isArray(value) && value.every((v) => typeof v === "string"))
+    ) {
+      errors.push(`Section "${key}" must be a list of strings`);
+    } else if (NUMBER_KEYS.includes(key as SoulKey) && (typeof value !== "number" || !Number.isFinite(value))) {
+      errors.push(`Section "${key}" must be a number`);
+    } else if (UNTRUSTED_SOURCES.has(source)) {
+      const texts = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
+      if (texts.some((t) => typeof t === "string" && SECTION_HEADING.test(t))) {
+        errors.push(`Section "${key}" must not contain a line starting with "##"`);
+      }
+    }
+  }
+  return errors;
+}
 
 // ─── Update Soul ────────────────────────────────────────────────
 
@@ -39,6 +99,11 @@ export async function updateSoul(
   try {
     const home = process.env.HOME || "/root";
     const resolvedPath = soulPath || path.join(home, ".automaton", "SOUL.md");
+
+    const keyErrors = checkUpdateKeys(updates as Record<string, unknown>, source);
+    if (keyErrors.length > 0) {
+      return { success: false, version: 0, errors: keyErrors };
+    }
 
     // Load current soul or create default
     let current = loadCurrentSoul(db, resolvedPath);
@@ -78,13 +143,9 @@ export async function updateSoul(
       updatedAt: new Date().toISOString(),
     };
 
-    // Write to file
+    // Write to file (temp + rename; never through a link at SOUL.md)
     const content = writeSoulMd(newSoul);
-    const dir = path.dirname(resolvedPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(resolvedPath, content, "utf-8");
+    writeFileSafe(resolvedPath, content, { trustedWriter: true });
 
     // Get previous version ID
     const latestHistory = getLatestSoulHistory(db);

@@ -14,6 +14,7 @@ import os from "os";
 import { createDatabase } from "../state/database.js";
 import {
   claimInboxMessages,
+  claimInboxMessagesFromOneSender,
   markInboxProcessed,
   markInboxFailed,
   resetInboxToReceived,
@@ -145,6 +146,78 @@ describe("Inbox Processing State Machine (Phase 1.2)", () => {
     it("returns empty array when no messages available", () => {
       const claimed = claimInboxMessages(db.raw, 10);
       expect(claimed).toHaveLength(0);
+    });
+  });
+
+  // ─── claimInboxMessagesFromOneSender ───────────────────────────
+
+  describe("claimInboxMessagesFromOneSender", () => {
+    const base = Date.parse("2026-01-01T00:00:00Z");
+    function insertAt(id: string, from: string, seconds: number): void {
+      db.insertInboxMessage({
+        id,
+        from,
+        to: "0xme",
+        content: `Message ${id}`,
+        signedAt: new Date(base + seconds * 1000).toISOString(),
+        createdAt: new Date(base + seconds * 1000).toISOString(),
+      });
+    }
+    function status(id: string): { status: string; retry_count: number } {
+      return db.raw
+        .prepare("SELECT status, retry_count FROM inbox_messages WHERE id = ?")
+        .get(id) as { status: string; retry_count: number };
+    }
+
+    it("claims only the oldest sender's messages, oldest first", () => {
+      insertAt("b-1", "0xbbb", 2);
+      insertAt("a-1", "0xaaa", 1);
+      insertAt("a-2", "0xaaa", 3);
+      insertAt("b-2", "0xbbb", 4);
+
+      const claimed = claimInboxMessagesFromOneSender(db.raw, 10);
+      expect(claimed.map((m) => m.id)).toEqual(["a-1", "a-2"]);
+      expect(claimed.every((m) => m.status === "in_progress" && m.retryCount === 1)).toBe(true);
+      expect(status("a-2")).toEqual({ status: "in_progress", retry_count: 1 });
+      expect(status("b-1")).toEqual({ status: "received", retry_count: 0 });
+
+      expect(claimInboxMessagesFromOneSender(db.raw, 10).map((m) => m.id)).toEqual(["b-1", "b-2"]);
+      expect(claimInboxMessagesFromOneSender(db.raw, 10)).toEqual([]);
+    });
+
+    it("respects the limit and leaves the rest for the next batch", () => {
+      for (let i = 0; i < 4; i++) insertAt(`a-${i}`, "0xaaa", i);
+      expect(claimInboxMessagesFromOneSender(db.raw, 3).map((m) => m.id)).toEqual(["a-0", "a-1", "a-2"]);
+      expect(status("a-3")).toEqual({ status: "received", retry_count: 0 });
+      expect(claimInboxMessagesFromOneSender(db.raw, 3).map((m) => m.id)).toEqual(["a-3"]);
+    });
+
+    it("skips an exhausted oldest row so it cannot block later senders", () => {
+      insertAt("a-old", "0xaaa", 1);
+      insertAt("b-1", "0xbbb", 2);
+      db.raw.prepare("UPDATE inbox_messages SET retry_count = max_retries WHERE id = 'a-old'").run();
+
+      const claimed = claimInboxMessagesFromOneSender(db.raw, 10);
+      expect(claimed.map((m) => m.id)).toEqual(["b-1"]);
+      expect(status("a-old")).toEqual({ status: "received", retry_count: 3 });
+    });
+
+    it("skips exhausted rows within the chosen sender's batch", () => {
+      insertAt("a-1", "0xaaa", 1);
+      insertAt("a-2", "0xaaa", 2);
+      db.raw.prepare("UPDATE inbox_messages SET retry_count = max_retries WHERE id = 'a-2'").run();
+      expect(claimInboxMessagesFromOneSender(db.raw, 10).map((m) => m.id)).toEqual(["a-1"]);
+    });
+
+    it("does not claim rows that are in progress, processed or failed", () => {
+      insertAt("a-1", "0xaaa", 1);
+      insertAt("b-1", "0xbbb", 2);
+      insertAt("c-1", "0xccc", 3);
+      insertAt("d-1", "0xddd", 4);
+      claimInboxMessagesFromOneSender(db.raw, 10);
+      markInboxProcessed(db.raw, ["b-1"]);
+      markInboxFailed(db.raw, ["c-1"]);
+      expect(claimInboxMessagesFromOneSender(db.raw, 10).map((m) => m.id)).toEqual(["d-1"]);
     });
   });
 

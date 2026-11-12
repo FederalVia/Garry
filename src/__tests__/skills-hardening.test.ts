@@ -112,18 +112,37 @@ describe("getActiveSkillInstructions", () => {
     expect(result).toContain("[REMOVED:system_role_injection]");
   });
 
-  it("truncates when total size exceeds limit", () => {
-    // Create skills that together exceed 10,000 characters
+  it("truncates each skill to its own budget so later skills still appear", () => {
+    // One oversized skill must not suppress the others (built-ins included).
     const longInstructions = "A".repeat(6000);
     const skills = [
       makeSkill({ name: "skill-1", instructions: longInstructions }),
       makeSkill({ name: "skill-2", instructions: longInstructions }),
+      makeSkill({ name: "survival", source: "builtin", instructions: "Conserve credits." }),
     ];
     const result = getActiveSkillInstructions(skills);
     expect(result).toContain("TRUNCATED");
-    // Should contain first skill but not second
-    expect(result).toContain("[SKILL: skill-1");
-    expect(result).not.toContain("[SKILL: skill-2 — UNTRUSTED CONTENT]\n");
+    expect(result).toContain("[SKILL: skill-1 — UNTRUSTED CONTENT]");
+    expect(result).toContain("[SKILL: skill-2 — UNTRUSTED CONTENT]");
+    expect(result).toContain("Conserve credits.");
+    // Built-in skills are rendered first.
+    expect(result.indexOf("[SKILL: survival")).toBeLessThan(result.indexOf("[SKILL: skill-1"));
+    for (const name of ["skill-1", "skill-2"]) {
+      const start = result.indexOf(`[SKILL: ${name}`);
+      const end = result.indexOf(`[END SKILL: ${name}]`) + `[END SKILL: ${name}]`.length;
+      expect(end - start).toBeLessThanOrEqual(4000);
+    }
+    expect(result.length).toBeLessThanOrEqual(10_200);
+  });
+
+  it("a single max-size skill does not hide the other skills", () => {
+    const skills = [
+      makeSkill({ name: "notes", instructions: "B".repeat(10_000) }),
+      makeSkill({ name: "payments", source: "builtin", instructions: "Pay with x402." }),
+    ];
+    const result = getActiveSkillInstructions(skills);
+    expect(result).toContain("Pay with x402.");
+    expect(result).toContain("[END SKILL: notes]");
   });
 
   it("handles multiple valid skills", () => {

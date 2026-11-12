@@ -5,8 +5,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { runAgentLoop } from "../agent/loop.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
+import { LocalWorkerPool } from "../orchestration/local-worker.js";
 import {
   MockInferenceClient,
   MockConwayClient,
@@ -18,6 +20,9 @@ import {
   noToolResponse,
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
+import { PolicyEngine } from "../agent/policy-engine.js";
+import { createDefaultRules } from "../agent/policy-rules/index.js";
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -221,6 +226,35 @@ describe("Agent Loop", () => {
     const execTurn = turns.find((t) => t.toolCalls.length > 0);
     expect(execTurn).toBeDefined();
     expect(execTurn!.toolCalls.length).toBeLessThanOrEqual(10);
+  });
+
+  it("fund_child calls count toward the per-turn transfer limit", async () => {
+    const policy = { ...DEFAULT_TREASURY_POLICY, maxTransfersPerTurn: 2 };
+    const policyEngine = new PolicyEngine(db.raw, createDefaultRules(policy));
+    const to = "0x1111111111111111111111111111111111111111";
+    const inference = new MockInferenceClient([
+      toolCallResponse([
+        { name: "fund_child", arguments: { child_id: "missing-1", amount_cents: 100 } },
+        { name: "fund_child", arguments: { child_id: "missing-2", amount_cents: 100 } },
+        { name: "transfer_credits", arguments: { to_address: to, amount_cents: 100 } },
+      ]),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+
+    await runAgentLoop({
+      identity,
+      config: createTestConfig({ treasuryPolicy: policy }),
+      db,
+      conway,
+      inference,
+      policyEngine,
+      onTurnComplete: (turn) => turns.push(turn),
+    });
+
+    const turn = turns.find((t) => t.toolCalls.some((tc) => tc.name === "transfer_credits"));
+    const transfer = turn!.toolCalls.find((tc) => tc.name === "transfer_credits");
+    expect(transfer!.error).toContain("TURN_TRANSFER_LIMIT");
   });
 
   it("consecutive errors trigger sleep", async () => {
@@ -799,7 +833,7 @@ describe("Agent Loop", () => {
     expect(loopWarning).toBeDefined();
   });
 
-  it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {
+  it("sleeps early when local workers are running and no self-assigned parent task remains", async () => {
     const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockResolvedValue({
       phase: "executing",
       tasksAssigned: 0,
@@ -808,6 +842,7 @@ describe("Agent Loop", () => {
       goalsActive: 1,
       agentsActive: 1,
     });
+    const activeSpy = vi.spyOn(LocalWorkerPool.prototype, "getActiveCount").mockReturnValue(1);
 
     const inference = new MockInferenceClient([
       noToolResponse("This should never be used."),
@@ -825,6 +860,67 @@ describe("Agent Loop", () => {
     expect(db.getKV("sleep_until")).toBeDefined();
     expect(inference.calls.length).toBe(0);
     tickSpy.mockRestore();
+    activeSpy.mockRestore();
+  });
+
+  it("H3-001: does not sleep on delegated work when no local worker is alive", async () => {
+    // A child row that looks busy: it can never finish a colony task.
+    db.raw.prepare(
+      "INSERT INTO children (id, name, address, sandbox_id, genesis_prompt, creator_message, funded_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run("child-1", "Kid", "0x2222222222222222222222222222222222222222", "sb-kid", "p", "m", 25, "running", new Date().toISOString());
+    const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockResolvedValue({
+      phase: "executing",
+      tasksAssigned: 0,
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      goalsActive: 1,
+      agentsActive: 1,
+    });
+
+    const inference = new MockInferenceClient([
+      noToolResponse("Checking on the goal."),
+    ]);
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+    });
+
+    expect(inference.calls.length).toBeGreaterThan(0);
+    tickSpy.mockRestore();
+  });
+
+  it("H3-001: the orchestrator wired by the loop runs tasks on local workers and never spawns or funds children", async () => {
+    const spawnModule = await import("../replication/spawn.js");
+    const spawnSpy = vi.spyOn(spawnModule, "spawnChild");
+    const funded = vi.spyOn(conway, "transferCredits");
+    const spawned = vi.spyOn(LocalWorkerPool.prototype, "spawn").mockReturnValue(null);
+    db.raw.prepare(
+      "INSERT INTO goals (id, title, description, status, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run("goal-w", "Worker goal", "d", "active", new Date().toISOString());
+    db.raw.prepare(
+      `INSERT INTO task_graph (id, goal_id, title, description, status, agent_role, priority, dependencies, created_at)
+       VALUES ('task-w', 'goal-w', 'T', 'd', 'pending', 'generalist', 50, '[]', ?)`,
+    ).run(new Date().toISOString());
+    db.setKV("orchestrator.state", JSON.stringify({ phase: "executing", goalId: "goal-w", replanCount: 0, failedTaskId: null, failedError: null }));
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference: new MockInferenceClient([noToolResponse("ok")]),
+    });
+
+    expect(spawned).toHaveBeenCalled();
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(funded).not.toHaveBeenCalled();
+    spawned.mockRestore();
+    spawnSpy.mockRestore();
+    funded.mockRestore();
   });
 
   it("does not sleep early when the parent has a self-assigned task", async () => {
@@ -871,5 +967,154 @@ describe("Agent Loop", () => {
 
     expect(inference.calls.length).toBeGreaterThan(0);
     tickSpy.mockRestore();
+  });
+});
+
+// ─── Balances the loop cannot read ─────────────────────────────
+
+describe("Agent Loop: unknown and cached balances", () => {
+  let db: AutomatonDatabase;
+  let conway: MockConwayClient;
+  let identity: ReturnType<typeof createTestIdentity>;
+  let config: ReturnType<typeof createTestConfig>;
+  const realFetch = globalThis.fetch;
+  const savedRpc = process.env.AUTOMATON_RPC_URL;
+  let payRequests: string[];
+
+  /** USDC RPC answers 1000 USDC; /pay probes are recorded; everything else fails. */
+  function stubNetwork(): void {
+    payRequests = [];
+    process.env.AUTOMATON_RPC_URL = "https://rpc.stub.invalid";
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input?.url ?? String(input);
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes('"jsonrpc"')) {
+        const req = JSON.parse(body);
+        const result = "0x" + (1000n * 1_000_000n).toString(16).padStart(64, "0");
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("/pay/")) {
+        payRequests.push(url);
+        // An unparseable offer: nothing is signed and nothing is retried.
+        return new Response("{}", { status: 402 });
+      }
+      throw new Error(`no network in this test: ${url}`);
+    }) as typeof fetch;
+  }
+
+  beforeEach(() => {
+    db = createTestDb();
+    conway = new MockConwayClient();
+    // A real throwaway key, so the topup path gets as far as the /pay probe.
+    const account = privateKeyToAccount(generatePrivateKey());
+    identity = { ...createTestIdentity(), account, address: account.address };
+    config = createTestConfig();
+    stubNetwork();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (savedRpc === undefined) delete process.env.AUTOMATON_RPC_URL;
+    else process.env.AUTOMATON_RPC_URL = savedRpc;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    db.close();
+  });
+
+  it("never buys credits on a cached balance (H1-001): three turns 61 s apart make no topup", async () => {
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 30, usdcBalance: 1000 }));
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let now = Date.parse("2026-11-12T10:00:00.000Z");
+    const states: AgentState[] = [];
+    let inferenceCalls = 0;
+    for (let i = 0; i < 3; i++) {
+      vi.setSystemTime(now);
+      const inference = new MockInferenceClient([noToolResponse("working on a cached balance")]);
+      await runAgentLoop({ identity, config, db, conway, inference, onStateChange: (s) => states.push(s) });
+      inferenceCalls += inference.calls.length;
+      db.deleteKV("sleep_until");
+      now += 61_000;
+    }
+    expect(payRequests).toEqual([]);
+    expect(db.getKV("last_inline_topup_attempt")).toBeUndefined();
+    // Not dead: a cached balance is never a death sentence, and the agent ran.
+    expect(states).not.toContain("dead");
+    expect(inferenceCalls).toBeGreaterThan(0);
+    // The cache still holds the last live read, not a guess.
+    expect(JSON.parse(db.getKV("last_known_balance")!)).toMatchObject({ creditsCents: 30 });
+  });
+
+  it("a cached negative balance with a failing live read never marks the agent dead", async () => {
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: -50, usdcBalance: 0 }));
+    db.setAgentState("sleeping");
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+    const states: AgentState[] = [];
+    const inference = new MockInferenceClient([noToolResponse("cached negative")]);
+    await runAgentLoop({ identity, config, db, conway, inference, onStateChange: (s) => states.push(s) });
+    expect(states).not.toContain("dead");
+    expect(db.getAgentState()).not.toBe("dead");
+    expect(payRequests).toEqual([]);
+  });
+
+  it("buys on live low balances (inline topup still works)", async () => {
+    conway.creditsCents = 30;
+    const inference = new MockInferenceClient([noToolResponse("low")]);
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(payRequests.length).toBe(1);
+  });
+
+  it("a dead agent with a cached balance stays dead and runs no inference", async () => {
+    db.setAgentState("dead");
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 500, usdcBalance: 0 }));
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+    const inference = new MockInferenceClient([noToolResponse("should not run")]);
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(inference.calls).toHaveLength(0);
+    expect(db.getAgentState()).toBe("dead");
+  });
+
+  it("a dead agent with no balance at all stays dead and runs no inference", async () => {
+    db.setAgentState("dead");
+    conway.getCreditsBalance = async () => {
+      throw new Error("Conway API error: GET /v1/credits/balance -> 503");
+    };
+    const inference = new MockInferenceClient([noToolResponse("should not run")]);
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(inference.calls).toHaveLength(0);
+    expect(db.getAgentState()).toBe("dead");
+  });
+
+  it("a dead agent comes back on a live funded read", async () => {
+    db.setAgentState("dead");
+    conway.creditsCents = 5_000;
+    const inference = new MockInferenceClient([noToolResponse("alive again")]);
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(inference.calls.length).toBeGreaterThan(0);
+    expect(db.getAgentState()).not.toBe("dead");
+  });
+
+  it("a malformed balance body is unknown, not zero: no topup, not dead", async () => {
+    conway.getCreditsBalance = async () => {
+      const { BalanceUnavailableError } = await import("../conway/balance.js");
+      throw new BalanceUnavailableError("malformed_response", "no numeric balance");
+    };
+    const states: AgentState[] = [];
+    const inference = new MockInferenceClient([noToolResponse("fine")]);
+    await runAgentLoop({ identity, config, db, conway, inference, onStateChange: (s) => states.push(s) });
+    expect(payRequests).toEqual([]);
+    expect(states).not.toContain("dead");
+    expect(states).not.toContain("critical");
   });
 });
