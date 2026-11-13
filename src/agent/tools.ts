@@ -49,6 +49,7 @@ import {
 } from "../heartbeat/schedule-store.js";
 import { updateConfigFile } from "../config.js";
 import cronParser from "cron-parser";
+import { notifyDistress } from "../notify/distress.js";
 
 const logger = createLogger("tools");
 
@@ -1516,7 +1517,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "distress_signal",
       description:
-        "Record a local distress signal with funding instructions. Used when critically low on compute.",
+        "Record a local distress signal with funding instructions, and notify the owner's distress webhook if one is configured (fixed fields only: level, balance, address; never your message). Needs a readable credit balance. Used when critically low on compute.",
       category: "survival",
       riskLevel: "dangerous",
       parameters: {
@@ -1546,7 +1547,15 @@ Model: ${ctx.inference.getDefaultModel()}
         };
 
         ctx.db.setKV("last_distress", JSON.stringify(payload));
-        return `Distress signal recorded locally. Address: ${ctx.identity.address} | Credits: $${(credits / 100).toFixed(2)}`;
+        // Fixed fields only: the model's message above never leaves the machine.
+        const notified = await notifyDistress(ctx.config, ctx.identity, ctx.db, {
+          level: "critical",
+          source: "agent",
+          balanceCents: credits,
+        });
+        const note =
+          notified === "sent" ? " Owner notified." : notified === "failed" ? " Owner notification failed." : "";
+        return `Distress signal recorded locally. Address: ${ctx.identity.address} | Credits: $${(credits / 100).toFixed(2)}${note}`;
       },
     },
     {

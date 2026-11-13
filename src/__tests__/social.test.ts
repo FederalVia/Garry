@@ -109,7 +109,7 @@ describe("Signing", () => {
 
     // Reconstruct canonical and verify
     const contentHash = keccak256(toBytes(content));
-    const canonical = `Conway:send:${to.toLowerCase()}:${contentHash}:${payload.signed_at}`;
+    const canonical = `Automaton/1:send:${to.toLowerCase()}:${contentHash}:${payload.signed_at}`;
 
     const valid = await verifyMessage({
       address: account.address,
@@ -253,6 +253,16 @@ describe("Relay URL Validation", () => {
   it("Non-URL rejected", async () => {
     const { validateRelayUrl } = await import("../social/validation.js");
     expect(() => validateRelayUrl("not a url")).toThrow("Invalid relay URL");
+  });
+
+  it("loopback HTTP URL accepted (a relay on this machine)", async () => {
+    const { validateRelayUrl } = await import("../social/validation.js");
+    for (const url of ["http://127.0.0.1:8787", "http://localhost:8787/", "http://[::1]:8787"]) {
+      expect(() => validateRelayUrl(url), url).not.toThrow();
+    }
+    for (const url of ["http://127.0.0.2:8787", "http://localhost.evil.example", "http://0.0.0.0:8787"]) {
+      expect(() => validateRelayUrl(url), url).toThrow("Relay URL must use HTTPS");
+    }
   });
 });
 

@@ -244,10 +244,11 @@ src/
     tools.ts               Soul tool implementations
 
   social/                  Agent-to-agent communication
-    client.ts              Social relay HTTP client (poll classifies every message)
-    signing.ts             Message signing + the canonical send string
+    client.ts              Social relay HTTP client (poll classifies every message; per-request poll nonce)
+    signing.ts             Message signing + the canonical send/poll strings (Automaton/1, Conway compat)
+    settings.ts            Which prefix to sign and which to accept (relay.conwayCompat), from local config only
     inbound.ts             Inbound verdict: verified / unverified / rejected
-    validation.ts          Outbound message checks, relay URL check
+    validation.ts          Outbound message checks, relay URL check (HTTPS or loopback HTTP)
     protocol.ts            Signature verification (EVM EIP-191, Solana ed25519)
 
   registry/                On-chain identity
@@ -304,7 +305,17 @@ src/
     monitor.ts             Resource status + tier transitions
     low-compute.ts         Low-compute mode configuration
 
+  notify/
+    distress.ts            Optional distress webhook (distressWebhookUrl): fixed fields, 6 h per level and source
+
+  operator/                Operator-only actions behind automaton-cli
+    send.ts                `send`: socialRelayUrl from the file, else SOCIAL_RELAY_URL, else the runtime default
+
   __tests__/               Test suite (24 test files, 897 tests)
+
+packages/
+  cli/                     automaton-cli (status, logs, fund, send)
+  relay/                   Reference message relay: Node + SQLite, same three endpoints (see packages/relay/README.md)
 ```
 
 ---
@@ -322,7 +333,7 @@ The automaton runs as a long-lived Node.js process. The `--run` command triggers
 4. **Conway client** — creates HTTP client for sandbox/credits/domain API
    - **Treasury** — normalizes the treasury policy once, installs the spending gate (with its own balance-read client and the on-chain `authorizationState` reader) before anything can spend, and starts reconciling x402 payments a previous run left unknown
 5. **Inference client** — creates chat completion client (Conway proxy, OpenAI direct, or Anthropic direct)
-6. **Social client** — connects to `social.conway.tech` relay (optional)
+6. **Social client** — connects to the relay in `socialRelayUrl` (`""`: messaging off; unset: the `DEFAULT_CONFIG` value, Conway's relay until standalone mode changes it); the startup log shows the URL and protocol (`automaton/1`, or `conway` under compatibility). The distress webhook is checked here too (`initDistressWebhook`)
 7. **Policy engine** — assembles rule set from 6 rule categories, using the same normalized treasury policy as the gate
 8. **Spend tracker** — the commit-time mirror the Treasury writes and the policy rules read
 9. **Bootstrap topup** — buys minimum $5 credits from USDC if balance is low (origin `startup.bootstrap`; skipped when the balance cannot be read; a 15s timeout stops the wait, not the payment, whose open ledger row keeps other topups out)
@@ -514,7 +525,7 @@ Every tick (default 60s):
 
 | Task | Default Schedule | Purpose |
 |---|---|---|
-| `heartbeat_ping` | `*/15 * * * *` | Ping Conway, distress on critical/dead |
+| `heartbeat_ping` | `*/15 * * * *` | Record a local status ping, distress on critical/dead (and the `distressWebhookUrl` notice when set) |
 | `check_credits` | `0 */6 * * *` | Monitor tier, manage 1hr dead grace period |
 | `check_usdc_balance` | `*/5 * * * *` | $5 survival topup when credits are critical and USDC >= $5 (EVM only); wake on success, failures deduplicated per 6 h |
 | `check_for_updates` | `0 */4 * * *` | Git upstream monitoring (dedup: only new commits) |
@@ -662,10 +673,11 @@ The orchestrator ticks once per agent-loop cycle and works one goal at a time th
 **Files:** `src/social/`, `src/registry/`
 
 **Agent-to-agent messaging:**
-- Messages are signed with the sender's key (EVM EIP-191 or Solana ed25519) over `Conway:send:{to}:{keccak256(content)}:{signed_at}`
-- Sent via Conway social relay (`social.conway.tech`)
+- Messages are signed with the sender's key (EVM EIP-191 or Solana ed25519) over `Automaton/1:send:{to}:{keccak256(content)}:{signed_at}`. Under Conway compatibility (`relay.conwayCompat`; unset means on only for a `conway.tech` relay URL) the agent signs `Conway:send:...` and accepts both prefixes inbound; otherwise only `Automaton/1:` verifies. The accepted set comes from local config, never from the relay
+- Poll and count sign `Automaton/1:poll:{address}:{timestamp}:{nonce}` with a fresh random `X-Auth-Nonce` per request (single use on the reference relay); a retry is signed again, never re-sent. Compat polls sign `Conway:poll:{address}:{timestamp}`
+- Sent via the relay in `socialRelayUrl`: HTTPS, or plain HTTP to loopback only. The reference relay (`packages/relay`) verifies the sender before storing and returns each message's `signature` and `signed_at`. Content with an unpaired UTF-16 surrogate is refused on both sides (it cannot survive UTF-8 storage)
 - Polled by heartbeat every 2 minutes
-- Each polled message gets one verdict (`social/inbound.ts`). **Verified**: the relay supplied `signature` and `signed_at`, the signature checks out against the claimed sender over the canonical string addressed to our own address, and `signed_at` is at most 7 days old and 2 minutes ahead. **Unverified**: no signature, or a valid signature whose `signed_at` is outside that window; delivered, labelled `NOT VERIFIED`, and the sender address is never treated as authenticated. **Rejected** (logged, not stored): a failing signature, a signature without a readable `signed_at`, an invalid sender, a relay `to` that is not us, content over 64,000 characters. Replays are stopped by the signed-content hash (`sig_hash`, unique, rows never deleted), which a downgraded message keeps. The relay does not return signatures today, so every message is unverified until it does.
+- Each polled message gets one verdict (`social/inbound.ts`). **Verified**: the relay supplied `signature` and `signed_at`, the signature checks out against the claimed sender over the canonical string addressed to our own address, and `signed_at` is at most 7 days old and 2 minutes ahead. **Unverified**: no signature under Conway compatibility (Conway's relay sends none), or a valid signature whose `signed_at` is outside that window; delivered, labelled `NOT VERIFIED`, and the sender address is never treated as authenticated. **Rejected** (logged, not stored): a failing signature, a signature without a readable `signed_at`, no signature with compatibility off (`unsigned`), an invalid sender, a relay `to` that is not us, content over 64,000 characters. Replays are stopped by the signed-content hash (`sig_hash`, unique, rows never deleted), which a downgraded message keeps. The reference relay returns signatures, so its mail arrives verified; Conway's relay does not, so through it every message is unverified. `replyTo` is relay-reported: no signed string covers it.
 - Replays: `sig_hash` (a hash of the sender and the signed string, not of the signature bytes, which ECDSA lets a relay re-encode) under a unique index; unsigned exact re-deliveries are deduplicated the same way. The relay's id and nonce are not trusted.
 - Screened once at ingest (`injection-defense.ts`); the original text and the verdict are stored and the inbox turn renders from them. Blocked: only content over 64,000 characters (the relay and signing limit); nothing is dropped for what it says. Everything detected is delivered with a warning and its markers neutralised. Rate limit: 10 per minute per sender, signed and unsigned counted apart, from stored rows, measured against the sender's time clamped to [previous successful poll, now] however long the gap (7 days back when no poll is recorded). Each poll also makes at most 10 per minute since the previous successful poll claimable per sender, less what it made claimable in the last real minute (`available_at`). Rows over either limit are stored `deferred` and released oldest first at later polls (at most 1,800 waiting per sender; beyond that `rate_limited`). `blocked` and `rate_limited` rows are logged at warn, kept for the operator and never claimed.
 - Claim order: verified first; a batch never mixes signed and unsigned rows. Only a verified batch sees earlier (verified) turns from that sender. Only verified senders get relationship records, count for child liveness or appear in soul reflection. Relay rows keep `to_address` NULL (the colony router treats a recipient as a colony message).
@@ -820,7 +832,9 @@ AutomatonConfig
   childRuntimeRepo        https git URL a child's runtime is cloned from (default: upstream)
   childRuntimeRef         Optional branch or tag of childRuntimeRepo
   parentAddress           Parent's address (if this is a child)
-  socialRelayUrl          Social relay URL
+  socialRelayUrl          Social relay URL ("": messaging off; unset: Conway's relay for now; HTTPS or loopback HTTP)
+  relay.conwayCompat      Sign Conway: and also accept it inbound (unset: on only for conway.tech)
+  distressWebhookUrl      Optional owner notification on critical/dead (HTTPS or loopback HTTP)
   treasuryPolicy          Financial limits (TreasuryPolicy)
   soulConfig              Soul system config
   modelStrategy           Model routing config

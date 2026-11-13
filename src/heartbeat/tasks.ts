@@ -49,6 +49,7 @@ import { WorkingMemoryManager } from "../memory/working.js";
 import { EpisodicMemoryManager } from "../memory/episodic.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
+import { notifyDistress } from "../notify/distress.js";
 
 const logger = createLogger("heartbeat.tasks");
 
@@ -148,6 +149,12 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         timestamp: new Date().toISOString(),
       };
       taskCtx.db.setKV("last_distress", JSON.stringify(distressPayload));
+      // Off unless the owner configured a webhook; never throws, never changes the wake.
+      await notifyDistress(taskCtx.config, taskCtx.identity, taskCtx.db, {
+        level: tier,
+        source: "heartbeat",
+        balanceCents: credits,
+      });
 
       return {
         shouldWake: true,

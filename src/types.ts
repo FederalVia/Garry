@@ -74,6 +74,13 @@ export interface AutomatonConfig {
   childRuntimeRef?: string;
   parentAddress?: string;
   socialRelayUrl?: string;
+  /**
+   * Relay protocol settings. conwayCompat: sign the legacy "Conway:" form and
+   * also accept it inbound. Unset: on only for a conway.tech relay URL.
+   */
+  relay?: { conwayCompat?: boolean };
+  /** HTTPS (or loopback HTTP) URL notified when the agent is in distress. Unset or "": off. */
+  distressWebhookUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
   // Phase 2 config additions
   soulConfig?: SoulConfig;
@@ -193,6 +200,7 @@ export interface InboxMessage {
   content: string;
   signedAt: string;
   createdAt: string;
+  /** Relay-reported on inbound mail: the signature does not cover it. */
   replyTo?: string;
   /**
    * True only when the sender's signature was checked against `from`.

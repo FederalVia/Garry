@@ -28,6 +28,8 @@ import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
 import { createSocialClient } from "./social/client.js";
+import { describeRelay, resolveRelayClientOptions } from "./social/settings.js";
+import { initDistressWebhook } from "./notify/distress.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
@@ -521,9 +523,14 @@ async function run(): Promise<void> {
   // Create social client (chain-aware: pass ChainIdentity for Solana signing)
   let social: SocialClientInterface | undefined;
   if (config.socialRelayUrl) {
-    social = createSocialClient(config.socialRelayUrl, resolvedChainType === "solana" ? chainIdentity : account);
-    logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
+    social = createSocialClient(
+      config.socialRelayUrl,
+      resolvedChainType === "solana" ? chainIdentity : account,
+      resolveRelayClientOptions(config),
+    );
+    logger.info(`[${new Date().toISOString()}] Social relay: ${describeRelay(config)}`);
   }
+  initDistressWebhook(config);
 
   // Initialize PolicyEngine (Phase 1.4) with the same normalized policy.
   const rules = createDefaultRules(treasuryPolicy);

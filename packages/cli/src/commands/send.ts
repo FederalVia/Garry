@@ -1,13 +1,15 @@
 /**
  * automaton-cli send <to-address> "message text"
  *
- * Send a signed message via the social relay with the automaton's wallet
- * (EVM or Solana), through the runtime social client: HTTPS relay only,
- * validated addresses and size, recipient case kept for Solana.
+ * Send a signed message via the configured social relay with the automaton's
+ * wallet (EVM or Solana), through the runtime social client: HTTPS relay (or
+ * loopback HTTP), validated addresses and size, recipient case kept for
+ * Solana. The relay is socialRelayUrl from automaton.json, else
+ * SOCIAL_RELAY_URL, else the agent's own default (Conway's relay until
+ * standalone mode makes it off). An empty socialRelayUrl means off.
  */
 
-import { loadConfig } from "@conway/automaton/config.js";
-import { formatSendResult, resolveRelayUrl, sendOperatorMessage } from "@conway/automaton/operator/send.js";
+import { formatSendResult, loadRelayTarget, sendOperatorMessage } from "@conway/automaton/operator/send.js";
 import { escapeForTerminal } from "@conway/automaton/observability/terminal-safe.js";
 
 const args = process.argv.slice(3);
@@ -23,8 +25,18 @@ try {
     process.exit(1);
   }
 
-  const relayUrl = resolveRelayUrl(loadConfig());
-  const result = await sendOperatorMessage({ relayUrl, to: toAddress, content: messageText });
+  // Resolved before any wallet is loaded.
+  const target = loadRelayTarget();
+  if (!target.ok) {
+    console.error(`Failed to send message: ${escapeForTerminal(target.error, { keepNewlines: false })}`);
+    process.exit(1);
+  }
+  const result = await sendOperatorMessage({
+    relayUrl: target.relayUrl,
+    to: toAddress,
+    content: messageText,
+    options: target.options,
+  });
   // Relay-chosen text (error, id) is escaped for the terminal.
   const out = formatSendResult(result);
   for (const line of out.lines) (out.ok ? console.log : console.error)(line);

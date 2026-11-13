@@ -106,13 +106,23 @@ describe("Conway client: non-idempotent calls", () => {
 });
 
 describe("relay client", () => {
-  it("send (POST) is not retried on 503; poll (a read-only POST) is", async () => {
+  it("send (POST) is not retried on 503; an Automaton/1 poll is tried twice, each signed afresh", async () => {
     const account = privateKeyToAccount(generatePrivateKey());
     const social = createSocialClient("https://relay.example.com", account);
 
     stub(() => json(503, { error: "busy" }));
     await expect(social.send("0x1234567890abcdef1234567890abcdef12345678", "hello")).rejects.toThrow(/503/);
     expect(calls.filter((c) => c.url.endsWith("/v1/messages"))).toHaveLength(1);
+
+    // The v1 poll credential is single-use, so the HTTP client never re-sends it.
+    stub(() => json(503, { error: "busy" }));
+    await expect(social.poll()).rejects.toThrow(/503/);
+    expect(calls.filter((c) => c.url.endsWith("/v1/messages/poll"))).toHaveLength(2);
+  });
+
+  it("a Conway-compat poll (a replayable read-only POST) is re-sent by the HTTP client as before", async () => {
+    const account = privateKeyToAccount(generatePrivateKey());
+    const social = createSocialClient("https://relay.example.com", account, { conwayCompat: true });
 
     stub(() => json(503, { error: "busy" }));
     await expect(social.poll()).rejects.toThrow(/503/);
