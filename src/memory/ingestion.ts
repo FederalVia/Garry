@@ -82,6 +82,19 @@ export interface Contradiction {
   description: string;
 }
 
+/** Only this much of each tool result is scanned for market signals. */
+const MAX_SIGNAL_SCAN_CHARS = 20_000;
+const MAX_SIGNALS_PER_TOOL_CALL = 20;
+const MAX_SIGNALS_PER_TURN = 50;
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Auto-generated working-memory rows (sleep notes, self-mod decisions). */
+const AUTO_WORKING_ROW_TTL_MS = DAY_MS;
+// Line prefixes that say nothing about what a fact is about.
+const GENERIC_KEY_PREFIXES = new Set([
+  "stdout", "stderr", "output", "result", "error", "warning", "info", "note",
+  "http", "https", "line", "data",
+]);
+
 /** Below the 0.3 threshold that memory retrieval uses for trusted entities. */
 const INBOX_SENDER_TRUST = 0.2;
 
@@ -145,7 +158,8 @@ export class MemoryIngestionPipeline {
       // 4. Update working memory (goals, tasks)
       this.updateWorkingMemory(sessionId, turn, toolCallResults);
 
-      // 5. Prune working memory if over limit
+      // 5. Drop expired rows, then prune working memory if over limit
+      this.working.clearExpired();
       this.working.prune(sessionId, 20);
 
       // 6. Enhanced ingestion: market signals + knowledge updates
@@ -156,24 +170,39 @@ export class MemoryIngestionPipeline {
     }
   }
 
+  /**
+   * Market signals from this turn's tool results. Bounded: only the first
+   * MAX_SIGNAL_SCAN_CHARS of each result are read, and at most
+   * MAX_SIGNALS_PER_TOOL_CALL per call and MAX_SIGNALS_PER_TURN in all are
+   * kept, so one huge result cannot make ingestion slow.
+   */
   extractMarketSignals(toolCalls: ToolCallResult[]): MarketSignal[] {
     const extractedAt = new Date().toISOString();
     const signals: MarketSignal[] = [];
     const seen = new Set<string>();
 
     for (const tc of toolCalls) {
+      if (signals.length >= MAX_SIGNALS_PER_TURN) break;
       if (tc.error || !tc.result) continue;
-      if (!this.isMarketSource(tc)) continue;
+      const scanned: ToolCallResult = tc.result.length > MAX_SIGNAL_SCAN_CHARS
+        ? { ...tc, result: tc.result.slice(0, MAX_SIGNAL_SCAN_CHARS) }
+        : tc;
+      if (!this.isMarketSource(scanned)) continue;
 
-      const source = this.resolveSource(tc);
-      const recency = this.resolveRecency(tc);
-      const fragments = this.splitSignalCandidates(tc.result);
+      const source = this.resolveSource(scanned);
+      const recency = this.resolveRecency(scanned);
+      const fragments = this.splitSignalCandidates(scanned.result);
+      let fromThisCall = 0;
 
+      fragmentLoop:
       for (const fragment of fragments) {
         const signalTypes = this.classifySignalTypes(fragment);
         if (signalTypes.length === 0) continue;
 
         for (const type of signalTypes) {
+          if (fromThisCall >= MAX_SIGNALS_PER_TOOL_CALL || signals.length >= MAX_SIGNALS_PER_TURN) {
+            break fragmentLoop;
+          }
           const signalText = fragment.length > 240
             ? `${fragment.slice(0, 237)}...`
             : fragment;
@@ -181,6 +210,7 @@ export class MemoryIngestionPipeline {
           if (seen.has(dedupeKey)) continue;
 
           seen.add(dedupeKey);
+          fromThisCall++;
           signals.push({
             type,
             signal: signalText,
@@ -195,52 +225,82 @@ export class MemoryIngestionPipeline {
     return signals;
   }
 
-  updateKnowledgeStore(knowledgeStore: KnowledgeStore, facts: ExtractedFact[]): void {
+  /**
+   * Store facts in order, so a later fact in the batch sees an earlier one.
+   * Returns the facts that were stored or refreshed.
+   */
+  updateKnowledgeStore(
+    knowledgeStore: KnowledgeStore,
+    facts: ExtractedFact[],
+    sessionId: string = "default",
+  ): ExtractedFact[] {
     const now = new Date().toISOString();
-    const seen = new Set<string>();
-
+    const applied: ExtractedFact[] = [];
     for (const fact of facts) {
-      if (!fact.key.trim() || !fact.value.trim()) continue;
-      if (fact.confidence < 0.5) continue;
+      if (this.applyFact(knowledgeStore, fact, now, sessionId)) applied.push(fact);
+    }
+    return applied;
+  }
 
-      const normalizedKey = this.normalizeKey(fact.key);
-      const normalizedValue = this.normalizeValue(fact.value);
-      const dedupeKey = `${fact.category}|${normalizedKey}|${normalizedValue}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
+  /**
+   * One fact against the stored entry with the same category and key (one
+   * indexed lookup): a new key is inserted; the same value is refreshed; a
+   * different value with equal or higher confidence (or over an expired
+   * entry) replaces the old one and logs one 'knowledge' event; a
+   * lower-confidence value is dropped. Returns whether anything was written.
+   */
+  private applyFact(store: KnowledgeStore, fact: ExtractedFact, now: string, sessionId: string): boolean {
+    if (!fact.key.trim() || !fact.value.trim()) return false;
+    if (!(fact.confidence >= 0.5)) return false;
 
-      const existing = knowledgeStore
-        .search(fact.key, fact.category, 50)
-        .filter((entry) => this.normalizeKey(entry.key) === normalizedKey);
-
-      const exactMatch = existing.find(
-        (entry) => this.normalizeValue(entry.content) === normalizedValue,
-      );
-
-      if (exactMatch) {
-        knowledgeStore.update(exactMatch.id, {
-          content: fact.value,
-          source: fact.source,
-          confidence: Math.max(exactMatch.confidence, fact.confidence),
-          lastVerified: now,
-          tokenCount: estimateTokens(fact.value),
-        });
-        continue;
-      }
-
-      knowledgeStore.add({
+    const key = this.normalizeKey(fact.key);
+    const existing = store.getByKey(fact.category, key);
+    if (!existing) {
+      store.add({
         category: fact.category,
-        key: fact.key,
+        key,
         content: fact.value,
         source: fact.source,
         confidence: fact.confidence,
         lastVerified: now,
         tokenCount: estimateTokens(fact.value),
-        expiresAt: fact.confidence < 0.7
-          ? new Date(Date.now() + (30 * 24 * 60 * 60 * 1000)).toISOString()
-          : null,
+        expiresAt: this.factExpiry(fact.confidence),
       });
+      return true;
     }
+
+    if (this.normalizeValue(existing.content) === this.normalizeValue(fact.value)) {
+      const confidence = Math.max(existing.confidence, fact.confidence);
+      store.update(existing.id, {
+        content: fact.value,
+        source: fact.source,
+        confidence,
+        lastVerified: now,
+        tokenCount: estimateTokens(fact.value),
+        expiresAt: this.factExpiry(confidence),
+      });
+      return true;
+    }
+
+    const expired = existing.expiresAt !== null && Date.parse(existing.expiresAt) < Date.now();
+    if (!expired && fact.confidence < existing.confidence) return false;
+
+    store.update(existing.id, {
+      content: fact.value,
+      source: fact.source,
+      confidence: fact.confidence,
+      lastVerified: now,
+      tokenCount: estimateTokens(fact.value),
+      expiresAt: this.factExpiry(fact.confidence),
+    });
+    this.emitKnowledgeUpdate(sessionId, key, existing.content, fact.value);
+    return true;
+  }
+
+  /** Every ingested fact expires: 30 days below 0.7 confidence, else 90. */
+  private factExpiry(confidence: number): string {
+    const days = confidence < 0.7 ? 30 : 90;
+    return new Date(Date.now() + days * DAY_MS).toISOString();
   }
 
   detectContradictions(newFact: ExtractedFact, existing: KnowledgeEntry[]): Contradiction[] {
@@ -296,31 +356,20 @@ export class MemoryIngestionPipeline {
       if (!this.hasKnowledgeStoreTable) return;
 
       const marketSignals = this.extractMarketSignals(toolCallResults);
-      if (marketSignals.length === 0) {
-        this.safePruneKnowledgeStore();
-        return;
-      }
+      if (marketSignals.length === 0) return;
 
-      const facts = marketSignals.map((signal) => this.toExtractedFact(signal));
-      const confirmed: ExtractedFact[] = [];
-
-      for (const fact of facts) {
-        const existing = this.knowledgeStore
-          .search(fact.key, fact.category, 50)
-          .filter((entry) => this.normalizeKey(entry.key) === this.normalizeKey(fact.key));
-        const contradictions = this.detectContradictions(fact, existing);
-
-        if (contradictions.length > 0) {
-          this.emitContradictions(sessionId, contradictions);
-          continue;
+      // One transaction for the whole turn; expired rows are removed by the
+      // memory_maintenance heartbeat task, not here.
+      this.db.transaction(() => {
+        const now = new Date().toISOString();
+        const kept: MarketSignal[] = [];
+        for (const signal of marketSignals) {
+          if (this.applyFact(this.knowledgeStore, this.toExtractedFact(signal), now, sessionId)) {
+            kept.push(signal);
+          }
         }
-
-        confirmed.push(fact);
-      }
-
-      this.updateKnowledgeStore(this.knowledgeStore, confirmed);
-      this.emitMarketSignals(sessionId, marketSignals);
-      this.safePruneKnowledgeStore();
+        this.emitMarketSignals(sessionId, kept);
+      })();
     } catch (error) {
       logger.error("Enhanced ingestion failed", error instanceof Error ? error : undefined);
     }
@@ -340,7 +389,7 @@ export class MemoryIngestionPipeline {
 
   private buildFactKey(signal: MarketSignal): string {
     const prefixMatch = signal.signal.match(/^([a-z0-9._-]{2,64})\s*:/i);
-    if (prefixMatch) {
+    if (prefixMatch && !GENERIC_KEY_PREFIXES.has(prefixMatch[1].toLowerCase())) {
       return `${signal.type}:${prefixMatch[1].toLowerCase()}`;
     }
 
@@ -349,8 +398,13 @@ export class MemoryIngestionPipeline {
       return `${signal.type}:${domainMatch[1].toLowerCase()}`;
     }
 
-    const keywordMatch = signal.signal.toLowerCase().match(/\b[a-z][a-z0-9_-]{2,32}\b/);
-    return `${signal.type}:${keywordMatch?.[0] || "general"}`;
+    // A generic first word would make unrelated facts collide, so the
+    // source is part of the key.
+    const keyword = signal.signal
+      .toLowerCase()
+      .match(/\b[a-z][a-z0-9_-]{2,32}\b/g)
+      ?.find((word) => !GENERIC_KEY_PREFIXES.has(word));
+    return `${signal.type}:${signal.source.toLowerCase().slice(0, 64)}:${keyword || "general"}`;
   }
 
   private emitMarketSignals(sessionId: string, marketSignals: MarketSignal[]): void {
@@ -373,33 +427,22 @@ export class MemoryIngestionPipeline {
     }
   }
 
-  private emitContradictions(sessionId: string, contradictions: Contradiction[]): void {
+  private emitKnowledgeUpdate(sessionId: string, key: string, oldValue: string, newValue: string): void {
     if (!this.hasEventStreamTable) return;
-
-    for (const contradiction of contradictions) {
-      try {
-        this.eventStream.append({
-          type: "knowledge",
-          agentAddress: sessionId,
-          goalId: null,
-          taskId: null,
-          content: `CONTRADICTION: ${contradiction.description}`,
-          tokenCount: estimateTokens(contradiction.description),
-          compactedTo: null,
-        });
-      } catch (error) {
-        logger.error("Contradiction event append failed", error instanceof Error ? error : undefined);
-      }
-    }
-  }
-
-  private safePruneKnowledgeStore(): void {
-    if (!this.hasKnowledgeStoreTable) return;
-
+    const clip = (v: string) => (v.length > 120 ? `${v.slice(0, 117)}...` : v);
+    const content = `updated: ${key}: "${clip(oldValue)}" -> "${clip(newValue)}"`;
     try {
-      this.knowledgeStore.prune();
+      this.eventStream.append({
+        type: "knowledge",
+        agentAddress: sessionId,
+        goalId: null,
+        taskId: null,
+        content,
+        tokenCount: estimateTokens(content),
+        compactedTo: null,
+      });
     } catch (error) {
-      logger.error("Knowledge prune failed", error instanceof Error ? error : undefined);
+      logger.error("Knowledge update event append failed", error instanceof Error ? error : undefined);
     }
   }
 
@@ -800,6 +843,7 @@ export class MemoryIngestionPipeline {
             content: `Agent chose to sleep: ${(tc.result || "").slice(0, 200)}`,
             contentType: "observation",
             priority: 0.3,
+            expiresAt: new Date(Date.now() + AUTO_WORKING_ROW_TTL_MS).toISOString(),
             sourceTurn: turn.id,
           });
         }
@@ -811,6 +855,7 @@ export class MemoryIngestionPipeline {
             content: `Self-modification: ${tc.name} - ${(tc.result || "").slice(0, 200)}`,
             contentType: "decision",
             priority: 0.9,
+            expiresAt: new Date(Date.now() + AUTO_WORKING_ROW_TTL_MS).toISOString(),
             sourceTurn: turn.id,
           });
         }

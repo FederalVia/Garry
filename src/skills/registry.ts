@@ -28,6 +28,7 @@ import {
   resolveSkillsRoot,
 } from "./loader.js";
 import { readRegularFileNoFollow, writeFileSafe } from "../security/secure-fs.js";
+import { commitSkillChange } from "../git/state-versioning.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -167,6 +168,7 @@ export async function installSkillFromGit(
     fs.renameSync(tmpDir, targetDir);
     const skill = prepareSkillForStorage(parsed);
     db.upsertSkill(skill);
+    await versionSkillChange(realRoot, name, "install");
     return skill;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -240,6 +242,7 @@ export async function installSkillFromUrl(
 
   const skill = prepareSkillForStorage(parsed);
   db.upsertSkill(skill);
+  await versionSkillChange(realRoot, name, "install");
   return skill;
 }
 
@@ -296,6 +299,7 @@ export async function createSkill(
   });
 
   db.upsertSkill(skill);
+  await versionSkillChange(realRoot, name, "create");
   return skill;
 }
 
@@ -342,6 +346,24 @@ export async function removeSkill(
     }
     fs.rmSync(targetDir, { recursive: true, force: true });
   }
+  await versionSkillChange(root, name, "remove");
+}
+
+/** Commit to the state repo, only when this skills root is the state repo's own. */
+async function versionSkillChange(
+  skillsRoot: string,
+  name: string,
+  action: "install" | "create" | "remove",
+): Promise<void> {
+  const stateSkills = path.join(process.env.HOME || "/root", ".automaton", "skills");
+  let real = stateSkills;
+  try {
+    real = fs.realpathSync(stateSkills);
+  } catch {
+    return;
+  }
+  if (path.resolve(skillsRoot) !== real && path.resolve(skillsRoot) !== path.resolve(stateSkills)) return;
+  await commitSkillChange(name, action);
 }
 
 /**

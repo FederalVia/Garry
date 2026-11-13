@@ -7,15 +7,17 @@
  * Phase 2.1: Soul System Redesign
  */
 
+import fs from "fs";
 import path from "path";
 import type BetterSqlite3 from "better-sqlite3";
 import type { SoulModel, SoulHistoryRow } from "../types.js";
-import { loadCurrentSoul, writeSoulMd, createHash, createDefaultSoul } from "./model.js";
+import { loadCurrentSoul, writeSoulMd, createHash, createDefaultSoul, MAX_SOUL_FILE_BYTES } from "./model.js";
 import { validateSoul } from "./validator.js";
 import { insertSoulHistory, getCurrentSoulVersion, getLatestSoulHistory, getSoulHistory } from "../state/database.js";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
 import { writeFileSafe } from "../security/secure-fs.js";
+import { commitSoulUpdate } from "../git/state-versioning.js";
 const logger = createLogger("soul");
 
 type SoulKey = keyof SoulModel;
@@ -105,8 +107,18 @@ export async function updateSoul(
       return { success: false, version: 0, errors: keyErrors };
     }
 
-    // Load current soul or create default
+    // Load current soul; create a default only when there is no SOUL.md at all.
     let current = loadCurrentSoul(db, resolvedPath);
+    const isNew = !current;
+    if (!current && pathEntryExists(resolvedPath)) {
+      return {
+        success: false,
+        version: 0,
+        errors: [
+          `SOUL.md exists but could not be read (over ${MAX_SOUL_FILE_BYTES} bytes, not a regular file, or unreadable); refusing to replace it with a default soul. Fix or shorten the file by hand.`,
+        ],
+      };
+    }
     if (!current) {
       current = createDefaultSoul(
         updates.corePurpose || "No purpose set.",
@@ -124,8 +136,14 @@ export async function updateSoul(
       updatedAt: new Date().toISOString(),
     };
 
-    // Validate
-    const validation = validateSoul(merged);
+    // Only the keys this update changes are checked and cleaned: an unchanged
+    // creator-written purpose or genesis is carried byte for byte.
+    const changedKeys = isNew
+      ? undefined
+      : Object.keys(updates).filter(
+          (k) => JSON.stringify((updates as any)[k]) !== JSON.stringify((current as any)[k]),
+        );
+    const validation = validateSoul(merged, { changedKeys });
     if (!validation.valid) {
       return {
         success: false,
@@ -143,8 +161,15 @@ export async function updateSoul(
       updatedAt: new Date().toISOString(),
     };
 
-    // Write to file (temp + rename; never through a link at SOUL.md)
-    const content = writeSoulMd(newSoul);
+    // SOUL.md is read with a size cap, so a larger file would lose the soul.
+    const content = fitSoulFile(newSoul, changedKeys);
+    if (content === null) {
+      return {
+        success: false,
+        version: current.version,
+        errors: [`SOUL.md would exceed ${MAX_SOUL_FILE_BYTES} bytes; shorten a section first`],
+      };
+    }
     writeFileSafe(resolvedPath, content, { trustedWriter: true });
 
     // Get previous version ID
@@ -164,6 +189,10 @@ export async function updateSoul(
       createdAt: new Date().toISOString(),
     });
 
+    if (isStateSoulPath(resolvedPath)) {
+      await commitSoulUpdate(`v${newVersion} (${source})${reason ? `: ${oneLineReason(reason)}` : ""}`);
+    }
+
     return { success: true, version: newVersion };
   } catch (error) {
     logger.error("updateSoul failed", error instanceof Error ? error : undefined);
@@ -173,6 +202,61 @@ export async function updateSoul(
       errors: [error instanceof Error ? error.message : "Unknown error"],
     };
   }
+}
+
+function pathEntryExists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (err: any) {
+    // Only a confirmed absence counts as missing.
+    return err?.code !== "ENOENT";
+  }
+}
+
+/**
+ * Serialize the soul within the read cap. A genesis copy this update did not
+ * change (the wizard stores the genesis in Core Purpose too) is shortened to
+ * fit; the full text stays in Core Purpose and the config. Null when even
+ * that is not enough.
+ */
+function fitSoulFile(soul: SoulModel, changedKeys: string[] | undefined): string | null {
+  let content = writeSoulMd(soul);
+  let over = Buffer.byteLength(content, "utf8") - MAX_SOUL_FILE_BYTES;
+  if (over <= 0) return content;
+  const genesisChanged = changedKeys === undefined || changedKeys.includes("genesisPromptOriginal");
+  if (genesisChanged || !soul.genesisPromptOriginal) return null;
+  let genesis = soul.genesisPromptOriginal;
+  while (over > 0 && genesis.length > 0) {
+    // Cut by UTF-8 bytes, not UTF-16 units: a CJK unit is 3 bytes.
+    genesis = truncateUtf8(genesis, Buffer.byteLength(genesis, "utf8") - over).trimEnd();
+    content = writeSoulMd({ ...soul, genesisPromptOriginal: genesis });
+    over = Buffer.byteLength(content, "utf8") - MAX_SOUL_FILE_BYTES;
+  }
+  // An empty copy would turn alignment checks off for good: refuse instead.
+  if (over > 0 || genesis.length === 0) return null;
+  logger.warn(`Genesis Prompt copy in SOUL.md shortened to ${genesis.length} chars to stay under the size cap`);
+  return content;
+}
+
+/** The longest prefix of text whose UTF-8 encoding fits in maxBytes. */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return text;
+  let end = maxBytes;
+  // Back up to the start of a character (continuation bytes are 10xxxxxx).
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString("utf8");
+}
+
+function isStateSoulPath(p: string): boolean {
+  const home = process.env.HOME || "/root";
+  return path.resolve(p) === path.resolve(home, ".automaton", "SOUL.md");
+}
+
+function oneLineReason(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 200);
 }
 
 // ─── View Soul ──────────────────────────────────────────────────

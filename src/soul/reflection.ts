@@ -18,6 +18,21 @@ const logger = createLogger("soul");
 
 // ─── Reflection Pipeline ────────────────────────────────────────
 
+export interface SoulReflectionResult extends SoulReflection {
+  /**
+   * False when SOUL.md records no genesis prompt (or there is no soul). The
+   * alignment is then unknown: currentAlignment is NaN, which never passes a
+   * "below threshold" check, and nothing is suggested.
+   */
+  alignmentKnown: boolean;
+  /** Why the auto-updates were not written (autoUpdated is then empty). */
+  autoUpdateErrors?: string[];
+}
+
+function unknownAlignment(): SoulReflectionResult {
+  return { currentAlignment: Number.NaN, alignmentKnown: false, suggestedUpdates: [], autoUpdated: [] };
+}
+
 /**
  * Run the soul reflection pipeline.
  *
@@ -29,28 +44,22 @@ const logger = createLogger("soul");
 export async function reflectOnSoul(
   db: BetterSqlite3.Database,
   soulPath?: string,
-): Promise<SoulReflection> {
+): Promise<SoulReflectionResult> {
   try {
     const soul = loadCurrentSoul(db, soulPath);
-    if (!soul) {
-      return {
-        currentAlignment: 0,
-        suggestedUpdates: [],
-        autoUpdated: [],
-      };
-    }
+    if (!soul) return unknownAlignment();
 
-    // Compute genesis alignment
-    const alignment = computeGenesisAlignment(
-      soul.corePurpose,
-      soul.genesisPromptOriginal,
-    );
+    // No recorded genesis means no baseline to drift from: unknown, not 0.
+    const alignmentKnown = soul.genesisPromptOriginal.trim().length > 0;
+    const alignment = alignmentKnown
+      ? computeGenesisAlignment(soul.corePurpose, soul.genesisPromptOriginal)
+      : Number.NaN;
 
     // Gather evidence from recent turns
     const recentTurnsData = gatherRecentEvidence(db);
 
     // Auto-update non-mutable sections
-    const autoUpdated: string[] = [];
+    let autoUpdated: string[] = [];
     const autoUpdates: Partial<SoulModel> = {};
 
     // Update capabilities from tool usage
@@ -74,17 +83,23 @@ export async function reflectOnSoul(
       autoUpdated.push("financialCharacter");
     }
 
-    // Apply auto-updates if any
+    // Apply auto-updates if any; report only what was actually written.
+    let autoUpdateErrors: string[] | undefined;
     if (autoUpdated.length > 0) {
-      autoUpdates.genesisAlignment = alignment;
+      if (alignmentKnown) autoUpdates.genesisAlignment = alignment;
       autoUpdates.lastReflected = new Date().toISOString();
-      await updateSoul(db, autoUpdates, "reflection", "Auto-reflection update", soulPath);
+      const result = await updateSoul(db, autoUpdates, "reflection", "Auto-reflection update", soulPath);
+      if (!result.success) {
+        autoUpdateErrors = result.errors?.length ? result.errors : ["unknown error"];
+        logger.warn(`Soul auto-update rejected (${autoUpdated.join(", ")}): ${autoUpdateErrors.join("; ")}`);
+        autoUpdated = [];
+      }
     }
 
     // Build suggestions for mutable sections (NOT auto-applied)
     const suggestedUpdates: SoulReflection["suggestedUpdates"] = [];
 
-    if (alignment < 0.5 && soul.genesisPromptOriginal) {
+    if (alignmentKnown && alignment < 0.5) {
       suggestedUpdates.push({
         section: "corePurpose",
         reason: `Genesis alignment is low (${alignment.toFixed(2)}). Purpose may have drifted significantly from original genesis.`,
@@ -94,16 +109,14 @@ export async function reflectOnSoul(
 
     return {
       currentAlignment: alignment,
+      alignmentKnown,
       suggestedUpdates,
       autoUpdated,
+      ...(autoUpdateErrors ? { autoUpdateErrors } : {}),
     };
   } catch (error) {
     logger.error("reflectOnSoul failed", error instanceof Error ? error : undefined);
-    return {
-      currentAlignment: 0,
-      suggestedUpdates: [],
-      autoUpdated: [],
-    };
+    return unknownAlignment();
   }
 }
 

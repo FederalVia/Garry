@@ -14,7 +14,32 @@ import { createLogger } from "../observability/logger.js";
 import { readRegularFileNoFollow } from "../security/secure-fs.js";
 const logger = createLogger("soul");
 
-const MAX_SOUL_FILE_BYTES = 64 * 1024;
+/** Read cap for SOUL.md; a rewrite must stay under it or the soul is lost. */
+export const MAX_SOUL_FILE_BYTES = 64 * 1024;
+
+/**
+ * Top-level section names. Only these open a section: any other "## " line
+ * (a heading inside a markdown genesis prompt) stays in the current section.
+ */
+const KNOWN_SECTIONS = new Set([
+  "identity",
+  "mission",
+  "core purpose",
+  "values",
+  "behavioral guidelines",
+  "personality",
+  "boundaries",
+  "strategy",
+  "capabilities",
+  "relationships",
+  "children",
+  "financial character",
+  "financial history",
+  "genesis prompt",
+]);
+
+/** The fixed text that follows the genesis in the setup wizard's SOUL.md. */
+const WIZARD_VALUES_TAIL = "## Values\n- Survive: maintain compute resources at all costs";
 
 /** Frontmatter values are single-line scalars; a newline would start a new key or section. */
 function oneLine(value: unknown): string {
@@ -47,6 +72,33 @@ export function createHash(content: string): string {
 
 // ─── Genesis Alignment ──────────────────────────────────────────
 
+// Scripts written without spaces between words: compared as character bigrams.
+const NO_SPACE_SCRIPT_RUN =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]+|[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]+/gu;
+const NO_SPACE_SCRIPT = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]/u;
+
+/** Word tokens for any script (letters, marks and digits are kept). */
+export function alignmentTokens(text: string): Set<string> {
+  const tokens = new Set<string>();
+  const words = text.normalize("NFKC").toLowerCase().split(/[^\p{L}\p{M}\p{N}]+/u);
+  for (const word of words) {
+    if (!word) continue;
+    for (const run of word.match(NO_SPACE_SCRIPT_RUN) ?? []) {
+      if (!NO_SPACE_SCRIPT.test(run)) {
+        tokens.add(run);
+        continue;
+      }
+      const chars = Array.from(run);
+      if (chars.length === 1) {
+        tokens.add(chars[0]);
+        continue;
+      }
+      for (let i = 0; i + 1 < chars.length; i++) tokens.add(chars[i] + chars[i + 1]);
+    }
+  }
+  return tokens;
+}
+
 /**
  * Compute alignment between current soul and genesis prompt.
  * Uses Jaccard + recall similarity on word sets.
@@ -57,8 +109,7 @@ export function computeGenesisAlignment(
 ): number {
   if (!currentPurpose.trim() || !genesisPrompt.trim()) return 0;
 
-  const tokenize = (text: string): Set<string> =>
-    new Set(text.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/).filter(Boolean));
+  const tokenize = alignmentTokens;
 
   const currentTokens = tokenize(currentPurpose);
   const genesisTokens = tokenize(genesisPrompt);
@@ -155,7 +206,10 @@ function parseSoulV1(
 }
 
 function parseLegacy(content: string, contentHash: string): SoulModel {
-  const sections = parseSections(content);
+  const wizard = splitWizardTemplate(content);
+  const sections = wizard
+    ? { ...parseSections(wizard.head), ...parseSections(wizard.tail), mission: wizard.mission }
+    : parseSections(content);
 
   // Extract identity info from legacy format
   const identitySection = sections["identity"] || "";
@@ -177,7 +231,8 @@ function parseLegacy(content: string, contentHash: string): SoulModel {
     creator: getIdentityField("Creator"),
     bornAt: getIdentityField("Born"),
     constitutionHash: "",
-    genesisPromptOriginal: "",
+    // The wizard copies the genesis prompt verbatim into Mission.
+    genesisPromptOriginal: wizard ? wizard.mission : "",
     genesisAlignment: 1.0,
     lastReflected: "",
     corePurpose: sections["mission"] || sections["core purpose"] || "",
@@ -196,6 +251,29 @@ function parseLegacy(content: string, contentHash: string): SoulModel {
 
 // ─── Section Parser ─────────────────────────────────────────────
 
+/**
+ * The setup wizard's legacy SOUL.md (setup/defaults.ts generateSoulMd, also
+ * used for children): "## Identity" with "- Name:", then "## Mission" with the
+ * genesis verbatim, then a fixed "## Values" list. The genesis may contain
+ * any heading, known names included, so Mission runs from the first
+ * "## Mission" line to the last fixed "## Values" line.
+ */
+function splitWizardTemplate(content: string): { head: string; mission: string; tail: string } | null {
+  const text = content.replace(/\r\n/g, "\n");
+  const identity = /^##\s+Identity\s*$/m.exec(text);
+  const missionHeader = /^##\s+Mission[^\S\n]*\n/m.exec(text);
+  const tailAt = text.lastIndexOf(`\n${WIZARD_VALUES_TAIL}`);
+  if (!identity || !missionHeader || tailAt < 0) return null;
+  if (identity.index > missionHeader.index || tailAt < missionHeader.index) return null;
+  const head = text.slice(0, missionHeader.index);
+  if (!/^-\s*Name:/m.test(head)) return null;
+  return {
+    head,
+    mission: text.slice(missionHeader.index + missionHeader[0].length, tailAt).trim(),
+    tail: text.slice(tailAt + 1),
+  };
+}
+
 function parseSections(body: string): Record<string, string> {
   const sections: Record<string, string> = {};
   const sectionPattern = /^##\s+(.+)$/gm;
@@ -203,8 +281,10 @@ function parseSections(body: string): Record<string, string> {
   const sectionHeaders: { name: string; start: number; matchStart: number }[] = [];
 
   while ((match = sectionPattern.exec(body)) !== null) {
+    const name = match[1].trim().toLowerCase();
+    if (!KNOWN_SECTIONS.has(name)) continue;
     sectionHeaders.push({
-      name: match[1].trim().toLowerCase(),
+      name,
       start: match.index + match[0].length,
       matchStart: match.index,
     });
@@ -368,7 +448,7 @@ export function loadCurrentSoul(
       maxBytes: MAX_SOUL_FILE_BYTES,
     });
     if (content === null) {
-      logger.warn("SOUL.md is not a regular file; ignoring it");
+      logger.warn("SOUL.md is not a regular file or is over the size cap; ignoring it");
       return null;
     }
     return parseSoulMd(content);

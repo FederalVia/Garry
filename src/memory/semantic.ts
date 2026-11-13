@@ -10,16 +10,27 @@ import type BetterSqlite3 from "better-sqlite3";
 import { ulid } from "ulid";
 import type { SemanticMemoryEntry, SemanticCategory } from "../types.js";
 import { createLogger } from "../observability/logger.js";
+import { LIKE_ESCAPE, likeContains } from "../state/like-escape.js";
 const logger = createLogger("memory.semantic");
 
 type Database = BetterSqlite3.Database;
+
+/**
+ * A score in [0, 1]: numbers (or numeric strings) are clamped, anything
+ * non-finite becomes the fallback. Keeps TEXT out of REAL score columns.
+ */
+export function clampScore(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
 
 export class SemanticMemoryManager {
   constructor(private db: Database) {}
 
   /**
    * Store a semantic memory entry. Upserts on (category, key).
-   * Returns the ULID id.
+   * Returns the id of the stored row; throws when the write fails.
    */
   store(entry: {
     category: SemanticCategory;
@@ -45,7 +56,7 @@ export class SemanticMemoryManager {
         entry.category,
         entry.key,
         entry.value,
-        entry.confidence ?? 1.0,
+        clampScore(entry.confidence, 1.0),
         entry.source,
         entry.embeddingKey ?? null,
       );
@@ -55,11 +66,12 @@ export class SemanticMemoryManager {
       const row = this.db.prepare(
         "SELECT id FROM semantic_memory WHERE category = ? AND key = ?",
       ).get(entry.category, entry.key) as { id: string } | undefined;
-      if (row) return row.id;
+      if (!row) throw new Error("stored row not found");
+      return row.id;
     } catch (error) {
       logger.error("Failed to store entry", error instanceof Error ? error : undefined);
+      throw error;
     }
-    return id;
   }
 
   /**
@@ -78,26 +90,27 @@ export class SemanticMemoryManager {
   }
 
   /**
-   * Search semantic memory by value content, optionally filtered by category.
+   * Search semantic memory by key or value, optionally filtered by category.
+   * A negative limit means no limit (SQLite LIMIT -1).
    */
-  search(query: string, category?: SemanticCategory): SemanticMemoryEntry[] {
+  search(query: string, category?: SemanticCategory, limit: number = -1): SemanticMemoryEntry[] {
     try {
-      // Escape SQL LIKE wildcards so literal '%' and '_' in the query
-      // don't match arbitrary characters.
-      const escaped = query.replace(/[%_]/g, (ch) => `\\${ch}`);
+      const pattern = likeContains(query);
       if (category) {
         const rows = this.db.prepare(
           `SELECT * FROM semantic_memory
-           WHERE category = ? AND (key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')
-           ORDER BY confidence DESC, updated_at DESC`,
-        ).all(category, `%${escaped}%`, `%${escaped}%`) as any[];
+           WHERE category = ? AND (key LIKE ? ${LIKE_ESCAPE} OR value LIKE ? ${LIKE_ESCAPE})
+           ORDER BY confidence DESC, updated_at DESC
+           LIMIT ?`,
+        ).all(category, pattern, pattern, limit) as any[];
         return rows.map(deserializeSemantic);
       }
       const rows = this.db.prepare(
         `SELECT * FROM semantic_memory
-         WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\'
-         ORDER BY confidence DESC, updated_at DESC`,
-      ).all(`%${escaped}%`, `%${escaped}%`) as any[];
+         WHERE key LIKE ? ${LIKE_ESCAPE} OR value LIKE ? ${LIKE_ESCAPE}
+         ORDER BY confidence DESC, updated_at DESC
+         LIMIT ?`,
+      ).all(pattern, pattern, limit) as any[];
       return rows.map(deserializeSemantic);
     } catch (error) {
       logger.error("Failed to search", error instanceof Error ? error : undefined);

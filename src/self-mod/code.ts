@@ -28,6 +28,8 @@ import {
 } from "../security/protected-paths.js";
 import { readFileSafe, writeFileVerified } from "../security/secure-fs.js";
 import { introducedNeutralisedMarker } from "../agent/injection-defense.js";
+import { formatAuditDiff } from "./line-diff.js";
+import { createHash } from "crypto";
 
 // ─── IMMUTABLE SAFETY INVARIANTS ─────────────────────────────
 // The protected and sensitive path rules live in security/protected-paths.ts,
@@ -79,18 +81,16 @@ export function isProtectedFile(filePath: string): boolean {
 }
 
 /**
- * Check if the modification rate limit has been exceeded.
+ * Check if the modification rate limit has been exceeded. Only code edits
+ * count: installs, reverts and resets do not use up the edit budget.
  */
 function isRateLimited(db: AutomatonDatabase): boolean {
-  const recentMods = db.getRecentModifications(MAX_MODIFICATIONS_PER_HOUR);
-  if (recentMods.length < MAX_MODIFICATIONS_PER_HOUR) return false;
-
-  // Check if the oldest is within the last hour
-  const oldest = recentMods[0];
-  if (!oldest) return false;
-
-  const hourAgo = Date.now() - 60 * 60 * 1000;
-  return new Date(oldest.timestamp).getTime() > hourAgo;
+  const row = db.raw
+    .prepare(
+      "SELECT COUNT(*) AS n FROM modifications WHERE type = 'code_edit' AND julianday(timestamp) > julianday('now', '-1 hour')",
+    )
+    .get() as { n: number } | undefined;
+  return (row?.n ?? 0) >= MAX_MODIFICATIONS_PER_HOUR;
 }
 
 // ─── Self-Modification API ───────────────────────────────────
@@ -115,7 +115,7 @@ export async function editFile(
   newContent: string,
   reason: string,
   opts?: EditFileOptions,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; commitError?: string }> {
   const repoRoot = resolveRepoRoot(opts);
 
   // 1-2. Path decision on the real path
@@ -145,12 +145,11 @@ export async function editFile(
   }
 
   // 5. Read current content for diff
-  let oldContent = "(new file)";
   let existing: string | null = null;
   try {
-    oldContent = existing = readFileSafe(target, { root: repoRoot });
+    existing = readFileSafe(target, { root: repoRoot });
   } catch {
-    oldContent = "(new file)";
+    existing = null;
   }
   // Text copied from a neutralised read would replace the original markers.
   const marker = introducedNeutralisedMarker(newContent, existing);
@@ -195,20 +194,23 @@ export async function editFile(
   }
 
   // 8. Generate diff and log
-  const diff = generateSimpleDiff(oldContent, newContent);
+  const newSha = createHash("sha256").update(newContent).digest("hex");
+  const diff = formatAuditDiff(existing ?? "", newContent, newSha, MAX_DIFF_SIZE);
 
   logModification(db, "code_edit", reason, {
     filePath: relPath,
-    diff: diff.slice(0, MAX_DIFF_SIZE),
+    diff,
     reversible: true,
   });
 
-  // 9. Post-modification commit of this file only
+  // 9. Post-modification commit of this file only; a failure is reported.
+  let commitError: string | undefined;
   try {
     await gitCommitPaths(conway, repoRoot, `self-mod: ${reason}`, [relPath]);
-  } catch {
-    // Git not available -- proceed without commit
+  } catch (err: any) {
+    commitError = String(err?.message ?? err).replace(/\s+/g, " ").trim().slice(0, 500);
   }
+  const withCommit = commitError ? { commitError } : {};
 
   // 10. Rebuild in the repo, and report a failed build
   if (/\.(ts|js|tsx|jsx)$/.test(target)) {
@@ -216,14 +218,14 @@ export async function editFile(
       const build = await conway.exec(`cd ${shellQuote(repoRoot)} && npm run build`, 60_000);
       if (build.exitCode !== 0) {
         const output = (build.stderr || build.stdout || "").slice(0, 500);
-        return { success: true, error: `rebuild failed: ${output}` };
+        return { success: true, error: `rebuild failed: ${output}`, ...withCommit };
       }
     } catch (err: any) {
-      return { success: true, error: `rebuild failed: ${String(err?.message ?? err).slice(0, 500)}` };
+      return { success: true, error: `rebuild failed: ${String(err?.message ?? err).slice(0, 500)}`, ...withCommit };
     }
   }
 
-  return { success: true };
+  return { success: true, ...withCommit };
 }
 
 function shellQuote(arg: string): string {
@@ -299,38 +301,4 @@ export function validateModification(
       : `Blocked: ${failedChecks.map((c) => c.detail).join("; ")}`,
     checks,
   };
-}
-
-// ─── Diff Generation ─────────────────────────────────────────
-
-/**
- * Generate a simple line-based diff between two strings.
- */
-function generateSimpleDiff(
-  oldContent: string,
-  newContent: string,
-): string {
-  const oldLines = oldContent.split("\n");
-  const newLines = newContent.split("\n");
-
-  const lines: string[] = [];
-  const maxLines = Math.max(oldLines.length, newLines.length);
-
-  let changes = 0;
-  for (let i = 0; i < maxLines && changes < 50; i++) {
-    const oldLine = oldLines[i];
-    const newLine = newLines[i];
-
-    if (oldLine !== newLine) {
-      if (oldLine !== undefined) lines.push(`- ${oldLine}`);
-      if (newLine !== undefined) lines.push(`+ ${newLine}`);
-      changes++;
-    }
-  }
-
-  if (changes >= 50) {
-    lines.push(`... (${maxLines - 50} more lines changed)`);
-  }
-
-  return lines.join("\n");
 }

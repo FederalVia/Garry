@@ -568,6 +568,7 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "inference/registry",
   "conway/inference",
   "conway/http-client",
+  "registry/erc8004",
   "security/protected-paths",
   "security/secure-fs",
   "security/child-env",

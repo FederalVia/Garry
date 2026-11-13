@@ -87,7 +87,7 @@ describe("F174: state repo allowlist", () => {
     write("skills/s/SKILL.md.tmp-abc123", "partial");
     write("skills/.install-deadbeef/SKILL.md", "half-cloned");
     write("skills/s/SKILL.md", "Skill v2.");
-    await commitStateChange(conway, "update skill", "skill");
+    await commitStateChange("update skill", "skill");
 
     const tracked = git(["ls-tree", "-r", "--name-only", "HEAD"]).trim().split("\n");
     expect(tracked).toContain("skills/s/SKILL.md");

@@ -262,6 +262,24 @@ describe("EpisodicMemoryManager", () => {
     expect(ep.getRecent("s1")).toHaveLength(1);
   });
   
+  it("prune keeps errors and strategic turns longer, but not forever", () => {
+    const age = (summary: string, days: number) =>
+      db.prepare("UPDATE episodic_memory SET created_at = datetime('now', ?) WHERE summary = ?").run(`-${days} days`, summary);
+    ep.record({ sessionId: "s1", eventType: "turn", summary: "routine old", importance: 0.5 });
+    ep.record({ sessionId: "s1", eventType: "turn", summary: "error mid", importance: 0.8, classification: "error" });
+    ep.record({ sessionId: "s1", eventType: "turn", summary: "error old", importance: 0.8, classification: "error" });
+    ep.record({ sessionId: "s1", eventType: "turn", summary: "strategic old", importance: 0.9, classification: "strategic" });
+    ep.record({ sessionId: "s1", eventType: "goal_archived", summary: "goal old", importance: 0.9 });
+    age("routine old", 40);
+    age("error mid", 100);
+    age("error old", 200);
+    age("strategic old", 200);
+    age("goal old", 400);
+
+    expect(ep.prune(30, 0.8, 180)).toBe(3);
+    expect(ep.getRecent("s1", 10).map((e) => e.summary).sort()).toEqual(["error mid", "goal old"]);
+  });
+
   it("should escape SQL LIKE wildcards in search queries", () => {
     ep.record({ sessionId: "s1", eventType: "test", summary: "100% complete" });
     ep.record({ sessionId: "s1", eventType: "test", summary: "file_name test" });
@@ -1076,8 +1094,9 @@ describe("Memory Tools", () => {
     });
 
     it("should search procedures by query", () => {
-      saveProcedure(db, { name: "deploy", description: "Deploy app", steps: "[]" });
-      saveProcedure(db, { name: "test", description: "Run tests", steps: "[]" });
+      // A procedure needs at least one step.
+      expect(saveProcedure(db, { name: "deploy", description: "Deploy app", steps: '[{"description":"push"}]' })).toContain("Procedure saved");
+      expect(saveProcedure(db, { name: "test", description: "Run tests", steps: '[{"description":"vitest"}]' })).toContain("Procedure saved");
 
       const result = recallProcedure(db, { query: "deploy" });
       expect(result).toContain("deploy");

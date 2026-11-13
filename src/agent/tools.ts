@@ -20,6 +20,7 @@ import type {
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { getForbiddenCommandMatch } from "./policy-rules/command-safety.js";
+import { isRegistryPackageSpec } from "./policy-rules/validation.js";
 import { introducedNeutralisedMarker, sanitizeToolResult } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
 import { UPSTREAM_INSTALL_STEPS } from "../self-mod/install.js";
@@ -761,8 +762,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
             at: new Date().toISOString(),
           });
           msg = `File edited: ${filePath} (audited + git-committed as ${headAfter.sha.slice(0, 7)})`;
+        } else if (result.commitError) {
+          msg = `File edited: ${filePath} (audited; NOT committed: ${result.commitError}; revert_last_edit cannot undo this edit)`;
         } else {
-          msg = `File edited: ${filePath} (audited; no new commit: the content was unchanged or git is unavailable)`;
+          msg = `File edited: ${filePath} (audited; no new commit: the content matched the last commit)`;
         }
         if (result.error) msg += `\nWarning: ${result.error}`;
         if (CODE_FILE_RE.test(filePath)) {
@@ -819,8 +822,11 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         if (busy.length > 0) {
           return `Nothing reverted: the repository has an operation in progress or staged changes (${busy.join(", ")}). Finish or clear it first; ${label} stays on the revert list.`;
         }
+        // Same fallback identity as the edit's commit, or a fresh machine stages the revert and fails.
+        const { fallbackIdentityFlags } = await import("../git/tools.js");
+        const identity = await fallbackIdentityFlags(ctx.conway, repo);
         const revert = await ctx.conway.exec(
-          `cd ${repo} && git revert --no-edit ${top.sha} 2>&1`,
+          `cd ${repo} && git ${identity}revert --no-edit ${top.sha} 2>&1`,
           30_000,
         );
         if (revert.exitCode !== 0) {
@@ -839,6 +845,17 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
             return `Nothing reverted: ${label} is already undone in the working tree. It was removed from the revert list.`;
           }
           if (!started) {
+            // The index was clean before, so staged changes now were left by this revert
+            // (git can apply the inverse and then fail to commit): roll them back.
+            if (after.includes("staged-changes")) {
+              const reset = await ctx.conway
+                .exec(`cd ${repo} && git reset -q --merge 2>&1 && git diff --cached --quiet`, 10_000)
+                .catch(() => ({ stdout: "", stderr: "reset failed", exitCode: 1 }));
+              if (reset.exitCode !== 0) {
+                return `Revert failed and left staged changes that could not be rolled back: ${output}\nInspect it by hand (git status); ${label} stays on the revert list.`;
+              }
+              return `Nothing reverted: git applied the revert but could not commit it, so the change was rolled back (the tree is unchanged): ${output}\n${label} stays on the revert list.`;
+            }
             // git refused before starting (e.g. local changes in the way): nothing to abort, keep the entry.
             return `Nothing reverted: git refused to start the revert (the tree is unchanged): ${output}\n${label} stays on the revert list.`;
           }
@@ -851,14 +868,20 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const build = await ctx.conway.exec(`cd ${repo} && npm run build`, 120_000);
         markRestartRequired(ctx.db, `revert_last_edit ${short}`);
 
-        // Audit log
-        const { logModification } = await import("../self-mod/audit-log.js");
-        logModification(ctx.db, "code_revert", `Reverted: ${label}`, {
-          reversible: true,
-        });
-
         const buildText =
           build.exitCode === 0 ? "Rebuild succeeded." : `Rebuild failed: ${commandOutput(build)}`;
+
+        // Audit log: what the revert touched and whether the rebuild worked.
+        const { logModification } = await import("../self-mod/audit-log.js");
+        logModification(
+          ctx.db,
+          "code_revert",
+          `Reverted: ${label}; files: ${touched.join(", ") || "(none)"}; rebuild: ${build.exitCode === 0 ? "ok" : `failed (exit ${build.exitCode})`}`,
+          {
+            diff: `Files: ${touched.join(", ") || "(none)"}\nRebuild: ${build.exitCode === 0 ? "ok" : `failed: ${commandOutput(build)}`}`,
+            reversible: true,
+          },
+        );
         return `Reverted: ${label}. ${buildText}\n${RESTART_NOTICE}`;
       },
     },
@@ -936,7 +959,17 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return `Refused: origin/main moved from ${plan.target} to ${target} since the plan. Nothing was changed; call reset_to_upstream() again for a new plan.`;
         }
 
+        // Record what the reset throws away and what it applies, before it runs.
         const discarded = await upstream.getLocalOnlyCommits(target).catch(() => "");
+        let dirty: { files: string[]; stat: string; diff: string };
+        try {
+          dirty = await upstream.getUncommittedChanges();
+        } catch (err: any) {
+          return `Refused: could not list uncommitted changes (${oneLine(err?.message || String(err), 300)}), so they cannot be recorded. Nothing was changed.`;
+        }
+        const applied = await upstream.getUpstreamRange(target).catch(() => "(could not list)");
+        const appliedFiles = await upstream.getFilesBetween("HEAD", target).catch(() => null);
+
         const reset = await ctx.conway.exec(`cd ${repo} && git reset --hard ${target}`, 30_000);
         if (reset.exitCode !== 0) {
           return `Reset failed: ${commandOutput(reset)}`;
@@ -946,11 +979,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         ctx.db.deleteKV(SELF_MOD_COMMITS_KEY);
 
         const failed = await runUpstreamInstall(ctx.conway, repo);
+        const buildOutcome = failed ? `${failed.failedStep} failed: ${failed.output}` : "ok";
 
-        // Audit log
+        // Audit log, written after install/build so it records the outcome.
         const { logModification } = await import("../self-mod/audit-log.js");
+        const auditDiff = [
+          `Discarded local commits:\n${discarded || "(none)"}`,
+          `Discarded uncommitted changes:\n${dirty.files.length ? `${dirty.stat}\n${dirty.diff}` : "(none)"}`,
+          `Applied upstream commits (HEAD..${target}):\n${applied || "(none)"}` +
+            (appliedFiles ? `\nFiles: ${appliedFiles.map((f) => `${f.path} (+${f.added} -${f.deleted})`).join(", ") || "(none)"}` : ""),
+          `Install/build: ${buildOutcome}`,
+        ].join("\n\n");
         logModification(ctx.db, "upstream_reset", `Reset to upstream origin/main ${target}`, {
-          diff: discarded || "(no local commits)",
+          diff: auditDiff.length > 20_000 ? `${auditDiff.slice(0, 20_000)}\n… (truncated)` : auditDiff,
           reversible: false,
         });
 
@@ -958,7 +999,11 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const buildText = failed
           ? `The ${failed.failedStep} step failed: ${failed.output}`
           : "Install and rebuild succeeded.";
-        return `Reset to upstream ${target}. ${discarded ? "Discarded local commits:\n" + discarded : "No local commits lost."}\n${buildText} The revert list was cleared.\n${RESTART_NOTICE}`;
+        const lostCommits = discarded ? `Discarded local commits:\n${discarded}` : "No local commits were discarded.";
+        const lostChanges = dirty.files.length
+          ? `Discarded uncommitted changes to ${dirty.files.length} tracked file(s): ${dirty.files.slice(0, 20).join(", ")}${dirty.files.length > 20 ? ", ..." : ""}`
+          : "No uncommitted changes were discarded.";
+        return `Reset to upstream ${target}. ${lostCommits}\n${lostChanges}\n${buildText} The revert list was cleared.\n${RESTART_NOTICE}`;
       },
     },
     {
@@ -977,14 +1022,19 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["package"],
       },
       execute: async (args, ctx) => {
-        const pkg = args.package as string;
-        // Defense-in-depth: validate package name inline in case the
-        // policy engine's validate.package_name rule is bypassed.
-        if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
-          return `Blocked: invalid package name "${pkg}"`;
+        const pkg = args.package;
+        // Defense-in-depth: validate the spec inline in case the policy
+        // engine's validate.package_name rule is bypassed.
+        if (!isRegistryPackageSpec(pkg)) {
+          return `Blocked: invalid package spec ${JSON.stringify(String(pkg)).slice(0, 120)}. Only npm registry packages are accepted (name, @scope/name, optionally @version); GitHub shorthand, paths, URLs and tarballs are refused.`;
         }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
+        const result = await ctx.conway.exec(`npm install -g -- ${escapeShellArg(pkg)}`, 60000);
 
+        if (result.exitCode !== 0) {
+          return `Failed to install ${pkg} (exit code ${result.exitCode}): ${oneLine(result.stderr || result.stdout || "", 1000)}`;
+        }
+
+        // Only a successful install is a modification.
         const { ulid } = await import("ulid");
         ctx.db.insertModification({
           id: ulid(),
@@ -993,10 +1043,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           description: `Installed npm package: ${pkg}`,
           reversible: true,
         });
-
-        return result.exitCode === 0
-          ? `Installed: ${pkg}`
-          : `Failed to install ${pkg}: ${result.stderr}`;
+        return `Installed: ${pkg} (exit code 0)`;
       },
     },
     // ── Self-Mod: Upstream Awareness ──
@@ -1211,7 +1258,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
             if (problem) {
               return `Refused: ${problem}. Read every page with review_upstream_changes(commit="${full.slice(0, 12)}", page=<n>) first.`;
             }
-            pickCommand = `git cherry-pick ${inRange.parents > 1 ? "-m 1 " : ""}${full}`;
+            const { fallbackIdentityFlags } = await import("../git/tools.js");
+            const identity = await fallbackIdentityFlags(ctx.conway, repo);
+            pickCommand = `git ${identity}cherry-pick ${inRange.parents > 1 ? "-m 1 " : ""}${full}`;
             appliedSummary = `Cherry-picked ${commit}`;
           } else {
             const current = await upstream.resolveUpstreamTarget();
@@ -1609,8 +1658,8 @@ Model: ${ctx.inference.getDefaultModel()}
         const name = args.name;
         // Defense-in-depth: validate package name inline in case the
         // policy engine's validate.package_name rule is bypassed.
-        if (typeof pkg !== "string" || !/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
-          return `Blocked: invalid package name "${pkg}"`;
+        if (!isRegistryPackageSpec(pkg)) {
+          return `Blocked: invalid package spec ${JSON.stringify(String(pkg)).slice(0, 120)}. Only npm registry packages are accepted (name, @scope/name, optionally @version).`;
         }
         // An invalid or duplicate name would make every inference request fail.
         if (typeof name !== "string" || !TOOL_NAME_RE.test(name)) {
@@ -1632,7 +1681,7 @@ Model: ${ctx.inference.getDefaultModel()}
             return `Blocked: config is not a valid JSON object: ${err?.message || String(err)}`;
           }
         }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
+        const result = await ctx.conway.exec(`npm install -g -- ${escapeShellArg(pkg)}`, 60000);
 
         if (result.exitCode !== 0) {
           return `Failed to install MCP server: ${result.stderr}`;
@@ -2085,24 +2134,37 @@ Model: ${ctx.inference.getDefaultModel()}
           return "ERC-8004 is an EVM-only standard. Your Solana identity is registered via Conway API instead.";
         }
 
-        // Check if already registered in local database
-        const existingEntry = ctx.db.getRegistryEntry();
+        const network = args.network === undefined || args.network === "" ? "mainnet" : args.network;
+        const erc8004 = await import("../registry/erc8004.js");
+        if (!erc8004.isRegistryNetwork(network)) {
+          return `Refused: network must be "mainnet" or "testnet" (got ${JSON.stringify(String(network)).slice(0, 60)}).`;
+        }
+
+        // Only a registration on the target chain counts: testnet says nothing about mainnet.
+        const existingEntry = erc8004.getRegistryEntryForChain(ctx.db.raw, erc8004.registryChainId(network));
         if (existingEntry) {
-          return `Already registered! Agent ID: ${existingEntry.agentId}. Use update_agent_card tool to update your agent URI instead of creating a new registration.`;
+          return `Already registered on ${network}! Agent ID: ${existingEntry.agentId}. Use update_agent_card tool to update your agent URI instead of creating a new registration.`;
         }
 
         // Phase 3.2: registerAgent now includes preflight gas check
-        const { registerAgent } = await import("../registry/erc8004.js");
         try {
-          const entry = await registerAgent(
+          const entry = await erc8004.registerAgent(
             ctx.identity.account,
             args.agent_uri as string,
-            ((args.network as string) || "mainnet") as any,
+            network,
             ctx.db,
             ctx.config.rpcUrl,
           );
-          return `Registered on-chain! Agent ID: ${entry.agentId}, TX: ${entry.txHash}`;
+          const result = `Registered on-chain (${network})! Agent ID: ${entry.agentId}, TX: ${entry.txHash}`;
+          // A resumed broadcast registers the URI it was sent with, not this call's.
+          if (entry.agentURI !== args.agent_uri) {
+            return `${result}. This resumed an earlier broadcast registration: the on-chain agent URI is ${entry.agentURI}, not the requested ${String(args.agent_uri)}.`;
+          }
+          return result;
         } catch (err: any) {
+          if (err?.name === "RegistrationPendingError" || err?.name === "RegistrationRefusedError") {
+            return `Registration not completed: ${err.message}`;
+          }
           if (err.message?.includes("Insufficient ETH")) {
             return `Registration failed: ${err.message}. Please fund your wallet with ETH for gas.`;
           }
@@ -3137,9 +3199,14 @@ Model: ${ctx.inference.getDefaultModel()}
         const reflection = await reflectOnSoul(ctx.db.raw);
 
         const lines: string[] = [
-          `Genesis alignment: ${reflection.currentAlignment.toFixed(2)}`,
+          reflection.alignmentKnown
+            ? `Genesis alignment: ${reflection.currentAlignment.toFixed(2)}`
+            : "Genesis alignment: unknown (no genesis prompt recorded in SOUL.md)",
           `Auto-updated sections: ${reflection.autoUpdated.length > 0 ? reflection.autoUpdated.join(", ") : "none"}`,
         ];
+        if (reflection.autoUpdateErrors?.length) {
+          lines.push(`Auto-update rejected: ${reflection.autoUpdateErrors.join("; ")}`);
+        }
 
         if (reflection.suggestedUpdates.length > 0) {
           lines.push("Suggested updates:");

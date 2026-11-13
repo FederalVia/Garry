@@ -27,13 +27,22 @@ export function getGlobalLogLevel(): LogLevel {
   return globalLogLevel;
 }
 
+/** A known level name (any case), or undefined. */
+export function parseLogLevel(value: unknown): LogLevel | undefined {
+  if (typeof value !== "string") return undefined;
+  const level = value.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(LOG_LEVEL_PRIORITY, level) ? (level as LogLevel) : undefined;
+}
+
 export class StructuredLogger {
   private module: string;
-  private minLevel: LogLevel;
+  // Unset means "follow the global level at write time": loggers are created
+  // at import, before the configured level is known.
+  private minLevel?: LogLevel;
 
   constructor(module: string, minLevel?: LogLevel) {
     this.module = module;
-    this.minLevel = minLevel ?? globalLogLevel;
+    this.minLevel = minLevel;
   }
 
   debug(message: string, context?: Record<string, unknown>): void {

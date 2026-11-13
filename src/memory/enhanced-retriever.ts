@@ -343,23 +343,16 @@ export class EnhancedRetriever extends MemoryRetriever {
     return entries;
   }
 
+  /**
+   * Every category is searched: inferred categories only weight the score
+   * (categoryMatchScore), so a guess cannot hide a relevant entry.
+   */
   private searchTermAcrossCategories(
     term: string,
-    categories: KnowledgeCategory[],
+    _categories: KnowledgeCategory[],
   ): KnowledgeEntry[] {
     if (term.trim().length === 0) return [];
-
-    if (categories.length === 0) {
-      return this.knowledgeStore.search(term, undefined, KNOWLEDGE_SEARCH_LIMIT);
-    }
-
-    const results: KnowledgeEntry[] = [];
-    for (const category of categories) {
-      results.push(
-        ...this.knowledgeStore.search(term, category, KNOWLEDGE_SEARCH_LIMIT),
-      );
-    }
-    return results;
+    return this.knowledgeStore.search(term, undefined, KNOWLEDGE_SEARCH_LIMIT);
   }
 
   private computeScoringFactors(
@@ -522,10 +515,12 @@ function categoriesFromText(text: string): KnowledgeCategory[] {
   const normalized = normalizeForMatch(text);
   const categories: KnowledgeCategory[] = [];
 
+  // Whole words (and plain plurals) only: 'sla' must not match 'translation'.
+  const words = new Set(normalized.split(/[^\p{L}\p{N}]+/u).filter(Boolean));
   for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS) as Array<
     [KnowledgeCategory, string[]]
   >) {
-    if (keywords.some((keyword) => normalized.includes(keyword))) {
+    if (keywords.some((keyword) => words.has(keyword) || words.has(`${keyword}s`))) {
       categories.push(category);
     }
   }

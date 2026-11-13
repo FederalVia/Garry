@@ -734,6 +734,35 @@ describe("Soul Tools", () => {
   });
 });
 
+describe("updateSoul on an oversized SOUL.md", () => {
+  it("refuses instead of replacing the soul with a default one", async () => {
+    const fs = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const { updateSoul } = await import("../soul/tools.js");
+    const { MAX_SOUL_FILE_BYTES } = await import("../soul/model.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "soul-big-"));
+    const db = createTestDb();
+    try {
+      const soulPath = path.join(dir, "SOUL.md");
+      const big = writeSoulMd({
+        ...createDefaultSoul("Run a translation business.", "Bob", "0xabc", "0xcre"),
+        genesisPromptOriginal: "Run a translation business for small shops. ".repeat(1600),
+      });
+      expect(Buffer.byteLength(big)).toBeGreaterThan(MAX_SOUL_FILE_BYTES);
+      fs.writeFileSync(soulPath, big);
+
+      const result = await updateSoul(db, { personality: "curious" }, "agent", "t", soulPath);
+      expect(result.success).toBe(false);
+      expect(result.errors?.[0]).toMatch(/exists but could not be read/);
+      expect(fs.readFileSync(soulPath, "utf8")).toBe(big);
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── Schema Migration ───────────────────────────────────────────
 
 describe("Schema Migration - MIGRATION_V5", () => {

@@ -32,11 +32,21 @@ import {
   countDeferredInboxFrom,
   countRecentInboxFrom,
   countShownInboxSince,
+  inferencePruneCosts,
   listDeferredInboxBuckets,
   metricsInsertSnapshot,
   metricsPruneOld,
+  pruneConsumedWakeEvents,
+  pruneEventsByType,
+  pruneHeartbeatHistory,
+  pruneOldInboxMessages,
+  pruneSpendRecords,
+  pruneStaleKV,
   releaseDeferredInbox,
 } from "../state/database.js";
+import { DEFAULT_INGESTION_CONFIG } from "../memory/types.js";
+import { WorkingMemoryManager } from "../memory/working.js";
+import { EpisodicMemoryManager } from "../memory/episodic.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { ulid } from "ulid";
 
@@ -72,6 +82,22 @@ const INBOX_FIRST_POLL_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 
 // Last time the "no auto-topup on Solana" note was logged (once a day).
 let lastSolanaTopupNoticeMs = 0;
+
+/** Retention used by the memory_maintenance task. */
+export const MEMORY_RETENTION = {
+  /** Episodic rows below this importance are pruned after the ingestion retention; goal rows never. */
+  episodicKeepImportance: 0.8,
+  /** Rows at or above it (errors, strategic turns) are kept this long. */
+  episodicHighImportanceDays: 180,
+  knowledgeEventDays: 30,
+  inboxDays: 30,
+  inboxSeenDays: 30,
+  wakeEventDays: 7,
+  heartbeatHistoryDays: 30,
+  // The longest spend window in use is a day; keep far more for audits.
+  spendDays: 90,
+  inferenceCostDays: 90,
+} as const;
 
 export const COLONY_TASK_INTERVALS_MS = {
   colony_health_check: 300_000,
@@ -912,6 +938,56 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       logger.error("knowledge_store_prune failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
+  },
+
+  /**
+   * Retention for the tables the agent writes every turn or that untrusted
+   * senders feed. Each step runs on its own, so one failure does not stop
+   * the rest; the counts are kept in KV last_memory_maintenance.
+   */
+  memory_maintenance: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    const raw = taskCtx.db.raw;
+    const counts: Record<string, number | string> = {};
+    const step = (name: string, fn: () => number): void => {
+      try {
+        counts[name] = fn();
+      } catch (error) {
+        counts[name] = `error: ${error instanceof Error ? error.message : String(error)}`;
+        logger.warn(`memory_maintenance: ${name} failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+    const { KnowledgeStore } = await import("../memory/knowledge-store.js");
+    const spendCutoff = new Date(Date.now() - MEMORY_RETENTION.spendDays * 86_400_000)
+      .toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+
+    step("working_expired", () => new WorkingMemoryManager(raw).clearExpired());
+    step("episodic", () => new EpisodicMemoryManager(raw).prune(
+      DEFAULT_INGESTION_CONFIG.episodicRetentionDays,
+      MEMORY_RETENTION.episodicKeepImportance,
+      MEMORY_RETENTION.episodicHighImportanceDays,
+    ));
+    step("knowledge", () => new KnowledgeStore(raw).prune());
+    step("knowledge_events", () => pruneEventsByType(raw, ["market_signal", "knowledge"], MEMORY_RETENTION.knowledgeEventDays));
+    step("inbox", () => pruneOldInboxMessages(raw, MEMORY_RETENTION.inboxDays));
+    step("inbox_seen", () => pruneStaleKV(raw, "inbox_seen_", MEMORY_RETENTION.inboxSeenDays));
+    step("wake_events", () => pruneConsumedWakeEvents(raw, MEMORY_RETENTION.wakeEventDays));
+    step("heartbeat_history", () => pruneHeartbeatHistory(raw, MEMORY_RETENTION.heartbeatHistoryDays));
+    step("spend_records", () => pruneSpendRecords(raw, spendCutoff));
+    step("inference_costs", () => inferencePruneCosts(raw, MEMORY_RETENTION.inferenceCostDays));
+
+    try {
+      taskCtx.db.setKV("last_memory_maintenance", JSON.stringify({
+        timestamp: new Date().toISOString(),
+        ...counts,
+      }));
+    } catch (error) {
+      logger.warn("memory_maintenance: could not record counts", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return { shouldWake: false };
   },
 
   dead_agent_cleanup: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {

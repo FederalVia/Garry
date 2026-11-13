@@ -6,6 +6,8 @@ export default defineConfig({
     teardownTimeout: 5_000,
     include: ["src/__tests__/**/*.test.ts"],
     globalSetup: ["src/__tests__/global-setup.ts"],
+    // Fails any non-loopback fetch, so no test depends on a public endpoint.
+    setupFiles: ["src/__tests__/setup/network-guard.ts"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

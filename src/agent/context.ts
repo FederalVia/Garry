@@ -266,40 +266,48 @@ export function trimContext(
 export function formatMemoryBlock(memories: MemoryRetrievalResult): string {
   const sections: string[] = [];
 
-  if (memories.workingMemory.length > 0) {
-    sections.push("### Working Memory");
-    for (const e of memories.workingMemory) {
-      sections.push(`- [${e.contentType}] (p=${e.priority.toFixed(1)}) ${e.content}`);
+  // Rows come from the database and may hold values of the wrong type (an
+  // older version stored model-supplied text in REAL columns). Each row is
+  // formatted on its own, so one bad row is skipped and the block survives.
+  const addSection = <T>(title: string, rows: T[] | undefined, format: (row: T) => string): void => {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    const lines: string[] = [];
+    for (const row of rows) {
+      try {
+        lines.push(format(row));
+      } catch {
+        // Skip a malformed row.
+      }
     }
-  }
+    if (lines.length === 0) return;
+    sections.push(title, ...lines);
+  };
+  const score = (value: unknown): string => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(1) : "?";
+  };
+  const count = (value: unknown): number => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  };
 
-  if (memories.episodicMemory.length > 0) {
-    sections.push("### Recent History");
-    for (const e of memories.episodicMemory) {
-      sections.push(`- [${e.eventType}] ${e.summary} (${e.outcome || "neutral"})`);
-    }
-  }
+  addSection("### Working Memory", memories.workingMemory, (e) =>
+    `- [${e.contentType}] (p=${score(e.priority)}) ${e.content}`);
 
-  if (memories.semanticMemory.length > 0) {
-    sections.push("### Known Facts");
-    for (const e of memories.semanticMemory) {
-      sections.push(`- [${e.category}/${e.key}] ${e.value}`);
-    }
-  }
+  addSection("### Recent History", memories.episodicMemory, (e) =>
+    `- [${e.eventType}] ${e.summary} (${e.outcome || "neutral"})`);
 
-  if (memories.proceduralMemory.length > 0) {
-    sections.push("### Known Procedures");
-    for (const e of memories.proceduralMemory) {
-      sections.push(`- ${e.name}: ${e.description} (${e.steps.length} steps, ${e.successCount}/${e.successCount + e.failureCount} success)`);
-    }
-  }
+  addSection("### Known Facts", memories.semanticMemory, (e) =>
+    `- [${e.category}/${e.key}] ${e.value}`);
 
-  if (memories.relationships.length > 0) {
-    sections.push("### Known Entities");
-    for (const e of memories.relationships) {
-      sections.push(`- ${e.entityName || e.entityAddress}: ${e.relationshipType} (trust: ${e.trustScore.toFixed(1)})`);
-    }
-  }
+  addSection("### Known Procedures", memories.proceduralMemory, (e) => {
+    const steps = Array.isArray(e.steps) ? e.steps.length : 0;
+    const ok = count(e.successCount);
+    return `- ${e.name}: ${e.description} (${steps} steps, ${ok}/${ok + count(e.failureCount)} success)`;
+  });
+
+  addSection("### Known Entities", memories.relationships, (e) =>
+    `- ${e.entityName || e.entityAddress}: ${e.relationshipType} (trust: ${score(e.trustScore)})`);
 
   if (sections.length === 0) return "";
 

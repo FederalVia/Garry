@@ -12,9 +12,11 @@
  *   oversized content.
  *
  * The relay-assigned id and nonce prove nothing (the relay chooses them), so
- * replay protection keys on what the sender signed instead. Inbox rows are
- * never deleted, so that key stops a replay for good; the freshness window
- * only decides whether a message counts as verified, never whether it is
+ * replay protection keys on what the sender signed instead. Finished inbox
+ * rows are kept for at least INBOX_MIN_RETENTION_DAYS (state/database.ts),
+ * well past the freshness window, so a replay is either stopped by that key
+ * or arrives stale and counts as unverified. The freshness window only
+ * decides whether a message counts as verified, never whether it is
  * delivered (a long sleep or a fast sender clock must not lose mail).
  */
 

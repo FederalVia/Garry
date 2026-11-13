@@ -49,7 +49,7 @@ import {
 } from "./runtime/shutdown.js";
 import { preloadLazyModules } from "./runtime/preload.js";
 import { bootstrapConfigFromGenesis, genesisPath } from "./setup/genesis-bootstrap.js";
-import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
+import { createLogger, setGlobalLogLevel, parseLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
 import { startupBootstrapTopup } from "./conway/topup.js";
 import { readUsdcAuthorizationState } from "./conway/x402.js";
@@ -276,6 +276,7 @@ async function run(): Promise<void> {
   logger.info(`[${new Date().toISOString()}] Conway Automaton v${VERSION} starting...`);
 
   const config = await loadRunConfig();
+  setGlobalLogLevel(parseLogLevel(config.logLevel) ?? "info");
 
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();

@@ -8,7 +8,25 @@
 import type { PolicyRule, PolicyRequest, PolicyRuleResult } from "../../types.js";
 import { hasValidEvmChecksum, isValidEvmAddress, isValidSolanaAddress, isZeroAddress, type ChainType } from "../../identity/chain.js";
 
-const PACKAGE_NAME_RE = /^[@a-zA-Z0-9._/-]+$/;
+/**
+ * An npm registry package: name or @scope/name, optionally @version, tag or
+ * range. No leading "-", "." or "/", no owner/repo shorthand, paths, URLs or
+ * tarballs: npm would fetch those from outside the registry and run their
+ * lifecycle scripts. The version may not start with "." (npm reads "foo@.."
+ * as a directory), and a name ending in .tgz/.tar is read as a local file.
+ */
+const REGISTRY_PACKAGE_SPEC_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(@[0-9a-z^~<>=*][0-9a-z.^~<>=*+-]*)?$/i;
+const TARBALL_NAME_RE = /\.(?:tgz|tar|tar\.gz)(?:@|$)/i;
+const MAX_PACKAGE_SPEC_LENGTH = 214;
+
+export function isRegistryPackageSpec(spec: unknown): spec is string {
+  return (
+    typeof spec === "string" &&
+    spec.length <= MAX_PACKAGE_SPEC_LENGTH &&
+    REGISTRY_PACKAGE_SPEC_RE.test(spec) &&
+    !TARBALL_NAME_RE.test(spec)
+  );
+}
 const SKILL_NAME_RE = /^[a-zA-Z0-9-]+$/;
 const GIT_HASH_RE = /^[a-f0-9]{7,40}$/;
 const CRON_PARTS_RE = /^(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)\s+(\*|[\d,*/-]+)$/;
@@ -36,11 +54,11 @@ function createPackageNameRule(): PolicyRule {
         return deny("validate.package_name", "VALIDATION_FAILED", "package must be a string");
       }
 
-      if (!PACKAGE_NAME_RE.test(pkg)) {
+      if (!isRegistryPackageSpec(pkg)) {
         return deny(
           "validate.package_name",
           "VALIDATION_FAILED",
-          `Invalid package name: "${pkg}". Must match ${PACKAGE_NAME_RE.source}`,
+          `Invalid package spec: "${String(pkg).slice(0, 100)}". Only npm registry packages (name, @scope/name, optionally @version) are accepted.`,
         );
       }
       return null;

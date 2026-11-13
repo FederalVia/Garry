@@ -10,6 +10,7 @@ import { ulid } from "ulid";
 import type { WorkingMemoryEntry, WorkingMemoryType } from "../types.js";
 import { estimateTokens } from "../agent/context.js";
 import { createLogger } from "../observability/logger.js";
+import { clampScore } from "./semantic.js";
 const logger = createLogger("memory.working");
 
 type Database = BetterSqlite3.Database;
@@ -18,7 +19,8 @@ export class WorkingMemoryManager {
   constructor(private db: Database) {}
 
   /**
-   * Add a new working memory entry. Returns the ULID id.
+   * Add a new working memory entry. Returns the ULID id; throws when the
+   * write fails.
    */
   add(entry: {
     sessionId: string;
@@ -39,13 +41,14 @@ export class WorkingMemoryManager {
         entry.sessionId,
         entry.content,
         entry.contentType,
-        entry.priority ?? 0.5,
+        clampScore(entry.priority, 0.5),
         tokenCount,
         entry.expiresAt ?? null,
         entry.sourceTurn ?? null,
       );
     } catch (error) {
       logger.error("Failed to add entry", error instanceof Error ? error : undefined);
+      throw error;
     }
     return id;
   }
@@ -80,7 +83,7 @@ export class WorkingMemoryManager {
     }
     if (updates.priority !== undefined) {
       setClauses.push("priority = ?");
-      params.push(updates.priority);
+      params.push(clampScore(updates.priority, 0.5));
     }
     if (updates.expiresAt !== undefined) {
       setClauses.push("expires_at = ?");
@@ -115,27 +118,56 @@ export class WorkingMemoryManager {
   }
 
   /**
-   * Prune lowest-priority entries when a session exceeds maxEntries.
+   * Bring a session down to maxEntries. Non-goal rows go first (lowest
+   * priority, then oldest), so other rows never evict a goal. If goals alone
+   * are over the limit, the lowest-priority goals are archived to episodic
+   * memory ('goal_archived') before they are removed.
    * Returns number of entries removed.
    */
   prune(sessionId: string, maxEntries: number = 20): number {
     if (maxEntries < 0) return 0;
     try {
-      const count = this.db.prepare(
-        "SELECT COUNT(*) as cnt FROM working_memory WHERE session_id = ?",
-      ).get(sessionId) as { cnt: number };
+      return this.db.transaction(() => {
+        const count = this.db.prepare(
+          "SELECT COUNT(*) as cnt FROM working_memory WHERE session_id = ?",
+        ).get(sessionId) as { cnt: number };
+        if (count.cnt <= maxEntries) return 0;
 
-      if (count.cnt <= maxEntries) return 0;
+        let toRemove = count.cnt - maxEntries;
+        const removedOthers = this.db.prepare(
+          `DELETE FROM working_memory WHERE id IN (
+            SELECT id FROM working_memory WHERE session_id = ? AND content_type <> 'goal'
+            ORDER BY priority ASC, created_at ASC
+            LIMIT ?
+          )`,
+        ).run(sessionId, toRemove).changes;
+        toRemove -= removedOthers;
+        if (toRemove <= 0) return removedOthers;
 
-      const toRemove = count.cnt - maxEntries;
-      const result = this.db.prepare(
-        `DELETE FROM working_memory WHERE id IN (
-          SELECT id FROM working_memory WHERE session_id = ?
-          ORDER BY priority ASC, created_at ASC
-          LIMIT ?
-        )`,
-      ).run(sessionId, toRemove);
-      return result.changes;
+        const goals = this.db.prepare(
+          `SELECT * FROM working_memory WHERE session_id = ? AND content_type = 'goal'
+           ORDER BY priority ASC, created_at ASC
+           LIMIT ?`,
+        ).all(sessionId, toRemove) as any[];
+        const archive = this.db.prepare(
+          `INSERT INTO episodic_memory (id, session_id, event_type, summary, detail, outcome, importance, token_count, classification)
+           VALUES (?, ?, 'goal_archived', ?, ?, 'neutral', ?, ?, 'maintenance')`,
+        );
+        const remove = this.db.prepare("DELETE FROM working_memory WHERE id = ?");
+        for (const goal of goals) {
+          const summary = `Goal archived (working memory full): ${goal.content}`;
+          archive.run(
+            ulid(),
+            sessionId,
+            summary,
+            `goal id ${goal.id}`,
+            clampScore(goal.priority, 0.5),
+            estimateTokens(summary),
+          );
+          remove.run(goal.id);
+        }
+        return removedOthers + goals.length;
+      })();
     } catch (error) {
       logger.error("Failed to prune", error instanceof Error ? error : undefined);
       return 0;
@@ -149,7 +181,9 @@ export class WorkingMemoryManager {
   clearExpired(): number {
     try {
       const result = this.db.prepare(
-        "DELETE FROM working_memory WHERE expires_at IS NOT NULL AND expires_at < datetime('now')",
+        // expires_at is written as ISO-8601; julianday() reads both that and
+        // SQLite's own format, where a text comparison would not.
+        "DELETE FROM working_memory WHERE expires_at IS NOT NULL AND julianday(expires_at) < julianday('now')",
       ).run();
       return result.changes;
     } catch (error) {

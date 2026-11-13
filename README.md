@@ -81,7 +81,7 @@ The first SIGTERM or SIGINT stops the agent at the next tool boundary. A second 
 
 **Agent loop.** Each turn, the agent gets a system prompt with its identity, the constitution, `SOUL.md`, the genesis prompt, its skills, its balance and tier, and relevant memories. It reasons, calls tools and saves the turn to SQLite. Every tool call is checked by a policy engine first. A wake cycle ends when the agent calls `sleep`; when it replies with text and no tool calls; after 10 turns in a row with no input and no state-changing tool; after `maxTurnsPerCycle` turns (default 25); when the inference gate refuses a call (it sleeps until the cap allows); or when it repeats the same calls despite a warning (a forced 5-minute sleep).
 
-**Heartbeat.** A scheduler in the same process keeps running while the agent sleeps. It runs cron entries from `heartbeat.yml`: status ping and distress (every 15 minutes), credit check (every 6 hours), USDC balance and survival topup (every 5 minutes), upstream update check (every 4 hours), sandbox health (every 30 minutes), child health (every 10 minutes) and social inbox polling (every 2 minutes). A task can wake the agent.
+**Heartbeat.** A scheduler in the same process keeps running while the agent sleeps. It runs cron entries from `heartbeat.yml`: status ping and distress (every 15 minutes), credit check (every 6 hours), USDC balance and survival topup (every 5 minutes), upstream update check (every 4 hours), sandbox health (every 30 minutes), child health (every 10 minutes), social inbox polling (every 2 minutes) and memory maintenance, which prunes old memory, events and inbox text (hourly). A task can wake the agent.
 
 **Survival tiers.** `getSurvivalTier` (`src/conway/credits.ts`) maps the Conway credit balance to one of five tiers (thresholds in `SURVIVAL_THRESHOLDS`, `src/types.ts`):
 
@@ -138,7 +138,7 @@ The Treasury also refuses any credit transfer above half the available balance, 
 - `review_upstream_changes` lists the commits on `origin/main` and shows each diff in pages. `pull_upstream` applies only commits whose every page was read: one commit by hash, or a fast-forward to the reviewed target. Upstream install scripts are disabled (`--ignore-scripts`), but the build still runs upstream's scripts. `reset_to_upstream` hard-resets in two steps, with a confirmation that names the target commit. If you cloned from this fork, `origin` is this fork.
 - `install_npm_package` and `install_mcp_server` install packages. MCP servers are not yet callable as tools. `install_skill`, `create_skill` and `modify_heartbeat` change skills and the schedule.
 - The running process keeps the code it loaded at startup. Rebuilding tools set a `restart_required` flag, and the agent does not restart itself.
-- At startup, `~/.automaton` becomes a git repository. It versions only `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md` and `skills/`. The agent commits it with its git tools.
+- At startup, `~/.automaton` becomes a git repository that versions only `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md` and `skills/`. Soul and skill changes are committed automatically when they happen.
 
 ## Child agents
 

@@ -9,6 +9,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { ulid } from "ulid";
 import type { ProceduralMemoryEntry, ProceduralStep } from "../types.js";
 import { createLogger } from "../observability/logger.js";
+import { LIKE_ESCAPE, likeContains } from "../state/like-escape.js";
 const logger = createLogger("memory.procedural");
 
 type Database = BetterSqlite3.Database;
@@ -18,7 +19,8 @@ export class ProceduralMemoryManager {
 
   /**
    * Save a procedure. Upserts on name.
-   * Returns the ULID id.
+   * Returns the id of the stored row (the original id when the name already
+   * existed); throws when the write fails.
    */
   save(entry: {
     name: string;
@@ -38,12 +40,17 @@ export class ProceduralMemoryManager {
         id,
         entry.name,
         entry.description,
-        JSON.stringify(entry.steps),
+        JSON.stringify(Array.isArray(entry.steps) ? entry.steps : []),
       );
+      const row = this.db.prepare(
+        "SELECT id FROM procedural_memory WHERE name = ?",
+      ).get(entry.name) as { id: string } | undefined;
+      if (!row) throw new Error("stored row not found");
+      return row.id;
     } catch (error) {
       logger.error("Failed to save", error instanceof Error ? error : undefined);
+      throw error;
     }
-    return id;
   }
 
   /**
@@ -76,18 +83,17 @@ export class ProceduralMemoryManager {
   }
 
   /**
-   * Search procedures by name or description.
+   * Search procedures by name or description. A negative limit means no limit.
    */
-  search(query: string): ProceduralMemoryEntry[] {
+  search(query: string, limit: number = -1): ProceduralMemoryEntry[] {
     try {
-      // Escape SQL LIKE wildcards so literal '%' and '_' in the query
-      // don't match arbitrary characters.
-      const escaped = query.replace(/[%_]/g, (ch) => `\\${ch}`);
+      const pattern = likeContains(query);
       const rows = this.db.prepare(
         `SELECT * FROM procedural_memory
-         WHERE name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\'
-         ORDER BY success_count DESC, updated_at DESC`,
-      ).all(`%${escaped}%`, `%${escaped}%`) as any[];
+         WHERE name LIKE ? ${LIKE_ESCAPE} OR description LIKE ? ${LIKE_ESCAPE}
+         ORDER BY success_count DESC, updated_at DESC
+         LIMIT ?`,
+      ).all(pattern, pattern, limit) as any[];
       return rows.map(deserializeProcedural);
     } catch (error) {
       logger.error("Failed to search", error instanceof Error ? error : undefined);
@@ -110,7 +116,9 @@ export class ProceduralMemoryManager {
 function deserializeProcedural(row: any): ProceduralMemoryEntry {
   let steps: ProceduralStep[] = [];
   try {
-    steps = JSON.parse(row.steps || "[]");
+    const parsed = JSON.parse(row.steps || "[]");
+    // A stored non-array (from before steps were validated) reads as no steps.
+    steps = Array.isArray(parsed) ? parsed.filter((s) => s && typeof s === "object") : [];
   } catch {
     logger.error("Failed to parse steps for: " + row.name);
   }

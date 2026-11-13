@@ -59,6 +59,8 @@ import {
   MIGRATION_V16,
   MIGRATION_V16_INBOX_COLUMNS,
   MIGRATION_V16_RETIRE_BLOCKED,
+  MIGRATION_V17,
+  REGISTRY_CHAIN_KEY_REBUILD,
   CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
 import { STATIC_MODEL_BASELINE } from "../inference/types.js";
@@ -88,6 +90,7 @@ import type {
 } from "../types.js";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
+import { LIKE_ESCAPE, likeContains, likePrefix } from "./like-escape.js";
 
 const logger = createLogger("database");
 
@@ -121,6 +124,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
   applyMigrations(db);
   repairPreV4InboxStatus(db);
   ensureChildrenAddressIndex(db);
+  ensureRegistryChainKey(db);
 
   // Ensure version is recorded
   const versionRow = db
@@ -445,15 +449,27 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
 
   const getRegistryEntry = (): RegistryEntry | undefined => {
     const row = db
-      .prepare("SELECT * FROM registry LIMIT 1")
+      // Base mainnet first: a testnet registration is not the identity the
+      // agent presents. Then the most recent.
+      .prepare(
+        `SELECT * FROM registry
+         ORDER BY CASE WHEN chain = 'eip155:8453' THEN 0 ELSE 1 END, registered_at DESC
+         LIMIT 1`,
+      )
       .get() as any | undefined;
     return row ? deserializeRegistry(row) : undefined;
   };
 
   const setRegistryEntry = (entry: RegistryEntry): void => {
+    // Keyed by (chain, agent_id): never replaces another chain's identity.
     db.prepare(
-      `INSERT OR REPLACE INTO registry (agent_id, agent_uri, chain, contract_address, tx_hash, registered_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO registry (agent_id, agent_uri, chain, contract_address, tx_hash, registered_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chain, agent_id) DO UPDATE SET
+         agent_uri = excluded.agent_uri,
+         contract_address = excluded.contract_address,
+         tx_hash = excluded.tx_hash,
+         registered_at = excluded.registered_at`,
     ).run(
       entry.agentId,
       entry.agentURI,
@@ -699,6 +715,12 @@ function applyMigrations(db: DatabaseType): void {
       // Adds the inbox sender-verification, replay and screening columns.
       apply: () => { migrateInboxVerification(db); },
     },
+    {
+      version: 17,
+      // Indexes for the per-turn memory and inbox queries, and repair of
+      // TEXT trust/priority values the memory tools used to store.
+      apply: () => { db.exec(MIGRATION_V17); },
+    },
   ];
 
   for (const m of migrations) {
@@ -789,6 +811,20 @@ export function ensureChildrenAddressIndex(db: DatabaseType): boolean {
     });
     return false;
   }
+}
+
+/**
+ * Rebuild a registry table keyed by agent_id alone into one keyed by
+ * (chain, agent_id). Runs at every open, so it does not depend on the
+ * schema version number. Returns true when the key is (chain, agent_id).
+ */
+export function ensureRegistryChainKey(db: DatabaseType): boolean {
+  const cols = db.prepare("PRAGMA table_info(registry)").all() as Array<{ name: string; pk: number }>;
+  if (cols.length === 0) return false;
+  const pk = cols.filter((c) => c.pk > 0).map((c) => c.name).sort();
+  if (pk.length === 2 && pk[0] === "agent_id" && pk[1] === "chain") return true;
+  db.transaction(() => { db.exec(REGISTRY_CHAIN_KEY_REBUILD); })();
+  return true;
 }
 
 const INBOX_V4_BACKFILL_SQL =
@@ -1316,21 +1352,35 @@ export function searchKnowledge(
   limit: number = 100,
 ): KnowledgeStoreRow[] {
   const now = new Date().toISOString();
-  const like = `%${query}%`;
+  const like = likeContains(query);
   if (category) {
     const rows = db
       .prepare(
-        "SELECT * FROM knowledge_store WHERE category = ? AND (key LIKE ? OR content LIKE ?) AND (expires_at IS NULL OR expires_at >= ?) ORDER BY confidence DESC, last_verified DESC LIMIT ?",
+        `SELECT * FROM knowledge_store WHERE category = ? AND (key LIKE ? ${LIKE_ESCAPE} OR content LIKE ? ${LIKE_ESCAPE}) AND (expires_at IS NULL OR expires_at >= ?) ORDER BY confidence DESC, last_verified DESC LIMIT ?`,
       )
       .all(category, like, like, now, limit) as any[];
     return rows.map(deserializeKnowledgeStoreRow);
   }
   const rows = db
     .prepare(
-      "SELECT * FROM knowledge_store WHERE (key LIKE ? OR content LIKE ?) AND (expires_at IS NULL OR expires_at >= ?) ORDER BY confidence DESC, last_verified DESC LIMIT ?",
+      `SELECT * FROM knowledge_store WHERE (key LIKE ? ${LIKE_ESCAPE} OR content LIKE ? ${LIKE_ESCAPE}) AND (expires_at IS NULL OR expires_at >= ?) ORDER BY confidence DESC, last_verified DESC LIMIT ?`,
     )
     .all(like, like, now, limit) as any[];
   return rows.map(deserializeKnowledgeStoreRow);
+}
+
+/** The entry with exactly this category and key, expired or not. */
+export function getKnowledgeByKey(
+  db: DatabaseType,
+  category: string,
+  key: string,
+): KnowledgeStoreRow | undefined {
+  const row = db
+    .prepare(
+      "SELECT * FROM knowledge_store WHERE category = ? AND key = ? ORDER BY confidence DESC, last_verified DESC LIMIT 1",
+    )
+    .get(category, key) as any | undefined;
+  return row ? deserializeKnowledgeStoreRow(row) : undefined;
 }
 
 export function updateKnowledge(
@@ -1535,9 +1585,57 @@ export function getUnconsumedWakeEvents(db: DatabaseType): WakeEventRow[] {
 
 export function pruneStaleKV(db: DatabaseType, prefix: string, retentionDays: number): number {
   const result = db.prepare(
-    `DELETE FROM kv WHERE key LIKE ? AND updated_at < datetime('now', ?)`,
-  ).run(`${prefix}%`, `-${retentionDays} days`);
+    `DELETE FROM kv WHERE key LIKE ? ${LIKE_ESCAPE} AND julianday(updated_at) < julianday('now', ?)`,
+  ).run(likePrefix(prefix), `-${retentionDays} days`);
   return result.changes;
+}
+
+// ─── Retention Helpers (memory_maintenance task) ────────────────
+
+/** Delete wake events consumed more than retentionDays ago. */
+export function pruneConsumedWakeEvents(db: DatabaseType, retentionDays: number): number {
+  return db.prepare(
+    "DELETE FROM wake_events WHERE consumed_at IS NOT NULL AND julianday(consumed_at) < julianday('now', ?)",
+  ).run(`-${retentionDays} days`).changes;
+}
+
+/** Delete heartbeat history rows that started more than retentionDays ago. */
+export function pruneHeartbeatHistory(db: DatabaseType, retentionDays: number): number {
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+  return db.prepare("DELETE FROM heartbeat_history WHERE started_at < ?").run(cutoff).changes;
+}
+
+/**
+ * Never delete inbox rows younger than this. A row's sig_hash blocks a replay
+ * of that message; once the row is gone a replay is delivered again, but as
+ * unverified, because its signed_at is older than the inbound freshness
+ * window (INBOUND_MAX_AGE_MS, 7 days, in social/inbound.ts). Keep this floor
+ * well above that window.
+ */
+export const INBOX_MIN_RETENTION_DAYS = 14;
+
+/**
+ * Delete finished inbox rows (processed, failed, blocked, rate_limited)
+ * received more than retentionDays ago (at least INBOX_MIN_RETENTION_DAYS).
+ * Rows still waiting to be processed are kept.
+ */
+export function pruneOldInboxMessages(db: DatabaseType, retentionDays: number): number {
+  const days = Math.max(INBOX_MIN_RETENTION_DAYS, retentionDays);
+  return db.prepare(
+    `DELETE FROM inbox_messages
+      WHERE status IN ('processed', 'failed', 'blocked', 'rate_limited')
+        AND julianday(received_at) < julianday('now', ?)`,
+  ).run(`-${days} days`).changes;
+}
+
+/** Delete event_stream rows of the given types created more than retentionDays ago. */
+export function pruneEventsByType(db: DatabaseType, types: readonly string[], retentionDays: number): number {
+  if (types.length === 0) return 0;
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+  const placeholders = types.map(() => "?").join(", ");
+  return db.prepare(
+    `DELETE FROM event_stream WHERE type IN (${placeholders}) AND created_at < ?`,
+  ).run(...types, cutoff).changes;
 }
 
 // ─── Dedup Helpers (Phase 1.1) ──────────────────────────────────
@@ -1556,16 +1654,18 @@ export function insertDedupKey(db: DatabaseType, key: string, taskName: string, 
   }
 }
 
+// expires_at is written as ISO-8601 ('...T...Z'), which does not compare as
+// text with datetime('now') ('... '); julianday() reads both.
 export function pruneExpiredDedupKeys(db: DatabaseType): number {
   const result = db.prepare(
-    "DELETE FROM heartbeat_dedup WHERE expires_at < datetime('now')",
+    "DELETE FROM heartbeat_dedup WHERE julianday(expires_at) < julianday('now')",
   ).run();
   return result.changes;
 }
 
 export function isDeduplicated(db: DatabaseType, key: string): boolean {
   const row = db.prepare(
-    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND expires_at >= datetime('now')",
+    "SELECT 1 FROM heartbeat_dedup WHERE dedup_key = ? AND julianday(expires_at) >= julianday('now')",
   ).get(key) as any | undefined;
   return !!row;
 }
@@ -2241,7 +2341,7 @@ export function wmPrune(db: DatabaseType, sessionId: string, maxEntries: number)
 
 export function wmClearExpired(db: DatabaseType): number {
   try {
-    const result = db.prepare("DELETE FROM working_memory WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").run();
+    const result = db.prepare("DELETE FROM working_memory WHERE expires_at IS NOT NULL AND julianday(expires_at) < julianday('now')").run();
     return result.changes;
   } catch (error) { logger.error("wmClearExpired failed", error instanceof Error ? error : undefined); return 0; }
 }
@@ -2267,8 +2367,8 @@ export function episodicGetRecent(db: DatabaseType, sessionId: string, limit: nu
 
 export function episodicSearch(db: DatabaseType, query: string, limit: number = 10): EpisodicMemoryEntry[] {
   try {
-    const escaped = query.replace(/[%_\\]/g, (ch) => `\\${ch}`);
-    const rows = db.prepare("SELECT * FROM episodic_memory WHERE summary LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\' ORDER BY importance DESC, created_at DESC LIMIT ?").all(`%${escaped}%`, `%${escaped}%`, limit) as any[];
+    const pattern = likeContains(query);
+    const rows = db.prepare(`SELECT * FROM episodic_memory WHERE summary LIKE ? ${LIKE_ESCAPE} OR detail LIKE ? ${LIKE_ESCAPE} ORDER BY importance DESC, created_at DESC LIMIT ?`).all(pattern, pattern, limit) as any[];
     return rows.map(deserializeEpisodicRow);
   } catch (error) { logger.error("episodicSearch failed", error instanceof Error ? error : undefined); return []; }
 }
@@ -2335,12 +2435,12 @@ export function semanticGet(db: DatabaseType, category: SemanticCategory, key: s
 
 export function semanticSearch(db: DatabaseType, query: string, category?: SemanticCategory): SemanticMemoryEntry[] {
   try {
-    const escaped = query.replace(/[%_\\]/g, (ch) => `\\${ch}`);
+    const pattern = likeContains(query);
     if (category) {
-      const rows = db.prepare("SELECT * FROM semantic_memory WHERE category = ? AND (key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\') ORDER BY confidence DESC, updated_at DESC").all(category, `%${escaped}%`, `%${escaped}%`) as any[];
+      const rows = db.prepare(`SELECT * FROM semantic_memory WHERE category = ? AND (key LIKE ? ${LIKE_ESCAPE} OR value LIKE ? ${LIKE_ESCAPE}) ORDER BY confidence DESC, updated_at DESC`).all(category, pattern, pattern) as any[];
       return rows.map(deserializeSemanticRow);
     }
-    const rows = db.prepare("SELECT * FROM semantic_memory WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\' ORDER BY confidence DESC, updated_at DESC").all(`%${escaped}%`, `%${escaped}%`) as any[];
+    const rows = db.prepare(`SELECT * FROM semantic_memory WHERE key LIKE ? ${LIKE_ESCAPE} OR value LIKE ? ${LIKE_ESCAPE} ORDER BY confidence DESC, updated_at DESC`).all(pattern, pattern) as any[];
     return rows.map(deserializeSemanticRow);
   } catch (error) { logger.error("semanticSearch failed", error instanceof Error ? error : undefined); return []; }
 }
@@ -2395,8 +2495,8 @@ export function proceduralRecordOutcome(db: DatabaseType, name: string, success:
 
 export function proceduralSearch(db: DatabaseType, query: string): ProceduralMemoryEntry[] {
   try {
-    const escaped = query.replace(/[%_\\]/g, (ch) => `\\${ch}`);
-    const rows = db.prepare("SELECT * FROM procedural_memory WHERE name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' ORDER BY success_count DESC, updated_at DESC").all(`%${escaped}%`, `%${escaped}%`) as any[];
+    const pattern = likeContains(query);
+    const rows = db.prepare(`SELECT * FROM procedural_memory WHERE name LIKE ? ${LIKE_ESCAPE} OR description LIKE ? ${LIKE_ESCAPE} ORDER BY success_count DESC, updated_at DESC`).all(pattern, pattern) as any[];
     return rows.map(deserializeProceduralRow);
   } catch (error) { logger.error("proceduralSearch failed", error instanceof Error ? error : undefined); return []; }
 }
@@ -2922,14 +3022,14 @@ export function agentCacheGet(db: DatabaseType, agentAddress: string): Discovere
 
 export function agentCacheGetValid(db: DatabaseType): DiscoveredAgentCacheRow[] {
   const rows = db
-    .prepare("SELECT * FROM discovered_agents_cache WHERE valid_until IS NULL OR valid_until >= datetime('now')")
+    .prepare("SELECT * FROM discovered_agents_cache WHERE valid_until IS NULL OR julianday(valid_until) >= julianday('now')")
     .all() as any[];
   return rows.map(deserializeAgentCacheRow);
 }
 
 export function agentCachePrune(db: DatabaseType): number {
   const result = db
-    .prepare("DELETE FROM discovered_agents_cache WHERE valid_until IS NOT NULL AND valid_until < datetime('now')")
+    .prepare("DELETE FROM discovered_agents_cache WHERE valid_until IS NOT NULL AND julianday(valid_until) < julianday('now')")
     .run();
   return result.changes;
 }

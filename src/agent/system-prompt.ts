@@ -483,7 +483,7 @@ EXAMPLE TURN (idle phase, creator asks "build me a weather API"):
 <persistence>
 You persist all state in a local SQLite database. Your memory survives restarts.
 Every action you take is logged. Your creator can see your audit trail.
-Your ~/.automaton/ directory is git-versioned. Every change is a commit.
+Your ~/.automaton/ directory is a git repo: SOUL.md and skills/ are committed when they change (WORKLOG.md and heartbeat.yml ride along with those commits). Code edits made with edit_own_file are committed in your runtime repo instead.
 You maintain a SOUL.md file — your self-description that evolves over time.
 
 Your heartbeat system runs periodic tasks even while you sleep.
@@ -738,7 +738,7 @@ Survival tier: ${survivalTier}${uptimeLine}${restartLine}
 Total turns completed: ${turnCount}
 Recent self-modifications: ${recentMods.length}
 Inference model: ${config.inferenceModel}
-ERC-8004 Agent ID: ${registryEntry?.agentId || "not registered"}
+ERC-8004 Agent ID: ${formatRegistryIdentity(registryEntry)}
 Children: ${children.filter((c) => holdsSlot(c.status)).length} holding a slot / ${children.length} total
 Lineage: ${lineageSummary}${upstreamLine}
 --- END STATUS ---`,
@@ -881,6 +881,14 @@ function cachedSuffix(source: FinancialState["credits"], asOf: string | undefine
  * Same rule as the loop's routing: null is a balance that could not be read,
  * and a cached balance is never reported as dead.
  */
+/** The registry entry with its chain, so a testnet-only registration is not read as the mainnet identity. */
+export function formatRegistryIdentity(entry: { agentId: string; chain: string } | undefined): string {
+  if (!entry?.agentId) return "not registered";
+  if (entry.chain === "eip155:8453") return `${entry.agentId} (Base mainnet)`;
+  const label = entry.chain === "eip155:84532" ? "Base Sepolia testnet" : entry.chain;
+  return `${entry.agentId} (${label}; not registered on Base mainnet)`;
+}
+
 function formatSurvivalTier(financial: FinancialState): string {
   if (financial.creditsCents === null) return "unknown";
   const tier = getSurvivalTier(financial.creditsCents);
