@@ -1,9 +1,9 @@
 #!/bin/sh
-# Conway Automaton Installer
-# curl -fsSL https://conway.tech/automaton.sh | sh
+# Automaton Installer
+# curl -fsSL https://raw.githubusercontent.com/FederalVia/Garry/main/scripts/automaton.sh | sh
 set -e
 
-REPO="https://github.com/Conway-Research/automaton.git"
+REPO="https://github.com/FederalVia/Garry.git"
 
 # Determine install directory
 if [ -n "$AUTOMATON_DIR" ]; then

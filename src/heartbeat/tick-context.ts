@@ -17,6 +17,7 @@ import type {
 import { getSurvivalTier } from "../conway/credits.js";
 import { readCredits, readUsdc, usdcNetworkFor, type BalanceRead } from "../conway/balance.js";
 import { createLogger } from "../observability/logger.js";
+import type { SurvivalSource } from "../providers/survival-source.js";
 
 type DatabaseType = BetterSqlite3.Database;
 const logger = createLogger("heartbeat.tick");
@@ -48,27 +49,45 @@ function generateTickId(): string {
  *   keeps the last known tier (else low_compute), never critical or dead
  * - Reads lowComputeMultiplier from config
  */
+export interface TickContextOptions {
+  /** Where the tier comes from. Default: the Conway credit balance. */
+  survival?: SurvivalSource;
+  /** Read the wallet's USDC balance (a chain RPC call). Default true. */
+  readUsdc?: boolean;
+}
+
 export async function buildTickContext(
   db: DatabaseType,
   conway: ConwayClient,
   config: HeartbeatConfig,
   walletAddress?: string,
   chainType?: string,
+  opts: TickContextOptions = {},
 ): Promise<TickContext> {
   const tickId = generateTickId();
   const startedAt = new Date();
+  const fixed = opts.survival?.kind === "fixed" ? opts.survival.tier : null;
 
-  const creditRead = await readCredits(conway);
-  const usdcRead: BalanceRead = walletAddress
-    ? await readUsdc(walletAddress, usdcNetworkFor(chainType), chainType as any)
-    : { known: false, reason: "unsupported_network", detail: "no wallet address" };
-  if (walletAddress && !usdcRead.known) {
+  // A fixed tier reads no balance at all.
+  const creditRead: BalanceRead = fixed
+    ? { known: false, reason: "disabled", detail: "fixed survival tier" }
+    : await readCredits(conway);
+  const usdcRead: BalanceRead =
+    opts.readUsdc === false
+      ? { known: false, reason: "disabled", detail: "payments are off" }
+      : walletAddress
+        ? await readUsdc(walletAddress, usdcNetworkFor(chainType), chainType as any)
+        : { known: false, reason: "unsupported_network", detail: "no wallet address" };
+  if (walletAddress && opts.readUsdc !== false && !usdcRead.known) {
     logger.warn(`USDC balance unavailable (${usdcRead.reason}): ${usdcRead.detail}`);
   }
 
   let survivalTier: SurvivalTier;
   let survivalTierKnown: boolean;
-  if (creditRead.known) {
+  if (fixed) {
+    survivalTier = fixed;
+    survivalTierKnown = true;
+  } else if (creditRead.known) {
     survivalTier = getSurvivalTier(creditRead.value);
     survivalTierKnown = true;
     kvSet(db, LAST_KNOWN_TIER_KEY, survivalTier);

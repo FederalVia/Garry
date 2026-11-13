@@ -5,7 +5,8 @@
  * with only genesis.json gets its config built non-interactively. Through
  * the real entrypoint (network stubbed): startup recovers stranded inbox
  * claims, and SIGTERM mid-turn lets the running tool finish, skips the rest
- * and exits 0.
+ * and exits 0. Every config written here gets a wallet.json first: --run
+ * never creates an identity.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -22,6 +23,17 @@ const REPO = path.resolve(__dirname, "../..");
 const ENTRY = path.join(REPO, "src/index.ts");
 const CREATOR = "0x" + "1".repeat(40);
 const PARENT = "0x" + "3".repeat(40);
+const TEST_PRIVATE_KEY = "0x" + "ab".repeat(32);
+
+/** --run loads wallet.json and never creates one, so tests write it first. */
+function writeTestWallet(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(dir, "wallet.json"),
+    JSON.stringify({ chainType: "evm", privateKey: TEST_PRIVATE_KEY, createdAt: "2026-01-01T00:00:00.000Z" }),
+    { mode: 0o600 },
+  );
+}
 
 function runEntrypoint(home: string): Promise<{ code: number | null; output: string }> {
   return new Promise((resolve, reject) => {
@@ -76,6 +88,7 @@ describe("--run startup", () => {
   it("refuses a second instance on the same state database, naming the holder's pid", { timeout: 60_000 }, async () => {
     const dir = path.join(home, ".automaton");
     fs.mkdirSync(dir, { mode: 0o700 });
+    writeTestWallet(dir);
     fs.writeFileSync(
       path.join(dir, "automaton.json"),
       JSON.stringify({
@@ -157,6 +170,7 @@ async function waitUntil(cond: () => boolean, ms: number, what: string, run: Run
 function writeRunConfig(home: string): string {
   const dir = path.join(home, ".automaton");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeTestWallet(dir);
   fs.writeFileSync(
     path.join(dir, "automaton.json"),
     JSON.stringify({

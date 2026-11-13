@@ -5,8 +5,8 @@
  * wallet (EVM or Solana), through the runtime social client: HTTPS relay (or
  * loopback HTTP), validated addresses and size, recipient case kept for
  * Solana. The relay is socialRelayUrl from automaton.json, else
- * SOCIAL_RELAY_URL, else the agent's own default (Conway's relay until
- * standalone mode makes it off). An empty socialRelayUrl means off.
+ * SOCIAL_RELAY_URL, else the agent's own default (Conway's relay in Conway
+ * mode; none in standalone). An empty socialRelayUrl means off.
  */
 
 import { formatSendResult, loadRelayTarget, sendOperatorMessage } from "@conway/automaton/operator/send.js";

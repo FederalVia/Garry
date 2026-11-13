@@ -11,6 +11,7 @@ import type { ConwayClient } from "../types.js";
 import type { ChainType } from "../identity/chain.js";
 import { CircuitOpenError } from "./http-client.js";
 import { getUsdcBalance } from "./x402.js";
+import { isFeatureDisabledError } from "../providers/features.js";
 
 export type BalanceUnknownReason =
   | "http_error"
@@ -19,7 +20,9 @@ export type BalanceUnknownReason =
   | "malformed_response"
   | "rpc_error"
   | "unsupported_network"
-  | "timeout";
+  | "timeout"
+  /** Not read on purpose: standalone mode, or a tier fixed by the creator. */
+  | "disabled";
 
 /** value: cents for credits, USDC (decimal) for usdc. */
 export type BalanceRead =
@@ -39,6 +42,7 @@ export class BalanceUnavailableError extends Error {
 
 export function classifyBalanceError(err: unknown): BalanceUnknownReason {
   if (err instanceof BalanceUnavailableError) return err.reason;
+  if (isFeatureDisabledError(err)) return "disabled";
   if (err instanceof CircuitOpenError) return "circuit_open";
   const e = err as { name?: unknown; status?: unknown } | null;
   if (e && (e.name === "AbortError" || e.name === "TimeoutError")) return "timeout";

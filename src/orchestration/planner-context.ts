@@ -7,6 +7,8 @@ import type { AgentWorkspace } from "./workspace.js";
 import { getActiveGoals } from "../state/database.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { getInstalledInferenceGate } from "../inference/gate.js";
+import { currentRuntime } from "../providers/mode.js";
+import type { PlannerDailyBudget } from "./planner.js";
 
 export interface PlannerContextOptions {
   db: Database;
@@ -44,8 +46,9 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
   return {
     creditsCents,
     usdcBalance,
-    // An unread balance is unknown to the planner, never a phantom zero.
-    survivalTier: creditsCents === null ? "unknown" : getSurvivalTier(creditsCents),
+    // An unread balance is never a phantom zero: it is unknown, unless the
+    // creator fixed the tier (no balance is tracked at all).
+    survivalTier: creditsCents === null ? fixedTierOrUnknown() : getSurvivalTier(creditsCents),
     availableRoles: normalizeStringList(options.availableRoles, [...DEFAULT_PLANNER_AVAILABLE_ROLES]),
     customRoles: normalizeStringList(options.customRoles, []),
     activeGoals: getActiveGoals(options.db).map((goal) => ({
@@ -60,7 +63,25 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
     busyAgents: clampCount(options.busyAgents),
     maxAgents: Math.max(1, clampCount(options.maxAgents, 1)),
     workspaceFiles: listWorkspaceFiles(options.workspace),
+    ...(currentRuntime()?.mode === "standalone" ? { dailyBudget: standaloneDailyBudget() } : {}),
   };
+}
+
+/** Standalone: the gate's daily cap and rolling 24h spend, the colony's whole budget. */
+function standaloneDailyBudget(): PlannerDailyBudget | undefined {
+  const gate = getInstalledInferenceGate();
+  if (!gate) return undefined;
+  try {
+    const u = gate.usage();
+    return {
+      capCents: u.caps.dailyCents,
+      spentCents: Math.round(u.last24h.cappedCents),
+      remainingCents: Math.floor(u.remaining.dailyCents),
+      orchestrationSharePct: u.caps.orchestrationSharePct,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function persistPlannerArtifacts(params: {
@@ -232,4 +253,8 @@ function clampCount(value: number | undefined, fallback = 0): number {
   }
 
   return Math.max(0, Math.floor(value));
+}
+
+function fixedTierOrUnknown(): string {
+  return getInstalledInferenceGate()?.fixedSurvivalTier?.() ?? "unknown";
 }

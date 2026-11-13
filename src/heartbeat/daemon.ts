@@ -24,7 +24,7 @@ import type {
   SocialClientInterface,
 } from "../types.js";
 import { BUILTIN_TASKS } from "./tasks.js";
-import { DurableScheduler } from "./scheduler.js";
+import { DurableScheduler, tickOptionsFor } from "./scheduler.js";
 import { seedHeartbeatSchedule } from "./schedule-store.js";
 import type BetterSqlite3 from "better-sqlite3";
 import { createLogger } from "../observability/logger.js";
@@ -146,7 +146,14 @@ export function createHeartbeatDaemon(
 
   const forceRun = async (taskName: string): Promise<void> => {
     const context = await import("./tick-context.js").then((m) =>
-      m.buildTickContext(rawDb, conway, heartbeatConfig, identity.address, identity.chainType),
+      m.buildTickContext(
+        rawDb,
+        conway,
+        heartbeatConfig,
+        identity.address,
+        identity.chainType,
+        tickOptionsFor(legacyContext),
+      ),
     );
     await scheduler.executeTask(taskName, context);
   };

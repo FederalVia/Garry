@@ -393,6 +393,18 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "heartbeat/tasks",
   // Balance snapshot the heartbeat's topup and survival decisions read.
   "heartbeat/tick-context",
+  // Decides which heartbeat tasks run in each mode.
+  "heartbeat/scheduler",
+  // Wires survival tier and chain-read options into the scheduler.
+  "heartbeat/daemon",
+  // Reports the survival tier to the planner.
+  "orchestration/planner-context",
+  // Operator commands refuse while an agent runs; --configure is the only
+  // in-tool way to leave standalone mode (and its daily cap ceiling).
+  "setup/operator-command",
+  "setup/configure",
+  // Writes providers.mode "standalone" for a keyless install (the sticky cap ceiling).
+  "setup/wizard",
   // The operator CLI signs and moves the operator's money.
   "packages/cli/src/commands/fund",
   "packages/cli/src/commands/send",
@@ -423,6 +435,8 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "replication",
   "survival",
   "operator",
+  // Runtime mode, survival source, the daily cap ceiling and tool visibility.
+  "providers",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
 // packages/ holds the workspace packages the root build compiles after the
@@ -599,8 +613,18 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "conway/transfer-status",
   "registry/erc8004",
   "heartbeat/tick-context",
+  "heartbeat/scheduler",
+  // Wires survival tier and chain-read options into the scheduler.
+  "heartbeat/daemon",
+  // Runtime mode, the daily cap ceiling, survival source and tool visibility.
+  "providers/mode",
+  "providers/standalone-client",
+  "providers/survival-source",
+  "providers/features",
+  "providers/model-defaults",
   "operator/fund",
   "operator/send",
+  "setup/operator-command",
   "orchestration/simple-tracker",
   "social/inbound",
   "social/signing",

@@ -6,7 +6,8 @@
  */
 
 import type BetterSqlite3 from "better-sqlite3";
-import type { ModelEntry, ModelRegistryRow } from "../types.js";
+import type { ConfiguredModel, ModelEntry, ModelRegistryRow } from "../types.js";
+import { ANTHROPIC_SEED_MODELS } from "../providers/model-defaults.js";
 import { STATIC_MODEL_BASELINE } from "./types.js";
 import {
   modelRegistryUpsert,
@@ -81,6 +82,61 @@ export class ModelRegistry {
       if (origin === "baseline") {
         modelRegistrySetEnabled(this.db, existing.modelId, false);
       }
+    }
+  }
+
+  /**
+   * Seed the models a provider's own key can serve (Anthropic). Rows are
+   * 'manual' origin, so initialize() never disables them, and enabled, which
+   * also re-enables retired baseline rows of an old database.
+   */
+  seedProviderModels(providers: readonly "anthropic"[]): void {
+    if (!providers.includes("anthropic")) return;
+    const now = new Date().toISOString();
+    for (const seed of ANTHROPIC_SEED_MODELS) {
+      const existing = modelRegistryGet(this.db, seed.modelId);
+      modelRegistryUpsert(
+        this.db,
+        { ...seed, enabled: true, createdAt: existing?.createdAt || now, updatedAt: now },
+        "manual",
+      );
+    }
+  }
+
+  /**
+   * Upsert the models listed for an OpenAI-compatible endpoint
+   * (providers.openai.models) as provider "openai", priced from the config.
+   * An unpriced row stays unpriced: the router skips it, since its spend
+   * cannot be capped.
+   */
+  upsertConfiguredModels(models: readonly ConfiguredModel[]): void {
+    const now = new Date().toISOString();
+    for (const m of models) {
+      const id = typeof m?.id === "string" ? m.id.trim() : "";
+      if (!id) continue;
+      const existing = modelRegistryGet(this.db, id);
+      const price = (usdPerM: unknown) =>
+        typeof usdPerM === "number" && Number.isFinite(usdPerM) && usdPerM >= 0 ? usdPerM * 10 : 0;
+      modelRegistryUpsert(
+        this.db,
+        {
+          modelId: id,
+          provider: "openai",
+          displayName: id,
+          tierMinimum: m.tierMinimum ?? "normal",
+          costPer1kInput: price(m.inputUsdPerM),
+          costPer1kOutput: price(m.outputUsdPerM),
+          maxTokens: existing?.maxTokens ?? 4096,
+          contextWindow: existing?.contextWindow ?? 128000,
+          supportsTools: true,
+          supportsVision: false,
+          parameterStyle: "max_tokens",
+          enabled: true,
+          createdAt: existing?.createdAt || now,
+          updatedAt: now,
+        },
+        "manual",
+      );
     }
   }
 

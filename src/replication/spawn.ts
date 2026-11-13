@@ -26,6 +26,7 @@ import { ulid } from "ulid";
 import { propagateConstitution } from "./constitution.js";
 import { INSTALL_AND_BUILD } from "../self-mod/install.js";
 import { createConfig } from "../config.js";
+import { isLocalSandboxId } from "../conway/client.js";
 
 /** Valid Conway sandbox pricing tiers. */
 const SANDBOX_TIERS = [
@@ -69,7 +70,7 @@ export interface SpawnLimits {
 }
 
 /** Where a child's runtime comes from unless the operator configures one. */
-export const DEFAULT_CHILD_RUNTIME_REPO = "https://github.com/Conway-Research/automaton.git";
+export const DEFAULT_CHILD_RUNTIME_REPO = "https://github.com/FederalVia/Garry.git";
 
 /** Present in a child checkout that builds automaton.json from genesis.json itself. */
 export const CHILD_GENESIS_BOOTSTRAP = "/root/automaton/dist/setup/genesis-bootstrap.js";
@@ -265,6 +266,7 @@ export async function spawnChild(
         diskGb: tier.diskGb,
       });
     }
+    assertChildSandboxId(sandbox.id);
     sandboxId = sandbox.id;
 
     // Create a scoped client so all exec/writeFile calls target the CHILD sandbox
@@ -451,6 +453,7 @@ async function spawnChildLegacy(
       memoryMb: legacyTier.memoryMb,
       diskGb: legacyTier.diskGb,
     });
+    assertChildSandboxId(sandbox.id);
     sandboxId = sandbox.id;
 
     // Create a scoped client so all exec/writeFile calls target the CHILD sandbox
@@ -537,6 +540,13 @@ async function spawnChildLegacy(
   }
 }
 
+/** An empty child sandbox id would make every setup step run on this machine. */
+function assertChildSandboxId(id: string | undefined): void {
+  if (isLocalSandboxId(id)) {
+    throw new Error("sandbox create returned no id; refusing to run child setup on this machine");
+  }
+}
+
 /**
  * Find a reusable sandbox: one whose DB child is 'failed', that is still
  * running remotely, that no slot-holding child uses, and in which no agent
@@ -549,8 +559,13 @@ async function findReusableSandbox(
 ): Promise<{ id: string } | null> {
   try {
     const children = db.getChildren();
-    const inUse = new Set(children.filter((c) => holdsSlot(c.status) && c.sandboxId).map((c) => c.sandboxId));
-    const failedChildren = children.filter((c) => c.status === "failed" && c.sandboxId && !inUse.has(c.sandboxId));
+    const inUse = new Set(
+      children.filter((c) => holdsSlot(c.status) && !isLocalSandboxId(c.sandboxId)).map((c) => c.sandboxId),
+    );
+    // A local-looking id ("", "undefined", "null") is never a sandbox to reuse.
+    const failedChildren = children.filter(
+      (c) => c.status === "failed" && !isLocalSandboxId(c.sandboxId) && !inUse.has(c.sandboxId),
+    );
     if (failedChildren.length === 0) return null;
 
     const remoteSandboxes = await conway.listSandboxes();

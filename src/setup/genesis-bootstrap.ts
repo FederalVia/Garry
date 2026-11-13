@@ -117,10 +117,11 @@ export async function bootstrapConfigFromGenesis(
   if (!fs.existsSync(path.join(dir, "heartbeat.yml"))) writeDefaultHeartbeatConfig(path.join(dir, "heartbeat.yml"));
   writeIfMissing(
     path.join(dir, "SOUL.md"),
-    generateSoulMd(genesis.name, chainIdentity.address, genesis.creatorAddress, genesis.genesisPrompt),
+    generateSoulMd(genesis.name, chainIdentity.address, genesis.creatorAddress, genesis.genesisPrompt, { conway: true }),
   );
+  // Children always run on Conway for now: only a Conway-mode parent spawns.
   const skillsDir = path.join(dir, "skills");
-  if (!fs.existsSync(skillsDir)) installDefaultSkills(skillsDir);
+  if (!fs.existsSync(skillsDir)) installDefaultSkills(skillsDir, { conway: true });
 
   return config;
 }

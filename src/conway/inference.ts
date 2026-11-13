@@ -39,20 +39,39 @@ interface InferenceClientOptions {
   openaiApiKey?: string;
   anthropicApiKey?: string;
   ollamaBaseUrl?: string;
+  /** OpenAI-compatible base URL including /v1. Default https://api.openai.com/v1. */
+  openaiBaseUrl?: string;
+  /**
+   * Models the operator listed for a custom OpenAI-compatible base URL; with
+   * a custom URL and a list, only these are served there.
+   */
+  openaiModels?: string[];
+  /**
+   * Whether Conway serves what no other backend can (Conway mode, default).
+   * When false, such a model has no backend: the call is refused before any
+   * I/O and canServe says no.
+   */
+  conwayFallback?: boolean;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
 }
 
-type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama";
+type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama" | "none";
+
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 export function createInferenceClient(
   options: InferenceClientOptions,
 ): InferenceClient {
   const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider } = options;
+  const conwayFallback = options.conwayFallback !== false;
+  const openaiBaseUrl = (options.openaiBaseUrl || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, "");
+  const customOpenAi = openaiBaseUrl !== DEFAULT_OPENAI_BASE_URL;
+  const openaiModels = options.openaiModels && options.openaiModels.length > 0 ? new Set(options.openaiModels) : null;
   const httpClient = new ResilientHttpClient({
     baseTimeout: INFERENCE_TIMEOUT_MS,
     retryableStatuses: [429, 500, 502, 503, 504],
-    allowHttpOnLoopback: isLoopbackHttpUrl(ollamaBaseUrl),
+    allowHttpOnLoopback: isLoopbackHttpUrl(ollamaBaseUrl) || isLoopbackHttpUrl(openaiBaseUrl),
   });
   let currentModel = options.defaultModel;
   let maxTokens = options.maxTokens;
@@ -88,7 +107,17 @@ export function createInferenceClient(
       anthropicApiKey,
       ollamaBaseUrl,
       getModelProvider,
+      conwayFallback,
     });
+
+    if (backend === "none") {
+      // Nothing was sent, so the reservation is released, not held.
+      gate.release(opts.reservationId, "no_provider");
+      throw new InferenceRefusedError("NO_MODEL", `No configured provider can serve model ${model}`, {
+        retryAfterMs: null,
+        budgetClass: budgetClassFor(currentInferenceScope().caller),
+      });
+    }
 
     // Newer models (o-series, gpt-5.x, gpt-4.1) require max_completion_tokens.
     // Ollama always uses max_tokens.
@@ -130,10 +159,10 @@ export function createInferenceClient(
       });
     }
 
-    const openAiLikeApiUrl =
-      backend === "openai" ? "https://api.openai.com" :
-      backend === "ollama" ? (ollamaBaseUrl as string).replace(/\/$/, "") :
-      apiUrl;
+    const endpoint =
+      backend === "openai" ? `${openaiBaseUrl}/chat/completions` :
+      backend === "ollama" ? `${(ollamaBaseUrl as string).replace(/\/$/, "")}/v1/chat/completions` :
+      `${apiUrl}/v1/chat/completions`;
     const openAiLikeApiKey =
       backend === "openai" ? (openaiApiKey as string) :
       backend === "ollama" ? "ollama" :
@@ -142,7 +171,7 @@ export function createInferenceClient(
     return chatViaOpenAiCompatible({
       model,
       body,
-      apiUrl: openAiLikeApiUrl,
+      endpoint,
       apiKey: openAiLikeApiKey,
       backend,
       httpClient,
@@ -169,14 +198,25 @@ export function createInferenceClient(
   };
 
   /**
-   * Whether some backend can serve the model: Ollama needs its base URL; any
-   * other model goes to its provider's key or, failing that, to Conway.
+   * Whether some backend can serve the model. Conway mode: Ollama needs its
+   * base URL; any other model goes to its provider's key or, failing that,
+   * to Conway. Without the Conway fallback each provider needs its own
+   * credential, and a custom OpenAI-compatible URL serves only the models
+   * listed for it, so the router never picks a model nobody can serve.
    */
   const canServe = (model: { modelId: string; provider: string }): boolean => {
     if (model.provider === "ollama") return !!ollamaBaseUrl;
-    if (model.provider === "anthropic" && anthropicApiKey) return true;
-    if (model.provider === "openai" && openaiApiKey) return true;
-    return !!apiKey;
+    if (conwayFallback) {
+      if (model.provider === "anthropic" && anthropicApiKey) return true;
+      if (model.provider === "openai" && openaiApiKey) return true;
+      return !!apiKey;
+    }
+    if (model.provider === "anthropic") return !!anthropicApiKey;
+    if (model.provider === "openai") {
+      if (!openaiApiKey) return false;
+      return !customOpenAi || !openaiModels || openaiModels.has(model.modelId);
+    }
+    return false;
   };
 
   return {
@@ -214,36 +254,39 @@ function resolveInferenceBackend(
     anthropicApiKey?: string;
     ollamaBaseUrl?: string;
     getModelProvider?: (modelId: string) => string | undefined;
+    conwayFallback?: boolean;
   },
 ): InferenceBackend {
+  const fallback: InferenceBackend = keys.conwayFallback === false ? "none" : "conway";
   // Registry-based routing: most accurate, no name guessing
   if (keys.getModelProvider) {
     const provider = keys.getModelProvider(model);
     if (provider === "ollama" && keys.ollamaBaseUrl) return "ollama";
     if (provider === "anthropic" && keys.anthropicApiKey) return "anthropic";
     if (provider === "openai" && keys.openaiApiKey) return "openai";
-    if (provider === "conway") return "conway";
+    if (provider === "conway") return fallback;
     // provider unknown or key not configured — fall through to heuristics
   }
 
   // Heuristic fallback (model not in registry yet)
   if (keys.anthropicApiKey && /^claude/i.test(model)) return "anthropic";
   if (keys.openaiApiKey && /^(gpt-[3-9]|gpt-4|gpt-5|o[1-9][-\s.]|o[1-9]$|chatgpt)/i.test(model)) return "openai";
-  return "conway";
+  return fallback;
 
 }
 
 async function chatViaOpenAiCompatible(params: {
   model: string;
   body: Record<string, unknown>;
-  apiUrl: string;
+  /** Full chat completions URL. */
+  endpoint: string;
   apiKey: string;
   backend: "conway" | "openai" | "ollama";
   httpClient: ResilientHttpClient;
   signal?: AbortSignal;
 }): Promise<InferenceResponse> {
   // retries: 0 — a billable POST is never resent here; the router owns retries.
-  const resp = await params.httpClient.request(`${params.apiUrl}/v1/chat/completions`, {
+  const resp = await params.httpClient.request(params.endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

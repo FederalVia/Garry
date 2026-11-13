@@ -16,7 +16,9 @@ import type {
   HeartbeatScheduleRow,
   TickContext,
 } from "../types.js";
-import { buildTickContext } from "./tick-context.js";
+import { buildTickContext, type TickContextOptions } from "./tick-context.js";
+import { resolveRuntime } from "../providers/mode.js";
+import { ALL_FEATURES, taskAllowed, type FeatureSet } from "../providers/features.js";
 import {
   getHeartbeatSchedule,
   updateHeartbeatSchedule,
@@ -141,6 +143,7 @@ export class DurableScheduler {
         this.config,
         this.legacyContext.identity.address,
         this.legacyContext.identity.chainType,
+        tickOptionsFor(this.legacyContext),
       );
 
       // Get tasks that are due
@@ -296,6 +299,12 @@ export class DurableScheduler {
       (r) => r.taskName === entryName,
     );
     const { fn: taskFn, taskName: resolvedTask } = this.resolveTask(entryName);
+    // A task for a feature this runtime lacks (standalone mode) is skipped,
+    // not failed; heartbeat.yml keeps the entry.
+    if (taskFn && !taskAllowed(resolvedTask, featuresOf(this.legacyContext))) {
+      logger.debug(`Skipped heartbeat task '${entryName}': feature off in this mode`);
+      return;
+    }
     if (!taskFn) {
       if (!this.warnedMissing.has(entryName)) {
         this.warnedMissing.add(entryName);
@@ -561,4 +570,16 @@ export class DurableScheduler {
       nextRunAt: retryAt,
     });
   }
+}
+
+/** Features of the runtime this context belongs to; a context without a config is Conway. */
+function featuresOf(ctx: HeartbeatLegacyContext): FeatureSet {
+  return ctx.config ? resolveRuntime(ctx.config).features : ALL_FEATURES;
+}
+
+/** Tick options for the runtime: a fixed tier reads no balance; payments off reads no USDC. */
+export function tickOptionsFor(ctx: HeartbeatLegacyContext): TickContextOptions {
+  if (!ctx.config) return {};
+  const runtime = resolveRuntime(ctx.config);
+  return { survival: runtime.survival, readUsdc: runtime.payments };
 }

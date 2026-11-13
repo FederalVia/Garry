@@ -7,8 +7,8 @@
  * stops accidental damage and copy-pasted injection one-liners: it denies a
  * command that names a secret (whatever the verb), globs hidden home paths,
  * dumps the environment, kills the runtime, reads the whole home or root
- * tree recursively, or writes to guard files (by shell verb, inline
- * interpreter or git). exec runs as the same OS user that owns the wallet,
+ * tree recursively, runs the automaton's own operator commands, or writes
+ * to guard files (by shell verb, inline interpreter or git). exec runs as the same OS user that owns the wallet,
  * so a script written to disk and run, string building, a `cd` in an earlier
  * exec call, `patch` from a file, a short glob or a background job get past
  * any pattern list. Confidentiality of the wallet, integrity of guard code and
@@ -607,6 +607,20 @@ const OPERATOR_CLI = /(?:^|[\s;|&(\/=])(?:@conway\/)?automaton-cli(?=$|[\s;|&)@]
 // and send (USDC, signed with the wallet). Both run outside the Treasury.
 const OPERATOR_MONEY_SUBCOMMAND = /(?:^|[\s;|&(])(?:fund|send)(?=$|[\s;|&)])/;
 
+// The automaton's own setup flags rewrite automaton.json (keys, mode) in a
+// new process the runtime's in-process fences never see. The operator CLI
+// (automaton-cli) rewrites no config; its money commands are matched below.
+const OPERATOR_FLAGS = new Set(["--provision", "--setup", "--configure", "--pick-model"]);
+const AUTOMATON_ENTRY = /(?:^|\/)(?:automaton|conway-automaton|index\.[cm]?[jt]s)$|(?:^|\/)(?:node|nodejs|tsx|bun|npx|pnpm|npm|yarn)$/;
+
+function operatorSetupFlagMatch(command: string): string | null {
+  for (const words of splitSegments(normalizeCommand(command))) {
+    const flag = words.find((w) => OPERATOR_FLAGS.has(w.split("=")[0]));
+    if (flag && words.some((w) => AUTOMATON_ENTRY.test(w))) return flag;
+  }
+  return null;
+}
+
 // git verbs that rewrite working-tree files.
 const GIT_REWRITE = /(?:^|[\s;|&(])git(?:\s+-\S+(?:\s+[^\s-]\S*)?)*?\s+(?:checkout|restore|apply|am|cherry-pick|revert|reset|stash)\b/;
 
@@ -644,6 +658,10 @@ function tripwireMatch(command: string): { description: string; pattern: string 
   }
   const selfKill = selfKillMatch(command);
   if (selfKill) return { description: "Kills the runtime process", pattern: selfKill };
+  const operator = operatorSetupFlagMatch(command);
+  if (operator) {
+    return { description: `Runs the automaton's operator command (${operator})`, pattern: operator };
+  }
   const reader = recursiveHomeReadMatch(command);
   if (reader) {
     return { description: "Recursive read of the home or root directory", pattern: reader };

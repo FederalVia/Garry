@@ -472,15 +472,31 @@ describe("operator send", () => {
     });
 
     it("without the variable it uses the same relay the agent would (the runtime default)", async () => {
-      writeConfig(base);
       const { loadRelayTarget } = await import("../operator/send.js");
       const { DEFAULT_CONFIG } = await import("../types.js");
+      const { loadConfig } = await import("../config.js");
+      const { resolveRuntime } = await import("../providers/mode.js");
+      // Conway mode: Conway's relay, as before.
+      writeConfig({ ...base, conwayApiKey: "cnwy_k_test" });
+      expect(resolveRuntime(loadConfig()!).relayUrl).toBe(DEFAULT_CONFIG.socialRelayUrl);
+      expect(loadRelayTarget({})).toMatchObject({ ok: true, relayUrl: DEFAULT_CONFIG.socialRelayUrl });
+      // Standalone: the agent's relay is off, so the CLI has none either.
+      writeConfig(base);
+      expect(resolveRuntime(loadConfig()!).relayUrl).toBe("");
       const r = loadRelayTarget({});
-      if (DEFAULT_CONFIG.socialRelayUrl) {
-        expect(r).toMatchObject({ ok: true, relayUrl: DEFAULT_CONFIG.socialRelayUrl });
-      } else {
-        expect(r.ok).toBe(false);
-      }
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/No relay configured/);
+      // An old save of Conway's URL counts as unset in standalone, not as the file's own "".
+      writeConfig({ ...base, socialRelayUrl: "https://social.conway.tech" });
+      const old = loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" });
+      expect(old).toMatchObject({ ok: true, relayUrl: "http://127.0.0.1:8787" });
+      // providers.relayUrl is the operator's own choice: it wins over the variable.
+      writeConfig({ ...base, providers: { relayUrl: "https://social.conway.tech" } });
+      expect(loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" })).toMatchObject({
+        ok: true,
+        relayUrl: "https://social.conway.tech",
+        options: { conwayCompat: true },
+      });
     });
 
     it("a socialRelayUrl written in automaton.json wins over the variable, and \"\" is off", async () => {

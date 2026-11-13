@@ -9,9 +9,9 @@
 
 import fs from "fs";
 import path from "path";
-import { getWallet, getAutomatonDir } from "./identity/wallet.js";
-import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
-import { loadConfig, resolvePath, getConfigPath, ConfigError } from "./config.js";
+import { getWallet, getAutomatonDir, loadWallet, WalletMissingError, WalletCorruptError } from "./identity/wallet.js";
+import { provision } from "./identity/provision.js";
+import { loadConfig, resolvePath, getConfigPath, ConfigError, pinStandaloneModeInFile } from "./config.js";
 import { RESTART_REQUIRED_KEY, getRestartRequired } from "./self-mod/restart-notice.js";
 import { createDatabase, recoverStrandedInboxClaims } from "./state/database.js";
 import { createConwayClient, createCreditBalanceReader } from "./conway/client.js";
@@ -61,6 +61,17 @@ import { getSurvivalTier } from "./conway/credits.js";
 import { resolveInferencePolicy, registryPrice, checkPolicySanity } from "./inference/policy.js";
 import { DEFAULT_ROUTING_MATRIX } from "./inference/types.js";
 import { protectRuntimeFile } from "./security/protected-paths.js";
+import {
+  resolveRuntime,
+  describeRuntime,
+  hasOwnAiProvider,
+  installRuntime,
+  clampForMode,
+  openaiBaseUrl,
+  configuredOpenAiModelIds,
+} from "./providers/mode.js";
+import { createStandaloneClient } from "./providers/standalone-client.js";
+import { BalanceUnavailableError } from "./conway/balance.js";
 import { holdsSlot } from "./replication/child-status.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
@@ -96,10 +107,21 @@ Usage:
   automaton --help         Show this help
 
 Environment:
-  CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
-  CONWAY_API_KEY           Conway API key (overrides config)
+  CONWAY_API_URL           Conway API URL (overrides config; default: https://api.conway.tech)
+  CONWAY_API_KEY           Conway API key (overrides config; selects Conway mode)
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
+  OPENAI_API_KEY           OpenAI key when automaton.json has none: main loop in standalone mode only,
+                           planner and workers in both modes
+  OPENAI_BASE_URL          Base URL for the planner and workers' OpenAI calls (not used with
+                           providers.openai.baseUrl or when Ollama models were discovered)
   AUTOMATON_SHUTDOWN_GRACE_MS  Time a stop may take before exit is forced (default 30000)
+
+Providers (automaton.json "providers" block, all optional):
+  mode: "standalone" | "conway" (default: conway with a Conway key, else standalone);
+  openai {apiKey, baseUrl, models}, anthropic {apiKey}, ollama {baseUrl}, conway {apiKey, apiUrl};
+  survival {fixedTier}, dailyCapCeilingCents (standalone, default 200), payments (default false),
+  relayUrl (standalone: the only way to use Conway's relay). Only an explicit mode change leaves
+  standalone; a new Conway key does not.
 `);
     process.exit(0);
   }
@@ -125,10 +147,43 @@ Environment:
     process.exit(0);
   }
 
+  // Operator commands that write automaton.json; never while an agent runs.
+  const operatorCommand = (["--provision", "--setup", "--pick-model", "--configure"] as const).find((f) =>
+    args.includes(f),
+  );
+  if (operatorCommand) {
+    const { operatorCommandRefusal } = await import("./setup/operator-command.js");
+    // --provision also runs unattended inside a new child's sandbox.
+    const refusal = operatorCommandRefusal(operatorCommand, { interactive: operatorCommand !== "--provision" });
+    if (refusal) {
+      logger.error(refusal);
+      process.exit(1);
+    }
+  }
+
   if (args.includes("--provision")) {
     try {
-      const result = await provision();
+      // The host the runtime will use (CONWAY_API_URL, then automaton.json).
+      let apiUrl: string | undefined;
+      try {
+        apiUrl = loadConfig()?.conwayApiUrl;
+      } catch {
+        apiUrl = undefined;
+      }
+      const result = await provision(apiUrl);
       logger.info(JSON.stringify(result));
+      let explicitStandalone = false;
+      try {
+        explicitStandalone = loadConfig()?.providers?.mode === "standalone";
+      } catch {
+        explicitStandalone = false;
+      }
+      if (explicitStandalone) {
+        logger.warn(
+          'providers.mode is "standalone" in automaton.json: the new Conway key is stored but not used. ' +
+            "Remove providers.mode (or set it to \"conway\") to run on Conway.",
+        );
+      }
     } catch (err: any) {
       logger.error(`Provision failed: ${err.message}`);
       process.exit(1);
@@ -257,21 +312,40 @@ async function loadRunConfig(): Promise<AutomatonConfig> {
   const genesisFile = genesisPath();
   if (pathExists(genesisFile)) {
     logger.info(`[${new Date().toISOString()}] No automaton.json; building it from genesis.json.`);
+    let built: AutomatonConfig;
     try {
-      return await bootstrapConfigFromGenesis();
+      built = await bootstrapConfigFromGenesis();
     } catch (err: any) {
       fail(`Could not build automaton.json from ${genesisFile}: ${err?.message || String(err)}`);
     }
+    return reloadAfterSetup(built);
   }
 
   if (process.stdin.isTTY && process.stdout.isTTY) {
     const { runSetupWizard } = await import("./setup/wizard.js");
-    return await runSetupWizard();
+    return reloadAfterSetup(await runSetupWizard());
   }
   fail(
     "No automaton.json and no terminal for the setup wizard. " +
       "Run `automaton --setup` in a terminal, or provide genesis.json.",
   );
+}
+
+/**
+ * The first session sees the config every restart will see: the one just
+ * written, merged with defaults and mode defaults by loadConfig.
+ */
+function reloadAfterSetup(written: AutomatonConfig): AutomatonConfig {
+  try {
+    return loadConfig() ?? written;
+  } catch (err: any) {
+    fail(`automaton.json cannot be read after setup: ${err?.message || String(err)}`);
+  }
+}
+
+/** Addresses compare case-insensitively on EVM; base58 (Solana) case is significant. */
+function sameAddress(a: string, b: string, chainType: string): boolean {
+  return chainType === "solana" ? a.trim() === b.trim() : a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 async function run(): Promise<void> {
@@ -280,14 +354,93 @@ async function run(): Promise<void> {
   const config = await loadRunConfig();
   setGlobalLogLevel(parseLogLevel(config.logLevel) ?? "info");
 
-  // Load wallet (chain-aware)
-  const { account, chainIdentity, chainType: walletChainType } = await getWallet();
-  const resolvedChainType = config.chainType || walletChainType || "evm";
-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
-    process.exit(1);
+  // ─── Mode: one line, before anything else starts ───
+  const runtime = resolveRuntime(config);
+  logger.info(describeRuntime(runtime, describeRelay(config)));
+  if (runtime.mode === "conway" && !config.conwayApiKey) {
+    fail(
+      'No Conway API key found. Run: automaton --provision, or set providers.mode to "standalone" ' +
+        "with your own AI provider.",
+    );
   }
+  if (runtime.mode === "standalone" && !hasOwnAiProvider(runtime)) {
+    fail(
+      "No AI provider configured. Set providers.openai.apiKey (optionally providers.openai.baseUrl for any " +
+        "OpenAI-compatible server), providers.anthropic.apiKey, providers.ollama.baseUrl, or a Conway key " +
+        "(automaton --provision).",
+    );
+  }
+  // Checked before the database: an empty identity field would otherwise
+  // surface as an opaque SQLite constraint error.
+  for (const [field, value] of [
+    ["name", config.name],
+    ["creatorAddress", config.creatorAddress],
+  ] as const) {
+    if (typeof value !== "string" || value.trim() === "") {
+      fail(
+        `automaton.json has no ${field}. Add "${field}" to ${getConfigPath()} ` +
+          "(automaton --setup writes it), then start again.",
+      );
+    }
+  }
+  if (runtime.mode === "standalone" && config.sandboxId) {
+    logger.warn(`sandboxId "${config.sandboxId}" is ignored in standalone mode; running on this machine.`);
+    config.sandboxId = "";
+  }
+
+  // ─── Identity: the wallet is the authority; it is never created here ───
+  let wallet: ReturnType<typeof loadWallet>;
+  try {
+    wallet = loadWallet();
+  } catch (err: any) {
+    if (err instanceof WalletMissingError) {
+      fail(
+        config.walletAddress
+          ? `wallet.json is missing but automaton.json records address ${config.walletAddress}; ` +
+              "restore wallet.json from backup. A new identity is never created here " +
+              "(automaton --init creates one on purpose)."
+          : `wallet.json is missing (${err.walletPath}). For a new agent, create its wallet first with ` +
+              "`automaton --init` (node dist/index.js --init); if this agent had a wallet, restore wallet.json " +
+              "from backup. A new identity is never created by --run.",
+      );
+    }
+    if (err instanceof WalletCorruptError) fail(err.message);
+    throw err;
+  }
+  const { account, chainIdentity, chainType: walletChainType } = wallet;
+  if (config.chainType && config.chainType !== walletChainType) {
+    fail(
+      `automaton.json says chainType "${config.chainType}" but wallet.json holds a ${walletChainType} key. ` +
+        "Fix chainType in automaton.json (or remove it to use the wallet's chain).",
+    );
+  }
+  if (config.walletAddress && !sameAddress(config.walletAddress, chainIdentity.address, walletChainType)) {
+    fail(
+      `automaton.json records address ${config.walletAddress} but wallet.json holds ${chainIdentity.address}. ` +
+        "Restore the matching wallet.json from backup, or correct walletAddress.",
+    );
+  }
+  // In memory only: every chainType guard follows the wallet.
+  config.chainType = walletChainType;
+  const resolvedChainType = walletChainType;
+  const apiKey = runtime.mode === "conway" ? config.conwayApiKey : "";
+  // A hand-written config that is standalone only for lack of a key would
+  // turn into uncapped Conway mode once any key appears; pin it now.
+  if (runtime.reason === "no-conway-key") {
+    try {
+      if (pinStandaloneModeInFile()) {
+        config.providers = { ...(config.providers ?? {}), mode: "standalone" };
+        logger.info(
+          'providers.mode saved as "standalone" in automaton.json: a Conway key stored later stays unused ' +
+            "until you change the mode.",
+        );
+      }
+    } catch (err: any) {
+      fail(`Could not save providers.mode "standalone" to ${getConfigPath()}: ${err?.message || String(err)}`);
+    }
+  }
+  // The Conway egress fence reads this.
+  installRuntime(runtime);
 
   // One running agent per state database: two would double spend and steal
   // each other's wake events and inbox claims.
@@ -407,26 +560,40 @@ async function run(): Promise<void> {
   // Create Conway client. Its value-moving calls resolve the installed
   // Treasury at call time, so the Treasury is installed right below, before
   // anything can spend.
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
-    sandboxId: config.sandboxId,
-  });
+  // Standalone: local commands, files and ports; every Conway-only call
+  // fails with FEATURE_DISABLED before any I/O.
+  const conway =
+    runtime.mode === "conway"
+      ? createConwayClient({
+          apiUrl: config.conwayApiUrl,
+          apiKey,
+          sandboxId: config.sandboxId,
+        })
+      : createStandaloneClient();
 
   // Treasury: the one spending gate. The normalized policy is shared by the
-  // policy rules and the gate, so both enforce the same numbers.
-  const treasuryPolicy = normalizeTreasuryPolicy(config.treasuryPolicy);
+  // policy rules and the gate, so both enforce the same numbers. Standalone
+  // forces the daily AI cap under its ceiling, in memory, so every later
+  // reader of config.treasuryPolicy sees the clamped number.
+  const treasuryPolicy = clampForMode(normalizeTreasuryPolicy(config.treasuryPolicy), runtime).policy;
+  config.treasuryPolicy = treasuryPolicy;
   const spendTracker = new SpendTracker(db.raw);
   // The gate's balance reads use their own client, so a circuit breaker
   // opened by unrelated failures (sandbox exec) does not refuse every outflow.
   // It also throws on a missing balance instead of reading it as zero.
-  const readCreditBalance = createCreditBalanceReader({ apiUrl: config.conwayApiUrl, apiKey });
+  const readCreditBalance =
+    runtime.mode === "conway"
+      ? createCreditBalanceReader({ apiUrl: config.conwayApiUrl, apiKey })
+      : async (): Promise<number> => {
+          throw new BalanceUnavailableError("disabled", "no credit balance in standalone mode");
+        };
   const treasury = new Treasury({
     db: db.raw,
     policy: treasuryPolicy,
     selfAddress: chainIdentity.address,
     readCreditBalance,
-    readAuthorizationState: readUsdcAuthorizationState,
+    // With payments off nothing reads the chain.
+    readAuthorizationState: runtime.payments ? readUsdcAuthorizationState : undefined,
     spendTracker,
     conwayApiUrl: config.conwayApiUrl,
     // acquireInstanceLock above: no other boot is alive on this database.
@@ -437,20 +604,31 @@ async function run(): Promise<void> {
   // Inference spend gate: every inference attempt (main loop, orchestrator,
   // workers) reserves against the same caps, including the daily cap from
   // treasuryPolicy.maxInferenceDailyCents.
-  const inferencePolicy = resolveInferencePolicy(config, treasuryPolicy);
-  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy });
+  const inferencePolicy = resolveInferencePolicy(config, treasuryPolicy, {
+    ceilingCents: runtime.dailyCapCeilingCents,
+  });
+  const fixedTier = runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined;
+  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy, fixedTier });
   installInferenceGate(inferenceGate);
-  // Resolve payments a previous run left without an answer.
-  void treasury
-    .reconcileX402({ limit: 20 })
-    .then((n) => {
-      if (n > 0) logger.info(`[${new Date().toISOString()}] Reconciled ${n} pending x402 payment(s).`);
-    })
-    .catch((err: any) => logger.warn(`x402 reconcile at startup failed: ${err?.message || String(err)}`));
+  if (runtime.payments) {
+    // Resolve payments a previous run left without an answer.
+    void treasury
+      .reconcileX402({ limit: 20 })
+      .then((n) => {
+        if (n > 0) logger.info(`[${new Date().toISOString()}] Reconciled ${n} pending x402 payment(s).`);
+      })
+      .catch((err: any) => logger.warn(`x402 reconcile at startup failed: ${err?.message || String(err)}`));
+  } else {
+    // Reconciling needs the chain; only count them.
+    const pending = countPendingX402(db.raw);
+    if (pending > 0) {
+      logger.warn(`${pending} x402 payment(s) from an earlier run stay unreconciled while payments are off.`);
+    }
+  }
 
-  // Register automaton identity (one-time, immutable)
+  // Register automaton identity (one-time, immutable). Conway mode only.
   const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
+  if (runtime.mode === "conway" && registrationState !== "registered") {
     try {
       const genesisPromptHash = config.genesisPrompt
         ? keccak256(toHex(config.genesisPrompt))
@@ -487,6 +665,11 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  if (runtime.mode === "standalone") {
+    if (runtime.providers.anthropic) modelRegistry.seedProviderModels(["anthropic"]);
+    const listed = config.providers?.openai?.models;
+    if (runtime.providers.openai && Array.isArray(listed)) modelRegistry.upsertConfiguredModels(listed);
+  }
   {
     const criticalId = config.modelStrategy?.criticalModel || "gpt-5-mini";
     const critical = modelRegistry.get(criticalId);
@@ -513,6 +696,10 @@ async function run(): Promise<void> {
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     ollamaBaseUrl,
+    openaiBaseUrl: openaiBaseUrl(config),
+    openaiModels: configuredOpenAiModelIds(config),
+    // Standalone: what no configured provider can serve is refused, not sent to Conway.
+    conwayFallback: runtime.mode === "conway",
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
 
@@ -522,7 +709,7 @@ async function run(): Promise<void> {
 
   // Create social client (chain-aware: pass ChainIdentity for Solana signing)
   let social: SocialClientInterface | undefined;
-  if (config.socialRelayUrl) {
+  if (runtime.relayUrl && config.socialRelayUrl) {
     social = createSocialClient(
       config.socialRelayUrl,
       resolvedChainType === "solana" ? chainIdentity : account,
@@ -541,11 +728,21 @@ async function run(): Promise<void> {
   const heartbeatConfig = loadHeartbeatConfig(heartbeatConfigPath);
   syncHeartbeatToDb(heartbeatConfig, db);
 
-  // Load skills
+  // Load skills (Conway's own skills only where Conway exists)
   const skillsDir = config.skillsDir || "~/.automaton/skills";
+  const skillOpts = runtime.features.conwayCompute ? {} : { exclude: CONWAY_ONLY_SKILLS };
+  if (!runtime.features.conwayCompute) {
+    logger.info(`Skipping Conway-only skills in standalone mode: ${CONWAY_ONLY_SKILLS.join(", ")}.`);
+  }
+  if (runtime.mode === "standalone") {
+    const { migrateConwayDefaultsForStandalone } = await import("./setup/defaults.js");
+    const { changed, warnings } = migrateConwayDefaultsForStandalone(getAutomatonDir(), skillsDir);
+    for (const line of changed) logger.info(`Standalone mode: ${line}.`);
+    for (const line of warnings) logger.warn(line);
+  }
   let skills: Skill[] = [];
   try {
-    skills = loadSkills(skillsDir, db);
+    skills = loadSkills(skillsDir, db, skillOpts);
     logger.info(`[${new Date().toISOString()}] Loaded ${skills.length} skills.`);
   } catch (err: any) {
     logger.warn(`[${new Date().toISOString()}] Skills loading failed: ${err.message}`);
@@ -562,29 +759,32 @@ async function run(): Promise<void> {
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
   // A failed balance read skips the buy; it is not a zero balance.
-  try {
-    const outcome = await startupBootstrapTopup({
-      apiUrl: config.conwayApiUrl,
-      account,
-      readCreditBalance: () => conway.getCreditsBalance(),
-      chainType: resolvedChainType,
-      timeoutMs: 15_000,
-    });
-    if (outcome.status === "done" && outcome.result?.success) {
-      logger.info(
-        `[${new Date().toISOString()}] Bootstrap topup: +$${outcome.result.amountUsd} credits from USDC`,
-      );
-    } else if (outcome.status === "skipped") {
-      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${outcome.reason}`);
-    } else if (outcome.status === "timed_out") {
-      logger.warn(
-        `[${new Date().toISOString()}] Bootstrap topup still pending after 15s; continuing (the payment stays in the ledger).`,
-      );
-    } else if (outcome.result && !outcome.result.success) {
-      logger.warn(`[${new Date().toISOString()}] Bootstrap topup not made: ${outcome.result.error}`);
+  // Standalone has no credits to buy.
+  if (runtime.features.topups) {
+    try {
+      const outcome = await startupBootstrapTopup({
+        apiUrl: config.conwayApiUrl,
+        account,
+        readCreditBalance: () => conway.getCreditsBalance(),
+        chainType: resolvedChainType,
+        timeoutMs: 15_000,
+      });
+      if (outcome.status === "done" && outcome.result?.success) {
+        logger.info(
+          `[${new Date().toISOString()}] Bootstrap topup: +$${outcome.result.amountUsd} credits from USDC`,
+        );
+      } else if (outcome.status === "skipped") {
+        logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${outcome.reason}`);
+      } else if (outcome.status === "timed_out") {
+        logger.warn(
+          `[${new Date().toISOString()}] Bootstrap topup still pending after 15s; continuing (the payment stays in the ledger).`,
+        );
+      } else if (outcome.result && !outcome.result.success) {
+        logger.warn(`[${new Date().toISOString()}] Bootstrap topup not made: ${outcome.result.error}`);
+      }
+    } catch (err: any) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
   }
 
   // Load every lazily imported module now, so a later rebuild cannot mix
@@ -630,7 +830,11 @@ async function run(): Promise<void> {
       // Workers from earlier cycles keep running while the loop sleeps,
       // so keep the gate's survival tier current. A failed read keeps the
       // last tier rather than reading as zero.
-      if (sinceSurvivalRefresh >= SURVIVAL_REFRESH_MS) {
+      if (sinceSurvivalRefresh >= SURVIVAL_REFRESH_MS && fixedTier) {
+        // A fixed tier needs no read.
+        sinceSurvivalRefresh = 0;
+        inferenceGate.setSurvival({ tier: fixedTier, creditsCents: null });
+      } else if (sinceSurvivalRefresh >= SURVIVAL_REFRESH_MS) {
         sinceSurvivalRefresh = 0;
         try {
           const creditsCents = await conway.getCreditsBalance();
@@ -663,7 +867,7 @@ async function run(): Promise<void> {
     try {
       // Reload skills (may have changed since last loop)
       try {
-        skills = loadSkills(skillsDir, db);
+        skills = loadSkills(skillsDir, db, skillOpts);
       } catch (error) {
         logger.error("Skills reload failed", error instanceof Error ? error : undefined);
       }
@@ -764,6 +968,24 @@ async function run(): Promise<void> {
 
 /** How often the sleeping runtime refreshes the gate's survival tier. */
 const SURVIVAL_REFRESH_MS = 5 * 60_000;
+
+/** Default skills that only work with a Conway account. */
+const CONWAY_ONLY_SKILLS: readonly string[] = ["conway-compute", "conway-payments"];
+
+/** x402 payments a previous run left unresolved (read from SQLite, no RPC). */
+function countPendingX402(raw: import("better-sqlite3").Database): number {
+  try {
+    const row = raw
+      .prepare(
+        `SELECT COUNT(*) AS n FROM treasury_ledger WHERE status = 'unknown'
+          AND kind IN ('x402_payment','credit_topup') AND x402_nonce IS NOT NULL`,
+      )
+      .get() as { n: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
 
 // ─── Entry Point ───────────────────────────────────────────────
 

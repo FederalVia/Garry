@@ -31,6 +31,7 @@ import type {
   SurvivalTier,
   ChatMessage,
   WakeEventRow,
+  ModelEntry,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
@@ -93,6 +94,9 @@ import {
   isInboxSource,
 } from "./inbox-isolation.js";
 import { CREDIT_TRANSFER_TOOLS } from "./policy-rules/financial.js";
+import { resolveRuntime, type ResolvedRuntime } from "../providers/mode.js";
+import { visibleTools, type FeatureSet } from "../providers/features.js";
+import { buildStandaloneProviderRegistry, ensureServableStrategy } from "../providers/model-defaults.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -157,6 +161,43 @@ const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
   }),
   pruneOldRecords: () => 0,
 };
+
+/** Orchestration cannot run with the configured providers (said once per process). */
+class OrchestrationUnavailable extends Error {}
+let orchestrationOffLogged = false;
+
+/**
+ * Standalone: seed Anthropic rows when its key exists, register the models
+ * listed for a custom OpenAI-compatible endpoint, and substitute a servable
+ * model for any strategy slot nobody can serve (in memory only).
+ */
+function prepareStandaloneModels(
+  config: AutomatonConfig,
+  registry: ModelRegistry,
+  runtime: ResolvedRuntime,
+  inference: InferenceClient,
+): void {
+  if (runtime.providers.anthropic) registry.seedProviderModels(["anthropic"]);
+  const listed = config.providers?.openai?.models;
+  if (runtime.providers.openai && Array.isArray(listed)) registry.upsertConfiguredModels(listed);
+  const canServe = inference.canServe ? (m: ModelEntry) => inference.canServe!(m) : () => true;
+  const { substitutions, unservable } = ensureServableStrategy(config, registry, canServe, runtime);
+  for (const sub of substitutions) {
+    logger.warn(`${sub.slot} ${sub.from} cannot be served by your providers; using ${sub.to} for this run.`);
+  }
+  if (unservable.length > 0) {
+    logger.error(`No configured provider can serve a model for ${unservable.join(", ")}; inference will be refused.`);
+    // A fixed tier never changes, so its slot being unservable means no AI call ever runs.
+    const fixed = runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined;
+    const slot = fixed === "low_compute" ? "lowComputeModel" : fixed === "critical" ? "criticalModel" : "inferenceModel";
+    if (fixed && unservable.includes(slot)) {
+      logger.error(
+        `The fixed survival tier "${fixed}" uses ${slot}, and no model your providers serve is allowed at that tier. ` +
+          `Give a model in providers.openai.models tierMinimum "${fixed}", or set providers.survival.fixedTier to "normal".`,
+      );
+    }
+  }
+}
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -224,9 +265,44 @@ export async function runAgentLoop(
   };
   if (shouldStop()) return;
 
-  const builtinTools = createBuiltinTools(identity.sandboxId);
+  // One mode for the whole cycle: tools, money, survival and providers agree.
+  const runtime = resolveRuntime(config);
+  const fixedTier = runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined;
+
+  // Discover Ollama models if configured
+  let ollamaModelIds: string[] = [];
+  if (ollamaBaseUrl) {
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    ollamaModelIds = await discoverOllamaModels(ollamaBaseUrl, db.raw);
+  }
+
+  // Keys go to the registry directly, never into process.env, where every
+  // child process would inherit them.
+  const providersPath = path.join(process.env.HOME || process.cwd(), ".automaton", "inference-providers.json");
+  // Standalone: the creator's own providers only; the Conway key is never
+  // lent. Built before the tool list, since without it the goal tools and
+  // the orchestration prompt could only mislead.
+  let standaloneProviders: ReturnType<typeof buildStandaloneProviderRegistry> | undefined;
+  let standaloneProvidersError: unknown;
+  if (runtime.mode === "standalone" && hasTable(db.raw, "goals")) {
+    try {
+      standaloneProviders = buildStandaloneProviderRegistry({ config, runtime, ollamaModelIds, providersPath });
+    } catch (err) {
+      // Reported where orchestration starts; the cycle runs without it.
+      standaloneProvidersError = err;
+    }
+  }
+  const features: FeatureSet =
+    standaloneProvidersError !== undefined || (standaloneProviders && !standaloneProviders.registry)
+      ? { ...runtime.features, orchestration: false }
+      : runtime.features;
+
+  // Standalone gets descriptions that do not promise Conway services.
+  const builtinTools = createBuiltinTools(identity.sandboxId, { standalone: runtime.mode === "standalone" });
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  // Tools that cannot work in this mode are not offered. This one list feeds
+  // the model, the inbox tools, the worker catalog and the tool context.
+  const tools = visibleTools([...builtinTools, ...installedTools], features);
   const toolNames = new Set(tools.map((t) => t.name));
   const inboxTools = tools.filter((t) => INBOX_ALLOWED_TOOLS.includes(t.name));
   const sessionSpend = spendTracker ?? NOOP_SPEND_TRACKER;
@@ -241,7 +317,7 @@ export async function runAgentLoop(
 
   // Inference spend gate: one per process, installed by index.ts, or here
   // for embedded use and tests, so every route passes through one.
-  const inferenceGate = ensureInferenceGate(db, config);
+  const inferenceGate = ensureInferenceGate(db, config, runtime);
   // Read on every route, so switch_model and --pick-model apply at once.
   const liveStrategy = (): ModelStrategyConfig => ({
     ...DEFAULT_MODEL_STRATEGY_CONFIG,
@@ -254,10 +330,8 @@ export async function runAgentLoop(
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
 
-  // Discover Ollama models if configured
-  if (ollamaBaseUrl) {
-    const { discoverOllamaModels } = await import("../ollama/discover.js");
-    await discoverOllamaModels(ollamaBaseUrl, db.raw);
+  if (runtime.mode === "standalone") {
+    prepareStandaloneModels(config, modelRegistry, runtime, inference);
   }
   const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, inferenceGate, liveStrategy, {
     canServe: inference.canServe ? (m) => inference.canServe!(m) : undefined,
@@ -269,13 +343,16 @@ export async function runAgentLoop(
    * low_compute.
    */
   const routeTier = (): SurvivalTier => {
+    if (financial.credits === "fixed" && financial.fixedTier) return financial.fixedTier;
     if (financial.creditsCents !== null) return routingTier(financial);
     const last = inferenceGate.survival().tier;
     return last === "unknown" ? "low_compute" : last;
   };
   /** Feed the survival tier to the gate, which orchestration routing follows. */
   const updateGateSurvival = (): void => {
-    if (financial.creditsCents === null) {
+    if (financial.credits === "fixed" && financial.fixedTier) {
+      inferenceGate.setSurvival({ tier: financial.fixedTier, creditsCents: null });
+    } else if (financial.creditsCents === null) {
       inferenceGate.setSurvival({ tier: inferenceGate.survival().tier, creditsCents: null });
     } else if (financial.credits === "live") {
       inferenceGate.setSurvival({
@@ -324,17 +401,18 @@ export async function runAgentLoop(
     try {
       planModeController = new PlanModeController(db.raw);
 
-      // Keys go to the registry directly, never into process.env, where
-      // every child process would inherit them.
-      const providerKeys = resolveProviderKeys(config);
-      const providersPath = path.join(
-        process.env.HOME || process.cwd(),
-        ".automaton",
-        "inference-providers.json",
-      );
-      const registry = ProviderRegistry.fromConfig(providersPath, { keys: providerKeys.keys });
-      if (providerKeys.openaiBaseUrl) {
-        registry.overrideBaseUrl("openai", providerKeys.openaiBaseUrl);
+      let registry: ProviderRegistry;
+      if (runtime.mode === "conway") {
+        const providerKeys = resolveProviderKeys(config);
+        registry = ProviderRegistry.fromConfig(providersPath, { keys: providerKeys.keys });
+        if (providerKeys.openaiBaseUrl) {
+          registry.overrideBaseUrl("openai", providerKeys.openaiBaseUrl);
+        }
+      } else {
+        if (standaloneProvidersError !== undefined) throw standaloneProvidersError;
+        const built = standaloneProviders!;
+        if (!built.registry) throw new OrchestrationUnavailable(built.reason);
+        registry = built.registry;
       }
 
       const unifiedInference = new UnifiedInferenceClient(registry);
@@ -394,11 +472,18 @@ export async function runAgentLoop(
         config,
       });
     } catch (error) {
-      logger.warn(
-        `Orchestrator initialization failed, continuing without orchestration: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      if (error instanceof OrchestrationUnavailable) {
+        if (!orchestrationOffLogged) {
+          orchestrationOffLogged = true;
+          logger.info(`Orchestration is off: ${error.message}.`);
+        }
+      } else {
+        logger.warn(
+          `Orchestrator initialization failed, continuing without orchestration: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       planModeController = undefined;
       orchestrator = undefined;
     }
@@ -429,6 +514,7 @@ export async function runAgentLoop(
   db.deleteKV("sleep_until");
 
   const chainType = config.chainType || identity.chainType || "evm";
+  const balanceOpts: BalanceOptions = { fixedTier, readUsdc: runtime.payments };
 
   /**
    * Buy credits from USDC before inference when credits are low (or in
@@ -437,6 +523,7 @@ export async function runAgentLoop(
    * just now: a cached balance never pays.
    */
   const maybeInlineTopup = async (current: FinancialState): Promise<FinancialState> => {
+    if (!runtime.features.topups) return current;
     if (current.credits !== "live" || current.usdc !== "live") return current;
     if (current.creditsCents === null || current.usdcBalance === null || current.usdcBalance < 5) return current;
     const tier = getSurvivalTier(current.creditsCents);
@@ -459,7 +546,7 @@ export async function runAgentLoop(
         // Re-fetch so the rest of the turn sees the new balance. A re-read
         // that is not live does not include the purchase, so it is kept
         // as cached and cannot trigger another buy.
-        const after = await getFinancialState(conway, identity.address, db, chainType);
+        const after = await getFinancialState(conway, identity.address, db, chainType, balanceOpts);
         if (after.credits !== "live") {
           return { ...after, creditsCents: current.creditsCents, credits: "cached", creditsAsOf: current.lastChecked };
         }
@@ -472,7 +559,14 @@ export async function runAgentLoop(
   };
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, chainType);
+  let financial = await getFinancialState(conway, identity.address, db, chainType, balanceOpts);
+
+  // A fixed tier has no balance that could keep the agent dead: an agent
+  // marked dead under Conway is revived.
+  if (db.getAgentState() === "dead" && financial.credits === "fixed") {
+    log(config, `[REVIVE] Marked dead by an earlier run; survival is now fixed at ${financial.fixedTier}, so running again.`);
+    db.setAgentState("waking");
+  }
 
   // Dead (marked by the heartbeat) and not shown funded by a live read: no
   // inference, and the state is left as it is so the runtime keeps waiting
@@ -570,6 +664,7 @@ export async function runAgentLoop(
       tools: inboxTools,
       isFirstRun: false,
       omitWorklog: true,
+      features,
     });
     const history = getInboxTurnsFromSender(db.raw, sender, verified, INBOX_HISTORY_LIMIT);
     const messages = buildContextMessages(systemPrompt, history, {
@@ -715,7 +810,7 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, chainType);
+      financial = await getFinancialState(conway, identity.address, db, chainType, balanceOpts);
       financial = await maybeInlineTopup(financial);
 
       // Check survival tier.
@@ -728,9 +823,18 @@ export async function runAgentLoop(
         running = false;
         break;
       }
-      // api_unreachable: no live read and nothing cached.
-      // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === null) {
+      if (financial.credits === "fixed" && financial.fixedTier) {
+        // Fixed by the creator: no balance, so nothing here can kill the agent.
+        const tier = financial.fixedTier;
+        const next: AgentState = tier === "critical" ? "critical" : tier === "low_compute" ? "low_compute" : "running";
+        if (db.getAgentState() !== next) {
+          db.setAgentState(next);
+          onStateChange?.(next);
+        }
+        inference.setLowComputeMode(next !== "running");
+      } else if (financial.creditsCents === null) {
+        // api_unreachable: no live read and nothing cached.
+        // Do NOT kill the agent; continue in low-compute mode and retry next tick.
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
@@ -867,6 +971,7 @@ export async function runAgentLoop(
         tools,
         skills,
         isFirstRun,
+        features,
       });
 
       // Phase 2.2: Pre-turn memory retrieval
@@ -933,7 +1038,9 @@ export async function runAgentLoop(
 
       // ── Inference Call (via router when available) ──
       const survivalTier = routeTier();
-      log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
+      // The router's pick, which may differ from the client's default after a substitution.
+      const routedModel = inferenceRouter.selectModel(survivalTier, "agent_turn")?.modelId ?? inference.getDefaultModel();
+      log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${routedModel})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
       const chatWithTools = (msgs: ChatMessage[], opts: any) => inference.chat(msgs, { ...opts, tools: inferenceTools });
@@ -1599,8 +1706,9 @@ function isUnfunded(financial: FinancialState): boolean {
   return financial.credits === "live" && financial.creditsCents !== null && financial.creditsCents <= 0;
 }
 
-/** A live read above zero: the only thing that lets a dead agent run again. */
+/** A live read above zero, or a tier fixed by the creator: what lets a dead agent run again. */
 function isLiveFunded(financial: FinancialState): boolean {
+  if (financial.credits === "fixed") return true;
   return financial.credits === "live" && financial.creditsCents !== null && financial.creditsCents > 0;
 }
 
@@ -1612,6 +1720,7 @@ function routingTier(financial: FinancialState): SurvivalTier {
 }
 
 function describeCredits(financial: FinancialState): string {
+  if (financial.credits === "fixed") return `not tracked (fixed survival tier: ${financial.fixedTier})`;
   if (financial.creditsCents === null) return "unknown (balance API unreachable)";
   const amount = `$${(financial.creditsCents / 100).toFixed(2)}`;
   return financial.credits === "live" ? amount : `${amount} (cached${financial.creditsAsOf ? ` as of ${financial.creditsAsOf}` : ""})`;
@@ -1648,12 +1757,15 @@ function resolveProviderKeys(config: AutomatonConfig): {
 }
 
 /** The installed gate when it uses this database, else a new one installed for it. */
-function ensureInferenceGate(db: AutomatonDatabase, config: AutomatonConfig): InferenceGate {
+function ensureInferenceGate(db: AutomatonDatabase, config: AutomatonConfig, runtime: ResolvedRuntime): InferenceGate {
   const installed = getInstalledInferenceGate();
   if (installed && installed.usesDatabase(db.raw)) return installed;
   const gate = new InferenceGate({
     db: db.raw,
-    policy: resolveInferencePolicy(config, normalizeTreasuryPolicy(config.treasuryPolicy)),
+    policy: resolveInferencePolicy(config, normalizeTreasuryPolicy(config.treasuryPolicy), {
+      ceilingCents: runtime.dailyCapCeilingCents,
+    }),
+    fixedTier: runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined,
   });
   installInferenceGate(gate);
   return gate;
@@ -1717,15 +1829,38 @@ function readCachedBalance(db?: AutomatonDatabase): CachedBalance {
  * with its time) or unknown (null). Only live reads are written to the
  * cache, so a failure never overwrites a good value.
  */
+interface BalanceOptions {
+  /** A tier fixed by the creator: credits are not read or cached. */
+  fixedTier?: SurvivalTier;
+  /** Read USDC on chain (payments on). Default true. */
+  readUsdc?: boolean;
+}
+
 async function getFinancialState(
   conway: ConwayClient,
   address: string,
   db?: AutomatonDatabase,
   chainType?: string,
+  opts: BalanceOptions = {},
 ): Promise<FinancialState> {
   const now = new Date().toISOString();
+  if (opts.fixedTier) {
+    const usdcRead =
+      opts.readUsdc === false ? null : await readUsdc(address, usdcNetworkFor(chainType), chainType as any);
+    return {
+      creditsCents: null,
+      usdcBalance: usdcRead?.known ? usdcRead.value : null,
+      credits: "fixed",
+      usdc: usdcRead?.known ? "live" : "unknown",
+      fixedTier: opts.fixedTier,
+      lastChecked: now,
+    };
+  }
   const creditRead = await readCredits(conway);
-  const usdcRead = await readUsdc(address, usdcNetworkFor(chainType), chainType as any);
+  const usdcRead =
+    opts.readUsdc === false
+      ? ({ known: false, reason: "disabled", detail: "payments are off" } as const)
+      : await readUsdc(address, usdcNetworkFor(chainType), chainType as any);
   const cached = readCachedBalance(db);
 
   const state: FinancialState = {

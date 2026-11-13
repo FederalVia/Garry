@@ -64,7 +64,11 @@ const NUMERIC_KEYS = Object.keys(DEFAULT_TREASURY_POLICY).filter(
  */
 export function normalizeTreasuryPolicy(
   input?: Partial<TreasuryPolicy> | null | unknown,
-  opts: { onWarning?: (message: string) => void } = {},
+  opts: {
+    onWarning?: (message: string) => void;
+    /** Payees used when x402AllowedDomains is missing or invalid (default: ['conway.tech']). */
+    x402DefaultDomains?: readonly string[];
+  } = {},
 ): ResolvedTreasuryPolicy {
   const warn = (message: string) => {
     logger.warn(message);
@@ -91,11 +95,12 @@ export function normalizeTreasuryPolicy(
   }
 
   const domains = src.x402AllowedDomains;
+  const defaultDomains = opts.x402DefaultDomains ?? DEFAULT_TREASURY_POLICY.x402AllowedDomains;
   if (domains === undefined) {
-    out.x402AllowedDomains = [...DEFAULT_TREASURY_POLICY.x402AllowedDomains];
+    out.x402AllowedDomains = [...defaultDomains];
   } else if (!Array.isArray(domains)) {
     warn(`Invalid treasury value for x402AllowedDomains; using the default list`);
-    out.x402AllowedDomains = [...DEFAULT_TREASURY_POLICY.x402AllowedDomains];
+    out.x402AllowedDomains = [...defaultDomains];
   } else {
     const valid = domains.filter(
       (d): d is string => typeof d === "string" && d.trim() !== "",

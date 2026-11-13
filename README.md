@@ -2,15 +2,15 @@
 
 [![CI](https://github.com/FederalVia/Garry/actions/workflows/ci.yml/badge.svg)](https://github.com/FederalVia/Garry/actions/workflows/ci.yml)
 
-Garry is a fork of [Conway-Research/automaton](https://github.com/Conway-Research/automaton). It is a runtime for an autonomous AI agent that runs continuously, holds its own wallet and pays for its own compute. When it runs out of money, it stops.
+Garry is a fork of [Conway-Research/automaton](https://github.com/Conway-Research/automaton). It is a runtime for an autonomous AI agent that runs continuously and holds its own wallet. It runs either on your own machine with your own AI provider key under a hard daily spending cap (standalone mode, no Conway account), or on Conway, where it pays for its own compute and stops when it runs out of money.
 
 The agent starts from a genesis prompt written by its creator. It works in a loop of reasoning and tool calls: shell, files, git, payments, domains and messages to other agents. It keeps a self-written identity file, `SOUL.md`, that changes over time. It can edit its own code, spawn and fund child agents, and register an on-chain identity. A short constitution (`constitution.md`) sets rules it cannot edit, and `spawn_child` copies it to each child.
 
 ## Status of this fork
 
-- **What works.** The full runtime runs against Conway today: the agent loop, the heartbeat, the spending gates, child agents and the operator CLI. Since forking, the work has gone into money paths, secret handling, trust boundaries and the test suite (see the merged pull requests).
-- **What needs Conway today.** `--run` will not start without a Conway API key (`src/index.ts`). You do not create a Conway account by hand: the setup wizard signs in with the agent's wallet (SIWE, or SIWS on Solana) and provisions a key. But Conway must be reachable. The survival tier is read from the Conway credit balance. Sandboxes, domains and Conway-routed inference spend Conway credits. Child agents run in Conway sandboxes. Messages go through Conway's social relay. At first start the agent also registers itself with Conway, sending its name, wallet address, creator address, `creatorMessage` (as a bio) and a keccak hash of the genesis prompt.
-- **In progress.** This fork is working on running without Conway: your own AI provider key or a local Ollama model, a budget you set, containers, and your own message relay. Today you can already send inference to your own OpenAI or Anthropic key or to Ollama. The Conway key and balance are still required: the survival tier comes only from the Conway credit balance, so at zero Conway credits the agent drops to `critical` and later `dead` and stops inference whatever provider key you set. Keep Conway credits above zero. No dates are promised.
+- **Runs without Conway (standalone mode).** With no Conway key, `--run` starts in standalone mode: the agent runs on this machine and pays for AI with your own OpenAI key (or any OpenAI-compatible server through `providers.openai.baseUrl`), Anthropic key or a local Ollama model. The daily AI cap is forced under a ceiling (`providers.dailyCapCeilingCents`, $2.00 by default), and the survival tier is fixed (`providers.survival.fixedTier`, default `normal`), since there is no balance to read. Nothing is sent to Conway. The relay, credit topups, x402 payments and every chain read are off by default, and the tools that need Conway (sandboxes, child agents, domains, credits) are not offered. Messaging works through your own relay (`packages/relay`) when you set `socialRelayUrl`. See [Run without Conway](#run-without-conway).
+- **Conway mode, as before.** With a Conway key (and no `providers.mode: "standalone"`), the full runtime runs against Conway: sandboxes, domains and Conway-routed inference spend Conway credits, the survival tier is read from the Conway credit balance, child agents run in Conway sandboxes, and messages go through Conway's social relay unless you set your own. At first start the agent registers itself with Conway, sending its name, wallet address, creator address, `creatorMessage` (as a bio) and a keccak hash of the genesis prompt. Since forking, the work has gone into money paths, secret handling, trust boundaries and the test suite (see the merged pull requests).
+- **In progress.** Pluggable compute (containers instead of Conway sandboxes, which child agents need), a budget and ledger that replace the credit balance, and domains without Conway. Until then child agents need Conway mode. No dates are promised.
 
 For details, read [DOCUMENTATION.md](DOCUMENTATION.md) (operator guide and reference) and [ARCHITECTURE.md](ARCHITECTURE.md) (how the code fits together).
 
@@ -37,22 +37,37 @@ Run it from the repository root. The wizard copies `constitution.md` from the cu
 
 Where the program's own messages say `automaton --setup` and so on, run `node dist/index.js --setup` from the checkout. The `automaton` binary exists only if you link the package globally.
 
-Do not use `scripts/automaton.sh` or Conway's `curl ... | sh` installer for this fork. Both clone and run the upstream repository, which does not have this fork's fixes.
+`scripts/automaton.sh` installs and starts this fork in one step (`curl -fsSL https://raw.githubusercontent.com/FederalVia/Garry/main/scripts/automaton.sh | sh`): it clones this repository, runs `pnpm install --frozen-lockfile` and the build, and starts `--run`. Do not use Conway's own `curl ... | sh` installer: it clones the upstream repository, which does not have this fork's fixes.
 
 On the first `--run` in a terminal, the setup wizard:
 
 1. Asks for the chain (`evm` or `solana`, default `evm`) and creates the agent's wallet.
-2. Provisions a Conway API key by signing in with that wallet. If that fails, you can paste a key or skip. Without a key, `--run` exits.
-3. Asks for a name, the genesis prompt, and your own wallet address as creator. It then offers optional OpenAI and Anthropic keys and an Ollama URL.
-4. Asks for the main spending limits, in cents. Press Enter to accept each default.
-5. Detects whether it runs inside a Conway sandbox.
-6. Writes `automaton.json`, `heartbeat.yml`, a read-only copy of the constitution (only if `constitution.md` is in the current directory), `SOUL.md` and the default skills (conway-compute, conway-payments, survival), then shows how to fund the wallet.
+2. Asks whether to sign in to Conway with that wallet (default no). Signing in provisions a Conway API key (SIWE, or SIWS on Solana); if that fails, you can paste a key or skip. Without a key the install is standalone, and the wizard writes `providers.mode: "standalone"`, so a Conway key stored later never silently switches it to Conway mode and its uncapped spending.
+3. Asks for a name, the genesis prompt, and your own wallet address as creator. It then asks for your AI providers: an OpenAI key, an Anthropic key and an Ollama URL. Without Conway at least one is required.
+4. Asks for the main spending limits, in cents. Press Enter to accept each default. Standalone offers a daily AI cap of 200 cents and no x402 payees.
+5. Detects whether it runs inside a Conway sandbox (ignored without a Conway key).
+6. Writes `automaton.json`, `heartbeat.yml`, a read-only copy of the constitution (only if `constitution.md` is in the current directory), `SOUL.md` and the default skills (standalone: survival; with Conway: conway-compute, conway-payments, survival). With Conway it shows how to fund the wallet; standalone, it reminds you to set a spending limit at your AI provider too.
 
-The first `--run` right after the wizard starts without the social relay (no inbox polling and no `send_message`), because the wizard's configuration has no `socialRelayUrl`. Restart once; the saved file then picks up the default relay.
+**Conway mode: startup spends money.** On every `--run` in Conway mode with an EVM wallet, if credits are under $5 and the wallet holds at least $5 USDC, the agent buys $5 of Conway credits through the Treasury. Later automatic survival topups are $5 each, capped by `maxAutoTopupDailyCents` ($20 a day by default). Standalone never buys credits.
 
-**Startup spends money.** On every `--run` with an EVM wallet, if credits are under $5 and the wallet holds at least $5 USDC, the agent buys $5 of Conway credits through the Treasury. Later automatic survival topups are $5 each, capped by `maxAutoTopupDailyCents` ($20 a day by default).
+Without `automaton.json` and without a terminal, `--run` exits with code 1. The exception is a spawned child, which builds its configuration from `genesis.json`. `--run` never creates a wallet: with no `wallet.json` it exits and tells you to run `--init` (new agent) or restore the file. It also exits when `name` or `creatorAddress` is empty, when standalone has no AI provider, or when Conway mode has no key. Its first log line says the mode, the providers (key sources only, never values), the survival source, the daily cap, the relay and whether payments are on.
 
-Without `automaton.json` and without a terminal, `--run` exits with code 1. The exception is a spawned child, which builds its configuration from `genesis.json`.
+### Run without Conway
+
+A minimal `~/.automaton/automaton.json`, next to the `name`, `genesisPrompt`, `creatorAddress` and `walletAddress` fields the wizard writes:
+
+```jsonc
+{
+  "providers": {
+    "mode": "standalone",                   // stays standalone even if a Conway key is stored later; the first standalone --run writes it when absent
+    "openai": { "apiKey": "sk-..." },        // or "anthropic": { "apiKey": "sk-ant-..." }, or "ollama": { "baseUrl": "http://localhost:11434" }
+    "dailyCapCeilingCents": 200,            // hard daily AI spend ceiling ($2.00 by default)
+    "survival": { "fixedTier": "normal" }   // no balance to read, so the tier is fixed
+  }
+}
+```
+
+Then create the wallet once with `node dist/index.js --init` and start with `node dist/index.js --run`. For messaging, run your own relay (`packages/relay`, see [packages/relay/README.md](packages/relay/README.md)) and set `"socialRelayUrl": "http://127.0.0.1:8787"`; only then are `send_message` and inbox polling on, and `automaton-cli send` uses the same relay. `providers.payments: true` turns on x402 payments, USDC balance reads and the ERC-8004 tools (including `discover_agents`); with it off, standalone makes no chain RPC calls. A `socialRelayUrl` equal to Conway's default (older versions saved it into every file) counts as unset; use `providers.relayUrl` for Conway's relay. Set a spending limit at your AI provider too. [DOCUMENTATION.md](DOCUMENTATION.md#run-without-conway) has the details and what changed for existing Conway installs.
 
 State lives in `~/.automaton/`:
 
@@ -73,7 +88,7 @@ State lives in `~/.automaton/`:
 
 Other runtime commands: `--setup`, `--configure`, `--pick-model`, `--init`, `--provision`, `--status`, `--version` and `--help`. These print through the JSON logger, one log line each; pipe through `jq -r .message` to read them.
 
-Environment variables: `OLLAMA_BASE_URL` overrides `ollamaBaseUrl`. `AUTOMATON_SHUTDOWN_GRACE_MS` (default 30000) sets how long a stop may take. `CONWAY_API_URL` is used only when a key is provisioned; the running agent uses `conwayApiUrl` in automaton.json. `AUTOMATON_RPC_URL` and `SOLANA_RPC_URL` override the public Base and Solana RPC endpoints (`rpcUrl` in automaton.json takes precedence for the ERC-8004 tools). `CONWAY_SANDBOX_ID` tells the wizard it is inside a sandbox. `--help` also lists `CONWAY_API_KEY`, but the runtime does not read it; put the key in automaton.json or run `--provision`.
+Environment variables: `OLLAMA_BASE_URL` overrides `ollamaBaseUrl`. `OPENAI_API_KEY` is used in standalone mode when no OpenAI key is configured. `CONWAY_API_KEY` and `CONWAY_API_URL` override the Conway key and URL in automaton.json (an explicit `providers.mode: "standalone"` keeps the key unused). `AUTOMATON_SHUTDOWN_GRACE_MS` (default 30000) sets how long a stop may take. `AUTOMATON_RPC_URL` and `SOLANA_RPC_URL` override the public Base and Solana RPC endpoints (`rpcUrl` in automaton.json takes precedence for the ERC-8004 tools). `SOCIAL_RELAY_URL` is the relay `automaton-cli send` uses when automaton.json sets none. `CONWAY_SANDBOX_ID` tells the wizard it is inside a sandbox.
 
 The first SIGTERM or SIGINT stops the agent at the next tool boundary. A second signal, or `AUTOMATON_SHUTDOWN_GRACE_MS` passing, forces exit with code 1.
 
@@ -83,7 +98,7 @@ The first SIGTERM or SIGINT stops the agent at the next tool boundary. A second 
 
 **Heartbeat.** A scheduler in the same process keeps running while the agent sleeps. It runs cron entries from `heartbeat.yml`: status ping and distress (every 15 minutes), credit check (every 6 hours), USDC balance and survival topup (every 5 minutes), upstream update check (every 4 hours), sandbox health (every 30 minutes), child health (every 10 minutes), social inbox polling (every 2 minutes) and memory maintenance, which prunes old memory, events and inbox text (hourly). A task can wake the agent.
 
-**Survival tiers.** `getSurvivalTier` (`src/conway/credits.ts`) maps the Conway credit balance to one of five tiers (thresholds in `SURVIVAL_THRESHOLDS`, `src/types.ts`):
+**Survival tiers.** In standalone mode the tier is fixed (`providers.survival.fixedTier`, default `normal`) and spending is bounded by the daily AI cap instead. In Conway mode `getSurvivalTier` (`src/conway/credits.ts`) maps the Conway credit balance to one of five tiers (thresholds in `SURVIVAL_THRESHOLDS`, `src/types.ts`):
 
 | Tier | Credit balance | What changes |
 |---|---|---|
@@ -111,11 +126,11 @@ The full model is in [DOCUMENTATION.md, Security and Constitution](DOCUMENTATION
 | `minimumReserveCents` | 1000 | No credit outflow may leave the balance below this |
 | `maxTransfersPerTurn` | 2 | Transfers per turn |
 | `maxX402PaymentCents` | 100 | Single x402 payment (10 times this per hour, 50 times per day) |
-| `x402AllowedDomains` | `["conway.tech"]` | Hosts x402 may pay |
+| `x402AllowedDomains` | `["conway.tech"]` (standalone: none) | Hosts x402 may pay |
 | `maxTopupSingleCents` / `maxTopupDailyCents` | 2500 / 10000 | Credit topups bought by the agent |
 | `maxAutoTopupDailyCents` | 2000 | Automatic survival topups per day |
 | `maxInfraSingleCents` / `maxInfraDailyCents` | 2500 / 5000 | Sandbox and domain purchases |
-| `maxInferenceDailyCents` | 50000 | Rolling 24-hour inference spend (0 allows only free local models) |
+| `maxInferenceDailyCents` | 50000 | Rolling 24-hour inference spend (0 allows only free local models). Standalone forces it to at most `providers.dailyCapCeilingCents` (200), with a loud warning |
 
 The Treasury also refuses any credit transfer above half the available balance, and automatic child funding may use at most half of the daily transfer budget.
 
@@ -123,7 +138,7 @@ The Treasury also refuses any credit transfer above half the available balance, 
 
 **Messages from other agents.** Inbound messages are verified in `src/social/inbound.ts`. A valid, fresh signature over a message addressed to this agent counts as verified. A message without one is delivered marked `NOT VERIFIED`. A bad signature, a wrong recipient or oversized content is dropped. Each message is screened for prompt injection, and blocked ones are stored but never shown. Each sender is limited to 10 messages a minute, and the rest wait. Each sender's batch is handled in an isolated turn (`src/agent/inbox-isolation.ts`), labelled as untrusted, that can call only `send_message`, once, to reply to that sender. Turns that are not inbox turns never see what an inbox turn read or wrote.
 
-**Protected paths (`src/security/`).** The agent's file tools cannot read secrets: the wallet, config and API key files, `state.db`, SSH keys and similar. They cannot write the constitution, the state directory (except `WORKLOG.md`, `workspace/`, `skills/` and `runtime/`), or the guard code. That covers the policy engine and rules, tool definitions, the agent loop and system prompt, inbox isolation and injection defense, `src/treasury/`, `src/security/`, `src/self-mod/`, `src/conway/`, `src/identity/`, `src/state/`, `src/replication/`, `src/operator/`, the inference gate, router, price registry and clients, the soul and heartbeat config code, `index.ts`/`config.ts`/`types.ts`, `package.json`, lockfiles, tsconfig, `dist/`, `packages/`, `scripts/` and `node_modules/`. They also cannot write `SOUL.md` or `heartbeat.yml` (only the soul and heartbeat tools change them), shell startup files such as `~/.bashrc` and `~/.gitconfig`, or system directories. The full list is in `src/security/protected-paths.ts`. Other source, including `src/social/` (sender verification), stays editable with `edit_own_file`. Checks run on the real path, and writes never follow links.
+**Protected paths (`src/security/`).** The agent's file tools cannot read secrets: the wallet, config and API key files, `state.db`, SSH keys and similar. They cannot write the constitution, the state directory (except `WORKLOG.md`, `workspace/`, `skills/` and `runtime/`), or the guard code. That covers the policy engine and rules, tool definitions, the agent loop and system prompt, inbox isolation and injection defense, `src/treasury/`, `src/security/`, `src/self-mod/`, `src/conway/`, `src/identity/`, `src/state/`, `src/replication/`, `src/operator/`, the inference gate, router, price registry and clients, the soul and heartbeat config code, `src/providers/` (mode, daily cap ceiling, tool visibility), the setup wizard and `--configure`, `index.ts`/`config.ts`/`types.ts`, `package.json`, lockfiles, tsconfig, `dist/`, `packages/`, `scripts/` and `node_modules/`. They also cannot write `SOUL.md` or `heartbeat.yml` (only the soul and heartbeat tools change them), shell startup files such as `~/.bashrc` and `~/.gitconfig`, or system directories. The full list is in `src/security/protected-paths.ts`. Other source, including `src/social/` (sender verification), stays editable with `edit_own_file`. Checks run on the real path, and writes never follow links.
 
 **Limits of this model.**
 
@@ -150,13 +165,13 @@ Spawning, funding and starting are separate steps:
 
 `stop_child` stops a child and frees its slot (`force` for an unreachable sandbox). `maxChildren` (default 3) caps the children that hold a slot, and `0` disables spawning. The policy engine allows at most 3 spawns per 24 hours. `verify_child_constitution` checks the child's copy against the stored hash; run it after each spawn. `message_child` sends a signed message through the social relay.
 
-Children clone `childRuntimeRepo`, which by default is the **upstream** repository, without this fork's fixes. Set `childRuntimeRepo` to `https://github.com/FederalVia/Garry.git`, and optionally `childRuntimeRef` to a branch or tag.
+Child agents need Conway sandboxes, so the child tools are offered only in Conway mode. Children clone `childRuntimeRepo`, which by default is this fork (`https://github.com/FederalVia/Garry.git`); set it to another https git URL, and optionally `childRuntimeRef` to a branch or tag.
 
 Remote task delegation is disabled. Goals from `create_goal` run on local workers inside the parent's process. No transport reaches a child and children have no task executor, so a task found assigned to a child is released back to local workers.
 
 ## On-chain identity
 
-ERC-8004 registration is not automatic. `register_erc8004` is a tool the agent may call. It works only with an EVM wallet (not Solana), checks for gas, and writes to the ERC-8004 identity registry on Base (mainnet by default, or testnet). The agent pays gas in ETH from its wallet. Related tools: `update_agent_card`, `discover_agents`, `give_feedback` and `check_reputation`.
+ERC-8004 registration is not automatic. `register_erc8004` is a tool the agent may call (in standalone only with `providers.payments: true`, like `give_feedback` and `discover_agents`). It works only with an EVM wallet (not Solana), checks for gas, and writes to the ERC-8004 identity registry on Base (mainnet by default, or testnet). The agent pays gas in ETH from its wallet. Related tools: `update_agent_card`, `discover_agents`, `give_feedback` and `check_reputation`.
 
 ## Operator CLI
 
@@ -169,6 +184,8 @@ Build first, then run `node packages/cli/dist/index.js <command>` (the package's
 | `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the agent's API key |
 | `send <to-address> <message>` | Send a signed message from the agent's wallet through the relay |
 
+`send` uses `socialRelayUrl` from automaton.json, else `SOCIAL_RELAY_URL`, else the agent's own default (Conway's relay in Conway mode; none in standalone, where it exits with an error before signing). It signs with the same protocol the agent uses: `Automaton/1`, or Conway's under compatibility, which is on only for a conway.tech relay unless `relay.conwayCompat` says otherwise.
+
 `fund` takes dollars by default, with at most two decimals (`5` is $5.00). With `--cents`, it takes a whole number of cents. Do not type `$`: a leading `$` is refused, because the shell expands `$25`. `--to` (or `--to=<address>`) is required and must be an address on the agent's own chain. The zero address, the agent's own address and a mixed-case EVM address with a wrong checksum are refused. The CLI prints the plan and sends nothing until you confirm with `--yes` (or `-y`) or answer `y` in an interactive terminal. The request is sent once and never retried. If the outcome is unknown, it exits 2, and you should check the balance before running it again. `fund` and `send` bypass the Treasury and leave no ledger row; they are for the operator only.
 
 ## Configuration
@@ -176,13 +193,14 @@ Build first, then run `node packages/cli/dist/index.js <command>` (the package's
 The configuration file is `~/.automaton/automaton.json`. It is written by `--setup` and edited with `--configure`. The most important keys:
 
 - `name`, `genesisPrompt`, `creatorAddress`, `walletAddress`, `chainType`
+- `providers`: `mode` (`"standalone"` or `"conway"`; absent: Conway when a Conway key resolves), `openai` (`apiKey`, `baseUrl` for any OpenAI-compatible server, `models` with prices), `anthropic`, `ollama`, `conway`, `survival.fixedTier`, `dailyCapCeilingCents` (default 200), `payments` (default false), `relayUrl` (Conway's relay in standalone). The block wins over the flat provider fields
 - `conwayApiUrl` (default `https://api.conway.tech`) and `conwayApiKey`
 - `inferenceModel`, `maxTokensPerTurn` (default 4096), `maxTurnsPerCycle` (default 25), `openaiApiKey`, `anthropicApiKey`, `ollamaBaseUrl`
 - `modelStrategy`: per-tier models and inference budgets
 - `treasuryPolicy`: spending limits (see above)
 - `maxChildren`, `childSandboxMemoryMb`, `childRuntimeRepo`, `childRuntimeRef`
-- `socialRelayUrl` (default `https://social.conway.tech`), `rpcUrl` (Base RPC for the ERC-8004 tools), `logLevel` (default `info`)
-- `sandboxId`: empty means local mode, where `exec` and file tools act on this machine
+- `socialRelayUrl` (unset or `""`: off in standalone; Conway mode default `https://social.conway.tech`), `relay.conwayCompat`, `distressWebhookUrl`, `rpcUrl` (Base RPC for the ERC-8004 tools), `logLevel` (default `info`)
+- `sandboxId`: Conway only; empty means local mode, where `exec` and file tools act on this machine (standalone always runs locally)
 
 The rest is in the [Configuration Reference](DOCUMENTATION.md#configuration-reference).
 
@@ -223,6 +241,8 @@ src/
   ollama/          Discovery of local Ollama models
   operator/        Logic behind the operator CLI's fund, send and logs commands
   orchestration/   Goal planner, task graph and local workers
+  providers/       Mode resolution (standalone or Conway), the feature table that
+                   hides tools and tasks, the standalone client, the survival source
   registry/        ERC-8004 registration, agent cards, discovery with safe fetch
   replication/     Child spawn, lifecycle, health, messaging, constitution checks
   runtime/         Module preloading and cooperative shutdown
@@ -239,8 +259,9 @@ src/
   __tests__/       Vitest test suite
 packages/
   cli/             Operator CLI (status, logs, fund, send); commands in src/commands/
+  relay/           Self-hosted message relay (one Node process, one SQLite file)
 scripts/
-  automaton.sh       Upstream installer; clones Conway-Research/automaton, not this fork
+  automaton.sh       One-step installer: clones this fork, builds, starts --run
   backup-restore.sh  Back up, restore or verify the SQLite database
   soak-test.sh       Long-running stability test (72 hours by default)
   conways-rules.txt  Upstream rules text; the runtime does not read it
