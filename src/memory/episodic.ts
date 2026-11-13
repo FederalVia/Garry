@@ -10,6 +10,8 @@ import { ulid } from "ulid";
 import type { EpisodicMemoryEntry, TurnClassification } from "../types.js";
 import { estimateTokens } from "../agent/context.js";
 import { createLogger } from "../observability/logger.js";
+import { LIKE_ESCAPE, likeContains } from "../state/like-escape.js";
+import { clampScore } from "./semantic.js";
 const logger = createLogger("memory.episodic");
 
 type Database = BetterSqlite3.Database;
@@ -18,7 +20,8 @@ export class EpisodicMemoryManager {
   constructor(private db: Database) {}
 
   /**
-   * Record a new episodic memory entry. Returns the ULID id.
+   * Record a new episodic memory entry. Returns the ULID id; throws when the
+   * write fails.
    */
   record(entry: {
     sessionId: string;
@@ -43,13 +46,14 @@ export class EpisodicMemoryManager {
         entry.summary,
         entry.detail ?? null,
         entry.outcome ?? null,
-        entry.importance ?? 0.5,
+        clampScore(entry.importance, 0.5),
         entry.embeddingKey ?? null,
         tokenCount,
         entry.classification ?? "maintenance",
       );
     } catch (error) {
       logger.error("Failed to record entry", error instanceof Error ? error : undefined);
+      throw error;
     }
     return id;
   }
@@ -74,15 +78,13 @@ export class EpisodicMemoryManager {
    */
   search(query: string, limit: number = 10): EpisodicMemoryEntry[] {
     try {
-      // Escape SQL LIKE wildcards so literal '%' and '_' in the query
-      // don't match arbitrary characters.
-      const escaped = query.replace(/[%_]/g, (ch) => `\\${ch}`);
+      const pattern = likeContains(query);
       const rows = this.db.prepare(
         `SELECT * FROM episodic_memory
-         WHERE summary LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\'
+         WHERE summary LIKE ? ${LIKE_ESCAPE} OR detail LIKE ? ${LIKE_ESCAPE}
          ORDER BY importance DESC, created_at DESC
          LIMIT ?`,
-      ).all(`%${escaped}%`, `%${escaped}%`, limit) as any[];
+      ).all(pattern, pattern, limit) as any[];
       return rows.map(deserializeEpisodic);
     } catch (error) {
       logger.error("Failed to search", error instanceof Error ? error : undefined);
@@ -104,15 +106,22 @@ export class EpisodicMemoryManager {
   }
 
   /**
-   * Prune entries older than retentionDays.
-   * Returns number of entries removed.
+   * Prune entries older than retentionDays whose importance is below
+   * `keepImportance`, and entries at or above it (errors, strategic turns)
+   * older than highImportanceRetentionDays. Goal completions and archives
+   * are always kept. Returns number of entries removed.
    */
-  prune(retentionDays: number): number {
-    if (retentionDays <= 0) return 0;
+  prune(retentionDays: number, keepImportance: number = 0.8, highImportanceRetentionDays: number = 180): number {
+    if (!(retentionDays > 0)) return 0;
+    // The longer window never drops below the short one.
+    const highDays = Math.max(retentionDays, highImportanceRetentionDays > 0 ? highImportanceRetentionDays : retentionDays);
     try {
       const result = this.db.prepare(
-        "DELETE FROM episodic_memory WHERE created_at < datetime('now', ?)",
-      ).run(`-${retentionDays} days`);
+        `DELETE FROM episodic_memory
+         WHERE event_type NOT IN ('goal_completed', 'goal_archived')
+           AND ((created_at < datetime('now', ?) AND importance < ?)
+             OR created_at < datetime('now', ?))`,
+      ).run(`-${retentionDays} days`, keepImportance, `-${highDays} days`);
       return result.changes;
     } catch (error) {
       logger.error("Failed to prune", error instanceof Error ? error : undefined);

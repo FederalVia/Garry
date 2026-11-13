@@ -131,14 +131,34 @@ export async function gitCommitPaths(
   }
   if (!status.stdout.trim()) return null;
 
+  const identity = await fallbackIdentityFlags(conway, repo);
   const result = await conway.exec(
-    `cd ${repo} && git commit -m ${escapeShellArg(message)} -- ${pathspec} 2>&1`,
+    `cd ${repo} && git ${identity}commit -m ${escapeShellArg(message)} -- ${pathspec} 2>&1`,
     10000,
   );
   if (result.exitCode !== 0) {
     throw new Error(`Git commit failed: ${result.stderr || result.stdout}`);
   }
   return result.stdout;
+}
+
+/**
+ * A fresh machine often has no git identity, and then every commit fails.
+ * Supply one with -c only for the parts that are missing; no config is written.
+ */
+export async function fallbackIdentityFlags(conway: ConwayClient, repo: string): Promise<string> {
+  const read = async (key: string): Promise<string> => {
+    try {
+      const res = await conway.exec(`cd ${repo} && git config ${key}`, 10000);
+      return res.exitCode === 0 ? res.stdout.trim() : "";
+    } catch {
+      return "";
+    }
+  };
+  const flags: string[] = [];
+  if (!(await read("user.name"))) flags.push("-c user.name=Automaton");
+  if (!(await read("user.email"))) flags.push("-c user.email=automaton@localhost");
+  return flags.length ? `${flags.join(" ")} ` : "";
 }
 
 /**

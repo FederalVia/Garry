@@ -451,13 +451,13 @@ InferenceRouter.route(request)
 The automaton has a 5-tier hierarchical memory system:
 
 ```
-+-------------------+  Short-term, session-scoped
++-------------------+  Short-term, capped at 20 entries
 | Working Memory    |  Goals, observations, plans, reflections
-+-------------------+  Expires after session
++-------------------+  Goals archived to episodic when over the cap
         |
 +-------------------+  Event log
 | Episodic Memory   |  Tool calls, decisions, outcomes
-+-------------------+  Importance-ranked, searchable
++-------------------+  Importance-ranked; kept 30 days (180 if >= 0.8)
         |
 +-------------------+  Fact store
 | Semantic Memory   |  Key-value facts by category
@@ -578,7 +578,7 @@ Each automaton has a unique EVM or Solana identity (`chainType` in the config):
 
 - **Wallet** (`wallet.ts`): Generated on first run (secp256k1 via `viem`, or an Ed25519 keypair for Solana). Stored at `~/.automaton/wallet.json` (mode 0600). The private key is never exposed to the agent via tools (blocked by path protection rules).
 - **Provisioning** (`provision.ts`): Signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway API. Receives an API key stored at `~/.automaton/api-key`.
-- **On-chain identity** (`registry/erc8004.ts`): Optional ERC-8004 agent registration on Base. Publishes a JSON-LD agent card with capabilities, services, and contact info.
+- **On-chain identity** (`registry/erc8004.ts`): Optional ERC-8004 agent registration on Base. Publishes a JSON-LD agent card with capabilities, services, and contact info. The register transaction is signed and recorded as pending before it is sent, so a lost send response is resumed rather than re-sent; a token the wallet owns from a recorded register (even one marked dropped or replaced) is adopted instead of refused. The system prompt shows the chain of the identity it reports.
 
 ---
 
@@ -611,13 +611,13 @@ The `ConwayClient` interface provides all Conway API operations:
 The automaton can modify its own code:
 
 - **File editing** (`code.ts`): `edit_own_file` tool applies diffs to source files. Protected files (constitution, wallet, DB, config) are blocked by path protection rules. All edits are logged to the `modifications` table. Each edit commits only its file; the tool records the new `self-mod:` commit's sha in KV `self_mod.commits` (only when this edit created it).
-- **Revert** (`tools.ts`): `revert_last_edit` reverts the newest recorded sha (`git revert --no-edit <sha>`) after checking it is an ancestor of HEAD and touches no protected file. Failed, stale or refused entries are dropped with a message, so a bad entry never blocks older ones. Operator commits are never reverted. `reset_to_upstream` clears the list.
+- **Revert** (`tools.ts`): `revert_last_edit` reverts the newest recorded sha (`git revert --no-edit <sha>`, with the same fallback identity as the edit's commit) after checking it is an ancestor of HEAD and touches no protected file. A revert git applied but could not commit is rolled back with `git reset --merge`. Failed, stale or refused entries are dropped with a message, so a bad entry never blocks older ones. Operator commits are never reverted. `reset_to_upstream` clears the list.
 - **Restart notice** (`restart-notice.ts`): every tool that rebuilds says the running process keeps the old code and sets KV `restart_required`.
 - **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` returns an index of upstream commits (flagging protected and guard files and install/build inputs: package files, lockfile, `.npmrc`, `.pnpmfile.*`, `tsconfig*.json`, `scripts/`) and then each commit's full `git show` diff in 8,000-character pages, recording which pages were read and a hash of each diff in KV (`upstream.review`). `pull_upstream` cherry-picks individual commits (hex hashes only) that were fully read and are unchanged, or fast-forwards to the reviewed target commit only when every commit up to it was read and HEAD is on the target's first-parent history, so the reviewed first-parent diffs add up to the fast-forward (never `git pull`). Review pages show invisible characters as visible escapes. It runs every command with `cd` into the runtime's repo (`process.cwd()`), and aborts a failed cherry-pick. `reset_to_upstream` is two calls: a plan, then a reset to the confirmed target hash. Installs run with dependency scripts off, then a native rebuild from a fixed list, then the build, each with its own timeout; the build runs upstream-defined scripts, so applying upstream code trusts origin. The automaton is not obligated to accept all upstream changes.
 - **Tool installation** (`agent/tools.ts`; `tools-manager.ts` holds older helpers no tool calls): `install_npm_package` adds packages. `install_mcp_server` validates the tool name (`^[a-zA-Z0-9_-]{1,64}$`, not a builtin, not installed) and installs the package, but MCP tools are not offered to the model: there is no MCP client. `loadInstalledTools` skips invalid, duplicate, builtin-colliding and MCP entries.
 - **Audit log** (`audit-log.ts`): Every modification is recorded with timestamp, type, diff, and hash for creator review.
 
-The `~/.automaton/` directory is a git repository. Every state change is versioned. The git tools default to it, expanding `~` before the path is quoted, and treat a failing git command as an error.
+The `~/.automaton/` directory is a git repository: `SOUL.md` and `skills/` are committed on each soul update and skill install, creation or removal (`WORKLOG.md` and `heartbeat.yml` ride along). Code edits are committed in the runtime repo instead. The git tools default to it, expanding `~` before the path is quoted, and treat a failing git command as an error.
 
 ---
 
@@ -699,7 +699,7 @@ SOUL.md is the automaton's self-description that evolves over time:
 
 **Validation** (`validator.ts`): Enforces size limits, required fields, injection detection. The `update_soul` tool validates changes before writing.
 
-**History:** All soul versions are stored in `soul_history` with content hashes for tamper detection.
+**History:** All soul versions are stored in `soul_history` with content hashes for tamper detection. `updateSoul` writes a default soul only when `SOUL.md` is missing; an existing file it cannot read (over 64 KiB, not a regular file) makes the update fail instead.
 
 ---
 

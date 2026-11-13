@@ -14,7 +14,7 @@ import type {
   TokenUsage,
   InferenceToolDefinition,
 } from "../types.js";
-import { ResilientHttpClient } from "./http-client.js";
+import { ResilientHttpClient, isLoopbackHttpUrl } from "./http-client.js";
 import { redactChatMessages } from "../security/secret-redaction.js";
 import { getInstalledInferenceGate, currentInferenceScope, budgetClassFor } from "../inference/gate.js";
 import {
@@ -44,18 +44,6 @@ interface InferenceClientOptions {
 }
 
 type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama";
-
-function isLoopbackHttpUrl(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    return parsed.protocol.toLowerCase() === "http:" &&
-      (host === "localhost" || host === "127.0.0.1" || host === "::1");
-  } catch {
-    return false;
-  }
-}
 
 export function createInferenceClient(
   options: InferenceClientOptions,

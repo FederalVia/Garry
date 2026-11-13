@@ -15,11 +15,36 @@ import { SemanticMemoryManager } from "./semantic.js";
 import { ProceduralMemoryManager } from "./procedural.js";
 import { RelationshipMemoryManager } from "./relationship.js";
 import { MemoryBudgetManager } from "./budget.js";
-import { estimateTokens } from "../agent/context.js";
+import { extractQueryTerms } from "./query-terms.js";
+import type { ProceduralMemoryEntry, SemanticMemoryEntry } from "../types.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("memory.retrieval");
 
 type Database = BetterSqlite3.Database;
+
+const FACTS_PER_TERM = 20;
+const PROCEDURES_PER_TERM = 10;
+
+/**
+ * Hits merged by id and ordered by how many terms matched, then by the
+ * tier's own score.
+ */
+function rankByTermHits<T extends { id: string }>(
+  hits: Map<string, { entry: T; terms: number }>,
+  score: (entry: T) => number,
+): T[] {
+  return [...hits.values()]
+    .sort((a, b) => b.terms - a.terms || score(b.entry) - score(a.entry))
+    .map((h) => h.entry);
+}
+
+function addHits<T extends { id: string }>(hits: Map<string, { entry: T; terms: number }>, entries: T[]): void {
+  for (const entry of entries) {
+    const existing = hits.get(entry.id);
+    if (existing) existing.terms += 1;
+    else hits.set(entry.id, { entry, terms: 1 });
+  }
+}
 
 export class MemoryRetriever {
   private working: WorkingMemoryManager;
@@ -50,14 +75,25 @@ export class MemoryRetriever {
 
       const episodicEntries = this.episodic.getRecent(sessionId, 20);
 
-      // For semantic and procedural, use current input as search query if available
-      const semanticEntries = currentInput
-        ? this.semantic.search(currentInput)
-        : this.semantic.getByCategory("self");
-
-      const proceduralEntries = currentInput
-        ? this.procedural.search(currentInput)
-        : [];
+      // The input is a whole prompt, so it is searched word by word. Creator
+      // and self facts are always included.
+      const terms = extractQueryTerms(currentInput);
+      const factHits = new Map<string, { entry: SemanticMemoryEntry; terms: number }>();
+      const procedureHits = new Map<string, { entry: ProceduralMemoryEntry; terms: number }>();
+      for (const term of terms) {
+        addHits(factHits, this.semantic.search(term, undefined, FACTS_PER_TERM));
+        addHits(procedureHits, this.procedural.search(term, PROCEDURES_PER_TERM));
+      }
+      const fixedFacts = [
+        ...this.semantic.getByCategory("creator"),
+        ...this.semantic.getByCategory("self"),
+      ];
+      const fixedIds = new Set(fixedFacts.map((f) => f.id));
+      const semanticEntries = [
+        ...fixedFacts,
+        ...rankByTermHits(factHits, (f) => Number(f.confidence) || 0).filter((f) => !fixedIds.has(f.id)),
+      ];
+      const proceduralEntries = rankByTermHits(procedureHits, (p) => Number(p.successCount) || 0);
 
       const relationshipEntries = this.relationships.getTrusted(0.3);
 

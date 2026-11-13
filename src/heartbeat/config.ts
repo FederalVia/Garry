@@ -66,6 +66,14 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       task: "check_social_inbox",
       enabled: true,
     },
+    {
+      // Retention for memory, events, inbox text, wake events and history.
+      // Operators can disable it in heartbeat.yml.
+      name: "memory_maintenance",
+      schedule: "23 * * * *",
+      task: "memory_maintenance",
+      enabled: true,
+    },
   ],
   defaultIntervalMs: 60_000,
   lowComputeMultiplier: 4,

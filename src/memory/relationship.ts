@@ -10,6 +10,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { ulid } from "ulid";
 import type { RelationshipMemoryEntry } from "../types.js";
 import { createLogger } from "../observability/logger.js";
+import { clampScore } from "./semantic.js";
 const logger = createLogger("memory.relationship");
 
 type Database = BetterSqlite3.Database;
@@ -19,7 +20,8 @@ export class RelationshipMemoryManager {
 
   /**
    * Record a relationship. Upserts on entityAddress.
-   * Returns the ULID id.
+   * Returns the id of the stored row (the original id when the address was
+   * already known); throws when the write fails.
    */
   record(entry: {
     entityAddress: string;
@@ -44,13 +46,18 @@ export class RelationshipMemoryManager {
         entry.entityAddress,
         entry.entityName ?? null,
         entry.relationshipType,
-        entry.trustScore ?? 0.5,
+        clampScore(entry.trustScore, 0.5),
         entry.notes ?? null,
       );
+      const row = this.db.prepare(
+        "SELECT id FROM relationship_memory WHERE entity_address = ?",
+      ).get(entry.entityAddress) as { id: string } | undefined;
+      if (!row) throw new Error("stored row not found");
+      return row.id;
     } catch (error) {
       logger.error("Failed to record", error instanceof Error ? error : undefined);
+      throw error;
     }
-    return id;
   }
 
   /**
@@ -103,11 +110,15 @@ export class RelationshipMemoryManager {
 
   /**
    * Get all relationships with trust score at or above the minimum threshold.
+   * A non-numeric stored score never qualifies (SQLite sorts TEXT above every
+   * number, so a bare comparison would let it through).
    */
   getTrusted(minTrust: number = 0.5): RelationshipMemoryEntry[] {
     try {
       const rows = this.db.prepare(
-        "SELECT * FROM relationship_memory WHERE trust_score >= ? ORDER BY trust_score DESC, interaction_count DESC",
+        `SELECT * FROM relationship_memory
+         WHERE typeof(trust_score) IN ('real', 'integer') AND trust_score >= ?
+         ORDER BY trust_score DESC, interaction_count DESC`,
       ).all(minTrust) as any[];
       return rows.map(deserializeRelationship);
     } catch (error) {

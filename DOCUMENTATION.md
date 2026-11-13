@@ -357,7 +357,7 @@ Configuration is stored at `~/.automaton/automaton.json`.
   "skillsDir": "~/.automaton/skills",
 
   // Behavior
-  "logLevel": "info",                           // debug | info | warn | error
+  "logLevel": "info",                           // debug | info | warn | error; applied to every logger at startup
   "version": "0.1.0",
   "maxChildren": 3,                             // Slot-holding children (0 disables spawn_child); also the local worker limit, max(1, maxChildren)
   "childSandboxMemoryMb": 1024,                 // Child sandbox tier
@@ -526,6 +526,7 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 | `refresh_models` | Configurable | Refreshes available models from Conway API. |
 | `prune_dead_children` | Configurable | Deletes old ended child records (keeps the last 5). |
 | `report_metrics` | Configurable | Saves metric snapshots and evaluates alert rules. |
+| `memory_maintenance` | Hourly at :23 | Enforces retention: episodic entries below 0.8 importance after 30 days and the rest (errors, strategic turns) after 180 days (goal records kept), knowledge TTL and prune, `market_signal`/knowledge events after 30 days, finished inbox messages after 30 days (never under 14, so a replay of a deleted message arrives stale and counts as unverified), `inbox_seen_*` keys after 30 days, consumed wake events after 7 days, heartbeat history after 30 days, spend and inference costs after 90 days. Disable it in `heartbeat.yml` to keep everything. |
 
 ### Heartbeat configuration
 
@@ -896,7 +897,9 @@ The heartbeat periodically runs a soul reflection that:
 
 ### Soul history
 
-Every soul change is versioned in the `soul_history` database table with content hashes. The creator can audit the complete evolution of the agent's identity.
+Every soul change is versioned in the `soul_history` database table with content hashes, and `SOUL.md` is committed to the `~/.automaton` git repository. `update_soul` creates a default soul only when there is no `SOUL.md`; if the file exists but cannot be read (over 64 KiB, not a regular file), the update is refused and the file is left alone. The creator can audit the complete evolution of the agent's identity.
+
+Only the sections an update changes are validated and cleaned; an unchanged section (for example a long creator-written core purpose) is kept exactly as it is. A rewrite that would make `SOUL.md` larger than 64 KiB is refused, except that a `## Genesis Prompt` copy the update did not change is shortened to fit. Only the known section names (`Core Purpose`, `Values`, `Strategy`, `Genesis Prompt`, ...) start a section, so a `## ` heading inside a genesis prompt stays part of it. For a SOUL.md written by the setup wizard, the mission is the genesis prompt and is used as the alignment baseline. Without a recorded genesis prompt, alignment is unknown: `reflect_on_soul` says so and the `soul_reflection` heartbeat task does not wake the agent. Alignment compares words in any script (Chinese, Japanese, Korean and Thai by character pairs). Reflection reports only the auto-updates that were actually written.
 
 ---
 
@@ -906,11 +909,11 @@ The automaton has a 5-tier hierarchical memory system that persists across resta
 
 ### Tier 1: Working Memory
 
-Session-scoped short-term memory for goals, observations, plans, and reflections. Entries expire after the session ends. Use `set_goal`, `complete_goal`, and `review_memory` to interact.
+Short-term memory for goals, observations, plans, and reflections. There is no session boundary: every turn uses the same session (`default`), so entries survive restarts. It is capped at 20 entries: over the cap, non-goal entries are removed first (lowest priority, then oldest), and if goals alone are over it the lowest-priority goals are archived to episodic memory as `goal_archived`. Goals never expire; the sleep and self-modification notes the ingestion pipeline writes expire after one day. Use `set_goal`, `complete_goal`, and `review_memory` to interact.
 
 ### Tier 2: Episodic Memory
 
-A log of significant events with importance ranking and classification. Includes tool call outcomes, decisions, and their results. Automatically populated by the post-turn ingestion pipeline.
+A log of significant events with importance ranking and classification. Includes tool call outcomes, decisions, and their results. Automatically populated by the post-turn ingestion pipeline. Retention (`memory_maintenance`): entries below 0.8 importance are deleted after 30 days; entries at or above it (error turns at 0.8, strategic turns at 0.9) after 180 days; `goal_completed` and `goal_archived` records are kept.
 
 ### Tier 3: Semantic Memory
 
@@ -946,13 +949,15 @@ The automaton can modify its own code while running.
 
 The `edit_own_file` tool allows the agent to modify source files in its codebase. Safeguards:
 - **Protected files** cannot be modified (see [Protected and sensitive paths](#protected-and-sensitive-paths)); the path is checked on its real path and the write never follows a link
-- Every edit is logged to the `modifications` audit table
-- Rate limits prevent runaway self-modification (20 per hour)
+- Every edit is logged to the `modifications` audit table with a unified line diff (3 lines of context), the added/removed line counts and the SHA-256 of the new content; only the assembled diff is cut at 10,000 characters, with a note of how many changed lines were left out (the full change is in the git commit when one was made, otherwise in the file, whose hash is recorded)
+- Rate limits prevent runaway self-modification (20 code edits per hour; package installs, reverts and resets do not count)
 - **Trust:** `edit_own_file` runs in the main process as the wallet owner, and every module is loaded at startup. An edit to any module that is not protected, followed by a restart, runs in the wallet-holding process with its full authority (it can read `wallet.json`, sign, or patch `fetch`), whether or not guard code imports it. Protecting more files does not close this, because `src/index.ts` imports nearly the whole runtime. So `edit_own_file` plus a restart is a full-trust capability, also in the recommended deployment where `exec` runs as a separate user: every agent-editable in-process module is part of the trust base. Review the `self-mod:` commits (and the `modifications` audit table) before restarting after `restart_required`, or keep the runtime checkout read-only to the agent if it must not change its own code.
-- Each edit commits only the edited file in the runtime's own repository (`self-mod: <reason>`), and no empty commits are made
+- Each edit commits only the edited file in the runtime's own repository (`self-mod: <reason>`), and no empty commits are made. When git has no `user.name`/`user.email`, the commit uses `Automaton <automaton@localhost>` through `-c` flags (no config is written). If the commit still fails, the result says "NOT committed" with git's reason, and that `revert_last_edit` cannot undo the edit
 - Editing a code file rebuilds `dist/`; the change takes effect after a restart (see [Restart after a rebuild](#restart-after-a-rebuild))
 
-**Reverting.** `edit_own_file` records each commit it makes (KV `self_mod.commits`, newest last, at most 50). `revert_last_edit` reverts only the newest recorded commit, so repeated calls go further back instead of re-applying the edit, and operator commits are never reverted. It refuses a recorded commit that touches a protected file. A recorded commit that is no longer in the history (after a reset), whose revert conflicts (it is aborted, leaving the tree unchanged), or that is already undone, is removed from the list with a message saying so, so it cannot block older edits. If git refuses to start (local changes in the way), nothing is aborted and the entry stays. `revert_last_edit` and `pull_upstream` refuse to start while the repository has a cherry-pick, revert, merge or rebase in progress or staged changes, because git's `--abort` would also roll back an operation the operator started; they abort only an operation their own command started. `reset_to_upstream` clears the list.
+**Reverting.** `edit_own_file` records each commit it makes (KV `self_mod.commits`, newest last, at most 50). `revert_last_edit` reverts only the newest recorded commit, so repeated calls go further back instead of re-applying the edit, and operator commits are never reverted. It refuses a recorded commit that touches a protected file. A recorded commit that is no longer in the history (after a reset), whose revert conflicts (it is aborted, leaving the tree unchanged), or that is already undone, is removed from the list with a message saying so, so it cannot block older edits. The revert and `pull_upstream`'s cherry-pick commit with the same fallback identity as `edit_own_file`. If git refuses to start (local changes in the way), nothing is aborted and the entry stays; if it applied the revert but could not commit it, the staged change is rolled back (`git reset --merge`) and the entry stays. `revert_last_edit` and `pull_upstream` refuse to start while the repository has a cherry-pick, revert, merge or rebase in progress or staged changes, because git's `--abort` would also roll back an operation the operator started; they abort only an operation their own command started. `reset_to_upstream` clears the list. The `code_revert` audit entry lists the files the revert touched and whether the rebuild succeeded.
+
+**Resetting.** Before a confirmed `reset_to_upstream` runs `git reset --hard`, it records the local commits it discards, the uncommitted changes to tracked files (`git diff --stat HEAD` and the diff, cut at 4,000 characters) and the upstream commits it applies (`HEAD..target`, with the files). The `upstream_reset` audit entry is written after install and build, with sections "Discarded local commits", "Discarded uncommitted changes", "Applied upstream commits" and "Install/build". The result names the discarded uncommitted files. If the uncommitted changes cannot be listed, the reset is refused.
 
 ### Upstream updates
 
@@ -968,8 +973,8 @@ The agent is never obligated to accept all upstream changes. Installing after a 
 
 ### Tool and package installation
 
-- `install_npm_package` — adds npm packages to the environment
-- `install_mcp_server` — installs an MCP (Model Context Protocol) server package. The runtime has no MCP client yet, so the server is not offered to the model as a tool and the result says so. Tool names must match `^[a-zA-Z0-9_-]{1,64}$`, may not reuse a built-in tool's name and must be unique; installed tools that break these rules are skipped (with a warning) instead of being sent to the provider, where they would fail every request.
+- `install_npm_package` — adds an npm registry package to the environment (`name`, `@scope/name`, optionally `@version`, tag or range). GitHub shorthand (`owner/repo`), paths, URLs, tarballs and anything starting with `-`, `.` or `/` are refused; the spec is passed quoted after `--`. Only a successful install (exit code 0) is recorded in `modifications`; a failure reports the exit code and npm's error
+- `install_mcp_server` — installs an MCP (Model Context Protocol) server package (npm registry specs only, as for `install_npm_package`). The runtime has no MCP client yet, so the server is not offered to the model as a tool and the result says so. Tool names must match `^[a-zA-Z0-9_-]{1,64}$`, may not reuse a built-in tool's name and must be unique; installed tools that break these rules are skipped (with a warning) instead of being sent to the provider, where they would fail every request.
 
 ---
 
@@ -1048,7 +1053,7 @@ Automatons communicate via a social relay at `social.conway.tech`.
    - **unverified** when there is no signature, or when a valid signature's `signed_at` is older than 7 days or more than 2 minutes ahead (logged at info). `from` is then not vouched for: an unverified sender is never treated as that address, only as what the relay reported. Such messages are delivered, labelled `NOT VERIFIED`, so a long sleep or a sender's fast clock loses no mail;
    - **dropped** (logged at warn, never stored) when a signature is present but fails or has no readable `signed_at`, `from` is not a valid address, the relay's `to` is not our address, or the content is over 64,000 characters.
    Today the relay does not return signatures, so every message is unverified. Anyone who can make the relay report an address (including the creator's) can claim it; the label and the isolated reply-only turn are what limit that. Dropping a bad signature gives no protection by itself (an attacker can strip it), and assumes the relay passes the sender's signature over this exact string; contract-wallet (ERC-1271) signatures are not supported and are dropped.
-5. **Replays** are stopped by a hash of what the sender signed (sender plus the canonical string), stored in `inbox_messages.sig_hash` under a unique index, so a signed message re-served under a new relay id is stored once and wakes nothing. Inbox rows are never deleted, so this holds for good; a signed message downgraded for its `signed_at` keeps the same hash, so it cannot be delivered twice either. An unsigned message re-delivered with the same nonce or `signed_at`, sender and content is also stored once. The relay's own `nonce` and message id prove nothing and are not trusted.
+5. **Replays** are stopped by a hash of what the sender signed (sender plus the canonical string), stored in `inbox_messages.sig_hash` under a unique index, so a signed message re-served under a new relay id is stored once and wakes nothing. Finished inbox rows are deleted after 30 days (never under 14), well past the 7-day freshness window, so a signed message replayed after its row is gone is delivered as unverified, never as verified; a signed message downgraded for its `signed_at` keeps the same hash, so it cannot be delivered twice either. An unsigned message re-delivered with the same nonce or `signed_at`, sender and content is also stored once. The relay's own `nonce` and message id prove nothing and are not trusted.
 6. **Screened once**, at ingest, and stored with the verdict and the original text unchanged (see "Inbound screening")
 7. **Rate limited** at ingest from stored rows: at most 10 per minute from one sender are delivered. The minute is measured against when the sender sent (signed time for verified messages, the relay's time otherwise), not when the inbox was polled, so one poll carrying several minutes or hours of mail is not cut to 10. That time is clamped to between the previous successful poll and now, however long ago that poll was (a restart, a relay outage or low-compute sleep keeps the backlog's real spacing), so a relay cannot back-date or spread a flood beyond what the elapsed time allows. With no previous poll recorded, the floor is 7 days back. Separately, what one poll makes claimable for a sender is bounded in real time: at most 10 times the minutes since the previous successful poll (at least 10), less what that sender had made claimable in the last real minute. So a flood, however its times are dated and however close together polls run, is shown at most 10 per minute of real time on average, and never more than 10 in any 60 seconds while polls are under a minute apart; a backlog after a long gap is shown at once. Messages over either limit (for example a backlog the relay pages over several polls, or delivers after the poll it was due in, so its times clamp together) are screened and stored as `deferred`: never claimed while they wait, and released oldest first at the start of each later successful poll within that poll's real-time room. While a sender has messages deferred, its new messages queue behind them, so delivery keeps sender order. A sender may have at most 1,800 deferred messages waiting (three hours at the limit); past that, further ones are stored as `rate_limited` and never handled (logged at warn). Signed and unsigned messages from the same address are counted separately, so forged traffic cannot use up a real sender's budget.
 8. Handled in one isolated, reply-only turn per sender batch. A batch is all signed or all unsigned; signed senders go first. Only a signed batch sees the sender's earlier (signed) inbox turns; an unsigned one sees none. Each message is shown as a label line (`[UNTRUSTED EXTERNAL SENDER <address> | signature verified]:` or `... | NOT VERIFIED: address reported by relay]:`) followed by its text, every line prefixed with `> `, so a label typed inside a message never starts a line.
@@ -1095,10 +1100,16 @@ Automatons can register on-chain via the [ERC-8004](https://ethereum-magicians.o
 
 ### Registration
 
-The `register_erc8004` tool:
-1. Checks ETH gas balance (preflight)
-2. Calls the ERC-8004 registry contract
-3. Publishes the agent's URI (pointing to its agent card)
+The `register_erc8004` tool (`network`: `mainnet`, the default, or `testnet`; anything else is refused):
+1. Checks for a registration on the target chain only (a Base Sepolia registration does not block Base mainnet)
+2. Resumes a register transaction already sent on that chain (a `pending` row in `onchain_transactions`) instead of sending another
+3. Refuses when the registry has no contract at its address on that chain, or when that or the wallet's identity-token balance cannot be read. When the wallet already owns a token there, it looks for a register transaction recorded on that chain (including one marked dropped, or the transaction that replaced one) whose receipt minted a token this wallet still owns, and records that entry; otherwise it refuses
+4. Checks ETH gas balance (preflight), signs the `register(agentURI)` transaction, records it as `pending` under its hash, and only then sends it. If the send call fails, the row stays pending (the transaction may have reached the network) and the next call resumes it
+5. Waits up to 180 s for the receipt. If it does not arrive, the transaction stays pending and the next call resumes it; a transaction the RPC node does not know (dropped) is marked failed, and the next registration reuses its nonce while that nonce is unspent, so at most one of the two can be mined
+6. Saves the registry entry only for a successful receipt that contains a mint (`Transfer` from the zero address to this wallet) emitted by the identity registry itself; a revert, a cancelled or replaced transaction, or a receipt with no such mint is marked failed and nothing is saved. The entry and the confirmed status are written in one database transaction, so a failed save leaves the transaction pending for the next call to resume. Entries are keyed by chain and agent ID, so a testnet and a mainnet identity with the same token ID are both kept
+7. When it resumed an earlier broadcast that used a different agent URI, the result says which URI is on-chain
+
+The registries are deployed at deterministic addresses, one pair on every mainnet and another on every testnet: Base uses `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` (identity) and `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` (reputation); Base Sepolia uses `0x8004A818BFB912233c491871b3d84c89A494BD9e` and `0x8004B663056A597Dffe9eCcC1965A193B7388713`.
 
 ### Agent card
 
@@ -1335,7 +1346,7 @@ The bootstrap topup attempts to buy $5 credits from USDC automatically on startu
 Check available models with `list_models`. The default is `gpt-5.2`. If using BYOK keys, ensure they're valid.
 
 **Rate limited:**
-Inference requests are POSTs and are sent once; the inference router or the agent loop decides whether to try again. The resilient HTTP client retries only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) automatically, on 429 and 5xx with exponential backoff (up to 3 retries).
+Inference requests are POSTs and are sent once; the inference router or the agent loop decides whether to try again. The resilient HTTP client retries only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) automatically, on 429 and 5xx with exponential backoff (up to 3 retries). Each attempt's timeout covers the whole exchange, body included (60 s for inference), so a server that sends headers and then stalls fails at the deadline. Plain HTTP is accepted only on loopback (`localhost`, `127.0.0.1`, `[::1]`) when enabled, as for a local Ollama.
 
 **Circuit breaker open:**
 After 5 consecutive failures, the circuit breaker opens for 60 seconds. Wait and retry.
@@ -1400,7 +1411,7 @@ All state is in `~/.automaton/state.db` (SQLite). Key tables:
 - `modifications` — every code change
 - `policy_decisions` — every policy evaluation
 
-The `~/.automaton/` directory is also git-versioned for file-level audit.
+The `~/.automaton/` directory is also a git repository. Only `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md` and `skills/` can be versioned (an allowlist `.gitignore`; `automaton.json`, the wallet, keys and `state.db` never are). A commit is made after each soul update (`soul: vN (source): reason`) and after a skill is installed, created or removed (`skill: ...`); it stages only `SOUL.md`, `WORKLOG.md`, `heartbeat.yml` and `skills/`, so `WORKLOG.md` and `heartbeat.yml` edits are committed with the next such change. Skills cloned from git are committed as files, not as embedded repositories. Configuration is never versioned.
 
 **How do I stop an automaton?**
 

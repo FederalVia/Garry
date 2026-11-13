@@ -197,6 +197,33 @@ export async function countUncommittedChanges(): Promise<number> {
   return out.split("\0").filter(Boolean).length;
 }
 
+/** What a hard reset would throw away from the working tree (tracked files only). */
+export async function getUncommittedChanges(maxDiffChars = 4000): Promise<{ files: string[]; stat: string; diff: string }> {
+  const status = await gitAsync(["status", "--porcelain", "-z", "--untracked-files=no"]);
+  const files: string[] = [];
+  const entries = status.split("\0");
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.length < 4) continue;
+    files.push(entry.slice(3));
+    // A rename or copy is followed by its source path.
+    if (entry[0] === "R" || entry[0] === "C") i++;
+  }
+  if (files.length === 0) return { files, stat: "", diff: "" };
+  const stat = (await gitAsync(["diff", "--stat", "--no-color", "HEAD"])).trim();
+  const diff = await gitAsync(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD"], 120_000);
+  return {
+    files,
+    stat,
+    diff: diff.length > maxDiffChars ? `${diff.slice(0, maxDiffChars)}\n… (diff truncated at ${maxDiffChars} chars)` : diff.trimEnd(),
+  };
+}
+
+/** The commits a reset to target applies (HEAD..target), oldest last as git log prints them. */
+export async function getUpstreamRange(target: string): Promise<string> {
+  return (await gitAsync(["log", "--oneline", "--no-decorate", `HEAD..${target}`])).trim();
+}
+
 export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }

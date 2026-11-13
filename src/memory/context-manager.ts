@@ -4,10 +4,15 @@
  * Model-aware context assembly with token-budget enforcement.
  */
 
+import { createHash } from "node:crypto";
 import { getEncoding, type Tiktoken } from "js-tiktoken";
 import type { ChatMessage } from "../types.js";
 
 const MAX_TOKEN_CACHE_SIZE = 10_000;
+/** Cap on the summed length of all cache keys. */
+const MAX_TOKEN_CACHE_KEY_CHARS = 2_000_000;
+/** Texts up to this length are their own cache key; longer ones are hashed. */
+const MAX_PLAIN_CACHE_KEY_TEXT = 256;
 const DEFAULT_RESERVE_TOKENS = 4_096;
 const COMPRESSION_HEADROOM_RATIO = 0.1;
 const MAX_EVENT_CONTENT_CHARS = 220;
@@ -116,16 +121,15 @@ interface RenderedTurn extends RenderedBundle {
   turnIndex: number;
 }
 
-function enforceLruLimit(cache: Map<string, number>): void {
-  if (cache.size <= MAX_TOKEN_CACHE_SIZE) return;
-  const oldestKey = cache.keys().next().value;
-  if (oldestKey !== undefined) {
-    cache.delete(oldestKey);
-  }
-}
-
+/**
+ * Short texts keep a readable key; a long text is keyed by its length and
+ * SHA-256, so the cache never holds a copy of a large tool result.
+ */
 function formatCacheKey(text: string, model?: string): string {
-  return `${model ?? "default"}::${text}`;
+  const prefix = `${model ?? "default"}::`;
+  if (text.length <= MAX_PLAIN_CACHE_KEY_TEXT) return `${prefix}${text}`;
+  const digest = createHash("sha256").update(text, "utf8").digest("hex");
+  return `${prefix}#${text.length}:${digest}`;
 }
 
 /**
@@ -269,6 +273,20 @@ function countTokensBounded(text: string, encoder: Tiktoken): number {
 
 export function createTokenCounter(): TokenCounter {
   const cache = new Map<string, number>();
+  let keyChars = 0;
+
+  // Least recently used first: evict while over the entry or key-size cap.
+  const enforceLimits = (): void => {
+    while (cache.size > MAX_TOKEN_CACHE_SIZE || keyChars > MAX_TOKEN_CACHE_KEY_CHARS) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) {
+        keyChars = 0;
+        return;
+      }
+      cache.delete(oldestKey);
+      keyChars -= oldestKey.length;
+    }
+  };
   let encoder: Tiktoken | null = null;
 
   try {
@@ -300,7 +318,8 @@ export function createTokenCounter(): TokenCounter {
     }
 
     cache.set(key, count);
-    enforceLruLimit(cache);
+    keyChars += key.length;
+    enforceLimits();
     return count;
   };
 

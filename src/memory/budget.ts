@@ -13,50 +13,53 @@ export class MemoryBudgetManager {
 
   /**
    * Allocate memories within budget, trimming each tier as needed.
-   * Returns a new MemoryRetrievalResult that fits within the budget.
+   * Tiers are filled in priority order (working, episodic, semantic,
+   * procedural, relationships); the budget a tier leaves unused rolls to the
+   * next one, so the total never exceeds the sum of the configured budgets.
    */
   allocate(memories: MemoryRetrievalResult): MemoryRetrievalResult {
     let totalTokens = 0;
+    let carry = 0;
 
-    // Working memory tier
-    const { items: workingMemory, tokens: workingTokens } = this.trimTier(
+    const fill = <T>(items: T[], budget: number, estimateFn: (item: T) => number): T[] => {
+      const available = Math.max(0, budget) + carry;
+      const { items: kept, tokens } = this.trimTier(items ?? [], available, estimateFn);
+      carry = available - tokens;
+      totalTokens += tokens;
+      return kept;
+    };
+
+    const workingMemory = fill(
       memories.workingMemory,
       this.budget.workingMemoryTokens,
       (entry) => estimateTokens(entry.content),
     );
-    totalTokens += workingTokens;
 
-    // Episodic memory tier
-    const { items: episodicMemory, tokens: episodicTokens } = this.trimTier(
+    const episodicMemory = fill(
       memories.episodicMemory,
       this.budget.episodicMemoryTokens,
       (entry) => estimateTokens(entry.summary + (entry.detail || "")),
     );
-    totalTokens += episodicTokens;
 
-    // Semantic memory tier
-    const { items: semanticMemory, tokens: semanticTokens } = this.trimTier(
+    const semanticMemory = fill(
       memories.semanticMemory,
       this.budget.semanticMemoryTokens,
       (entry) => estimateTokens(`${entry.category}/${entry.key}: ${entry.value}`),
     );
-    totalTokens += semanticTokens;
 
-    // Procedural memory tier
-    const { items: proceduralMemory, tokens: proceduralTokens } = this.trimTier(
+    const proceduralMemory = fill(
       memories.proceduralMemory,
       this.budget.proceduralMemoryTokens,
-      (entry) => estimateTokens(`${entry.name}: ${entry.description} (${entry.steps.length} steps)`),
+      (entry) => estimateTokens(
+        `${entry.name}: ${entry.description} (${Array.isArray(entry.steps) ? entry.steps.length : 0} steps)`,
+      ),
     );
-    totalTokens += proceduralTokens;
 
-    // Relationship memory tier
-    const { items: relationships, tokens: relationshipTokens } = this.trimTier(
+    const relationships = fill(
       memories.relationships,
       this.budget.relationshipMemoryTokens,
       (entry) => estimateTokens(`${entry.entityAddress}: ${entry.relationshipType} trust=${entry.trustScore}`),
     );
-    totalTokens += relationshipTokens;
 
     return {
       workingMemory,
@@ -89,7 +92,8 @@ export class MemoryBudgetManager {
   }
 
   /**
-   * Trim a tier's items to fit within a token budget.
+   * Trim a tier's items to fit within a token budget. An item that does not
+   * fit is skipped, so one oversized entry does not hide smaller ones.
    */
   private trimTier<T>(
     items: T[],
@@ -101,7 +105,7 @@ export class MemoryBudgetManager {
 
     for (const item of items) {
       const itemTokens = estimateFn(item);
-      if (tokens + itemTokens > budgetTokens) break;
+      if (tokens + itemTokens > budgetTokens) continue;
       result.push(item);
       tokens += itemTokens;
     }

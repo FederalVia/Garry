@@ -39,6 +39,13 @@ import type {
 } from "../types.js";
 import type BetterSqlite3 from "better-sqlite3";
 
+// buildTickContext reads the USDC balance on every tick; without this mock
+// that read went to the public Base mainnet RPC.
+vi.mock("../conway/x402.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../conway/x402.js")>()),
+  getUsdcBalance: vi.fn(async () => 0),
+}));
+
 type DatabaseType = BetterSqlite3.Database;
 
 const DEFAULT_HB_CONFIG: HeartbeatConfig = {

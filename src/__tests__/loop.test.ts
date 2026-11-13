@@ -23,6 +23,18 @@ import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import { PolicyEngine } from "../agent/policy-engine.js";
 import { createDefaultRules } from "../agent/policy-rules/index.js";
+import { getUsdcBalance } from "../conway/x402.js";
+
+// The loop reads the USDC balance every phase; without this mock that read
+// went to the public Base mainnet RPC. 0 USDC (what a fresh test wallet holds)
+// keeps the bootstrap topup, and its module-level cooldown, out of these tests.
+const realX402 = vi.hoisted(() => ({ getUsdcBalance: null as null | ((...args: any[]) => Promise<number>) }));
+vi.mock("../conway/x402.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../conway/x402.js")>();
+  realX402.getUsdcBalance = actual.getUsdcBalance;
+  return { ...actual, getUsdcBalance: vi.fn(async () => 0) };
+});
+const usdcBalanceMock = vi.mocked(getUsdcBalance);
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -35,11 +47,19 @@ describe("Agent Loop", () => {
     conway = new MockConwayClient();
     identity = createTestIdentity();
     config = createTestConfig();
+    usdcBalanceMock.mockClear();
+    usdcBalanceMock.mockImplementation(async () => 0);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     db.close();
+  });
+
+  it("reads the USDC balance through the mock, never the network", async () => {
+    const inference = new MockInferenceClient([noToolResponse("Done.")]);
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(usdcBalanceMock).toHaveBeenCalled();
   });
 
   it("exec tool runs and is persisted", async () => {
@@ -1006,6 +1026,8 @@ describe("Agent Loop: unknown and cached balances", () => {
   }
 
   beforeEach(() => {
+    // These tests answer the balance RPC with their own fetch stub.
+    usdcBalanceMock.mockImplementation((...args: any[]) => realX402.getUsdcBalance!(...args));
     db = createTestDb();
     conway = new MockConwayClient();
     // A real throwaway key, so the topup path gets as far as the /pay probe.

@@ -149,6 +149,16 @@ describe("revert_last_edit", () => {
 
     expect(await revert()).toMatch(/^No recorded self-modification/);
     expect(readA()).toBe("export const a = 1;\n");
+
+    // The audit entries name the reverted files and the rebuild outcome.
+    const audits = db.raw
+      .prepare("SELECT description, diff FROM modifications WHERE type = 'code_revert' ORDER BY rowid")
+      .all() as Array<{ description: string; diff: string }>;
+    expect(audits).toHaveLength(2);
+    for (const a of audits) {
+      expect(a.description).toMatch(/^Reverted: .*; files: src\/a\.ts; rebuild: ok$/);
+      expect(a.diff).toBe("Files: src/a.ts\nRebuild: ok");
+    }
   }, 60_000);
 
   it("leaves the operator's cherry-pick in progress alone and keeps the entry", async () => {

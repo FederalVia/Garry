@@ -12,6 +12,7 @@ import {
   ResilientHttpClient,
   CircuitOpenError,
   RedirectRefusedError,
+  isLoopbackHttpUrl,
 } from "../conway/http-client.js";
 
 // ─── Mock fetch ────────────────────────────────────────────────
@@ -789,5 +790,85 @@ describe("redirect hops are checked like the first URL", () => {
       /HTTPS required/,
     );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Body timeout and IPv6 loopback ────────────────────────────
+
+describe("the timeout covers the response body (F148)", () => {
+  let server: http.Server | null = null;
+
+  beforeEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+  });
+
+  afterEach(async () => {
+    if (server) {
+      server.closeAllConnections();
+      await new Promise<void>((r) => server!.close(() => r()));
+      server = null;
+    }
+  });
+
+  it("a server that stalls after the headers makes text() reject at the deadline", async () => {
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"balance":');
+      // ...and never finishes the body.
+    });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+
+    const started = Date.now();
+    const response = await client.request(`http://127.0.0.1:${port}/slow`, { timeout: 300 });
+    expect(response.status).toBe(200);
+    await expect(response.text()).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("a body read before the deadline is returned whole", async () => {
+    server = http.createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end('{"ok":true}');
+    });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    const response = await client.request(`http://127.0.0.1:${port}/fast`, { timeout: 200 });
+    expect(await response.json()).toEqual({ ok: true });
+    // The deadline passing afterwards changes nothing.
+    await new Promise((r) => setTimeout(r, 300));
+  });
+});
+
+describe("IPv6 loopback over plain HTTP (F152)", () => {
+  it("sends http://[::1] when loopback HTTP is allowed", async () => {
+    const seen: string[] = [];
+    globalThis.fetch = vi.fn(async (input: any) => {
+      seen.push(String(input));
+      return mockResponse(200, { ok: true });
+    }) as typeof fetch;
+    const client = new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 });
+    const response = await client.request("http://[::1]:1/x");
+    expect(response.status).toBe(200);
+    expect(seen).toEqual(["http://[::1]:1/x"]);
+  });
+
+  it("still refuses http://[::1] when loopback HTTP is not allowed, and other IPv6 hosts", async () => {
+    globalThis.fetch = vi.fn(async () => mockResponse(200)) as typeof fetch;
+    await expect(new ResilientHttpClient({ maxRetries: 0 }).request("http://[::1]:1/x")).rejects.toThrow(/HTTPS required/);
+    await expect(
+      new ResilientHttpClient({ allowHttpOnLoopback: true, maxRetries: 0 }).request("http://[::2]:1/x"),
+    ).rejects.toThrow(/HTTPS required/);
+  });
+
+  it("isLoopbackHttpUrl recognises the bracketed IPv6 loopback", () => {
+    expect(isLoopbackHttpUrl("http://[::1]:11434")).toBe(true);
+    expect(isLoopbackHttpUrl("http://localhost:11434")).toBe(true);
+    expect(isLoopbackHttpUrl("https://[::1]:11434")).toBe(false);
+    expect(isLoopbackHttpUrl("http://[::2]:11434")).toBe(false);
+    expect(isLoopbackHttpUrl(undefined)).toBe(false);
   });
 });

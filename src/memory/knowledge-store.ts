@@ -8,6 +8,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import {
   deleteKnowledge,
   getKnowledgeByCategory,
+  getKnowledgeByKey,
   insertKnowledge,
   searchKnowledge,
   updateKnowledge,
@@ -170,6 +171,15 @@ export class KnowledgeStore {
   ): KnowledgeEntry[] {
     const rows = searchKnowledge(this.db, query, category, limit);
     return rows.map(toKnowledgeEntry);
+  }
+
+  /**
+   * The entry stored under exactly this category and key (expired or not),
+   * using the (category, key) index. Highest confidence first if several.
+   */
+  getByKey(category: KnowledgeCategory, key: string): KnowledgeEntry | null {
+    const row = getKnowledgeByKey(this.db, category, key);
+    return row ? toKnowledgeEntry(row) : null;
   }
 
   update(id: string, updates: Partial<KnowledgeEntry>): void {

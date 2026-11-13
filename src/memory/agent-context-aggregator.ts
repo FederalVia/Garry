@@ -51,8 +51,8 @@ interface GroupAccumulator {
   highlights: string[];
 }
 
-const HEARTBEAT_PATTERNS = ["heartbeat", "alive", "ping", "health"];
-const ERROR_PATTERNS = ["error", "failed", "exception", "fatal"];
+const HEARTBEAT_PATTERNS = ["heartbeat", "alive", "ping", "health", "healthy"];
+const ERROR_PATTERNS = ["error", "failed", "failure", "exception", "fatal"];
 const BLOCKED_PATTERNS = ["blocked", "stalled", "waiting_on_dependency"];
 const COMPLETED_PATTERNS = ["completed", "done", "finished", "resolved"];
 const PROGRESS_PATTERNS = ["progress", "running", "in_progress", "working"];
@@ -194,12 +194,15 @@ export class AgentContextAggregator {
     let rendered = lines.join("\n");
     if (params.budgetTokens <= 0) return "";
 
-    const maxChars = params.budgetTokens * 4;
+    // Same ratio as estimateTokens(), so the result is within the budget.
+    const maxChars = Math.floor(params.budgetTokens * CHARS_PER_TOKEN);
     if (rendered.length <= maxChars) return rendered;
 
     // Preserve highest-signal updates by clipping from the end.
-    rendered = `${rendered.slice(0, maxChars - 25)}\n[TRUNCATED FOR TOKEN BUDGET]`;
-    return rendered;
+    if (maxChars >= TRUNCATION_MARKER.length) {
+      return `${rendered.slice(0, maxChars - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`;
+    }
+    return SHORT_TRUNCATION_MARKER.length <= maxChars ? SHORT_TRUNCATION_MARKER : "";
   }
 
   private isError(update: AgentStatusUpdate): boolean {
@@ -259,10 +262,23 @@ export class AgentContextAggregator {
   }
 }
 
+/**
+ * Whole-word match: 'ping' must not match 'sleeping', nor 'done' 'abandoned'.
+ * '_' separates words, so the event kind 'task_failed' matches 'failed'; a
+ * pattern with '_' ('in_progress') matches those words in sequence. A
+ * plain plural of the last word counts ('3 errors').
+ */
 function matchesAny(value: string | undefined, patterns: string[]): boolean {
   if (!value) return false;
-  const lower = value.toLowerCase();
-  return patterns.some((pattern) => lower.includes(pattern));
+  const words = value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return patterns.some((pattern) => {
+    const parts = pattern.split("_");
+    for (let i = 0; i + parts.length <= words.length; i++) {
+      const last = parts.length - 1;
+      if (parts.every((part, j) => words[i + j] === part || (j === last && words[i + j] === `${part}s`))) return true;
+    }
+    return false;
+  });
 }
 
 function normalizeMessage(input: string | undefined, maxChars: number = 120): string | null {
@@ -273,6 +289,10 @@ function normalizeMessage(input: string | undefined, maxChars: number = 120): st
   return `${compact.slice(0, maxChars)}...`;
 }
 
+const CHARS_PER_TOKEN = 3.5;
+const TRUNCATION_MARKER = "\n[TRUNCATED FOR TOKEN BUDGET]";
+const SHORT_TRUNCATION_MARKER = "[TRUNCATED]";
+
 function estimateTokens(text: string): number {
-  return Math.ceil((text ?? "").length / 3.5);
+  return Math.ceil((text ?? "").length / CHARS_PER_TOKEN);
 }

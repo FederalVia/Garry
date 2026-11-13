@@ -655,7 +655,22 @@ describe("package install inline validation", () => {
     const tool = tools.find((t) => t.name === "install_npm_package")!;
     await tool.execute({ package: "axios" }, ctx);
     expect(conway.execCalls.length).toBe(1);
-    expect(conway.execCalls[0].command).toBe("npm install -g axios");
+    // Registry specs only, quoted after "--".
+    expect(conway.execCalls[0].command).toBe("npm install -g -- 'axios'");
+  });
+
+  for (const pkg of ["-x", "./dir", "owner/repo", "../evil"]) {
+    it(`install_mcp_server accepts registry specs only: ${pkg}`, async () => {
+      const tool = tools.find((t) => t.name === "install_mcp_server")!;
+      expect(await tool.execute({ package: pkg, name: "test" }, ctx)).toContain("Blocked");
+      expect(conway.execCalls.length).toBe(0);
+    });
+  }
+
+  it("install_mcp_server quotes the spec after --", async () => {
+    const tool = tools.find((t) => t.name === "install_mcp_server")!;
+    await tool.execute({ package: "@modelcontextprotocol/server-github", name: "github" }, ctx);
+    expect(conway.execCalls[0].command).toBe("npm install -g -- '@modelcontextprotocol/server-github'");
   });
 
   it("install_npm_package allows scoped packages", async () => {

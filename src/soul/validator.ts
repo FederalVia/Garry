@@ -99,13 +99,25 @@ export function containsInjectionPatterns(text: string): boolean {
   return INJECTION_PATTERNS.some((p) => p.test(text));
 }
 
+export interface ValidateSoulOptions {
+  /**
+   * Keys this update changes. When given, only these are checked for size and
+   * injection and only these are sanitized; every other field is carried as
+   * stored (a long creator-written purpose must not block or be truncated by
+   * an unrelated update). Required fields are always checked.
+   */
+  changedKeys?: Iterable<string>;
+}
+
 /**
  * Validate a SoulModel against size limits, structural requirements, and injection patterns.
  * Never throws — returns a ValidationResult.
  */
-export function validateSoul(soul: SoulModel): SoulValidationResult {
+export function validateSoul(soul: SoulModel, opts?: ValidateSoulOptions): SoulValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
+  const changed = opts?.changedKeys ? new Set<string>(opts.changedKeys) : null;
+  const check = (key: string): boolean => changed === null || changed.has(key);
 
   // Structural validation
   if (!soul.corePurpose.trim()) {
@@ -113,29 +125,29 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
   }
 
   // Size limits
-  if (soul.corePurpose.length > LIMITS.corePurpose) {
+  if (check("corePurpose") && soul.corePurpose.length > LIMITS.corePurpose) {
     errors.push(`Core purpose exceeds ${LIMITS.corePurpose} chars (${soul.corePurpose.length})`);
   }
 
-  if (soul.values.length > LIMITS.values) {
+  if (check("values") && soul.values.length > LIMITS.values) {
     errors.push(`Too many values (${soul.values.length}, max ${LIMITS.values})`);
   }
 
-  if (soul.behavioralGuidelines.length > LIMITS.behavioralGuidelines) {
+  if (check("behavioralGuidelines") && soul.behavioralGuidelines.length > LIMITS.behavioralGuidelines) {
     errors.push(
       `Too many behavioral guidelines (${soul.behavioralGuidelines.length}, max ${LIMITS.behavioralGuidelines})`,
     );
   }
 
-  if (soul.personality.length > LIMITS.personality) {
+  if (check("personality") && soul.personality.length > LIMITS.personality) {
     errors.push(`Personality exceeds ${LIMITS.personality} chars (${soul.personality.length})`);
   }
 
-  if (soul.boundaries.length > LIMITS.boundaries) {
+  if (check("boundaries") && soul.boundaries.length > LIMITS.boundaries) {
     errors.push(`Too many boundaries (${soul.boundaries.length}, max ${LIMITS.boundaries})`);
   }
 
-  if (soul.strategy && soul.strategy.length > LIMITS.strategy) {
+  if (check("strategy") && soul.strategy && soul.strategy.length > LIMITS.strategy) {
     warnings.push(`Strategy exceeds ${LIMITS.strategy} chars (${soul.strategy.length})`);
   }
 
@@ -147,6 +159,7 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
   ];
 
   for (const section of textSections) {
+    if (!check(section.name)) continue;
     if (section.content && containsInjectionPatterns(section.content)) {
       errors.push(`Injection pattern detected in ${section.name}`);
     }
@@ -159,6 +172,7 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
   ];
 
   for (const section of listSections) {
+    if (!check(section.name)) continue;
     for (const item of section.items) {
       if (containsInjectionPatterns(item)) {
         errors.push(`Injection pattern detected in ${section.name}`);
@@ -173,6 +187,8 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
   for (const field of FRONTMATTER_FIELDS) {
     const value = soul[field];
     if (value === undefined || value === null || value === "") continue;
+    // Unchanged values are written through oneLine(), which keeps the file intact.
+    if (!check(field)) continue;
     if (typeof value !== "string") {
       errors.push(`${field} must be a string`);
       continue;
@@ -185,14 +201,17 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
     }
   }
 
-  if (soul.genesisPromptOriginal && containsInjectionPatterns(soul.genesisPromptOriginal)) {
-    errors.push("Injection pattern detected in genesisPromptOriginal");
-  }
-  if (soul.genesisPromptOriginal && soul.genesisPromptOriginal.length > LIMITS.genesisPromptOriginal) {
-    warnings.push(`genesisPromptOriginal exceeds ${LIMITS.genesisPromptOriginal} chars; truncated`);
+  if (check("genesisPromptOriginal")) {
+    if (soul.genesisPromptOriginal && containsInjectionPatterns(soul.genesisPromptOriginal)) {
+      errors.push("Injection pattern detected in genesisPromptOriginal");
+    }
+    if (soul.genesisPromptOriginal && soul.genesisPromptOriginal.length > LIMITS.genesisPromptOriginal) {
+      warnings.push(`genesisPromptOriginal exceeds ${LIMITS.genesisPromptOriginal} chars; truncated`);
+    }
   }
 
   for (const field of AUTO_SECTIONS) {
+    if (!check(field)) continue;
     const value = soul[field];
     if (!value) continue;
     if (containsInjectionPatterns(value)) {
@@ -207,16 +226,16 @@ export function validateSoul(soul: SoulModel): SoulValidationResult {
     valid: errors.length === 0,
     errors,
     warnings,
-    sanitized: sanitizeSoul(soul),
+    sanitized: sanitizeSoul(soul, opts?.changedKeys),
   };
 }
 
 /**
  * Strip injection patterns and enforce size limits on a soul model.
- * Returns a cleaned copy.
+ * Returns a cleaned copy. With changedKeys, only those fields are cleaned.
  */
-export function sanitizeSoul(soul: SoulModel): SoulModel {
-  return {
+export function sanitizeSoul(soul: SoulModel, changedKeys?: Iterable<string>): SoulModel {
+  const cleaned: SoulModel = {
     ...soul,
     corePurpose: stripInjection(soul.corePurpose).slice(0, LIMITS.corePurpose),
     values: soul.values.slice(0, LIMITS.values).map(stripInjection),
@@ -235,7 +254,27 @@ export function sanitizeSoul(soul: SoulModel): SoulModel {
       ? stripInjection(soul.genesisPromptOriginal).slice(0, LIMITS.genesisPromptOriginal)
       : soul.genesisPromptOriginal,
   };
+  if (changedKeys === undefined) return cleaned;
+  const changed = new Set<string>(changedKeys);
+  const out: SoulModel = { ...soul };
+  for (const key of SANITIZED_KEYS) {
+    if (changed.has(key)) (out as any)[key] = cleaned[key];
+  }
+  return out;
 }
+
+const SANITIZED_KEYS = [
+  "corePurpose",
+  "values",
+  "behavioralGuidelines",
+  "personality",
+  "boundaries",
+  "strategy",
+  "capabilities",
+  "relationships",
+  "financialCharacter",
+  "genesisPromptOriginal",
+] as const;
 
 // ─── Internal Helpers ───────────────────────────────────────────
 

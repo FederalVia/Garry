@@ -42,6 +42,16 @@ vi.mock("../observability/logger.js", () => ({
   }),
 }));
 
+// Agent cards are fetched through node:https, not fetch: stub the fetcher so
+// the mocked tokenURIs (example.com) are never contacted.
+const mockFetchPublicHttps = vi.hoisted(() =>
+  vi.fn(async (_url: string) => ({ ok: false as const, error: "stubbed in tests", bytesRead: 0 })),
+);
+vi.mock("../registry/safe-fetch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../registry/safe-fetch.js")>();
+  return { ...actual, fetchPublicHttps: mockFetchPublicHttps };
+});
+
 import {
   queryAgent,
   getTotalAgents,
@@ -225,6 +235,9 @@ describe("discoverAgents", () => {
     expect(totalSupplyCall).toBeDefined();
     // getLogs should NOT have been called (no event fallback needed)
     expect(mockGetLogs).not.toHaveBeenCalled();
+    // Cards went through the stubbed fetcher.
+    expect(mockFetchPublicHttps).toHaveBeenCalled();
+    expect(String(mockFetchPublicHttps.mock.calls[0]?.[0])).toMatch(/^https:\/\/example\.com\/agent\d\.json$/);
   });
 
   it("falls back to event scanning when totalSupply returns 0", async () => {

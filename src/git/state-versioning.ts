@@ -2,16 +2,18 @@
  * State Versioning
  *
  * Version control the automaton's own state files (~/.automaton/).
- * Every self-modification triggers a git commit with a descriptive message.
- * The automaton's entire identity history is version-controlled and replayable.
+ * SOUL.md, WORKLOG.md, heartbeat.yml and skills/ are committed after each
+ * soul update and skill install, creation or removal (WORKLOG.md and
+ * heartbeat.yml edits ride along with the next such commit). Keys, the
+ * wallet, the database and automaton.json are never versioned.
  */
 
-import { execFile } from "child_process";
+import { execFile, execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { promisify } from "util";
 import type { ConwayClient, AutomatonDatabase } from "../types.js";
-import { gitInit, gitCommit, gitStatus, gitLog } from "./tools.js";
+import { gitInit, gitCommit, gitLog } from "./tools.js";
 import { readRegularFileNoFollow, writeFileSafe } from "../security/secure-fs.js";
 import { createLogger } from "../observability/logger.js";
 
@@ -180,28 +182,118 @@ export async function migrateStateRepo(
   return { untracked, historyHasSecrets };
 }
 
+/** The only paths a state commit stages. */
+const STATE_PATHS = ["SOUL.md", "WORKLOG.md", "heartbeat.yml", "skills"] as const;
+const MAX_SKILL_FILE_BYTES = 1024 * 1024;
+const MAX_SKILL_FILES = 2000;
+
+function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/** Skill directories cloned from git: plain `git add` would record them as gitlinks. */
+function nestedSkillRepos(dir: string): string[] {
+  const skillsDir = path.join(dir, "skills");
+  const st = lstatOrNull(skillsDir);
+  if (!st || !st.isDirectory()) return [];
+  const out: string[] = [];
+  for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    if (lstatOrNull(path.join(skillsDir, entry.name, ".git"))) out.push(`skills/${entry.name}`);
+  }
+  return out;
+}
+
+/** Regular files under rel (no links, no .git), relative to dir. */
+function listFiles(dir: string, rel: string, out: string[]): void {
+  for (const entry of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+    if (out.length >= MAX_SKILL_FILES) return;
+    if (entry.name === ".git") continue;
+    const child = `${rel}/${entry.name}`;
+    if (entry.isDirectory()) listFiles(dir, child, out);
+    else if (entry.isFile() && (lstatOrNull(path.join(dir, child))?.size ?? Infinity) <= MAX_SKILL_FILE_BYTES) {
+      out.push(child);
+    }
+  }
+}
+
 /**
- * Commit a state change with a descriptive message.
- * Called after any self-modification.
+ * Stage the files of a skill cloned from git as ordinary blobs, honouring the
+ * state .gitignore, and drop index entries for files that are gone.
+ */
+async function stageNestedRepo(dir: string, rel: string): Promise<void> {
+  const files: string[] = [];
+  listFiles(dir, rel, files);
+  let kept = files;
+  if (files.length > 0) {
+    let ignored = "";
+    try {
+      ignored = execFileSync(
+        "git",
+        ["-c", "core.hooksPath=/dev/null", "check-ignore", "--no-index", "--stdin", "-z"],
+        { cwd: dir, encoding: "utf-8", input: files.join("\0") + "\0", timeout: 15_000, maxBuffer: 4 * 1024 * 1024 },
+      );
+    } catch (err: any) {
+      // Exit 1 means nothing is ignored.
+      if (err?.status !== 1) throw err;
+    }
+    const ignoredSet = new Set(ignored.split("\0").filter(Boolean));
+    kept = files.filter((f) => !ignoredSet.has(f));
+  }
+  const tracked = (await git(dir, ["ls-files", "-z", "--", rel])).split("\0").filter(Boolean);
+  const keep = new Set(kept);
+  const gone = tracked.filter((f) => !keep.has(f));
+  if (gone.length > 0) await git(dir, ["update-index", "--force-remove", "--", ...gone]);
+  for (const file of kept) {
+    const sha = (await git(dir, ["hash-object", "-w", "--no-filters", "--", file])).trim();
+    const mode = (lstatOrNull(path.join(dir, file))!.mode & 0o111) !== 0 ? "100755" : "100644";
+    await git(dir, ["update-index", "--add", "--replace", "--cacheinfo", `${mode},${sha},${file}`]);
+  }
+}
+
+function underStatePaths(file: string): boolean {
+  return STATE_PATHS.some((p) => file === p || file.startsWith(`${p}/`));
+}
+
+/**
+ * Commit the allowlisted state files (SOUL.md, WORKLOG.md, heartbeat.yml,
+ * skills/) with a descriptive message. Nothing else is staged, and nothing
+ * is committed when they are unchanged. Returns quietly when ~/.automaton has
+ * no git repo, and never throws: a broken state repo must not fail the change.
  */
 export async function commitStateChange(
-  conway: ConwayClient,
   description: string,
   category: string = "state",
 ): Promise<string> {
   const dir = resolveHome(AUTOMATON_DIR);
+  if (!lstatOrNull(path.join(dir, ".git"))) return "No state repo";
 
-  // Never throws: a missing or broken state repo must not fail the change itself.
   try {
-    const status = await gitStatus(conway, dir);
-    if (status.clean) {
-      return "No changes to commit";
-    }
+    const tracked = (await git(dir, ["ls-files", "-z", "--", ...STATE_PATHS])).split("\0").filter(Boolean);
+    // A pathspec naming nothing on disk or in the index makes `git add` fail.
+    const present = STATE_PATHS.filter(
+      (p) => lstatOrNull(path.join(dir, p)) || tracked.some((t) => t === p || t.startsWith(`${p}/`)),
+    );
+    if (present.length === 0) return "No changes to commit";
 
-    const message = `${category}: ${description}`;
-    return await gitCommit(conway, dir, message);
+    const nested = nestedSkillRepos(dir);
+    await git(dir, ["add", "-A", "--", ...present, ...nested.map((n) => `:(exclude)${n}`)]);
+    for (const rel of nested) await stageNestedRepo(dir, rel);
+
+    // Commit only what this function staged: anything else is unstaged first.
+    const staged = (await git(dir, ["diff", "--cached", "--name-only", "-z"])).split("\0").filter(Boolean);
+    const stray = staged.filter((f) => !underStatePaths(f));
+    if (stray.length > 0) await git(dir, ["reset", "-q", "--", ...stray]);
+    if (staged.length === stray.length) return "No changes to commit";
+
+    await git(dir, ["commit", "-q", "-m", `${category}: ${description}`]);
+    return (await git(dir, ["rev-parse", "HEAD"])).trim();
   } catch (err: any) {
-    const msg = err?.message || String(err);
+    const msg = String(err?.stderr || err?.message || err).trim();
     logger.warn(`State repo commit skipped: ${msg}`);
     return `State repo unavailable: ${msg}`;
   }
@@ -210,46 +302,25 @@ export async function commitStateChange(
 /**
  * Commit after a SOUL.md update.
  */
-export async function commitSoulUpdate(
-  conway: ConwayClient,
-  description: string,
-): Promise<string> {
-  return commitStateChange(conway, description, "soul");
+export async function commitSoulUpdate(description: string): Promise<string> {
+  return commitStateChange(description, "soul");
 }
 
 /**
  * Commit after a skill installation or removal.
  */
 export async function commitSkillChange(
-  conway: ConwayClient,
   skillName: string,
-  action: "install" | "remove" | "update",
+  action: "install" | "remove" | "update" | "create",
 ): Promise<string> {
-  return commitStateChange(
-    conway,
-    `${action} skill: ${skillName}`,
-    "skill",
-  );
+  return commitStateChange(`${action} skill: ${skillName}`, "skill");
 }
 
 /**
- * Commit after heartbeat config change.
+ * Commit after a heartbeat.yml change.
  */
-export async function commitHeartbeatChange(
-  conway: ConwayClient,
-  description: string,
-): Promise<string> {
-  return commitStateChange(conway, description, "heartbeat");
-}
-
-/**
- * Commit after config change.
- */
-export async function commitConfigChange(
-  conway: ConwayClient,
-  description: string,
-): Promise<string> {
-  return commitStateChange(conway, description, "config");
+export async function commitHeartbeatChange(description: string): Promise<string> {
+  return commitStateChange(description, "heartbeat");
 }
 
 /**

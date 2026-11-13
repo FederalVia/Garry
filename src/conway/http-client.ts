@@ -12,6 +12,23 @@ import { DEFAULT_HTTP_CLIENT_CONFIG } from "../types.js";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
+/** URL.hostname keeps the brackets of an IPv6 literal ("[::1]"). */
+export function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  return LOOPBACK_HOSTS.has(host);
+}
+
+/** True for a plain-HTTP URL on a loopback host. */
+export function isLoopbackHttpUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol.toLowerCase() === "http:" && isLoopbackHost(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function assertSecureUrl(
   url: string,
   allowHttpOnLoopback: boolean,
@@ -28,8 +45,7 @@ function assertSecureUrl(
     return;
   }
 
-  const host = parsed.hostname.toLowerCase();
-  if (protocol === "http:" && allowHttpOnLoopback && LOOPBACK_HOSTS.has(host)) {
+  if (protocol === "http:" && allowHttpOnLoopback && isLoopbackHost(parsed.hostname)) {
     return;
   }
 
@@ -249,14 +265,18 @@ export class ResilientHttpClient {
     callerSignal?: AbortSignal,
   ): Promise<Response> {
     const controller = new AbortController();
+    // The deadline covers the whole exchange: the timer stays armed after the
+    // headers arrive, so a server that stalls mid-body makes json()/text()
+    // reject instead of waiting for undici's 300 s body timeout. Aborting
+    // after the body was read does nothing. unref: never keeps the process up.
     const timer = setTimeout(() => controller.abort(), timeout);
-    // The caller's signal stays attached to the fetch, so it still aborts
-    // the body read after headers arrive; the own timeout covers headers.
+    timer.unref?.();
     const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
     try {
       return await fetch(url, { ...init, signal, redirect: "manual" });
-    } finally {
+    } catch (err) {
       clearTimeout(timer);
+      throw err;
     }
   }
 

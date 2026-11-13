@@ -332,6 +332,43 @@ describe("reset_to_upstream", () => {
     for (const c of pnpm) expect(c.timeout).toBe(300_000);
   }, 60_000);
 
+  it("records discarded uncommitted work, the applied upstream commits and the build outcome", async () => {
+    const target = commitInOrigin({ "src/b.ts": "export const b = 1;\n" }, "add b upstream");
+    fs.writeFileSync(path.join(local, "src/a.ts"), "export const a = 'uncommitted worker patch';\n");
+
+    const plan = await reset();
+    expect(plan).toMatch(/Uncommitted changes to tracked files that will be discarded: 1/);
+    const out = await reset({ confirm: target });
+    expect(out).toContain(`Reset to upstream ${target}`);
+    expect(out).toMatch(/Discarded uncommitted changes to 1 tracked file\(s\): src\/a\.ts/);
+    expect(out).not.toMatch(/No local commits lost/);
+
+    const audit = db.getRecentModifications(1)[0];
+    expect(audit.type).toBe("upstream_reset");
+    expect(audit.diff).toContain("Discarded uncommitted changes:");
+    expect(audit.diff).toContain("src/a.ts");
+    expect(audit.diff).toContain("+export const a = 'uncommitted worker patch';");
+    expect(audit.diff).toMatch(/Applied upstream commits[^\n]*:\n[0-9a-f]+ add b upstream/);
+    expect(audit.diff).toContain("src/b.ts (+1 -0)");
+    expect(audit.diff).toMatch(/Install\/build: ok$/);
+  }, 60_000);
+
+  it("records a failed build step in the audit entry", async () => {
+    const target = commitInOrigin({ "src/c.ts": "export const c = 1;\n" }, "add c");
+    await reset();
+    const realExec = conway.exec.bind(conway);
+    conway.exec = async (command: string, timeout?: number) => {
+      if (command.includes("pnpm run build")) {
+        conway.calls.push({ command, timeout });
+        return { exitCode: 2, stdout: "", stderr: "tsc: error TS1005" };
+      }
+      return realExec(command, timeout);
+    };
+    const out = await reset({ confirm: target });
+    expect(out).toMatch(/step failed/);
+    expect(db.getRecentModifications(1)[0].diff).toMatch(/Install\/build: .*failed: .*TS1005/);
+  }, 60_000);
+
   it("refuses a confirm when origin/main moved after the plan", async () => {
     const target = commitInOrigin({ "src/e.ts": "export const e = 1;\n" }, "e");
     await reset();

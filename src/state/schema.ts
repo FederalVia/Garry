@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -129,14 +129,16 @@ export const CREATE_TABLES = `
     last_checked TEXT
   );
 
-  -- ERC-8004 registration state
+  -- ERC-8004 registration state. Token ids are per chain, so mainnet and
+  -- testnet can mint the same id.
   CREATE TABLE IF NOT EXISTS registry (
-    agent_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
     agent_uri TEXT NOT NULL,
     chain TEXT NOT NULL DEFAULT 'eip155:8453',
     contract_address TEXT NOT NULL,
     tx_hash TEXT NOT NULL,
-    registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chain, agent_id)
   );
 
   -- Reputation feedback received and given
@@ -934,4 +936,39 @@ export const MIGRATION_V16 = `
 export const MIGRATION_V16_RETIRE_BLOCKED = `
   UPDATE inbox_messages SET status = 'blocked'
    WHERE status = 'received' AND substr(content, 1, 10) = '[BLOCKED: ';
+`;
+
+// === Registry keyed by chain ===
+// Rebuilds a registry table whose primary key is agent_id alone, so a
+// testnet and a mainnet identity with the same token id both fit.
+export const REGISTRY_CHAIN_KEY_REBUILD = `
+  CREATE TABLE registry_chain_key (
+    agent_id TEXT NOT NULL,
+    agent_uri TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'eip155:8453',
+    contract_address TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chain, agent_id)
+  );
+  INSERT OR IGNORE INTO registry_chain_key (agent_id, agent_uri, chain, contract_address, tx_hash, registered_at)
+    SELECT agent_id, agent_uri, chain, contract_address, tx_hash, registered_at FROM registry;
+  DROP TABLE registry;
+  ALTER TABLE registry_chain_key RENAME TO registry;
+`;
+
+// === Memory and inbox indexes, bad score repair ===
+// Applied by the version 17 entry of applyMigrations (database.ts). Every
+// statement is idempotent. A TEXT trust score becomes 0.2, below the 0.3
+// retrieval threshold; a TEXT priority becomes 0.5.
+export const MIGRATION_V17 = `
+  -- Schema version: 17
+  CREATE INDEX IF NOT EXISTS idx_episodic_session_created ON episodic_memory(session_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_inbox_received_pending ON inbox_messages(received_at) WHERE status = 'received';
+  CREATE INDEX IF NOT EXISTS idx_knowledge_category_key ON knowledge_store(category, key);
+  CREATE INDEX IF NOT EXISTS idx_wake_consumed ON wake_events(consumed_at) WHERE consumed_at IS NOT NULL;
+  UPDATE relationship_memory SET trust_score = 0.2 WHERE typeof(trust_score) NOT IN ('real', 'integer');
+  UPDATE relationship_memory SET trust_score = MAX(0.0, MIN(1.0, trust_score)) WHERE trust_score < 0 OR trust_score > 1;
+  UPDATE working_memory SET priority = 0.5 WHERE typeof(priority) NOT IN ('real', 'integer');
+  UPDATE working_memory SET priority = MAX(0.0, MIN(1.0, priority)) WHERE priority < 0 OR priority > 1;
 `;
