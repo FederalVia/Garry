@@ -11,6 +11,7 @@ declare module "@conway/automaton/config.js" {
     openaiApiKey?: string;
     anthropicApiKey?: string;
     socialRelayUrl?: string;
+    relay?: { conwayCompat?: boolean };
     chainType?: "evm" | "solana";
   }
 
@@ -106,15 +107,39 @@ declare module "@conway/automaton/operator/fund.js" {
 }
 
 declare module "@conway/automaton/operator/send.js" {
+  export interface RelayClientOptions {
+    conwayCompat: boolean;
+  }
   export type SendOperatorResult =
-    | { ok: true; id: string; from: string; to: string; relayUrl: string; chainType: "evm" | "solana" }
+    | {
+        ok: true;
+        id: string;
+        from: string;
+        to: string;
+        relayUrl: string;
+        chainType: "evm" | "solana";
+        protocol: "automaton/1" | "conway";
+      }
+    | { ok: false; error: string };
+  export type RelayTarget =
+    | { ok: true; relayUrl: string; options: RelayClientOptions }
     | { ok: false; error: string };
 
-  export function resolveRelayUrl(config: { socialRelayUrl?: string } | null | undefined): string;
+  export const CONWAY_SOCIAL_RELAY_URL: string;
+  export function resolveRelayTarget(
+    config: { socialRelayUrl?: string; relay?: { conwayCompat?: unknown } } | null | undefined,
+    env?: NodeJS.ProcessEnv,
+    opts?: { fileSetsRelayUrl?: boolean },
+  ): RelayTarget;
+  export function loadRelayTarget(env?: NodeJS.ProcessEnv): RelayTarget;
+  export function resolveRelayUrl(
+    config: { socialRelayUrl?: string; relay?: { conwayCompat?: unknown } } | null | undefined,
+  ): string;
   export function sendOperatorMessage(input: {
     relayUrl: string;
     to: string;
     content: string;
+    options?: RelayClientOptions;
   }): Promise<SendOperatorResult>;
   export function formatSendResult(result: SendOperatorResult): { ok: boolean; lines: string[] };
 }

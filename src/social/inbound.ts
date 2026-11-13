@@ -5,11 +5,12 @@
  * - verified: the relay supplied the sender's signature and signed_at, the
  *   signature checks out against the claimed sender over the canonical send
  *   string addressed to us, and signed_at is inside the freshness window;
- * - unverified: no signature, or a valid signature whose signed_at is outside
- *   the freshness window; the sender address is not vouched for;
+ * - unverified: no signature (only when unsigned mail is allowed), or a valid
+ *   signature whose signed_at is outside the freshness window; the sender
+ *   address is not vouched for;
  * - rejected: a signature that fails, a missing or unreadable signed_at next
- *   to a signature, an invalid sender, a recipient that is not us, or
- *   oversized content.
+ *   to a signature, no signature where one is required, an invalid sender, a
+ *   recipient that is not us, or oversized content.
  *
  * The relay-assigned id and nonce prove nothing (the relay chooses them), so
  * replay protection keys on what the sender signed instead. Finished inbox
@@ -21,8 +22,8 @@
  */
 
 import { keccak256, toBytes } from "viem";
-import { MESSAGE_LIMITS, canonicalSendMessage } from "./signing.js";
-import { verifyMessageSignature } from "./protocol.js";
+import { MESSAGE_LIMITS, PREFIX_V1, canonicalSendMessage, type SignedPrefix } from "./signing.js";
+import { matchSignedPrefix } from "./protocol.js";
 import { normalizeSenderAddress } from "../agent/inbox-isolation.js";
 
 /** Oldest signed message still counted as verified. */
@@ -41,6 +42,7 @@ export interface RelayInboundMessage {
   signedAt?: unknown;
   createdAt?: unknown;
   nonce?: unknown;
+  /** Relay-reported: no signed string covers it, even on a verified message. */
   replyTo?: unknown;
 }
 
@@ -51,7 +53,8 @@ export type InboundRejectReason =
   | "too_large"
   | "wrong_recipient"
   | "bad_timestamp"
-  | "bad_signature";
+  | "bad_signature"
+  | "unsigned";
 
 export type InboundVerdict =
   | {
@@ -107,12 +110,18 @@ function unverifiedHash(
 /**
  * Classify one polled message. `selfAddress` is our own address: the
  * signature must cover it as the recipient, so a message signed for someone
- * else cannot be forwarded to us.
+ * else cannot be forwarded to us. `acceptPrefixes` is the local set of signed
+ * protocol prefixes counted as valid; a signature that verifies only under
+ * another prefix is a bad signature like any other. With `requireSignature`,
+ * a message without a signature is rejected instead of passed on unverified:
+ * a relay that speaks Automaton/1 always returns signatures, so an unsigned
+ * row can only come from a hostile relay or someone writing its database.
  */
 export async function classifyInbound(
   raw: RelayInboundMessage,
   selfAddress: string,
   now: number = Date.now(),
+  opts: { acceptPrefixes?: readonly SignedPrefix[]; requireSignature?: boolean } = {},
 ): Promise<InboundVerdict> {
   if (!str(raw.id)) return { verdict: "rejected", reason: "missing_id" };
 
@@ -136,6 +145,7 @@ export async function classifyInbound(
   const signedAt = str(raw.signed_at) ?? str(raw.signedAt);
   const signature = str(raw.signature);
   if (!signature) {
+    if (opts.requireSignature) return { verdict: "rejected", reason: "unsigned" };
     return {
       verdict: "unverified",
       from,
@@ -151,15 +161,17 @@ export async function classifyInbound(
     now - t > INBOUND_MAX_AGE_MS ? "stale" : t - now > INBOUND_FUTURE_SKEW_MS ? "future" : undefined;
 
   // Our own address, not the relay's `to`, is what the signature must cover.
-  const ok = await verifyMessageSignature(
+  const prefix = await matchSignedPrefix(
     { to: selfAddress, content, signed_at: signedAt, signature },
     from,
+    opts.acceptPrefixes ?? [PREFIX_V1],
   );
-  if (!ok) return { verdict: "rejected", reason: "bad_signature" };
+  if (!prefix) return { verdict: "rejected", reason: "bad_signature" };
 
   // The signed-content hash, even when downgraded: the sender did sign this,
   // so a later or earlier delivery of the same message is still a duplicate.
-  const sigHash = verifiedHash(from, canonicalSendMessage(selfAddress, content, signedAt));
+  // It covers the string that verified, prefix included.
+  const sigHash = verifiedHash(from, canonicalSendMessage(selfAddress, content, signedAt, prefix));
   if (outsideWindow) {
     // Too old or too far ahead to vouch for (it could be a replay into a
     // fresh database), but the text is kept and labelled NOT VERIFIED, as an

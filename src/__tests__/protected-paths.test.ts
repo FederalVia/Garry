@@ -189,6 +189,24 @@ describe("matchProtected (write-deny)", () => {
     }
   });
 
+  it("protects the relay client's verdict code, the distress notifier and the relay store", () => {
+    for (const p of [
+      `${R()}/src/social/inbound.ts`,
+      `${R()}/src/social/settings.ts`,
+      `${R()}/dist/social/signing.js`,
+      `${R()}/src/notify/distress.ts`,
+    ]) {
+      expect(matchProtected(p) ?? "none", p).toMatch(/^guard:(social|notify)/);
+    }
+    for (const name of ["relay.db", "relay.db-wal", "relay.db-shm", "relay.db-journal"]) {
+      expect(matchSensitive(`/var/lib/automaton-relay/${name}`), name).not.toBeNull();
+      expect(matchProtected(`${H()}/.local/state/automaton-relay/${name}`), name).not.toBeNull();
+    }
+    for (const f of ["social/inbound", "social/signing", "social/protocol", "social/settings", "notify/distress"]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+  });
+
   it("SOUL.md is readable but not writable", () => {
     expect(matchSensitive(`${S()}/SOUL.md`)).toBeNull();
     expect(matchProtected(`${S()}/SOUL.md`)).not.toBeNull();

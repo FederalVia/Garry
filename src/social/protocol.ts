@@ -13,7 +13,7 @@ import { verifyMessage } from "viem";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 import { detectChainType } from "../identity/chain.js";
-import { canonicalSendMessage } from "./signing.js";
+import { canonicalSendMessage, PREFIX_V1, type SignedPrefix } from "./signing.js";
 
 /**
  * A fully signed social message.
@@ -43,20 +43,43 @@ export function createNonce(): string {
 }
 
 /**
- * Verify a sender's signature over the canonical send string.
+ * The first accepted prefix under which the sender's signature verifies,
+ * or null.
  *
  * `message.to` must be the recipient the caller expects (for inbound mail,
  * our own address), never a value taken on trust from the relay. EVM senders
  * are checked with EIP-191 recovery; Solana senders with an ed25519 detached
- * signature in base58. Anything else is false.
+ * signature in base58. Anything else is null. The accepted set is local
+ * configuration, so a relay cannot widen it.
  */
+export async function matchSignedPrefix(
+  message: { to: string; content: string; signed_at: string; signature: string },
+  expectedFrom: string,
+  prefixes: readonly SignedPrefix[] = [PREFIX_V1],
+): Promise<SignedPrefix | null> {
+  for (const prefix of prefixes) {
+    if (await verifyUnder(message, expectedFrom, prefix)) return prefix;
+  }
+  return null;
+}
+
+/** True when the signature verifies under one of the accepted prefixes. */
 export async function verifyMessageSignature(
   message: { to: string; content: string; signed_at: string; signature: string },
   expectedFrom: string,
+  prefixes: readonly SignedPrefix[] = [PREFIX_V1],
+): Promise<boolean> {
+  return (await matchSignedPrefix(message, expectedFrom, prefixes)) !== null;
+}
+
+async function verifyUnder(
+  message: { to: string; content: string; signed_at: string; signature: string },
+  expectedFrom: string,
+  prefix: SignedPrefix,
 ): Promise<boolean> {
   try {
     if (typeof message.signature !== "string" || message.signature.length === 0) return false;
-    const canonical = canonicalSendMessage(message.to, message.content, message.signed_at);
+    const canonical = canonicalSendMessage(message.to, message.content, message.signed_at, prefix);
     const chain = detectChainType(expectedFrom);
     if (chain === "evm") {
       if (!/^0x[0-9a-fA-F]+$/.test(message.signature)) return false;

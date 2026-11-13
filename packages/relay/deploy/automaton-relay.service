@@ -1,0 +1,43 @@
+# systemd unit for the Automaton reference relay.
+# Install: build with `pnpm --filter @automaton/relay build`, copy the checkout
+# to /opt/automaton, then:
+#   sudo cp automaton-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now automaton-relay
+# A separate dynamic user means the agent (running as your user) cannot edit
+# the relay DB.
+
+[Unit]
+Description=Automaton reference message relay
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=automaton-relay
+StateDirectoryMode=0700
+Environment=RELAY_DB=/var/lib/automaton-relay/relay.db
+# Loopback only. For remote agents put a TLS proxy in front and set
+# RELAY_TRUST_PROXY=1 (keep RELAY_HOST on loopback behind a local proxy).
+Environment=RELAY_HOST=127.0.0.1
+Environment=RELAY_PORT=8787
+ExecStart=/usr/bin/node /opt/automaton/packages/relay/dist/main.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryMax=256M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

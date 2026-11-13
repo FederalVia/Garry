@@ -329,7 +329,7 @@ describe("operator send", () => {
     expect(fetchCalls[0]!.url).toBe("https://relay.test/v1/messages");
     expect(body.from).toBe(sender);
     expect(body.to).toBe(SOL_RECIPIENT);
-    const canonical = `Conway:send:${SOL_RECIPIENT}:${keccak256(toBytes("hi"))}:${body.signed_at}`;
+    const canonical = `Automaton/1:send:${SOL_RECIPIENT}:${keccak256(toBytes("hi"))}:${body.signed_at}`;
     expect(
       nacl.sign.detached.verify(new TextEncoder().encode(canonical), bs58.decode(body.signature), kp.publicKey),
     ).toBe(true);
@@ -346,7 +346,7 @@ describe("operator send", () => {
     const body = fetchCalls[0]!.body;
     expect(body.from).toBe(account.address.toLowerCase());
     expect(body.to).toBe(CHILD);
-    const canonical = `Conway:send:${CHILD}:${keccak256(toBytes("hello"))}:${body.signed_at}`;
+    const canonical = `Automaton/1:send:${CHILD}:${keccak256(toBytes("hello"))}:${body.signed_at}`;
     expect(await verifyMessage({ address: account.address, message: canonical, signature: body.signature })).toBe(true);
   });
 
@@ -419,5 +419,137 @@ describe("operator send", () => {
     expect(sent.lines[1]).toContain("\\x1b]52");
     for (const line of sent.lines) expect(line).not.toMatch(unsafe);
     for (const line of sent.lines) expect(line).not.toContain("\n");
+  });
+  it("with no config and no SOCIAL_RELAY_URL there is no relay: an error, and no request", async () => {
+    const { resolveRelayTarget, resolveRelayUrl } = await import("../operator/send.js");
+    const r = resolveRelayTarget(null, {});
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/socialRelayUrl/);
+      expect(r.error).toMatch(/SOCIAL_RELAY_URL/);
+      expect(r.error).not.toMatch(/conway\.tech/);
+    }
+    expect(resolveRelayTarget({}, {}).ok).toBe(false);
+    vi.stubEnv("SOCIAL_RELAY_URL", "");
+    expect(() => resolveRelayUrl(null)).toThrow(/No relay configured/);
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it("an explicit empty socialRelayUrl means messaging is off, even with SOCIAL_RELAY_URL set", async () => {
+    const { resolveRelayTarget } = await import("../operator/send.js");
+    const r = resolveRelayTarget({ socialRelayUrl: "" }, { SOCIAL_RELAY_URL: "https://relay.test" });
+    expect(r).toEqual({
+      ok: false,
+      error:
+        "Messaging is off (socialRelayUrl is empty in automaton.json). Set it to your relay, for example http://127.0.0.1:8787.",
+    });
+  });
+
+  it("SOCIAL_RELAY_URL is used when the config has no relay, strict Automaton/1 for an own relay", async () => {
+    const { resolveRelayTarget } = await import("../operator/send.js");
+    expect(resolveRelayTarget(null, { SOCIAL_RELAY_URL: "http://127.0.0.1:8787" })).toEqual({
+      ok: true,
+      relayUrl: "http://127.0.0.1:8787",
+      options: { conwayCompat: false },
+    });
+  });
+
+  describe("loadRelayTarget (what automaton-cli send uses)", () => {
+    function writeConfig(data: object): void {
+      fs.mkdirSync(path.join(home, ".automaton"), { recursive: true });
+      fs.writeFileSync(path.join(home, ".automaton", "automaton.json"), JSON.stringify(data), { mode: 0o600 });
+    }
+    const base = { name: "x", creatorAddress: "0x0000000000000000000000000000000000000001" };
+
+    it("SOCIAL_RELAY_URL wins over the runtime default when automaton.json has no socialRelayUrl", async () => {
+      writeConfig(base);
+      const { loadRelayTarget } = await import("../operator/send.js");
+      expect(loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" })).toEqual({
+        ok: true,
+        relayUrl: "http://127.0.0.1:8787",
+        options: { conwayCompat: false },
+      });
+    });
+
+    it("without the variable it uses the same relay the agent would (the runtime default)", async () => {
+      writeConfig(base);
+      const { loadRelayTarget } = await import("../operator/send.js");
+      const { DEFAULT_CONFIG } = await import("../types.js");
+      const r = loadRelayTarget({});
+      if (DEFAULT_CONFIG.socialRelayUrl) {
+        expect(r).toMatchObject({ ok: true, relayUrl: DEFAULT_CONFIG.socialRelayUrl });
+      } else {
+        expect(r.ok).toBe(false);
+      }
+    });
+
+    it("a socialRelayUrl written in automaton.json wins over the variable, and \"\" is off", async () => {
+      writeConfig({ ...base, socialRelayUrl: "https://relay.test" });
+      let mod = await import("../operator/send.js");
+      expect(mod.loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" })).toMatchObject({
+        ok: true,
+        relayUrl: "https://relay.test",
+      });
+      writeConfig({ ...base, socialRelayUrl: "" });
+      vi.resetModules();
+      mod = await import("../operator/send.js");
+      const r = mod.loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/Messaging is off/);
+    });
+
+    it("with no automaton.json: the variable, else an error", async () => {
+      const { loadRelayTarget } = await import("../operator/send.js");
+      expect(loadRelayTarget({ SOCIAL_RELAY_URL: "http://127.0.0.1:8787" })).toMatchObject({ ok: true });
+      expect(loadRelayTarget({}).ok).toBe(false);
+    });
+  });
+
+  it("a social.conway.tech relay still signs the Conway: form, as before", async () => {
+    const pk = generatePrivateKey();
+    const account = privateKeyToAccount(pk);
+    writeWallet({ chainType: "evm", privateKey: pk, createdAt: new Date().toISOString() });
+    const { resolveRelayTarget, sendOperatorMessage } = await import("../operator/send.js");
+    const target = resolveRelayTarget({ socialRelayUrl: "https://social.conway.tech" }, {});
+    expect(target).toMatchObject({ ok: true, options: { conwayCompat: true } });
+    if (!target.ok) return;
+    const r = await sendOperatorMessage({ relayUrl: target.relayUrl, to: CHILD, content: "hi", options: target.options });
+    expect(r).toMatchObject({ ok: true, protocol: "conway" });
+    const body = fetchCalls[0]!.body;
+    expect(fetchCalls[0]!.url).toBe("https://social.conway.tech/v1/messages");
+    const canonical = `Conway:send:${CHILD}:${keccak256(toBytes("hi"))}:${body.signed_at}`;
+    expect(await verifyMessage({ address: account.address, message: canonical, signature: body.signature })).toBe(true);
+  });
+
+  it("relay.conwayCompat: true on an own relay signs the Conway: form", async () => {
+    const pk = generatePrivateKey();
+    const account = privateKeyToAccount(pk);
+    writeWallet({ chainType: "evm", privateKey: pk, createdAt: new Date().toISOString() });
+    const { resolveRelayTarget, sendOperatorMessage } = await import("../operator/send.js");
+    const target = resolveRelayTarget({ socialRelayUrl: "https://relay.test", relay: { conwayCompat: true } }, {});
+    expect(target).toMatchObject({ ok: true, relayUrl: "https://relay.test", options: { conwayCompat: true } });
+    if (!target.ok) return;
+    const r = await sendOperatorMessage({ relayUrl: target.relayUrl, to: CHILD, content: "hi", options: target.options });
+    expect(r).toMatchObject({ ok: true, protocol: "conway" });
+    const body = fetchCalls[0]!.body;
+    const canonical = `Conway:send:${CHILD}:${keccak256(toBytes("hi"))}:${body.signed_at}`;
+    expect(await verifyMessage({ address: account.address, message: canonical, signature: body.signature })).toBe(true);
+  });
+
+  it("prints a Protocol: line, escaped", async () => {
+    const { formatSendResult } = await import("../operator/send.js");
+    const out = formatSendResult({
+      ok: true,
+      id: "m1",
+      from: AUTOMATON,
+      to: CHILD,
+      relayUrl: "http://127.0.0.1:8787",
+      chainType: "evm",
+      protocol: "automaton/1\x1b[2K" as any,
+    });
+    const line = out.lines.find((l) => l.includes("Protocol:"));
+    expect(line).toBeDefined();
+    expect(line).toContain("automaton/1");
+    expect(line).not.toMatch(/[\x00-\x1f]/);
   });
 });

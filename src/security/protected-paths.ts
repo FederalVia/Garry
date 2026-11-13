@@ -150,6 +150,11 @@ const SECRET_NAMES = new Set([
   "state.db-wal",
   "state.db-shm",
   "state.db-journal",
+  // The reference relay's store: other recipients' mail.
+  "relay.db",
+  "relay.db-wal",
+  "relay.db-shm",
+  "relay.db-journal",
 ]);
 
 const ENV_EXAMPLE_NAMES = new Set([".env.example", ".env.sample", ".env.template", ".env.dist"]);
@@ -293,6 +298,10 @@ const PROTECTED_NAMES = new Set([
   "state.db-wal",
   "state.db-shm",
   "state.db-journal",
+  "relay.db",
+  "relay.db-wal",
+  "relay.db-shm",
+  "relay.db-journal",
   "constitution.md",
   "automaton.json",
   "package.json",
@@ -394,6 +403,10 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   // text-normalize; the logger and the operator CLI escape with terminal-safe.
   "agent/text-normalize",
   "observability/terminal-safe",
+  // Inbound sender verdicts, accepted signed prefixes, poll auth, the relay URL rule.
+  "social/**",
+  // Survival notification and its fixed-field outflow rule.
+  "notify/distress",
 ]);
 
 /**
@@ -589,6 +602,11 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "operator/fund",
   "operator/send",
   "orchestration/simple-tracker",
+  "social/inbound",
+  "social/signing",
+  "social/protocol",
+  "social/settings",
+  "notify/distress",
   "heartbeat.yml",
   "constitution.md",
   "soul.md",

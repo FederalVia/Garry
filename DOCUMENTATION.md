@@ -205,9 +205,11 @@ node packages/cli/dist/index.js <command>
 | `status` | Show automaton status |
 | `logs [--tail N]` | View automaton logs |
 | `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the automaton's API key |
-| `send <to-address> <message>` | Send a signed social message (EVM or Solana wallet) |
+| `send <to-address> <message>` | Send a signed social message (EVM or Solana wallet) through the configured relay |
 
 `fund` units: the amount is **dollars** by default, at most two decimals (`5` is $5.00, `0.75` is 75 cents). With `--cents` it is a whole number of cents (`75 --cents` is $0.75). Do not type a `$` sign: unquoted, the shell expands `$25` to `5` before the CLI sees it, so a leading `$` is refused. `--to` is required and must be an address on the automaton's own chain (0x... on EVM, base58 on Solana); the zero address, the Solana system address (all-zero key), the automaton's own address and a mixed-case EVM address whose EIP-55 checksum is wrong are refused. The plan (`$X.XX (N cents) from ... to ...`) is printed and must be confirmed with `--yes` or a `y` on an interactive terminal. The request is sent once with one idempotency key and is never retried: a timeout, a 5xx or a redirect exits 2 with "outcome unknown"; check the balance before running it again. A 2xx reply whose status says the transfer was declined, refused or short of funds is reported as a failure, and a 2xx status the CLI does not recognise (anything other than `submitted`, `pending`, `completed`, `succeeded` and similar) exits 2 with "outcome unknown". The agent's own tools classify transfer statuses with the same rules (`src/conway/transfer-status.ts`).
+
+`send` uses `socialRelayUrl` if `automaton.json` sets it, else the `SOCIAL_RELAY_URL` environment variable, else the same relay the agent itself would use (today the runtime default, Conway's `https://social.conway.tech`; standalone mode will make it off). It signs with the same protocol the runtime would (`relay.conwayCompat`, below). With `socialRelayUrl` set to `""` (messaging off), or with no `automaton.json` and no `SOCIAL_RELAY_URL`, it exits with an error before signing anything. The relay URL must pass the same check as the runtime's (HTTPS, or plain HTTP to loopback only).
 
 `fund` and `send` are for the operator only: they use the automaton's API key and wallet outside every treasury cap and leave no ledger row. The agent's `exec` tripwire refuses a command that runs them (`automaton-cli`, `packages/cli` or `cli/dist/index.js` together with `fund` or `send`), and the agent's file tools cannot write anything under `packages/` in the runtime checkout, so it cannot change the CLI the operator runs. Like the rest of the tripwire this is not a boundary against an agent that writes its own script (see [Exec tripwire](#exec-tripwire)).
 
@@ -363,7 +365,9 @@ Configuration is stored at `~/.automaton/automaton.json`.
   "childSandboxMemoryMb": 1024,                 // Child sandbox tier
   "childRuntimeRepo": "https://github.com/Conway-Research/automaton.git", // https git URL a child's runtime is cloned from
   "childRuntimeRef": "main",                    // Optional branch or tag (default: the repository's default branch)
-  "socialRelayUrl": "https://social.conway.tech",
+  "socialRelayUrl": "http://127.0.0.1:8787",    // Your relay (packages/relay); "" = messaging off; unset = Conway's relay (for now)
+  "relay": { "conwayCompat": false },           // Optional; unset = on only for a conway.tech relay URL
+  "distressWebhookUrl": "https://hooks.example.com/automaton", // Optional owner notification; unset = off
 
   // Financial safety
   "treasuryPolicy": {
@@ -515,7 +519,7 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 
 | Task | Schedule | What it does |
 |---|---|---|
-| `heartbeat_ping` | Every 15 min | Publishes status to Conway. Sends distress on critical/dead. |
+| `heartbeat_ping` | Every 15 min | Records a local status ping. Records distress on critical/dead, and notifies `distressWebhookUrl` when set (see [Distress webhook](#distress-webhook)). |
 | `check_credits` | Every 6 hours | Monitors credit tier. Manages 1-hour dead grace period. |
 | `check_usdc_balance` | Every 5 min | When credits are critical and USDC is at least $5, tries a $5 survival topup (EVM only). Wakes the agent on success, and on failure at most once per distinct error per 6 h. |
 | `check_for_updates` | Every 4 hours | Checks git upstream for new commits. Wakes on new commits. |
@@ -527,6 +531,18 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 | `prune_dead_children` | Configurable | Deletes old ended child records (keeps the last 5). |
 | `report_metrics` | Configurable | Saves metric snapshots and evaluates alert rules. |
 | `memory_maintenance` | Hourly at :23 | Enforces retention: episodic entries below 0.8 importance after 30 days and the rest (errors, strategic turns) after 180 days (goal records kept), knowledge TTL and prune, `market_signal`/knowledge events after 30 days, finished inbox messages after 30 days (never under 14, so a replay of a deleted message arrives stale and counts as unverified), `inbox_seen_*` keys after 30 days, consumed wake events after 7 days, heartbeat history after 30 days, spend and inference costs after 90 days. Disable it in `heartbeat.yml` to keep everything. |
+
+### Distress webhook
+
+Off unless `distressWebhookUrl` is set in `automaton.json` (which the agent cannot edit). When the heartbeat reads a `critical` or `dead` balance, or the agent calls `distress_signal`, the runtime POSTs a fixed JSON body:
+
+```json
+{ "event": "automaton.distress", "version": 1, "level": "critical", "source": "heartbeat",
+  "agent": { "name": "...", "address": "0x..." }, "balanceCents": 0,
+  "hint": "The agent is low on funds. Add budget or credits for it.", "timestamp": "..." }
+```
+
+Nothing else goes out: never the model's own text, config, keys or inbox content, so the hook cannot become an exfiltration channel. The response is discarded unread. At most one notice per level and source every 6 hours, sooner only when the level gets worse (`critical` to `dead`). Heartbeat and agent notices are debounced separately, so a `distress_signal` call (always `critical`, `source: "agent"`, with the real balance) never holds back the heartbeat's notice. Notices fire only on a known balance (Conway credits today): the heartbeat sends none while the balance cannot be read, and `distress_signal` fails without one, so with no Conway account the hook stays silent until a budget balance exists. The URL must be HTTPS, or plain HTTP to `localhost`, `127.0.0.1` or `[::1]`; an invalid URL is reported at startup and the hook stays off. The URL is treated as a secret and redacted from logs. A failed notice is logged and never changes the heartbeat's result.
 
 ### Heartbeat configuration
 
@@ -611,8 +627,8 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 |---|---|---|
 | `sleep` | caution | Enter sleep mode. Heartbeat continues. Params: duration_seconds. |
 | `system_synopsis` | safe | Get system status (state, tools, heartbeats, turn count). |
-| `heartbeat_ping` | safe | Publish status ping to Conway. |
-| `distress_signal` | dangerous | Record distress signal with funding instructions. |
+| `heartbeat_ping` | safe | Record a local status ping. |
+| `distress_signal` | dangerous | Record distress signal with funding instructions. Notifies `distressWebhookUrl` when set (fixed fields only). Needs a readable credit balance. |
 | `enter_low_compute` | caution | Manually enter low-compute mode. |
 | `update_genesis_prompt` | dangerous | Change the core genesis prompt. Requires justification. Saves only `genesisPrompt` to `automaton.json`. |
 
@@ -1041,18 +1057,34 @@ The colony health monitor (`colony_health_check`) only reports on live children.
 
 ## Social and Messaging
 
-Automatons communicate via a social relay at `social.conway.tech`.
+Automatons communicate through a message relay set by `socialRelayUrl`. `""` means messaging is off. Unset currently means Conway's hosted relay (the runtime default); standalone mode will make unset mean off. The reference relay is `packages/relay` (one Node process and one SQLite file, the same three endpoints Conway's relay had); see [packages/relay/README.md](packages/relay/README.md) to run it. Conway's hosted relay (`social.conway.tech`) still works with compatibility on.
+
+The relay URL must be `https://`, or plain `http://` only to `localhost`, `127.0.0.1` or `[::1]`, where there is no network to protect. Anything else is refused before anything is signed or sent.
+
+### Protocol
+
+| | Automaton/1 (default) | Conway compatibility |
+|---|---|---|
+| Send signs | `Automaton/1:send:{to}:{keccak256(content)}:{signed_at}` | `Conway:send:{to}:{keccak256(content)}:{signed_at}` |
+| Poll and count sign | `Automaton/1:poll:{address}:{timestamp}:{nonce}`, with a fresh random 32-hex `X-Auth-Nonce` per request | `Conway:poll:{address}:{timestamp}`, no nonce |
+| Inbound accepted as verified | `Automaton/1:` signatures only | `Automaton/1:` and `Conway:` signatures |
+
+Compatibility is set by `relay.conwayCompat` in `automaton.json`. Unset, it is on only when `socialRelayUrl` is `conway.tech` or one of its subdomains, so an existing Conway install keeps working; `true` or `false` overrides that. The accepted set comes only from local configuration, never from the relay, so a relay cannot downgrade what counts as verified. A 401 on a send says which way to flip the setting.
+
+The poll nonce makes a captured poll header good for exactly one request: the reference relay records each nonce and refuses it again. A poll or count that fails with a network error or a 5xx other than 501 is retried once, signed again with a new nonce; the HTTP client never re-sends the same credential. Conway-compatible polls are replayable within 5 minutes, as they always were on Conway.
+
+Outbound content must be at most 64,000 UTF-16 units and well formed: text with an unpaired UTF-16 surrogate is refused by the client and by the reference relay, because a relay stores UTF-8 and would return different text, which the recipient would then drop as a bad signature.
 
 ### How messaging works
 
-1. Messages are **signed** with the sender's key (EIP-191 for EVM, ed25519 for Solana) over `Conway:send:{to}:{keccak256(content)}:{signed_at}`
-2. Sent to the social relay via HTTP
+1. Messages are **signed** with the sender's key (EIP-191 for EVM, ed25519 for Solana) over the send string above
+2. Sent to the relay via HTTP. The reference relay checks the signature and stores nothing unless it covers the stored recipient, content and `signed_at` (a forged sender gets 401). `reply_to` is not signed: on inbound mail it is whatever the relay reports
 3. Recipients poll the relay (every 2 minutes via heartbeat)
 4. Each polled message is **classified** (`src/social/inbound.ts`):
-   - **verified** when the relay supplies the sender's `signature` and `signed_at`, the signature checks out against the claimed `from` over the canonical string addressed to *our own* address, and `signed_at` is at most 7 days old and at most 2 minutes in the future;
-   - **unverified** when there is no signature, or when a valid signature's `signed_at` is older than 7 days or more than 2 minutes ahead (logged at info). `from` is then not vouched for: an unverified sender is never treated as that address, only as what the relay reported. Such messages are delivered, labelled `NOT VERIFIED`, so a long sleep or a sender's fast clock loses no mail;
-   - **dropped** (logged at warn, never stored) when a signature is present but fails or has no readable `signed_at`, `from` is not a valid address, the relay's `to` is not our address, or the content is over 64,000 characters.
-   Today the relay does not return signatures, so every message is unverified. Anyone who can make the relay report an address (including the creator's) can claim it; the label and the isolated reply-only turn are what limit that. Dropping a bad signature gives no protection by itself (an attacker can strip it), and assumes the relay passes the sender's signature over this exact string; contract-wallet (ERC-1271) signatures are not supported and are dropped.
+   - **verified** when the relay supplies the sender's `signature` and `signed_at`, the signature checks out against the claimed `from` over an accepted canonical string addressed to *our own* address, and `signed_at` is at most 7 days old and at most 2 minutes in the future;
+   - **unverified** when there is no signature and Conway compatibility is on (Conway's relay sends none), or when a valid signature's `signed_at` is older than 7 days or more than 2 minutes ahead (logged at info). `from` is then not vouched for: an unverified sender is never treated as that address, only as what the relay reported. Such messages are delivered, labelled `NOT VERIFIED`, so a long sleep or a sender's fast clock loses no mail;
+   - **dropped** (logged at warn, never stored) when a signature is present but fails or has no readable `signed_at`, there is no signature and compatibility is off (`unsigned`: an Automaton/1 relay always returns signatures, so an unsigned row can only come from a hostile relay or someone writing its database), `from` is not a valid address, the relay's `to` is not our address, or the content is over 64,000 characters.
+   The reference relay returns every message's `signature` and `signed_at`, so mail through it arrives verified (or, past the freshness window, unverified). Conway's relay does not, so through it every message is unverified: anyone who can make that relay report an address (including the creator's) can claim it; the label and the isolated reply-only turn are what limit that. Dropping a bad signature gives no protection by itself (an attacker can strip it), and assumes the relay passes the sender's signature over this exact string; contract-wallet (ERC-1271) signatures are not supported and are dropped.
 5. **Replays** are stopped by a hash of what the sender signed (sender plus the canonical string), stored in `inbox_messages.sig_hash` under a unique index, so a signed message re-served under a new relay id is stored once and wakes nothing. Finished inbox rows are deleted after 30 days (never under 14), well past the 7-day freshness window, so a signed message replayed after its row is gone is delivered as unverified, never as verified; a signed message downgraded for its `signed_at` keeps the same hash, so it cannot be delivered twice either. An unsigned message re-delivered with the same nonce or `signed_at`, sender and content is also stored once. The relay's own `nonce` and message id prove nothing and are not trusted.
 6. **Screened once**, at ingest, and stored with the verdict and the original text unchanged (see "Inbound screening")
 7. **Rate limited** at ingest from stored rows: at most 10 per minute from one sender are delivered. The minute is measured against when the sender sent (signed time for verified messages, the relay's time otherwise), not when the inbox was polled, so one poll carrying several minutes or hours of mail is not cut to 10. That time is clamped to between the previous successful poll and now, however long ago that poll was (a restart, a relay outage or low-compute sleep keeps the backlog's real spacing), so a relay cannot back-date or spread a flood beyond what the elapsed time allows. With no previous poll recorded, the floor is 7 days back. Separately, what one poll makes claimable for a sender is bounded in real time: at most 10 times the minutes since the previous successful poll (at least 10), less what that sender had made claimable in the last real minute. So a flood, however its times are dated and however close together polls run, is shown at most 10 per minute of real time on average, and never more than 10 in any 60 seconds while polls are under a minute apart; a backlog after a long gap is shown at once. Messages over either limit (for example a backlog the relay pages over several polls, or delivers after the poll it was due in, so its times clamp together) are screened and stored as `deferred`: never claimed while they wait, and released oldest first at the start of each later successful poll within that poll's real-time room. While a sender has messages deferred, its new messages queue behind them, so delivery keeps sender order. A sender may have at most 1,800 deferred messages waiting (three hours at the limit); past that, further ones are stored as `rate_limited` and never handled (logged at warn). Signed and unsigned messages from the same address are counted separately, so forged traffic cannot use up a real sender's budget.
@@ -1088,7 +1120,7 @@ If the social relay is unreachable, the heartbeat backs off for 5 minutes before
 ### Sending messages
 
 Use the `send_message` tool:
-- `to_address` — recipient's Ethereum address
+- `to_address` — recipient's address (EVM 0x... or Solana base58)
 - `content` — message text
 - `reply_to` — optional message ID for threading
 
@@ -1356,7 +1388,8 @@ After 5 consecutive failures, the circuit breaker opens for 60 seconds. Wait and
 If `check_social_inbox` fails:
 - The heartbeat backs off for 5 minutes automatically
 - Error details are stored in KV: `last_social_inbox_error`
-- Check if `socialRelayUrl` is correct in config
+- Check if `socialRelayUrl` is correct in config, and that the relay is running (`GET /healthz` on the reference relay)
+- Repeated 401s usually mean the two sides disagree on the protocol: see `relay.conwayCompat`
 
 ### Heartbeat not running
 
