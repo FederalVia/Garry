@@ -126,7 +126,12 @@ function inferSource(skillDir: string): SkillSource {
 export function loadSkills(
   skillsDir: string,
   db: AutomatonDatabase,
+  opts: {
+    /** Skill names not loaded this pass (their rows are kept, not disabled). */
+    exclude?: readonly string[];
+  } = {},
 ): Skill[] {
+  const exclude = new Set(opts.exclude ?? []);
   const lexicalDir = path.resolve(resolveHome(skillsDir));
   try {
     fs.lstatSync(lexicalDir);
@@ -154,6 +159,10 @@ export function loadSkills(
     // A symlinked directory reports isSymbolicLink(), not isDirectory().
     if (!entry.isDirectory()) continue;
     if (entry.name.startsWith(".") || !SKILL_NAME_RE.test(entry.name)) continue;
+    if (exclude.has(entry.name)) {
+      backed.add(entry.name);
+      continue;
+    }
 
     const skillDir = path.join(realRoot, entry.name);
     const skillMdPath = path.join(skillDir, "SKILL.md");

@@ -318,13 +318,26 @@ export class InferenceGate {
   private readonly now: () => number;
   private readonly bootId: string;
   private survivalState: SurvivalState = { tier: "unknown", creditsCents: null };
+  /** A tier fixed by the creator: the gate tier is then never "unknown". */
+  private readonly fixedTier?: SurvivalTier;
   /** Free local reservations made while the ledger was unavailable (D9). */
   private readonly unrecordedLocal = new Set<string>();
   private readonly stmt: { [K in keyof typeof GATE_SQL]: BetterSqlite3.Statement };
 
-  constructor(deps: { db: Database; policy: ResolvedInferencePolicy; now?: () => number; bootId?: string }) {
+  constructor(deps: {
+    db: Database;
+    policy: ResolvedInferencePolicy;
+    now?: () => number;
+    bootId?: string;
+    /** Survival tier fixed by the creator (no balance source). */
+    fixedTier?: SurvivalTier;
+  }) {
     this.db = deps.db;
     this.policy = deps.policy;
+    if (deps.fixedTier) {
+      this.fixedTier = deps.fixedTier;
+      this.survivalState = { tier: deps.fixedTier, creditsCents: null };
+    }
     this.now = deps.now ?? Date.now;
     this.bootId = deps.bootId ?? inferenceGateBootId();
     const now = this.now();
@@ -587,11 +600,18 @@ export class InferenceGate {
   }
 
   setSurvival(s: { tier: GateSurvivalTier; creditsCents: number | null }): void {
-    this.survivalState = { tier: s.tier, creditsCents: s.creditsCents };
+    // Whatever caller forgets the fixed tier, unknown never replaces it.
+    const tier = s.tier === "unknown" && this.fixedTier ? this.fixedTier : s.tier;
+    this.survivalState = { tier, creditsCents: s.creditsCents };
   }
 
   survival(): SurvivalState {
     return { ...this.survivalState };
+  }
+
+  /** The tier the creator fixed, when there is no balance source. */
+  fixedSurvivalTier(): SurvivalTier | undefined {
+    return this.fixedTier;
   }
 
   /** Cumulative spend of a task across all its attempts and retries (fractional cents). */

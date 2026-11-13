@@ -88,6 +88,15 @@ describe("ResilientHttpClient", () => {
       expect(resp.status).toBe(200);
     });
 
+    it("allows bracketed IPv6 loopback HTTP when explicitly enabled", async () => {
+      const client = new ResilientHttpClient({ maxRetries: 0, allowHttpOnLoopback: true });
+      globalThis.fetch = vi.fn().mockResolvedValue(mockResponse(200, { ok: true }));
+
+      const resp = await client.request("http://[::1]:8080/v1/models");
+      expect(resp.status).toBe(200);
+      await expect(client.request("http://[::2]:8080/v1/models")).rejects.toThrow("HTTPS required");
+    });
+
     it("rejects invalid URL strings", async () => {
       const client = new ResilientHttpClient({ maxRetries: 0 });
       const fetchSpy = vi.fn();

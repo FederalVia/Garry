@@ -504,7 +504,9 @@ function createWorkerIdentity(
     ...parentIdentity,
     name: `worker-${role ?? "generalist"}-${workerId.slice(-6)}`,
     address: `local://${workerId}`,
-    sandboxId: workerId,
+    // The parent's sandbox: a worker runs where its parent runs, so parent
+    // tools it calls take the same local or remote path as the parent's.
+    sandboxId: parentIdentity.sandboxId,
   };
 }
 

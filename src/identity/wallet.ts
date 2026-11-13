@@ -17,29 +17,60 @@ import type { WalletData } from "../types.js";
 import type { ChainType } from "./chain.js";
 import { EvmChainIdentity, SolanaChainIdentity } from "./chain.js";
 import type { ChainIdentity } from "./chain.js";
-import { writeFileSafe } from "../security/secure-fs.js";
+import { createFileExclusive } from "../security/secure-fs.js";
 import { registerSecret } from "../security/secret-redaction.js";
+
+/** wallet.json does not exist. */
+export class WalletMissingError extends Error {
+  constructor(readonly walletPath: string) {
+    super(`No wallet at ${walletPath}`);
+    this.name = "WalletMissingError";
+  }
+}
+
+/** wallet.json exists but is empty, unreadable or holds no usable key. No new key is ever made over it. */
+export class WalletCorruptError extends Error {
+  constructor(
+    readonly walletPath: string,
+    detail: string,
+  ) {
+    super(
+      `Cannot read wallet: wallet.json at ${walletPath} is empty or corrupt (${detail}); ` +
+        "restore it from backup (no new key was created)",
+    );
+    this.name = "WalletCorruptError";
+  }
+}
 
 /** Read wallet.json and register its key material for redaction. */
 function readWalletData(): WalletData {
-  const walletData: WalletData = JSON.parse(fs.readFileSync(WALLET_FILE, "utf-8"));
+  let text: string;
+  try {
+    text = fs.readFileSync(WALLET_FILE, "utf-8");
+  } catch (err: any) {
+    if (err?.code === "ENOENT") throw new WalletMissingError(WALLET_FILE);
+    throw new WalletCorruptError(WALLET_FILE, err?.message || String(err));
+  }
+  let walletData: WalletData;
+  try {
+    walletData = JSON.parse(text);
+  } catch (err: any) {
+    throw new WalletCorruptError(WALLET_FILE, text.trim() === "" ? "empty file" : "not valid JSON");
+  }
+  if (!walletData || typeof walletData !== "object" || Array.isArray(walletData)) {
+    throw new WalletCorruptError(WALLET_FILE, "not a JSON object");
+  }
   registerSecret(walletData.privateKey, "wallet");
   registerSecret(walletData.secretKey, "wallet");
   return walletData;
 }
 
-/** Create wallet.json via temp file + rename; refuses if a link sits at that name. */
+/**
+ * Create wallet.json, failing with EEXIST when anything is already there
+ * (two creators racing cannot both win). Refuses if a link sits at that name.
+ */
 function writeNewWallet(walletData: WalletData): void {
-  let existing: fs.Stats | null = null;
-  try {
-    existing = fs.lstatSync(WALLET_FILE);
-  } catch {
-    existing = null;
-  }
-  if (existing) {
-    throw new Error(`Refusing to create a wallet: ${WALLET_FILE} exists but is not a readable wallet file`);
-  }
-  writeFileSafe(WALLET_FILE, JSON.stringify(walletData, null, 2), { trustedWriter: true, mode: 0o600 });
+  createFileExclusive(WALLET_FILE, JSON.stringify(walletData, null, 2), { trustedWriter: true, mode: 0o600 });
   registerSecret(walletData.privateKey, "wallet");
   registerSecret(walletData.secretKey, "wallet");
 }
@@ -110,54 +141,67 @@ export async function getWallet(chainType?: ChainType): Promise<{
     fs.mkdirSync(AUTOMATON_DIR, { recursive: true, mode: 0o700 });
   }
 
-  if (fs.existsSync(WALLET_FILE)) {
-    const walletData = readWalletData();
-    const resolvedChainType = walletData.chainType || "evm";
-
-    if (resolvedChainType === "solana" && walletData.secretKey) {
-      const secretKey = bs58.decode(walletData.secretKey);
-      const solanaIdentity = new SolanaChainIdentity(secretKey);
-      const account = createSolanaStubAccount(solanaIdentity.address);
-      return { account, chainIdentity: solanaIdentity, chainType: "solana", isNew: false };
+  let existing = true;
+  try {
+    fs.lstatSync(WALLET_FILE);
+  } catch {
+    existing = false;
+  }
+  if (existing) {
+    try {
+      return { ...loadWallet(), isNew: false };
+    } catch (err) {
+      // Something is at the name but it reads as missing (a dangling link):
+      // never create a wallet over it.
+      if (err instanceof WalletMissingError) {
+        throw new Error(`Refusing to create a wallet: ${WALLET_FILE} exists but is not a readable wallet file`);
+      }
+      throw err;
     }
-
-    // EVM path (default)
-    const account = privateKeyToAccount(walletData.privateKey!);
-    return { account, chainIdentity: new EvmChainIdentity(account), chainType: "evm", isNew: false };
   }
 
   // Create new wallet
   const resolvedChain = chainType || "evm";
-
+  let walletData: WalletData;
   if (resolvedChain === "solana") {
-    const { secretKey, address } = generateSolanaKeypair();
-    const solanaIdentity = new SolanaChainIdentity(secretKey);
-
-    const walletData: WalletData = {
-      chainType: "solana",
-      secretKey: bs58.encode(secretKey),
-      createdAt: new Date().toISOString(),
-    };
-
-    writeNewWallet(walletData);
-
-    const account = createSolanaStubAccount(address);
-    return { account, chainIdentity: solanaIdentity, chainType: "solana", isNew: true };
+    const { secretKey } = generateSolanaKeypair();
+    walletData = { chainType: "solana", secretKey: bs58.encode(secretKey), createdAt: new Date().toISOString() };
+  } else {
+    walletData = { chainType: "evm", privateKey: generatePrivateKey(), createdAt: new Date().toISOString() };
   }
+  try {
+    writeNewWallet(walletData);
+  } catch (err: any) {
+    // Another process created it first: that wallet is the identity.
+    if (err?.code === "EEXIST") return { ...loadWallet(), isNew: false };
+    throw err;
+  }
+  return { ...loadWallet(), isNew: true };
+}
 
-  // EVM wallet
-  const privateKey = generatePrivateKey();
-  const account = privateKeyToAccount(privateKey);
-
-  const walletData: WalletData = {
-    chainType: "evm",
-    privateKey,
-    createdAt: new Date().toISOString(),
-  };
-
-  writeNewWallet(walletData);
-
-  return { account, chainIdentity: new EvmChainIdentity(account), chainType: "evm", isNew: true };
+/**
+ * Load the existing wallet, never creating one. Throws WalletMissingError
+ * when there is no wallet.json and WalletCorruptError when it is unusable.
+ */
+export function loadWallet(): {
+  account: PrivateKeyAccount;
+  chainIdentity: ChainIdentity;
+  chainType: ChainType;
+} {
+  let loaded: ReturnType<typeof loadChainIdentity>;
+  try {
+    loaded = loadChainIdentity();
+  } catch (err: any) {
+    if (err instanceof WalletCorruptError) throw err;
+    throw new WalletCorruptError(WALLET_FILE, err?.message || String(err));
+  }
+  if (!loaded) throw new WalletMissingError(WALLET_FILE);
+  const { chainIdentity, chainType } = loaded;
+  const account =
+    chainType === "solana"
+      ? createSolanaStubAccount(chainIdentity.address)
+      : (chainIdentity as EvmChainIdentity).account;
+  return { account, chainIdentity, chainType };
 }
 
 /**
@@ -178,7 +222,8 @@ export function loadChainIdentity(): {
   try {
     walletData = readWalletData();
   } catch (err: any) {
-    throw new Error(`Cannot read wallet at ${WALLET_FILE}: ${err?.message || String(err)}`);
+    if (err instanceof WalletMissingError) return null;
+    throw err;
   }
 
   const chainType: ChainType = walletData.chainType || "evm";

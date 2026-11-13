@@ -430,6 +430,19 @@ describe("Agent Card", () => {
     expect(cardStr).not.toContain("sandbox-123");
   });
 
+  it("generateAgentCard claims x402 support only where payments are on", async () => {
+    const { generateAgentCard } = await import("../registry/agent-card.js");
+    const { createTestConfig } = await import("./mocks.js");
+    const identity = { name: "a", address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", chainType: "evm" } as any;
+    const db = {} as any;
+    expect(generateAgentCard(identity, createTestConfig(), db).x402Support).toBe(true);
+    const standalone = { conwayApiKey: "", openaiApiKey: "sk", socialRelayUrl: "" };
+    expect(generateAgentCard(identity, createTestConfig(standalone), db).x402Support).toBe(false);
+    expect(
+      generateAgentCard(identity, createTestConfig({ ...standalone, providers: { payments: true } }), db).x402Support,
+    ).toBe(true);
+  });
+
   it("generateAgentCard does NOT include Conway API URL", async () => {
     const { generateAgentCard } = await import("../registry/agent-card.js");
 

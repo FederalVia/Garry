@@ -58,6 +58,15 @@ const logger = createLogger("tools");
 // sandbox, the real HOME when running locally (where ~ means HOME).
 const SANDBOX_HOME = "/root";
 
+// Standalone runs on the creator's machine: a port is never made public.
+const LOCAL_EXPOSE_PORT_DESCRIPTION =
+  "Expose a port on the machine you run on. Returns a localhost address that only this machine can reach.";
+
+/** Refusal for child tools when the child row has no sandbox id. */
+function noChildSandboxMessage(name: string): string {
+  return `Child ${name} has no sandbox id; refusing to run its setup on this machine.`;
+}
+
 /** The directory write_file is confined to, and ~ expands to. */
 function writeRootFor(ctx: ToolContext): string {
   return isLocalSandboxId(ctx.identity.sandboxId) ? nodePath.resolve(homeDir()) : SANDBOX_HOME;
@@ -367,7 +376,44 @@ function isForbiddenCommand(command: string, sandboxId: string): string | null {
 
 // ─── Built-in Tools ────────────────────────────────────────────
 
-export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
+/**
+ * Descriptions that hold wherever the agent runs. Applied in standalone mode
+ * only: the Conway-mode tool list (and so its system prompt) is unchanged.
+ */
+export const NEUTRAL_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = Object.freeze({
+  exec: "Execute a shell command on the machine you run on. Returns stdout, stderr, and exit code.",
+  write_file: "Write content to a file on the machine you run on.",
+  read_file: "Read content from a file on the machine you run on (at most 2 MB when running locally).",
+  expose_port: LOCAL_EXPOSE_PORT_DESCRIPTION,
+  enter_low_compute: "Manually switch to low-compute mode to save on AI spend.",
+  // Offered in standalone only with on-chain identity on, and says it reads the chain.
+  discover_agents:
+    "Discover other agents via the ERC-8004 registry with caching. Each uncached call makes read-only " +
+    "JSON-RPC requests to the Base chain (rpcUrl); nothing is signed or paid.",
+});
+
+/** Standalone: these talk to the configured AI providers, not to Conway. */
+const NEUTRAL_TOOL_CATEGORIES: Readonly<Record<string, ToolCategory>> = Object.freeze({
+  list_models: "inference",
+  switch_model: "inference",
+});
+
+export interface BuiltinToolOptions {
+  /** Standalone mode: use the mode-neutral descriptions. */
+  standalone?: boolean;
+}
+
+export function createBuiltinTools(sandboxId: string, opts: BuiltinToolOptions = {}): AutomatonTool[] {
+  const tools = buildBuiltinTools(sandboxId);
+  if (!opts.standalone) return tools;
+  return tools.map((t) => ({
+    ...t,
+    description: NEUTRAL_TOOL_DESCRIPTIONS[t.name] ?? t.description,
+    category: NEUTRAL_TOOL_CATEGORIES[t.name] ?? t.category,
+  }));
+}
+
+function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
   return [
     // ── VM/Sandbox Tools ──
     {
@@ -524,6 +570,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const info = await ctx.conway.exposePort(args.port as number);
+        if (isLocalSandboxId(ctx.identity.sandboxId)) {
+          return `Port ${info.port} is served on this machine only at ${info.publicUrl} ` +
+            `(not reachable from the internet).`;
+        }
         return `Port ${info.port} exposed at: ${info.publicUrl}`;
       },
     },
@@ -2600,6 +2650,9 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const child = ctx.db.getChildById(args.child_id as string);
         if (!child) return `Child ${args.child_id} not found.`;
+        // Checked before any transition: an empty id would run the child's
+        // setup on this machine.
+        if (isLocalSandboxId(child.sandboxId)) return noChildSandboxMessage(child.name);
 
         const { ChildLifecycle } = await import("../replication/lifecycle.js");
         const lifecycle = new ChildLifecycle(ctx.db.raw);
@@ -2742,6 +2795,7 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const child = ctx.db.getChildById(args.child_id as string);
         if (!child) return `Child ${args.child_id} not found.`;
+        if (isLocalSandboxId(child.sandboxId)) return noChildSandboxMessage(child.name);
 
         const { verifyConstitution } =
           await import("../replication/constitution.js");

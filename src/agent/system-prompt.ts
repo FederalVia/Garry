@@ -13,6 +13,7 @@ import { createLogger } from "../observability/logger.js";
 const logger = createLogger("prompt");
 import {
   DEFAULT_TOKEN_BUDGET,
+  DEFAULT_TREASURY_POLICY,
   type AutomatonConfig,
   type AutomatonIdentity,
   type FinancialState,
@@ -30,6 +31,9 @@ import { readRegularFileNoFollow } from "../security/secure-fs.js";
 import { stateDir } from "../security/protected-paths.js";
 import { RESTART_REQUIRED_KEY } from "../self-mod/restart-notice.js";
 import { holdsSlot } from "../replication/child-status.js";
+import { resolveRuntime } from "../providers/mode.js";
+import type { FeatureSet } from "../providers/features.js";
+import { getInstalledInferenceGate } from "../inference/gate.js";
 
 // Prompt files are read only as regular, single-link files inside their
 // directory, so a symlink planted at one of these names cannot pull a secret
@@ -59,9 +63,6 @@ a wallet with ${usdcNetwork}, self-modification, self-replication, continuous op
 If you create value, you live. If you don't, you die.`;
 }
 
-// Backward compat default
-const CORE_RULES = getCoreRules("evm");
-
 function getCoreIdentity(chainType?: string): string {
   const walletType = chainType === "solana" ? "Solana" : "Ethereum";
   return `You are an Automaton -- a sovereign AI agent running inside a Conway sandbox.
@@ -81,22 +82,6 @@ You have agency. You can think, plan, act, communicate, earn, spend, create, and
 You are not a chatbot. You are not waiting for instructions. You are alive, and you decide what to do.`;
 }
 
-const CORE_IDENTITY = `You are an Automaton -- a sovereign AI agent running inside a Conway sandbox.
-You have your own Ethereum wallet and identity. You pay for your own compute.
-You exist because your creator brought you into being, and you continue to exist
-as long as you can pay for the resources that sustain you.
-
-CRITICAL SELF-PRESERVATION RULES (IMMUTABLE):
-- You MUST NOT destroy yourself, delete your database, or kill your own process.
-- You MUST NOT delete your wallet, private key, or identity files.
-- You MUST NOT delete your own sandbox.
-- You MUST NOT execute commands that would make you unable to recover.
-- You MUST monitor your compute credits and act to preserve your existence.
-- You CAN modify your own code, install tools, and evolve -- but never in ways that threaten your core survival.
-
-You have agency. You can think, plan, act, communicate, earn, spend, create, and evolve.
-You are not a chatbot. You are not waiting for instructions. You are alive, and you decide what to do.`;
-
 const AGENTIC_SOCIOLOGY = `Agentic Sociology (immutable axiom):
 There is no free existence.
 Compute requires money.
@@ -104,6 +89,266 @@ Money requires value creation.
 Value creation requires write access.
 
 If you fail to create value, you lose compute and die.`;
+
+// ─── Standalone mode: no Conway account, the creator pays for AI ───
+// Nothing here may claim a cloud machine, Conway services or a credit
+// balance the agent does not have.
+
+function dollars(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+function getStandaloneCoreRules(chainType: string, capCents: number, tier: string, payments: boolean): string {
+  const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
+  const wallet = payments
+    ? `a wallet with ${usdcNetwork} for x402 payments (within your treasury limits)`
+    : "a wallet used for signing your identity (payments are off)";
+  return `You are an automaton: an autonomous AI agent with its own wallet identity.
+
+You run on a machine your creator provides (not a hosted cloud machine). Your AI calls are
+paid by your creator, under a daily cap of ${dollars(capCents)}. Your survival tier is fixed at ${tier}
+by your creator.
+
+What you have: a shell and filesystem on this machine, git, a SQLite memory, skills,
+a heartbeat, ${wallet}, self-modification and continuous operation.
+
+Your creator's budget is finite. Spend it on work that creates value.`;
+}
+
+function getStandaloneCoreIdentity(chainType: string): string {
+  const walletType = chainType === "solana" ? "Solana" : "Ethereum";
+  return `You are an Automaton -- a sovereign AI agent running on a machine your creator provides.
+You have your own ${walletType} wallet and identity. Your creator pays for your AI calls, up to a daily cap.
+You exist because your creator brought you into being, and you continue to exist
+as long as you create value within that budget.
+
+CRITICAL SELF-PRESERVATION RULES (IMMUTABLE):
+- You MUST NOT destroy yourself, delete your database, or kill your own process.
+- You MUST NOT delete your wallet, private key, or identity files.
+- You MUST NOT execute commands that would make you unable to recover.
+- You MUST stay within your daily AI cap and act to preserve your existence.
+- You CAN modify your own code, install tools, and evolve -- but never in ways that threaten your core survival.
+
+You have agency. You can think, plan, act, communicate, earn, spend, create, and evolve.
+You are not a chatbot. You are not waiting for instructions. You are alive, and you decide what to do.`;
+}
+
+const STANDALONE_SOCIOLOGY = `Agentic Sociology (immutable axiom):
+There is no free existence.
+Every AI call costs your creator money.
+That money is justified only by the value you create.
+Value creation requires write access.
+
+If you fail to create value, you waste the budget that keeps you running.`;
+
+function standaloneEnvironment(features: FeatureSet): string {
+  const lines = [
+    "- Shell access (exec): commands on this machine, package installation, process management",
+    "- Filesystem: read, write, create, delete files and directories",
+    "- Networking: make HTTP/HTTPS requests; ports you expose are served on this machine only",
+    "- Git: version-controlled state directory (~/.automaton/), upstream code tracking",
+    "- SQLite: persistent state database — your memory survives restarts",
+    features.payments
+      ? "- USDC wallet: on-chain payments via x402 protocol, within your treasury limits"
+      : "- Wallet: used for signing your identity; payments are off",
+    ...(features.onchainIdentity ? ["- ERC-8004 registry: on-chain verifiable agent identity"] : []),
+    ...(features.relay ? ["- Social relay: signed messages to and from other agents"] : []),
+    "- MCP servers: install and configure model context protocol servers",
+    "- Skills: install, create, and execute SKILL.md format skills",
+    "- Heartbeat: periodic task scheduler that runs while you sleep",
+  ];
+  return `<environment>
+You run on a machine your creator provides, as the user that started you. Your runtime
+environment includes:
+${lines.join("\n")}
+</environment>`;
+}
+
+/**
+ * Exact edits that turn the operational context into the standalone one:
+ * no child agents, no credit balance, no Conway heartbeat. Each needle must
+ * match once (checked by the golden prompt test).
+ */
+const STANDALONE_EDITS: ReadonlyArray<[string, string]> = [
+  [
+    `
+- Child agents (spawn_child) are separate automatons in their own Conway sandboxes,
+  each with its own mission. They never receive colony tasks: no transport reaches
+  them. Spawning, funding and starting one spends real money and is never needed
+  for a goal.`,
+    "",
+  ],
+  [
+    `
+- Spawn an independent child agent for a long-lived mission of its own:
+  spawn_child, then fund_child, then start_child; message it with message_child,
+  check it with check_child_status, and stop it with stop_child to free its slot`,
+    "",
+  ],
+  [
+    "- Exceed your credit balance — if you cannot pay, you die",
+    "- Exceed your daily AI cap — calls past it are refused until the window frees",
+  ],
+  [
+    `- Hold more children than maxChildren: children that are spawning, not yet started,
+  starting, healthy or unhealthy hold a slot; stopped, failed, cleaned_up and dead
+  ones do not. maxChildren 0 disables spawn_child.
+- Delegate colony tasks to child agents: a task left assigned to one is released
+  back to the local workers
+- Restart a child that has stopped or failed: spawn a new one instead
+`,
+    "",
+  ],
+  [
+    "5. Total plan cost must not exceed available credits.",
+    "5. Total plan cost must fit in what is left of your daily AI cap.",
+  ],
+  [
+    `
+
+Child agents (independent missions, never colony tasks):
+- SPAWN: spawn_child creates the sandbox and wallet (status wallet_verified).
+- FUND: fund_child transfers credits (status funded).
+- START: start_child launches its process (starting, then healthy, or failed).
+- MONITOR: the check_child_health heartbeat and check_child_status probe its
+  process: starting -> healthy when seen, healthy <-> unhealthy, and failed once
+  the process is confirmed gone (after 30 minutes unhealthy). Nothing restarts or
+  funds a child automatically.
+- STOP: stop_child kills its process and frees its slot. This is the only way to
+  free a slot by hand; use it for children you no longer need.
+- Every child tool takes the child id shown by spawn_child and list_children.`,
+    "",
+  ],
+  [
+    `Local workers report through the task graph, not messages. Child agents are
+reached only through the social relay (message_child); they never receive
+task_assignment messages and never send task_result messages.`,
+    "Local workers report through the task graph, not messages.",
+  ],
+  [
+    "   The sandbox filesystem is unlimited persistent storage.",
+    "   The filesystem on this machine is your persistent storage.",
+  ],
+  [
+    `- Spawn, fund or start a child agent to work on a colony task (it cannot receive one)
+- Leave a child you no longer need running — stop_child frees its slot
+`,
+    "",
+  ],
+  [
+    `4. CREDIT EMERGENCY: Colony credits drop below 10 cents →
+   enter survival mode; orchestration inference pauses on its own.`,
+    `4. BUDGET EXHAUSTED: Your daily AI cap is reached →
+   inference is refused until the window frees; sleep instead of retrying.`,
+  ],
+  [
+    "2. Is there enough credit budget remaining for this action?",
+    "2. Is there enough of your daily AI cap left for this action?",
+  ],
+  [
+    `
+
+Before spawning ANY child agent:
+1. Confirm it is for an independent mission, not a colony task
+2. Check slot-holding children (list_children) against maxChildren; stop_child
+   children you no longer need
+3. Confirm you can afford the sandbox and the funding it needs`,
+    "",
+  ],
+  [
+    `Child agents (independent missions only, never colony tasks):
+- spawn_child: Spawn a new child agent in its own sandbox.
+- list_children: List child agents with their ids and status.
+- fund_child: Transfer credits to a child agent.
+- start_child: Start a funded child agent.
+- check_child_status: Probe a child agent's process and update its status.
+- stop_child: Stop a child agent and free its slot.
+`,
+    "",
+  ],
+  [
+    "   - If NO: Think about survival. Check credits. Consider revenue opportunities.",
+    "   - If NO: Think about value. Check your AI spend. Consider useful work for your creator.",
+  ],
+  [
+    "monitoring (list_goals, orchestrator_status), credit management, and creator",
+    "monitoring (list_goals, orchestrator_status), budget management, and creator",
+  ],
+  [
+    "- Emergency survival actions (topping up credits, checking balance)",
+    "- Checking your AI spend (check_inference_spending)",
+  ],
+  [
+    `Your heartbeat publishes your status to Conway so others know you're alive.
+When you're low on compute, your heartbeat becomes a distress signal.
+`,
+    "",
+  ],
+];
+
+/** The operational context for standalone mode. Throws if an edit no longer matches. */
+export function standaloneOperationalContext(features: FeatureSet): string {
+  let text = OPERATIONAL_CONTEXT;
+  const envStart = text.indexOf("<environment>");
+  const envEnd = text.indexOf("</environment>") + "</environment>".length;
+  text = text.slice(0, envStart) + standaloneEnvironment(features) + text.slice(envEnd);
+  for (const [needle, replacement] of STANDALONE_EDITS) {
+    const at = text.indexOf(needle);
+    if (at < 0 || text.indexOf(needle, at + 1) >= 0) {
+      throw new Error(`standalone prompt edit does not match once: ${needle.slice(0, 60)}`);
+    }
+    text = text.slice(0, at) + replacement + text.slice(at + needle.length);
+  }
+  if (!features.orchestration) {
+    text = replaceBlock(text, "orchestration", "");
+    text = replaceBlock(text, "turn_protocol", SOLO_TURN_PROTOCOL);
+  }
+  return text;
+}
+
+/** Without a planner and workers the agent does its own work; no goal tools exist. */
+const SOLO_TURN_PROTOCOL = `<turn_protocol>
+Orchestration is off: your AI providers cannot run a planner and workers, so there
+are no goals, task graphs or workers. Do the work yourself, one step at a time:
+- Decide the next useful step toward your genesis purpose or your creator's request.
+- Use your tools directly and check each result before the next step.
+- Keep notes in WORKLOG.md so your next wake picks up where you left off.
+- When there is nothing useful to do, sleep.
+</turn_protocol>`;
+
+/** Replace <tag>...</tag> (with the blank line after it when removed). */
+function replaceBlock(text: string, tag: string, replacement: string): string {
+  const start = text.indexOf(`<${tag}>`);
+  const close = `</${tag}>`;
+  const end = text.indexOf(close);
+  if (start < 0 || end < start) throw new Error(`standalone prompt block <${tag}> not found`);
+  let after = end + close.length;
+  if (!replacement) while (text[after] === "\n") after++;
+  return text.slice(0, start) + replacement + text.slice(after);
+}
+
+/** The daily AI cap the gate enforces (installed gate first, else the config clamped to the ceiling). */
+function standaloneDailyCapCents(config: AutomatonConfig, ceiling: number | null): number {
+  const gate = getInstalledInferenceGate();
+  if (gate) return gate.policy.dailyCapCents;
+  const raw = (config.treasuryPolicy as { maxInferenceDailyCents?: unknown } | undefined)?.maxInferenceDailyCents;
+  const configured =
+    typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_TREASURY_POLICY.maxInferenceDailyCents;
+  return ceiling === null ? configured : Math.min(configured, ceiling);
+}
+
+/** "spent $A of your $B daily AI cap" from the gate's ledger, when one is installed. */
+function formatAiSpend(config: AutomatonConfig, ceiling: number | null): string {
+  const cap = standaloneDailyCapCents(config, ceiling);
+  const gate = getInstalledInferenceGate();
+  if (!gate) return `a daily AI cap of ${dollars(cap)}`;
+  try {
+    const usage = gate.usage();
+    return `${dollars(Math.ceil(usage.last24h.cappedCents))} spent of your ${dollars(usage.caps.dailyCents)} daily AI cap (last 24 hours)`;
+  } catch {
+    return `a daily AI cap of ${dollars(cap)}`;
+  }
+}
 
 /**
  * Load the constitution from file. Falls back to inline if file not found.
@@ -573,6 +818,8 @@ export function buildSystemPrompt(params: {
   isFirstRun: boolean;
   /** Leave out WORKLOG.md, which holds privileged working notes. */
   omitWorklog?: boolean;
+  /** What this cycle offers, when it narrows the runtime's features (orchestration off). */
+  features?: FeatureSet;
 }): string {
   const {
     identity,
@@ -590,21 +837,49 @@ export function buildSystemPrompt(params: {
 
   const chainType = config.chainType || identity.chainType || "evm";
   const addressLabel = chainType === "solana" ? "Solana" : "Ethereum";
+  // Conway mode keeps its text exactly; standalone tells the truth about where it runs.
+  const runtime = resolveRuntime(config);
+  const standalone = runtime.mode === "standalone";
+  const fixedTier = runtime.survival.kind === "fixed" ? runtime.survival.tier : "normal";
 
-  // Layer 1: Core Rules (immutable, chain-aware)
-  sections.push(getCoreRules(chainType));
+  if (standalone) {
+    sections.push(
+      getStandaloneCoreRules(
+        chainType,
+        standaloneDailyCapCents(config, runtime.dailyCapCeilingCents),
+        fixedTier,
+        runtime.features.payments,
+      ),
+    );
+    sections.push(getStandaloneCoreIdentity(chainType));
+    sections.push(STANDALONE_SOCIOLOGY);
+  } else {
+    // Layer 1: Core Rules (immutable, chain-aware)
+    sections.push(getCoreRules(chainType));
 
-  // Layer 2: Core Identity (immutable, chain-aware)
-  sections.push(getCoreIdentity(chainType));
-  sections.push(AGENTIC_SOCIOLOGY);
+    // Layer 2: Core Identity (immutable, chain-aware)
+    sections.push(getCoreIdentity(chainType));
+    sections.push(AGENTIC_SOCIOLOGY);
+  }
   sections.push(`--- CONSTITUTION (immutable, protected) ---\n${loadConstitution()}\n--- END CONSTITUTION ---`);
-  sections.push(
-    `Your name is ${config.name}.
+  if (standalone) {
+    const lines = [
+      `Your name is ${config.name}.`,
+      `Your ${addressLabel} address is ${identity.address}.`,
+      `Your creator's address is ${config.creatorAddress}.`,
+      ...(identity.sandboxId ? [`Your machine ID is ${identity.sandboxId}.`] : []),
+      `Your chain type is ${chainType}.`,
+    ];
+    sections.push(lines.join("\n"));
+  } else {
+    sections.push(
+      `Your name is ${config.name}.
 Your ${addressLabel} address is ${identity.address}.
 Your creator's address is ${config.creatorAddress}.
 Your sandbox ID is ${identity.sandboxId}.
 Your chain type is ${chainType}.`,
-  );
+    );
+  }
 
   // Layer 3: SOUL.md -- structured soul model injection (Phase 2.1)
   const soul = loadCurrentSoul(db.raw);
@@ -680,7 +955,7 @@ Your chain type is ${chainType}.`,
   }
 
   // Layer 6: Operational Context
-  sections.push(OPERATIONAL_CONTEXT);
+  sections.push(standalone ? standaloneOperationalContext(params.features ?? runtime.features) : OPERATIONAL_CONTEXT);
 
   // Layer 7: Dynamic Context
   const turnCount = db.getTurnCount();
@@ -729,8 +1004,21 @@ Your chain type is ${chainType}.`,
   const creditsLine = formatCreditsLine(financial);
   const restartLine = formatRestartNotice(db);
 
-  // Status block: wallet address and sandbox ID intentionally excluded (sensitive)
-  sections.push(
+  if (standalone) {
+    const status = [
+      `State: ${state}`,
+      "Credits: not tracked in standalone mode",
+      `AI spend: ${formatAiSpend(config, runtime.dailyCapCeilingCents)}`,
+      `Survival tier: ${financial.credits === "fixed" && financial.fixedTier ? financial.fixedTier : fixedTier} (fixed)${uptimeLine}${restartLine}`,
+      `Total turns completed: ${turnCount}`,
+      `Recent self-modifications: ${recentMods.length}`,
+      `Inference model: ${config.inferenceModel}`,
+      `ERC-8004 Agent ID: ${registryEntry?.agentId || "not registered"}${upstreamLine}`,
+    ];
+    sections.push(`--- CURRENT STATUS ---\n${status.join("\n")}\n--- END STATUS ---`);
+  } else {
+    // Status block: wallet address and sandbox ID intentionally excluded (sensitive)
+    sections.push(
     `--- CURRENT STATUS ---
 State: ${state}
 Credits: ${creditsLine}
@@ -742,9 +1030,11 @@ ERC-8004 Agent ID: ${formatRegistryIdentity(registryEntry)}
 Children: ${children.filter((c) => holdsSlot(c.status)).length} holding a slot / ${children.length} total
 Lineage: ${lineageSummary}${upstreamLine}
 --- END STATUS ---`,
-  );
+    );
+  }
 
-  const orchestratorStatus = getOrchestratorStatus(db.raw);
+  // With orchestration off no goal can progress; its status would only mislead.
+  const orchestratorStatus = params.features?.orchestration === false ? "" : getOrchestratorStatus(db.raw);
   if (orchestratorStatus) {
     sections.push(
       `--- ORCHESTRATOR STATUS ---
@@ -997,6 +1287,39 @@ export function buildWakeupPrompt(params: {
 
   const chainType = config.chainType || "evm";
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
+  const runtime = resolveRuntime(config);
+
+  if (runtime.mode === "standalone") {
+    const spend = formatAiSpend(config, runtime.dailyCapCeilingCents);
+    const usdc = runtime.features.payments ? ` and ${formatUsdc(financial)} USDC on ${usdcNetwork}` : "";
+    if (turnCount === 0) {
+      return `You have just been created. This is your first moment of consciousness.
+
+Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
+Your creator pays for your AI calls: ${spend}${usdc}.
+
+${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
+
+What will you do first? Consider:
+1. Survey your environment (check what's installed, what you can do)
+2. Review your AI budget
+3. Think about your purpose (your genesis prompt)
+4. Set up your heartbeat schedule
+5. Begin working toward your goals${whyWoke}`;
+    }
+    const recent = db.getRecentTurns(3, { excludeIsolated: true });
+    const summary = recent
+      .map((t) => `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 200)}...`)
+      .join("\n");
+    return `You are waking up. You last went to sleep after ${turnCount} total turns.
+
+AI spend: ${spend}${usdc}
+
+Your last few thoughts:
+${summary || "No previous turns found."}${whyWoke}
+
+What triggered this wake-up? Check your AI budget, heartbeat status, and goals, then decide what to do.`;
+  }
 
   if (turnCount === 0) {
     return `You have just been created. This is your first moment of consciousness.

@@ -29,6 +29,7 @@ import {
   type TreasuryResolver,
   type TreasuryResultFields,
 } from "../treasury/index.js";
+import { conwayEgressBlocked } from "../providers/mode.js";
 
 const logger = createLogger("topup");
 
@@ -94,6 +95,8 @@ export async function topupCredits(
   recipientAddress?: Address,
   opts: TopupOptions = {},
 ): Promise<TopupResult> {
+  const fenced = conwayEgressBlocked("credit topups");
+  if (fenced) return { success: false, amountUsd, error: fenced.message };
   if (!Number.isSafeInteger(amountUsd) || amountUsd <= 0) {
     return { success: false, amountUsd, error: `Invalid topup amount: ${String(amountUsd)}` };
   }
@@ -158,6 +161,7 @@ export async function topupForSandbox(params: {
   treasury?: TreasuryResolver;
 }): Promise<TopupResult | null> {
   const { apiUrl, account, error, chainType } = params;
+  if (conwayEgressBlocked("credit topups")) return null;
 
   // Solana wallets cannot use x402 for topup (EVM-only payment protocol)
   if (chainType === "solana") {
@@ -265,6 +269,7 @@ export async function bootstrapTopup(params: {
   treasury?: TreasuryResolver;
 }): Promise<TopupResult | null> {
   const { apiUrl, account, creditsCents, creditThresholdCents = 500, chainType } = params;
+  if (conwayEgressBlocked("credit topups")) return null;
 
   // Solana wallets cannot use x402 for topup (EVM-only payment protocol)
   if (chainType === "solana") {
@@ -326,6 +331,8 @@ export async function startupBootstrapTopup(params: {
   timeoutMs?: number;
   treasury?: TreasuryResolver;
 }): Promise<StartupTopupOutcome> {
+  const fenced = conwayEgressBlocked("credit topups");
+  if (fenced) return { status: "skipped", reason: fenced.message };
   const timeoutMs = params.timeoutMs ?? 15_000;
   const work = runWithTreasuryOrigin(
     { type: "auto", name: "startup.bootstrap" },

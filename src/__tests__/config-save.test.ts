@@ -161,3 +161,29 @@ describe("loadConfig", () => {
     expect(() => cfg.loadConfig()).toThrow(cfg.ConfigError);
   });
 });
+
+describe("pinStandaloneModeInFile", () => {
+  const HAND_WRITTEN = { name: "agent", creatorAddress: "0x" + "1".repeat(40), providers: { openai: { apiKey: "sk-x" } } };
+
+  it("pins a config that sets no mode and holds no Conway key, keeping everything else", () => {
+    writeConfig({ ...HAND_WRITTEN, treasuryPolicy: { maxInferenceDailyCents: 150 } });
+    expect(cfg.pinStandaloneModeInFile()).toBe(true);
+    expect(readDisk()).toEqual({
+      ...HAND_WRITTEN,
+      treasuryPolicy: { maxInferenceDailyCents: 150 },
+      providers: { openai: { apiKey: "sk-x" }, mode: "standalone" },
+    });
+    // A Conway key stored later no longer selects Conway mode.
+    fs.writeFileSync(path.join(home, ".automaton", "config.json"), JSON.stringify({ apiKey: "cnwy_k_later" }));
+    expect(cfg.loadConfig({})!.providers?.mode).toBe("standalone");
+    expect(cfg.pinStandaloneModeInFile()).toBe(false);
+  });
+
+  it("leaves an explicit mode and a Conway key in the file alone", () => {
+    writeConfig({ ...HAND_WRITTEN, providers: { mode: "conway" }, conwayApiKey: "cnwy_k" });
+    expect(cfg.pinStandaloneModeInFile()).toBe(false);
+    writeConfig({ ...HAND_WRITTEN, conwayApiKey: "cnwy_k" });
+    expect(cfg.pinStandaloneModeInFile()).toBe(false);
+    expect(readDisk().providers.mode).toBeUndefined();
+  });
+});

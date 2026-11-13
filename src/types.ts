@@ -87,9 +87,46 @@ export interface AutomatonConfig {
   modelStrategy?: ModelStrategyConfig;
   /** Custom RPC endpoint for Base chain interactions (overrides default public RPC) */
   rpcUrl?: string;
-  /** Chain type for this automaton. Defaults to "evm" if absent. */
+  /** Chain type for this automaton. When absent, the wallet's chain is used. */
   chainType?: ChainType;
+  /**
+   * Where the agent gets AI, compute and money. Optional: the flat fields
+   * above (conwayApiKey, openaiApiKey, ...) remain aliases, and loadConfig
+   * writes the resolved values back into them.
+   */
+  providers?: ProvidersConfig;
 }
+
+/** A model served by an OpenAI-compatible endpoint, priced by the operator. */
+export interface ConfiguredModel {
+  id: string;
+  /** USD per 1M input tokens. */
+  inputUsdPerM?: number;
+  /** USD per 1M output tokens. */
+  outputUsdPerM?: number;
+  tierMinimum?: SurvivalTier;
+}
+
+export interface ProvidersConfig {
+  /** Absent: "conway" when a Conway key resolves, else "standalone". */
+  mode?: "standalone" | "conway";
+  openai?: { apiKey?: string; baseUrl?: string; models?: ConfiguredModel[] };
+  anthropic?: { apiKey?: string };
+  ollama?: { baseUrl?: string };
+  conway?: { apiKey?: string; apiUrl?: string };
+  survival?: { source?: "fixed" | "conway"; fixedTier?: Exclude<SurvivalTier, "dead"> };
+  /** Standalone only: hard ceiling on treasuryPolicy.maxInferenceDailyCents. Default 200. */
+  dailyCapCeilingCents?: number;
+  /** Standalone only: x402 payments, USDC balance reads and on-chain identity. Default false. */
+  payments?: boolean;
+  /**
+   * Standalone only: the social relay URL, taking precedence over
+   * socialRelayUrl. The only way to use Conway's relay in standalone.
+   */
+  relayUrl?: string;
+}
+
+export type { FeatureSet } from "./providers/features.js";
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   conwayApiUrl: "https://api.conway.tech",
@@ -169,6 +206,7 @@ export interface AutomatonTool {
 export type ToolCategory =
   | "vm"
   | "conway"
+  | "inference"
   | "self_mod"
   | "financial"
   | "survival"
@@ -260,8 +298,11 @@ export interface HeartbeatPingPayload {
 
 // ─── Financial ───────────────────────────────────────────────────
 
-/** Where a balance came from: read now, the last good read, or nothing. */
-export type BalanceSource = "live" | "cached" | "unknown";
+/**
+ * Where a balance came from: read now, the last good read, nothing, or not
+ * tracked at all (a survival tier fixed by the creator).
+ */
+export type BalanceSource = "live" | "cached" | "unknown" | "fixed";
 
 /**
  * Balances as the agent sees them. null means unknown (never read, or the
@@ -278,6 +319,8 @@ export interface FinancialState {
   creditsAsOf?: string;
   /** When a cached usdcBalance was read. */
   usdcAsOf?: string;
+  /** Set when credits is "fixed": the tier the creator fixed. */
+  fixedTier?: SurvivalTier;
 }
 
 export type SurvivalTier = "dead" | "critical" | "low_compute" | "normal" | "high";

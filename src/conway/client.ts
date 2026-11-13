@@ -558,8 +558,14 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
         redirect: "manual",
       },
     );
+    const id = typeof result === "object" && result !== null ? result.id || result.sandbox_id : undefined;
+    // No status on this error: the request was sent, so the guard holds the
+    // reservation as unknown rather than releasing it.
+    if (typeof id !== "string" || isLocalSandboxId(id)) {
+      throw new Error("sandbox create returned no id; the sandbox may exist and be billed");
+    }
     return {
-      id: result.id || result.sandbox_id,
+      id,
       status: result.status || "running",
       region: result.region || "",
       vcpu: result.vcpu || options.vcpu || 1,
@@ -893,6 +899,11 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
   // Raw on purpose: the guarded wrapper re-guards scoped clients, so each
   // outflow is gated exactly once.
   const createScopedClient = (targetSandboxId: string): ConwayClient => {
+    // An empty id makes the raw client run locally: a child's setup would
+    // then execute on the parent's machine.
+    if (isLocalSandboxId(targetSandboxId)) {
+      throw new Error("refusing a child client with an empty sandbox id: it would run on this machine");
+    }
     return createRawConwayClient({ apiUrl, apiKey, sandboxId: targetSandboxId });
   };
 

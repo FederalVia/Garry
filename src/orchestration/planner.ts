@@ -53,6 +53,15 @@ export interface PlannerContext {
   busyAgents: number;
   maxAgents: number;
   workspaceFiles: string[];
+  /** Standalone only: the daily AI cap is the colony's whole budget. */
+  dailyBudget?: PlannerDailyBudget;
+}
+
+export interface PlannerDailyBudget {
+  capCents: number;
+  spentCents: number;
+  remainingCents: number;
+  orchestrationSharePct: number;
 }
 
 export interface PlannerGoalInput {
@@ -259,7 +268,7 @@ export function buildPlannerPrompt(context: PlannerContext): string {
   const usdcDisplay =
     typeof context.usdcBalance === "number" && Number.isFinite(context.usdcBalance) ? String(context.usdcBalance) : "unknown";
 
-  return `# Planner Agent
+  const prompt = `# Planner Agent
 
 <identity>
 You are the strategic planner for an autonomous agent colony on the Conway
@@ -530,6 +539,63 @@ Before producing ANY plan:
 
 ## Available Tools
 ${toolList}`;
+  return context.dailyBudget ? standalonePlannerPrompt(prompt, context, context.dailyBudget) : prompt;
+}
+
+/**
+ * Standalone: no Conway network and no credit balance. The planner budgets
+ * against the daily AI cap, the only money the colony has. Conway mode keeps
+ * its text exactly. Throws if an edit no longer matches.
+ */
+function standalonePlannerPrompt(prompt: string, context: PlannerContext, budget: PlannerDailyBudget): string {
+  const usdc =
+    typeof context.usdcBalance === "number" && Number.isFinite(context.usdcBalance) ? `, ${context.usdcBalance} USDC` : "";
+  const edits: Array<[string, string]> = [
+    [
+      "You are the strategic planner for an autonomous agent colony on the Conway\nnetwork. You are the colony's chief strategist, project decomposer, and",
+      "You are the strategic planner for your colony of autonomous agents. You are\nthe colony's chief strategist, project decomposer, and",
+    ],
+    [
+      /- Current financial state: .* credits, .* USDC\n/.exec(prompt)?.[0] ?? "\u0000",
+      `- Daily AI budget: ${budget.capCents} cents per rolling 24h, ${budget.spentCents} cents spent, ` +
+        `${budget.remainingCents} cents left${usdc}. Planning and workers may use ${budget.orchestrationSharePct}% of the cap. ` +
+        "There is no credit balance.\n",
+    ],
+    ["| Agent Type | Cost per Task (credits) | Typical Duration |", "| Agent Type | Cost per Task (cents) | Typical Duration |"],
+    [
+      "- Inference (tier:fast): ~5 credits/turn, ~25 turns/task = ~125 credits\n" +
+        "- Inference (tier:reasoning): ~15 credits/turn, ~15 turns/task = ~225 credits\n" +
+        "- Web search: ~3.5 credits/search, ~3 searches/task = ~10 credits\n" +
+        "- Sandbox compute: ~1 credit/minute\n",
+      "- Inference (tier:fast): ~5 cents/turn, ~25 turns/task = ~125 cents\n" +
+        "- Inference (tier:reasoning): ~15 cents/turn, ~15 turns/task = ~225 cents\n" +
+        "- Web search: ~3.5 cents/search, ~3 searches/task = ~10.5 cents\n" +
+        "- Compute: runs on the creator's machine, not billed\n",
+    ],
+    [
+      "CRITICAL: When colony is in SURVIVAL MODE (credits < 1000), cap total plan\ncost at 50% of remaining credits. Never risk the colony on a single plan.",
+      `CRITICAL: Cap total plan cost at 50% of what is left of today's AI budget\n` +
+        `(${Math.floor(budget.remainingCents / 2)} cents now). Never risk the colony on a single plan.`,
+    ],
+    ['"stripe-conway-bridge"', '"stripe-crm-bridge"'],
+    ["- Spawn agents or transfer credits - the orchestrator", "- Spawn agents or move money - the orchestrator"],
+    [
+      "1. Verify current credit balance can cover estimated total cost + 20% buffer",
+      "1. Verify what is left of today's AI budget can cover estimated total cost + 20% buffer",
+    ],
+    [
+      "- If estimated total cost > 80% of available credits: flag as HIGH RISK",
+      "- If estimated total cost > 80% of today's remaining AI budget: flag as HIGH RISK",
+    ],
+  ];
+  let text = prompt;
+  for (const [needle, replacement] of edits) {
+    if (text.split(needle).length !== 2) {
+      throw new Error(`standalone planner edit does not match once: ${needle.slice(0, 60)}`);
+    }
+    text = text.replace(needle, () => replacement);
+  }
+  return text;
 }
 
 export function validatePlannerOutput(output: unknown): PlannerOutput {

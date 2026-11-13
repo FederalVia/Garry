@@ -20,6 +20,7 @@ import type { ConwayClient, HealthCheckResult, ChildHealthConfig } from "../type
 import { DEFAULT_CHILD_HEALTH_CONFIG } from "../types.js";
 import type { ChildLifecycle } from "./lifecycle.js";
 import { latestLifecycleEventMs } from "./child-status.js";
+import { isLocalSandboxId } from "../conway/client.js";
 
 export { DEFAULT_CHILD_HEALTH_CONFIG };
 
@@ -62,7 +63,7 @@ export class ChildHealthMonitor {
     if (!childRow) {
       return { childId, healthy: false, lastSeen: null, uptime: null, creditBalance: null, issues: ["child not found"], probe };
     }
-    if (!childRow.sandbox_id) {
+    if (isLocalSandboxId(childRow.sandbox_id)) {
       return { childId, healthy: false, lastSeen: null, uptime: null, creditBalance: null, issues: ["child has no sandbox"], probe };
     }
 
@@ -260,6 +261,9 @@ export async function killChildProcess(
   conway: ConwayClient,
   sandboxId: string,
 ): Promise<{ outcome: "stopped" | "alive" | "unknown"; detail: string }> {
+  // Nothing to stop remotely, and a sandbox listing could misreport an empty
+  // id as "not running".
+  if (isLocalSandboxId(sandboxId)) return { outcome: "unknown", detail: "child has no sandbox id" };
   try {
     const result = await conway.createScopedClient(sandboxId).exec(CHILD_STOP_COMMAND, 30_000);
     const last = (result.stdout || "").trim().split("\n").pop()?.trim() ?? "";

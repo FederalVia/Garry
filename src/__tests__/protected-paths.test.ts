@@ -207,6 +207,40 @@ describe("matchProtected (write-deny)", () => {
     }
   });
 
+  it("guards the runtime mode, money ceiling, survival source and tool visibility", async () => {
+    for (const f of [
+      "providers/mode",
+      "providers/standalone-client",
+      "providers/survival-source",
+      "providers/features",
+      "providers/model-defaults",
+      "heartbeat/scheduler",
+      "heartbeat/daemon",
+      "setup/operator-command",
+    ]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+    for (const rel of [
+      "src/providers/mode.ts",
+      "src/providers/features.ts",
+      "src/providers/new-file.ts",
+      "dist/providers/mode.js",
+      "src/heartbeat/scheduler.ts",
+      "src/heartbeat/daemon.ts",
+      "src/orchestration/planner-context.ts",
+      "src/setup/operator-command.ts",
+      "src/setup/configure.ts",
+      "src/setup/wizard.ts",
+    ]) {
+      const p = path.join(R(), rel);
+      expect(matchProtected(p), rel).not.toBeNull();
+      expect(checkWrite(p).ok, rel).toBe(false);
+    }
+    const { getForbiddenCommandMatch } = await import("../agent/policy-rules/command-safety.js");
+    expect(getForbiddenCommandMatch("sed -i 's/200/99999/' src/providers/features.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i s/200/9/ src/providers/mode.ts")).not.toBeNull();
+  });
+
   it("SOUL.md is readable but not writable", () => {
     expect(matchSensitive(`${S()}/SOUL.md`)).toBeNull();
     expect(matchProtected(`${S()}/SOUL.md`)).not.toBeNull();

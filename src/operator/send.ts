@@ -9,8 +9,7 @@
  * itself uses, never a separate CLI fallback.
  */
 
-import fs from "node:fs";
-import { getConfigPath, loadConfig } from "../config.js";
+import { loadConfig, relayUrlIsDefaulted } from "../config.js";
 import { loadChainIdentity } from "../identity/wallet.js";
 import { createSocialClient } from "../social/client.js";
 import {
@@ -84,16 +83,6 @@ export function resolveRelayTarget(
   return { ok: true, relayUrl, options: resolveRelayClientOptions({ socialRelayUrl: relayUrl, relay: config?.relay }) };
 }
 
-/** True when automaton.json itself has a socialRelayUrl string (not a merged-in default). */
-function fileSetsRelayUrl(configPath: string): boolean {
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
-    return typeof raw?.socialRelayUrl === "string";
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The relay `automaton-cli send` uses: loadConfig() (which throws on a
  * corrupt file), with SOCIAL_RELAY_URL ahead of a defaulted socialRelayUrl.
@@ -101,7 +90,7 @@ function fileSetsRelayUrl(configPath: string): boolean {
 export function loadRelayTarget(env: NodeJS.ProcessEnv = process.env): RelayTarget {
   const config = loadConfig();
   return resolveRelayTarget(config, env, {
-    fileSetsRelayUrl: config !== null && fileSetsRelayUrl(getConfigPath()),
+    fileSetsRelayUrl: config !== null && !relayUrlIsDefaulted(config),
   });
 }
 

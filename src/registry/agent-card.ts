@@ -14,6 +14,7 @@ import crypto from "crypto";
 import path from "path";
 import { writeFileSafe } from "../security/secure-fs.js";
 import { stateDir } from "../security/protected-paths.js";
+import { resolveRuntime } from "../providers/mode.js";
 import type {
   AgentCard,
   AgentService,
@@ -61,7 +62,8 @@ export function generateAgentCard(
     name: config.name,
     description,
     services,
-    x402Support: chainType !== "solana",
+    // Standalone with payments off pays and accepts nothing over x402.
+    x402Support: chainType !== "solana" && resolveRuntime(config).payments,
     active: true,
   };
 }

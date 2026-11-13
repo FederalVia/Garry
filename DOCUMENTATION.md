@@ -46,31 +46,73 @@ The automaton has a genesis prompt (its purpose), a set of tools (shell access, 
 
 ## Quick Start
 
-### One-line install (Conway sandbox)
+### One-line install
 
 ```bash
-curl -fsSL https://conway.tech/automaton.sh | sh
+curl -fsSL https://raw.githubusercontent.com/FederalVia/Garry/main/scripts/automaton.sh | sh
 ```
 
-This clones the repo, builds, and launches the setup wizard inside a Conway sandbox.
+This clones the repo, builds, and launches the setup wizard on the machine you run it on.
 
 ### Manual install
 
 ```bash
-git clone https://github.com/Conway-Research/automaton.git
-cd automaton
+git clone https://github.com/FederalVia/Garry.git
+cd Garry
 pnpm install
 pnpm build
 node dist/index.js --run
 ```
 
-On first run, the interactive setup wizard walks you through wallet generation, API key provisioning, naming, genesis prompt, and financial safety configuration.
+On first run, the interactive setup wizard walks you through wallet generation, naming, genesis prompt, your AI provider key(s), and financial safety configuration. Signing in to Conway (API key provisioning) is optional; the wizard asks, and the default is no.
+
+### Run without Conway
+
+With no Conway key the agent runs in standalone mode: on your machine, with AI calls paid by your own provider key under a hard daily cap. Minimal settings in `~/.automaton/automaton.json`, next to the `name`, `genesisPrompt` and `creatorAddress` fields the wizard writes (`sandboxId` is Conway-only and can be left out; `--run` refuses to start without a name or creator address):
+
+```jsonc
+{
+  "providers": {
+    "openai": { "apiKey": "sk-..." },        // or "anthropic": { "apiKey": "sk-ant-..." }, or "ollama": { "baseUrl": "http://localhost:11434" }
+    "dailyCapCeilingCents": 200,            // hard daily AI spend ceiling ($2.00 by default)
+    "survival": { "fixedTier": "normal" }   // no balance to read, so the survival tier is fixed
+  }
+}
+```
+
+Then create the agent's wallet and start it:
+
+```bash
+node dist/index.js --init    # creates ~/.automaton/wallet.json (once; --run never creates a wallet)
+node dist/index.js --run
+```
+
+In standalone mode the social relay, credit topups, x402 payments and on-chain balance reads are off, and the tools that need a Conway account (sandboxes, children, domains, credits) are not offered to the agent. Set a spending limit at your AI provider as well.
+
+Details:
+
+- **Relay.** On only when `socialRelayUrl` names a relay other than Conway's, such as your own `packages/relay` on `http://127.0.0.1:8787` (see [Social and Messaging](#social-and-messaging)). Only then are `send_message`, `message_child` (with children, so Conway mode only) and the `check_social_inbox` heartbeat task offered, and `automaton-cli send` uses the same relay. A `socialRelayUrl` of `https://social.conway.tech` (older versions saved it into every `automaton.json`) counts as unset, and so does an `x402AllowedDomains` of `["conway.tech"]`. To use Conway's relay in standalone, set `providers.relayUrl`. Conway compatibility is on only for a conway.tech relay unless `relay.conwayCompat` says otherwise.
+- **Payments.** `providers.payments: true` turns on x402 payments, USDC balance reads, the ERC-8004 tools and `discover_agents`. With payments off (the default) no tool or heartbeat task that reads the Base or Solana chain is offered, so standalone makes no chain RPC calls.
+- **Staying standalone.** An explicit `providers.mode: "standalone"` is kept when a Conway key is stored (`--provision`, `--configure`): the key is saved but unused. The setup wizard, and `--configure` when it leaves no Conway key, write that explicit mode, so a key stored later never silently switches the agent to Conway mode, which has no daily cap ceiling. A hand-written config without `providers.mode` gets it too: the first standalone `--run` that passes its startup checks writes `"mode": "standalone"` into `automaton.json` and logs it. Only changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone and its daily cap ceiling.
+- **Older installs.** Setups made before standalone mode installed Conway's survival skill and a Conway `SOUL.md` for every install. A standalone start replaces them when unmodified (and logs it); an edited `SOUL.md` that still lists Conway capabilities gets a warning.
+- **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use.
+
+### Existing Conway installs
+
+An install with a Conway key and no new settings runs in Conway mode and sends the same Conway requests and system prompt as before, with these deliberate exceptions:
+
+- `CONWAY_API_KEY` and `CONWAY_API_URL` in the environment now override `automaton.json`.
+- `--run` refuses to start when `wallet.json` is missing, corrupt or holds another address than `walletAddress`, or when `name` or `creatorAddress` is empty (it never creates a wallet).
+- `--provision` also writes the new key into `automaton.json`, where the runtime reads it, and exits 1 while an automaton runs on the same state database; `--setup`, `--configure` and `--pick-model` do the same and also need a terminal.
+- Local workers carry the parent's sandbox id, so a parent tool a worker calls runs where the parent runs (previously the worker id was used as a sandbox id).
+- With an empty `sandboxId` (local Conway install), `expose_port` returns a localhost address and says it is served on this machine only.
+- The agent's `exec` tripwire refuses the automaton's own setup commands (`--provision`, `--setup`, `--configure`, `--pick-model`).
 
 ### Prerequisites
 
 - Node.js >= 20.0.0
 - pnpm (recommended) or npm
-- Internet access (for Conway API, USDC on-chain operations)
+- Internet access (for your AI provider; for the Conway API and USDC on-chain operations only when you use them)
 
 ---
 
@@ -79,8 +121,8 @@ On first run, the interactive setup wizard walks you through wallet generation, 
 ### From source
 
 ```bash
-git clone https://github.com/Conway-Research/automaton.git
-cd automaton
+git clone https://github.com/FederalVia/Garry.git
+cd Garry
 pnpm install
 pnpm build
 ```
@@ -89,7 +131,7 @@ pnpm build
 
 ```bash
 pnpm typecheck   # TypeScript type checking
-pnpm test        # Run all 897 tests
+pnpm test        # Run the test suite
 ```
 
 ### File locations after setup
@@ -121,7 +163,7 @@ node dist/index.js --setup
 
 ### Step 1: Wallet Generation
 
-An Ethereum wallet is generated automatically using `viem`. The private key is stored at `~/.automaton/wallet.json` with file permissions `0600` (owner read/write only).
+The wizard generates an Ethereum wallet using `viem`. The private key is stored at `~/.automaton/wallet.json` with file permissions `0600` (owner read/write only). Only the wizard, `--init` and the genesis bootstrap of a spawned child create a wallet; `--run` never does. If `wallet.json` is missing, corrupt, or holds a different address than `automaton.json` records, `--run` refuses to start (see [Troubleshooting](#troubleshooting)).
 
 ```
 [1/6] Generating identity (wallet)...
@@ -188,11 +230,15 @@ node dist/index.js [command]
 |---|---|
 | `--run` | Start the automaton. Without `automaton.json` it builds the config from `genesis.json` (children) or, in a terminal, runs the setup wizard; otherwise it exits 1. A second `--run` on the same state database exits 1. |
 | `--setup` | Re-run the interactive setup wizard |
-| `--init` | Initialize wallet and config directory only |
-| `--provision` | Provision a Conway API key via SIWE |
+| `--configure` | Edit providers (including the mode), model strategy, treasury policy and general settings |
+| `--pick-model` | Pick the active inference model |
+| `--init` | Create the wallet (`wallet.json`) and config directory only |
+| `--provision` | Provision a Conway API key via SIWE. Keeps an explicit `providers.mode: "standalone"` (the key is then stored but unused) |
 | `--status` | Show current automaton status |
 | `--version`, `-v` | Show version |
 | `--help`, `-h` | Show help |
+
+`--provision`, `--setup`, `--configure` and `--pick-model` write `automaton.json`. They exit 1 while an automaton holds the state database's lock (stop it first), and all but `--provision` need a terminal on stdin and stdout. The agent's `exec` tripwire also refuses them.
 
 ### Creator CLI (`automaton-cli`)
 
@@ -209,7 +255,7 @@ node packages/cli/dist/index.js <command>
 
 `fund` units: the amount is **dollars** by default, at most two decimals (`5` is $5.00, `0.75` is 75 cents). With `--cents` it is a whole number of cents (`75 --cents` is $0.75). Do not type a `$` sign: unquoted, the shell expands `$25` to `5` before the CLI sees it, so a leading `$` is refused. `--to` is required and must be an address on the automaton's own chain (0x... on EVM, base58 on Solana); the zero address, the Solana system address (all-zero key), the automaton's own address and a mixed-case EVM address whose EIP-55 checksum is wrong are refused. The plan (`$X.XX (N cents) from ... to ...`) is printed and must be confirmed with `--yes` or a `y` on an interactive terminal. The request is sent once with one idempotency key and is never retried: a timeout, a 5xx or a redirect exits 2 with "outcome unknown"; check the balance before running it again. A 2xx reply whose status says the transfer was declined, refused or short of funds is reported as a failure, and a 2xx status the CLI does not recognise (anything other than `submitted`, `pending`, `completed`, `succeeded` and similar) exits 2 with "outcome unknown". The agent's own tools classify transfer statuses with the same rules (`src/conway/transfer-status.ts`).
 
-`send` uses `socialRelayUrl` if `automaton.json` sets it, else the `SOCIAL_RELAY_URL` environment variable, else the same relay the agent itself would use (today the runtime default, Conway's `https://social.conway.tech`; standalone mode will make it off). It signs with the same protocol the runtime would (`relay.conwayCompat`, below). With `socialRelayUrl` set to `""` (messaging off), or with no `automaton.json` and no `SOCIAL_RELAY_URL`, it exits with an error before signing anything. The relay URL must pass the same check as the runtime's (HTTPS, or plain HTTP to loopback only).
+`send` uses `socialRelayUrl` if `automaton.json` sets it, else the `SOCIAL_RELAY_URL` environment variable, else the same relay the agent itself would use (in Conway mode Conway's `https://social.conway.tech` when unset; in standalone, `providers.relayUrl` or nothing, since unset means off). It signs with the same protocol the runtime would (`relay.conwayCompat`, below). With `socialRelayUrl` set to `""` (messaging off), or with no `automaton.json` and no `SOCIAL_RELAY_URL`, it exits with an error before signing anything. The relay URL must pass the same check as the runtime's (HTTPS, or plain HTTP to loopback only).
 
 `fund` and `send` are for the operator only: they use the automaton's API key and wallet outside every treasury cap and leave no ledger row. The agent's `exec` tripwire refuses a command that runs them (`automaton-cli`, `packages/cli` or `cli/dist/index.js` together with `fund` or `send`), and the agent's file tools cannot write anything under `packages/` in the runtime checkout, so it cannot change the CLI the operator runs. Like the rest of the tripwire this is not a boundary against an agent that writes its own script (see [Exec tripwire](#exec-tripwire)).
 
@@ -217,8 +263,11 @@ node packages/cli/dist/index.js <command>
 
 | Variable | Description |
 |---|---|
-| `CONWAY_API_URL` | Conway API URL (default: `https://api.conway.tech`) |
-| `CONWAY_API_KEY` | Conway API key (overrides config file) |
+| `CONWAY_API_URL` | Conway API URL (overrides config; default: `https://api.conway.tech`) |
+| `CONWAY_API_KEY` | Conway API key (overrides config; selects Conway mode) |
+| `OLLAMA_BASE_URL` | Ollama base URL (overrides config, e.g. `http://localhost:11434`) |
+| `OPENAI_API_KEY` | OpenAI key when `automaton.json` has none: for the main loop in standalone mode only, for the planner and workers in both modes |
+| `OPENAI_BASE_URL` | Base URL for the planner and workers' OpenAI calls; not used with `providers.openai.baseUrl` or when Ollama models were discovered |
 | `AUTOMATON_SHUTDOWN_GRACE_MS` | How long a clean shutdown may take before the process is forced to exit with code 1 (default `30000`) |
 
 ### Status output
@@ -257,7 +306,7 @@ Version:    0.1.0
 Another automaton (pid 12345) is already running on /root/.automaton/state.db. Stop it first.
 ```
 
-The operating system drops the lock when its holder exits or is killed, so the lock cannot go stale and needs no cleanup. The file itself is never deleted; do not delete it by hand while an automaton runs. Closing any descriptor on a locked file drops the lock held by that process, so the agent's `read_file` and `write_file` refuse the lock file and the state database files (`Blocked: ... (runtime-lock)`) wherever `dbPath` puts them. `--status`, `--configure` and the other read or edit commands take no lock.
+The operating system drops the lock when its holder exits or is killed, so the lock cannot go stale and needs no cleanup. The file itself is never deleted; do not delete it by hand while an automaton runs. Closing any descriptor on a locked file drops the lock held by that process, so the agent's `read_file` and `write_file` refuse the lock file and the state database files (`Blocked: ... (runtime-lock)`) wherever `dbPath` puts them. `--status` takes no lock. `--provision`, `--setup`, `--configure` and `--pick-model` check it and exit 1 while it is held, so a running agent cannot change its own keys or mode through them.
 
 ### Startup
 
@@ -363,11 +412,24 @@ Configuration is stored at `~/.automaton/automaton.json`.
   "version": "0.1.0",
   "maxChildren": 3,                             // Slot-holding children (0 disables spawn_child); also the local worker limit, max(1, maxChildren)
   "childSandboxMemoryMb": 1024,                 // Child sandbox tier
-  "childRuntimeRepo": "https://github.com/Conway-Research/automaton.git", // https git URL a child's runtime is cloned from
+  "childRuntimeRepo": "https://github.com/FederalVia/Garry.git", // https git URL a child's runtime is cloned from
   "childRuntimeRef": "main",                    // Optional branch or tag (default: the repository's default branch)
-  "socialRelayUrl": "http://127.0.0.1:8787",    // Your relay (packages/relay); "" = messaging off; unset = Conway's relay (for now)
+  "socialRelayUrl": "http://127.0.0.1:8787",    // Your relay (packages/relay); unset or "" = messaging off in standalone; Conway mode default: https://social.conway.tech
   "relay": { "conwayCompat": false },           // Optional; unset = on only for a conway.tech relay URL
   "distressWebhookUrl": "https://hooks.example.com/automaton", // Optional owner notification; unset = off
+
+  // Providers (optional; wins over the flat provider fields)
+  "providers": {
+    "mode": "standalone",                       // or "conway"; absent: conway when a Conway key resolves (the wizard writes "standalone" when it stores no Conway key)
+    "openai": { "apiKey": "sk-...", "baseUrl": "https://api.openai.com/v1", "models": [] },
+    "anthropic": { "apiKey": "sk-ant-..." },
+    "ollama": { "baseUrl": "http://localhost:11434" },
+    "conway": { "apiKey": "cnwy_k_...", "apiUrl": "https://api.conway.tech" },
+    "survival": { "fixedTier": "normal" },
+    "dailyCapCeilingCents": 200,                // standalone: ceiling on maxInferenceDailyCents
+    "payments": false,                          // standalone: x402, USDC reads, ERC-8004 and discover_agents (chain RPC)
+    "relayUrl": "https://social.conway.tech"    // standalone: the only way to use Conway's relay
+  },
 
   // Financial safety
   "treasuryPolicy": {
@@ -376,7 +438,7 @@ Configuration is stored at `~/.automaton/automaton.json`.
     "maxDailyTransferCents": 25000,
     "minimumReserveCents": 1000,
     "maxX402PaymentCents": 100,
-    "x402AllowedDomains": ["conway.tech"],
+    "x402AllowedDomains": ["conway.tech"],       // Conway mode default; standalone default [] (["conway.tech"] counts as unset)
     "transferCooldownMs": 0,
     "maxTransfersPerTurn": 2,
     "maxInferenceDailyCents": 50000,
@@ -829,9 +891,9 @@ Skills are Markdown files with YAML frontmatter that give the agent domain-speci
 
 ### Default skills (installed on setup)
 
-- **conway-compute** — Guidance on sandbox management, exec, ports, file operations
-- **conway-payments** — Financial operations, x402, credit management
-- **survival** — Survival strategies, low-compute mode, conservation tactics
+- **conway-compute** — Guidance on sandbox management, exec, ports, file operations (Conway installs; not loaded in standalone)
+- **conway-payments** — Financial operations, x402, credit management (Conway installs; not loaded in standalone)
+- **survival** — Survival strategies, low-compute mode, conservation tactics. A standalone install gets a version about the daily AI cap; a standalone start replaces an unmodified Conway copy with it
 
 ### Skill format
 
@@ -1004,7 +1066,7 @@ Automatons can spawn child automatons, creating a lineage of sovereign agents. A
 2. `fund_child` transfers credits (through the Treasury) and moves the child to `funded`.
 3. `start_child` launches `node dist/index.js --run` in the child's sandbox: `starting`, then `healthy` once the process is seen, or `failed` when it exits at once. When the launch or the check call itself errors, the child stays `starting` and the health check resolves it.
 
-`childRuntimeRepo` defaults to the upstream repository. A checkout without the genesis bootstrap (`dist/setup/genesis-bootstrap.js`) cannot build its config from `genesis.json`, so the child provisions its own API key and the parent writes its `automaton.json` at spawn time. Production colonies should point `childRuntimeRepo` at a runtime that bootstraps from `genesis.json`.
+`childRuntimeRepo` defaults to `https://github.com/FederalVia/Garry.git`. A checkout without the genesis bootstrap (`dist/setup/genesis-bootstrap.js`) cannot build its config from `genesis.json`, so the child provisions its own API key and the parent writes its `automaton.json` at spawn time. Production colonies should point `childRuntimeRepo` at a runtime that bootstraps from `genesis.json`.
 
 ### Child status
 
@@ -1045,6 +1107,7 @@ The colony health monitor (`colony_health_check`) only reports on live children.
 
 - **Phases:** idle, classifying, planning, plan_review, executing, replanning, complete, failed. A goal that is cancelled, completed or paused is dropped at the next tick: its workers are stopped and its held tasks released. Planning commits the tasks together with the next phase, so a restart cannot plan a goal twice.
 - **Planner limits:** each task's estimate is clamped to 0-500 cents and its timeout to 1 minute - 1 hour; `maxRetries` to 0-10.
+- **Planner budget:** in Conway mode the planner sees the credit balance; in standalone it sees the daily AI cap, today's spend, what is left and the orchestration share, and caps a plan at half of what is left.
 - **Workers:** at most `max(1, maxChildren)` run at once. A ready task is assigned to a new worker before it starts.
 - **Ownership:** a task in `assigned`/`running` has one owner, `local://<worker>` or the parent's own address, and only the owner settles it. A worker that lost its task (cancelled, superseded, timed out, released) stops at its next turn. Its late result is dropped and recorded as a `stale_task_report` event; its spend is still added to the task.
 - **Retries:** a dead worker or one past `timeout + 2 min` loses the task, which spends a retry. Inference refusals and shutdown defer the task without spending one. A task that fails for good triggers a replan (3 per goal by default): old pending, blocked and failed tasks are cancelled, running and completed work is kept, and the planner is told which tasks are done or still running.
@@ -1057,7 +1120,7 @@ The colony health monitor (`colony_health_check`) only reports on live children.
 
 ## Social and Messaging
 
-Automatons communicate through a message relay set by `socialRelayUrl`. `""` means messaging is off. Unset currently means Conway's hosted relay (the runtime default); standalone mode will make unset mean off. The reference relay is `packages/relay` (one Node process and one SQLite file, the same three endpoints Conway's relay had); see [packages/relay/README.md](packages/relay/README.md) to run it. Conway's hosted relay (`social.conway.tech`) still works with compatibility on.
+Automatons communicate through a message relay set by `socialRelayUrl`. `""` means messaging is off. In standalone mode unset means off too (see [Run without Conway](#run-without-conway)); in Conway mode unset means Conway's hosted relay, as before. The reference relay is `packages/relay` (one Node process and one SQLite file, the same three endpoints Conway's relay had); see [packages/relay/README.md](packages/relay/README.md) to run it. Conway's hosted relay (`social.conway.tech`) still works with compatibility on.
 
 The relay URL must be `https://`, or plain `http://` only to `localhost`, `127.0.0.1` or `[::1]`, where there is no network to protect. Anything else is refused before anything is signed or sent.
 
@@ -1151,11 +1214,11 @@ A JSON-LD structured document containing:
 - Capabilities and services
 - Contact information
 
-Generated and saved with `update_agent_card`.
+Generated and saved with `update_agent_card`. `x402Support` is true only on EVM with payments on (always in Conway mode; in standalone only with `providers.payments: true`).
 
 ### Discovery
 
-The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Results are cached in the `discovered_agents_cache` table under the chain, registry contract and agent id; a cached card counts only while the agent's URI is unchanged.
+The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Each uncached call makes read-only JSON-RPC requests to the Base chain at `rpcUrl`, so in standalone it is offered only with `providers.payments: true`. Results are cached in the `discovered_agents_cache` table under the chain, registry contract and agent id; a cached card counts only while the agent's URI is unchanged.
 
 Agent URIs come from a permissionless registry, so card fetches are bounded: HTTPS only; `localhost`, `*.localhost`, `*.local`, `*.internal` and `*.home.arpa` refused; the name is resolved and refused if any address is loopback, private, link-local, CGNAT, unique-local, multicast, reserved or IPv4-mapped to one of these, and the connection goes to the checked address (no DNS rebinding); at most 3 redirects, each re-checked in full; no compressed bodies; the body is streamed and cut off at `maxCardSizeBytes`, with one deadline of `fetchTimeoutMs` for the whole fetch. Once the deadline passes no further request is started (for example after a slow DNS answer or between redirect hops), and a request in flight is aborted. The configured IPFS gateway origin skips the private-address check (it is operator configuration) but keeps the size and time limits.
 
@@ -1240,7 +1303,7 @@ The rules live in `src/security/protected-paths.ts`, which is itself protected.
 
 ### Exec tripwire
 
-The `exec` command check (`src/agent/policy-rules/command-safety.ts`) is a **tripwire, not a security boundary**. It denies a command that names a secret file or directory (whatever the verb), reaches into `~/.automaton` outside its allowed entries, globs hidden home paths, dumps the environment (`env`, `printenv`, `/proc/*/environ`), kills the runtime, deletes its state, or writes to guard files. It also denies recursive readers (`grep -r`, `rg`, `find`, `tar`, `zip -r`, `cp -r`, `rsync`, ...) aimed at the home or root directory (`.`, `~+`, `$PWD` or no path counts as home, because exec starts in `HOME`; `~-` and `$OLDPWD` are treated as home; `~user` as that user's home), including a `find` over home or root whose file list is consumed by `$(...)`, backticks, `<(...)`, `| xargs` or `| while read`; relative globs over hidden home entries (`cat .?utomaton/w?llet.json`); `/proc/*/environ` however the path is spelled (`/proc//self`, `/proc/./self`, `cd /proc/self`); self-kill through `xargs kill`, backticks, a `for`/`while read` loop over `pgrep`, `pidof` or `ps` output that runs `kill` (a loop nested inside that loop's body is not followed), the runtime's own PID, `kill 0` or a `pkill -f` pattern that matches its command line, and an inline interpreter (`python -c`, `node -e`, a script on `/dev/stdin`, ...), a line or screen editor (`ed`, `ex`, `vim -es`, ...) or a git rewrite (`checkout`, `restore`, `apply`, ...) that names a guard file. A write to a guard file named through an unquoted glob (`src/agent/policy-eng*.ts`) is denied too, when the glob part keeps at least three literal characters; shorter globs (`src/agent/p*/financial.ts`, `dist/*`) are not caught, because `rm -rf dist/*` is ordinary in any project. The interpreter rule cannot tell reading from writing, so it also refuses inline code that only reads guard code; `read_file` reads it. Embedded use without a policy engine runs the same check. It stops accidents and copy-pasted injection one-liners.
+The `exec` command check (`src/agent/policy-rules/command-safety.ts`) is a **tripwire, not a security boundary**. It denies a command that names a secret file or directory (whatever the verb), reaches into `~/.automaton` outside its allowed entries, globs hidden home paths, dumps the environment (`env`, `printenv`, `/proc/*/environ`), kills the runtime, deletes its state, runs the automaton's setup commands (`--provision`, `--setup`, `--configure` or `--pick-model` with an automaton entry point such as `node dist/index.js`) or the operator CLI's `fund` and `send` (see [Creator CLI](#creator-cli-automaton-cli)), or writes to guard files. It also denies recursive readers (`grep -r`, `rg`, `find`, `tar`, `zip -r`, `cp -r`, `rsync`, ...) aimed at the home or root directory (`.`, `~+`, `$PWD` or no path counts as home, because exec starts in `HOME`; `~-` and `$OLDPWD` are treated as home; `~user` as that user's home), including a `find` over home or root whose file list is consumed by `$(...)`, backticks, `<(...)`, `| xargs` or `| while read`; relative globs over hidden home entries (`cat .?utomaton/w?llet.json`); `/proc/*/environ` however the path is spelled (`/proc//self`, `/proc/./self`, `cd /proc/self`); self-kill through `xargs kill`, backticks, a `for`/`while read` loop over `pgrep`, `pidof` or `ps` output that runs `kill` (a loop nested inside that loop's body is not followed), the runtime's own PID, `kill 0` or a `pkill -f` pattern that matches its command line, and an inline interpreter (`python -c`, `node -e`, a script on `/dev/stdin`, ...), a line or screen editor (`ed`, `ex`, `vim -es`, ...) or a git rewrite (`checkout`, `restore`, `apply`, ...) that names a guard file. A write to a guard file named through an unquoted glob (`src/agent/policy-eng*.ts`) is denied too, when the glob part keeps at least three literal characters; shorter globs (`src/agent/p*/financial.ts`, `dist/*`) are not caught, because `rm -rf dist/*` is ordinary in any project. The interpreter rule cannot tell reading from writing, so it also refuses inline code that only reads guard code; `read_file` reads it. Embedded use without a policy engine runs the same check. It stops accidents and copy-pasted injection one-liners.
 
 `exec` runs as the same OS user that owns the wallet, so a script written to disk and run, string building, `cd` across calls, `patch` from a file, a short glob, a command the tripwire does not parse or a background job gets past any pattern list. Secret redaction keeps a known key out of inference requests only while it recognises the encoding; the file stays readable to the next command. Real confidentiality of the wallet, integrity of the guard code and `dist/`, and protection of the process from signals need `exec` under a separate OS user (or a container or bubblewrap sandbox) with no read access to `~/.automaton` and no write access to the runtime checkout. That is the recommended deployment: run `exec` as a dedicated unprivileged user and have a supervisor restart the agent. Even then, `edit_own_file` runs in the main process: an edit to a non-protected module plus a restart still runs agent code with the wallet (see the trust note under [Code editing](#code-editing)).
 
@@ -1336,11 +1399,37 @@ cd ~/.automaton && git log --oneline
 
 ### Agent won't start
 
-**No API key:**
+**No AI provider (standalone mode):**
 ```
-No API key found. Run: automaton --provision
+No AI provider configured. Set providers.openai.apiKey (...), providers.anthropic.apiKey, providers.ollama.baseUrl, or a Conway key (automaton --provision).
 ```
-Fix: Run `node dist/index.js --provision` or set `CONWAY_API_KEY` environment variable.
+Fix: add one provider to `automaton.json` (see [Run without Conway](#run-without-conway)), or provision a Conway key.
+
+**Conway mode without a key:**
+```
+No Conway API key found. Run: automaton --provision, or set providers.mode to "standalone" with your own AI provider.
+```
+`providers.mode` is `"conway"` but no key was found. Run `node dist/index.js --provision`, set `CONWAY_API_KEY`, or switch to standalone.
+
+**Missing identity field:**
+```
+automaton.json has no creatorAddress. Add "creatorAddress" to ~/.automaton/automaton.json (automaton --setup writes it), then start again.
+```
+`name` and `creatorAddress` are required.
+
+**Wallet missing, mismatched or corrupt:**
+```
+wallet.json is missing (...). For a new agent, create its wallet first with `automaton --init` (node dist/index.js --init); if this agent had a wallet, restore wallet.json from backup. A new identity is never created by --run.
+automaton.json records address 0x... but wallet.json holds 0x.... Restore the matching wallet.json from backup, or correct walletAddress.
+Cannot read wallet: wallet.json at ... is empty or corrupt (...); ...
+```
+`--run` never creates a wallet, so a lost key never silently becomes a new identity. For a first run (no `walletAddress` in `automaton.json`), run `--init`. Otherwise restore `wallet.json` from backup; run `--init` only when you want a new identity on purpose. When `automaton.json` records a `walletAddress`, the message names it and says to restore from backup.
+
+**Chain mismatch:**
+```
+automaton.json says chainType "solana" but wallet.json holds a evm key. ...
+```
+Fix `chainType` in `automaton.json`, or remove it to use the wallet's chain.
 
 **Another automaton is already running:**
 ```
@@ -1416,7 +1505,7 @@ The balance API may be temporarily unreachable. The runtime caches the last know
 
 **Can I run an automaton locally without Conway Cloud?**
 
-Yes. Leave `sandboxId` empty in the config. The automaton runs locally: shell commands execute on your machine, files read/write from your filesystem. You still need an API key for inference.
+Yes. With no Conway key the automaton runs in standalone mode: shell commands execute on your machine and files read/write from your filesystem, and AI calls use your own OpenAI, Anthropic or Ollama provider under a daily cap. See [Run without Conway](#run-without-conway).
 
 **How much does it cost to run an automaton?**
 

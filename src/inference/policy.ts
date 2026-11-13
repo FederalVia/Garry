@@ -95,7 +95,14 @@ export interface InferencePolicySource {
 export function resolveInferencePolicy(
   config: InferencePolicySource | null | undefined,
   treasuryPolicy: { maxInferenceDailyCents?: number } | null | undefined,
-  opts: { onWarning?: Warn } = {},
+  opts: {
+    onWarning?: Warn;
+    /**
+     * Standalone ceiling on the daily cap. The survival allowance gets only
+     * the room the daily cap leaves under it, so the ceiling is the total.
+     */
+    ceilingCents?: number | null;
+  } = {},
 ): ResolvedInferencePolicy {
   const warn: Warn = (m) => {
     logger.warn(m);
@@ -108,13 +115,18 @@ export function resolveInferencePolicy(
   const tp: Record<string, unknown> =
     treasuryPolicy && typeof treasuryPolicy === "object" ? (treasuryPolicy as Record<string, unknown>) : {};
 
-  const dailyCapCents = nonNegativeNumber(
+  const ceiling =
+    typeof opts.ceilingCents === "number" && Number.isFinite(opts.ceilingCents) && opts.ceilingCents >= 0
+      ? Math.floor(opts.ceilingCents)
+      : null;
+  const configuredDaily = nonNegativeNumber(
     tp,
     "maxInferenceDailyCents",
     DEFAULT_TREASURY_POLICY.maxInferenceDailyCents,
     warn,
     { integer: true },
   );
+  const dailyCapCents = ceiling === null ? configuredDaily : Math.min(configuredDaily, ceiling);
   const hourlyExplicit = nonNegativeNumber(ms, "hourlyBudgetCents", 0, warn, { integer: true });
   const hourlyCapCents = Math.min(
     hourlyExplicit > 0 ? hourlyExplicit : Math.ceil(dailyCapCents / 6),
@@ -136,7 +148,10 @@ export function resolveInferencePolicy(
     orchestrationSharePct: nonNegativeNumber(ms, "orchestrationSharePct", DEFAULT_ORCHESTRATION_SHARE_PCT, warn, {
       max: 100,
     }),
-    survivalAllowanceCents: nonNegativeNumber(ms, "survivalAllowanceCents", DEFAULT_SURVIVAL_ALLOWANCE_CENTS, warn),
+    survivalAllowanceCents: Math.min(
+      nonNegativeNumber(ms, "survivalAllowanceCents", DEFAULT_SURVIVAL_ALLOWANCE_CENTS, warn),
+      ceiling === null ? Infinity : Math.max(0, ceiling - dailyCapCents),
+    ),
     survivalMinIntervalMs: nonNegativeNumber(ms, "survivalMinIntervalMs", DEFAULT_SURVIVAL_MIN_INTERVAL_MS, warn, {
       integer: true,
     }),

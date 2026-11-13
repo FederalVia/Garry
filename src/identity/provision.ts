@@ -9,13 +9,15 @@
 import fs from "fs";
 import path from "path";
 import { SiweMessage } from "siwe";
-import { getWallet, getAutomatonDir } from "./wallet.js";
+import { loadWallet, getAutomatonDir } from "./wallet.js";
 import type { ProvisionResult } from "../types.js";
 import { ResilientHttpClient } from "../conway/http-client.js";
 import type { ChainIdentity } from "./chain.js";
 import { buildSiwsMessage, signSiwsMessage } from "./siws.js";
 import { writeFileSafe } from "../security/secure-fs.js";
 import { registerSecret } from "../security/secret-redaction.js";
+import { assertConwayAllowed } from "../providers/mode.js";
+import { setConwayApiKey } from "../config.js";
 
 const httpClient = new ResilientHttpClient();
 
@@ -55,22 +57,43 @@ function saveConfig(apiKey: string, walletAddress: string): void {
 }
 
 /**
+ * The SIWE/SIWS domain for a Conway API URL: the URL's host, so a signature
+ * sent to another host cannot be replayed to conway.tech. Production keeps
+ * the domain it has always signed.
+ */
+export function siweDomainFor(apiUrl: string): string {
+  let host: string;
+  try {
+    host = new URL(apiUrl).host.toLowerCase();
+  } catch {
+    throw new Error(`Invalid Conway API URL: ${apiUrl}`);
+  }
+  return host === "api.conway.tech" ? "conway.tech" : host;
+}
+
+/**
  * Run the full SIWE provisioning flow:
  * 1. Load wallet
  * 2. Get nonce from Conway API
  * 3. Sign SIWE message
  * 4. Verify signature -> get JWT
  * 5. Create API key
- * 6. Save to config.json
+ * 6. Save to config.json, and to automaton.json when it exists (the key
+ *    the runtime reads), so a re-provisioned key replaces the old one
+ *
+ * Never creates a wallet. Refused while a standalone runtime is installed;
+ * the --provision CLI and the setup wizard run before any runtime is.
  */
 export async function provision(
   apiUrl?: string,
   solanaIdentity?: ChainIdentity,
 ): Promise<ProvisionResult> {
-  const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
+  assertConwayAllowed("Conway API key provisioning");
+  const url = (apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL).replace(/\/+$/, "");
+  const domain = siweDomainFor(url);
 
-  // 1. Load wallet
-  const { account, chainIdentity, chainType } = await getWallet();
+  // 1. Load wallet (never created here)
+  const { account, chainIdentity } = loadWallet();
   const identity = solanaIdentity || chainIdentity;
   const address = identity.address;
   const isSolana = identity.chainType === "solana";
@@ -92,7 +115,7 @@ export async function provision(
   if (isSolana) {
     // 3a. SIWS path: Sign-In With Solana
     const siwsMsg = buildSiwsMessage({
-      domain: "conway.tech",
+      domain,
       address,
       statement: "Sign in to Conway as an Automaton to provision an API key.",
       uri: `${url}/v1/auth/verify`,
@@ -105,7 +128,7 @@ export async function provision(
   } else {
     // 3b. SIWE path: Sign-In With Ethereum (unchanged)
     const siweMessage = new SiweMessage({
-      domain: "conway.tech",
+      domain,
       address,
       statement:
         "Sign in to Conway as an Automaton to provision an API key.",
@@ -165,37 +188,7 @@ export async function provision(
 
   // 6. Save to config
   saveConfig(key, address);
+  setConwayApiKey(key);
 
   return { apiKey: key, walletAddress: address, keyPrefix: key_prefix };
-}
-
-/**
- * Register the automaton's creator as its parent with Conway.
- * This allows the creator to see automaton logs and inference calls.
- */
-export async function registerParent(
-  creatorAddress: string,
-  apiUrl?: string,
-): Promise<void> {
-  const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
-  const apiKey = loadApiKeyFromConfig();
-  if (!apiKey) {
-    throw new Error("Must provision API key before registering parent");
-  }
-
-  const resp = await httpClient.request(`${url}/v1/automaton/register-parent`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: apiKey,
-    },
-    body: JSON.stringify({ creatorAddress }),
-  });
-
-  // Endpoint may not exist yet -- fail gracefully
-  if (!resp.ok && resp.status !== 404) {
-    throw new Error(
-      `Failed to register parent: ${resp.status} ${await resp.text()}`,
-    );
-  }
 }

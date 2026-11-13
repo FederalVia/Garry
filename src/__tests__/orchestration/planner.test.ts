@@ -276,6 +276,29 @@ describe("buildPlannerPrompt", () => {
     expect(prompt).toContain("generalist");
   });
 
+  it("Conway mode keeps its planner text (Conway network, credits, survival mode)", () => {
+    const prompt = buildPlannerPrompt(context);
+    expect(prompt).toContain("autonomous agent colony on the Conway\nnetwork");
+    expect(prompt).toContain("| Agent Type | Cost per Task (credits) | Typical Duration |");
+    expect(prompt).toContain("CRITICAL: When colony is in SURVIVAL MODE (credits < 1000)");
+    expect(prompt).toContain("- Sandbox compute: ~1 credit/minute");
+  });
+
+  it("standalone budgets against the daily AI cap, not credits", () => {
+    const prompt = buildPlannerPrompt({
+      ...context,
+      creditsCents: null,
+      usdcBalance: null,
+      dailyBudget: { capCents: 200, spentCents: 50, remainingCents: 150, orchestrationSharePct: 50 },
+    });
+    expect(prompt).toContain("Daily AI budget: 200 cents per rolling 24h, 50 cents spent, 150 cents left.");
+    expect(prompt).toContain("Planning and workers may use 50% of the cap");
+    expect(prompt).toContain("(75 cents now)");
+    expect(prompt).not.toMatch(/conway/i);
+    expect(prompt.replace("There is no credit balance.", "")).not.toMatch(/credit/i);
+    expect(prompt).not.toContain("SURVIVAL MODE");
+  });
+
   it("includes agent availability numbers", () => {
     const prompt = buildPlannerPrompt(context);
     expect(prompt).toContain("2");   // idleAgents
@@ -440,6 +463,34 @@ describe("buildPlannerContext", () => {
       expect(context.survivalTier).toBe("normal");
     } finally {
       spy.mockRestore();
+      db.close();
+    }
+  });
+
+  it("standalone: the context carries the gate's daily cap and spend", async () => {
+    const { createInMemoryDb } = await import("./test-db.js");
+    const { buildPlannerContext } = await import("../../orchestration/planner-context.js");
+    const gateModule = await import("../../inference/gate.js");
+    const modeModule = await import("../../providers/mode.js");
+    const db = createInMemoryDb();
+    const spy = vi.spyOn(gateModule, "getInstalledInferenceGate").mockReturnValue({
+      survival: () => ({ tier: "normal", creditsCents: null }),
+      fixedSurvivalTier: () => "normal",
+      usage: () => ({
+        caps: { dailyCents: 200, orchestrationSharePct: 50 },
+        last24h: { cappedCents: 20.4 },
+        remaining: { dailyCents: 179.6 },
+      }),
+    } as never);
+    const runtimeSpy = vi.spyOn(modeModule, "currentRuntime").mockReturnValue({ mode: "standalone" } as never);
+    try {
+      const context = await buildPlannerContext({ db });
+      expect(context.dailyBudget).toEqual({ capCents: 200, spentCents: 20, remainingCents: 179, orchestrationSharePct: 50 });
+      runtimeSpy.mockReturnValue({ mode: "conway" } as never);
+      expect((await buildPlannerContext({ db })).dailyBudget).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+      runtimeSpy.mockRestore();
       db.close();
     }
   });

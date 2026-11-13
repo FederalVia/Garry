@@ -1,7 +1,7 @@
 /**
  * File and shell tools shared by the worker harnesses.
  *
- * Local mode (no sandboxId: the Conway client is the host anyway): files go
+ * Local mode (empty sandbox id, as isLocalSandboxId reads it: the Conway client is the host anyway): files go
  * through the secure-fs primitives confined to the worker root, and exec runs
  * in the worker root with a scrubbed environment.
  *
@@ -24,6 +24,7 @@ import {
   resolveReal,
 } from "../../security/protected-paths.js";
 import { listDirSafe, readFileSafe, UnsafePathError, writeFileVerified } from "../../security/secure-fs.js";
+import { isLocalSandboxId } from "../../conway/client.js";
 
 const MAX_EXEC_OUTPUT = 16_000;
 const MAX_EXEC_BUFFER = 1024 * 1024;
@@ -35,8 +36,9 @@ export interface WorkerFsContext {
   localMode: boolean;
 }
 
+/** Same answer as the Conway client's own local check, so both pick one path. */
 export function isLocalMode(config: AutomatonConfig): boolean {
-  return !config.sandboxId;
+  return isLocalSandboxId(config.sandboxId);
 }
 
 export function workerFsContext(context: HarnessContext): WorkerFsContext {

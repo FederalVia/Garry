@@ -87,7 +87,11 @@ The runtime alternates between two states: **running** (the agent loop is active
        |
   [Load config]           Corrupt file: exit 1. Missing: genesis.json bootstrap,
        |                  else the wizard (TTY only), else exit 1
-  [Load wallet]
+  [Resolve mode]          One "Mode:" line: conway or standalone, providers,
+       |                  survival source, daily AI cap, relay, payments.
+       |                  No provider, no name/creatorAddress: exit 1
+  [Load wallet]           Never created here: missing, corrupt or mismatched
+       |                  wallet.json (or chainType): exit 1
        |
   [Instance lock]         <dbPath>.lock; a live holder: exit 1
        |
@@ -95,9 +99,11 @@ The runtime alternates between two states: **running** (the agent loop is active
        |
   [Preload modules]       Every lazily imported module, so one code version runs
        |
-  [Install Treasury]      The spending gate; reconcile pending x402 payments
+  [Install Treasury]      The spending gate (daily AI cap clamped in standalone);
+       |                  reconcile pending x402 payments (payments on only)
        |
-  [Bootstrap topup]       If credits < $5 and USDC available, buy $5 credits
+  [Bootstrap topup]       Conway mode only: if credits < $5 and USDC
+       |                  available, buy $5 credits
        |
   [Start heartbeat]       DurableScheduler begins ticking
        |
@@ -125,6 +131,24 @@ The runtime alternates between two states: **running** (the agent loop is active
   | DEAD |-----> Heartbeat broadcasts distress
   +------+      Waits for funding
 ```
+
+**Standalone mode.** With no Conway key (or `providers.mode: "standalone"`) the same lifecycle runs on this machine with the creator's own AI providers. `resolveRuntime` (`src/providers/mode.ts`) decides the mode once, before anything starts, and the rest of startup follows it: the Conway client is the standalone facade (`src/providers/standalone-client.ts`: local exec, files and ports; every Conway-only call throws `FEATURE_DISABLED` before any I/O), the daily AI cap is clamped to `providers.dailyCapCeilingCents` (default 200 cents, with a loud warning when the config asks for more), survival is a fixed tier (`providers.survival.fixedTier`, default `normal`), registration with Conway and the bootstrap topup are skipped, the social relay starts only when `socialRelayUrl` is set to something other than Conway's default (a self-hosted `packages/relay` on loopback works; Conway's relay only through `providers.relayUrl`; the protocol follows `relay.conwayCompat`, by default Conway compatibility only for a conway.tech relay), and x402 payments, USDC balance reads and pending-payment reconciliation run only with `providers.payments: true`. A Conway egress fence (`assertConwayAllowed`) refuses Conway API calls in standalone. An explicit `providers.mode: "standalone"` is sticky, and the setup wizard and `--configure` write it whenever they leave no Conway key: storing a Conway key (`--provision`, `--configure`, `setConwayApiKey`) never removes it, and the operator commands that write `automaton.json` refuse while an agent holds the state database (`src/setup/operator-command.ts`), so the agent cannot leave standalone, and its cap ceiling, by running them through `exec`. Tools and heartbeat tasks that cannot work are hidden, not offered to fail (`src/providers/features.ts`):
+
+| Feature | Conway | Standalone | Tools and tasks it gates |
+|---|---|---|---|
+| `conwayCompute` | on | off | sandboxes, Conway-only skills |
+| `children` | on | off | `spawn_child` and the other child tools, child health tasks |
+| `conwayCredits` | on | off | `check_credits`, `transfer_credits`, `heartbeat_ping`, `distress_signal` |
+| `topups` | on | off | `topup_credits`, bootstrap and inline topups |
+| `domains` | on | off | domain and DNS tools |
+| `conwayModels` | on | off | `refresh_models` |
+| `relay` | on | `socialRelayUrl` set (not Conway's default) or `providers.relayUrl` | `send_message`, `message_child` (with `children`), inbox polling |
+| `payments` / `onchainIdentity` | on | `providers.payments` | `x402_fetch`, `check_usdc_balance`, ERC-8004 tools including `discover_agents` |
+| `orchestration` | on | an OpenAI-compatible or Ollama provider | goal tools and the orchestration prompt |
+
+`discover_agents` needs `onchainIdentity` like the other ERC-8004 tools, so standalone with payments off offers no tool that reads a chain; with payments on, its standalone description says each uncached call makes read-only JSON-RPC requests to the Base chain. The agent card claims `x402Support` only when payments are on.
+
+The standalone system prompt says where the agent runs and what it can pay for, and never mentions Conway or a sandbox. At startup, standalone replaces the Conway survival skill and the Conway capability lines of `SOUL.md` that older setups installed for every install, when they are unmodified (an edited `SOUL.md` that still names Conway gets a warning). The planner is given the daily AI cap, today's spend and the orchestration share instead of a credit balance; Conway mode keeps its planner text. Strategy slots no configured provider can serve get a substitute the router accepts at that slot's tier, in memory only (`src/providers/model-defaults.ts`).
 
 **State transitions** (`AgentState`):
 - `setup` -> `waking` -> `running` -> `sleeping` -> `waking` (cycle)
@@ -327,16 +351,17 @@ packages/
 The automaton runs as a long-lived Node.js process. The `--run` command triggers the full bootstrap sequence:
 
 1. **Config load** — reads `~/.automaton/automaton.json`; a corrupt file exits 1; a missing one is built from `genesis.json` when present, else the setup wizard runs only on a terminal, else exit 1
+   - **Mode** — `resolveRuntime` logs the one `Mode:` line; Conway mode with no key, standalone with no AI provider, or a missing `name`/`creatorAddress` exits 1 with the setting to fix; a `sandboxId` is ignored in standalone
    - **Instance lock** — `<dbPath>.lock`, before the database opens
-2. **Wallet load** — reads or generates `~/.automaton/wallet.json` (viem PrivateKeyAccount)
+2. **Wallet load** — reads `~/.automaton/wallet.json`; it is never created here (only the wizard, `--init` and the genesis bootstrap create one). A missing or corrupt file, an address that differs from `walletAddress`, or a `chainType` that differs from the wallet's exits 1
 3. **Database init** — opens `~/.automaton/state.db`, applies schema migrations (v1-v8)
-4. **Conway client** — creates HTTP client for sandbox/credits/domain API
-   - **Treasury** — normalizes the treasury policy once, installs the spending gate (with its own balance-read client and the on-chain `authorizationState` reader) before anything can spend, and starts reconciling x402 payments a previous run left unknown
-5. **Inference client** — creates chat completion client (Conway proxy, OpenAI direct, or Anthropic direct)
-6. **Social client** — connects to the relay in `socialRelayUrl` (`""`: messaging off; unset: the `DEFAULT_CONFIG` value, Conway's relay until standalone mode changes it); the startup log shows the URL and protocol (`automaton/1`, or `conway` under compatibility). The distress webhook is checked here too (`initDistressWebhook`)
+4. **Conway client** — Conway mode: HTTP client for sandbox/credits/domain API. Standalone: the facade that runs exec, files and ports locally and refuses every Conway-only call with `FEATURE_DISABLED`
+   - **Treasury** — normalizes the treasury policy once (standalone clamps `maxInferenceDailyCents` to `providers.dailyCapCeilingCents`, with a loud warning), installs the spending gate (with its own balance-read client and, with payments on, the on-chain `authorizationState` reader) before anything can spend, and reconciles x402 payments a previous run left unknown only when payments are on (otherwise it only counts them and warns)
+5. **Inference client** — creates chat completion client (Conway proxy, OpenAI or an OpenAI-compatible base URL, Anthropic direct, or Ollama); in standalone a model no configured provider serves is refused, never sent to Conway
+6. **Social client** — connects to the relay in `socialRelayUrl` (unset or `""`: messaging off in standalone; Conway mode keeps Conway's relay as its default). Standalone turns Conway's relay on only through `providers.relayUrl`; a self-hosted relay URL works in either mode. The `Mode:` line and the startup log show the URL and protocol (`automaton/1`, or `conway` under compatibility). The distress webhook is checked here too (`initDistressWebhook`)
 7. **Policy engine** — assembles rule set from 6 rule categories, using the same normalized treasury policy as the gate
 8. **Spend tracker** — the commit-time mirror the Treasury writes and the policy rules read
-9. **Bootstrap topup** — buys minimum $5 credits from USDC if balance is low (origin `startup.bootstrap`; skipped when the balance cannot be read; a 15s timeout stops the wait, not the payment, whose open ledger row keeps other topups out)
+9. **Bootstrap topup** — Conway mode only: buys minimum $5 credits from USDC if balance is low (origin `startup.bootstrap`; skipped when the balance cannot be read; a 15s timeout stops the wait, not the payment, whose open ledger row keeps other topups out)
 10. **Heartbeat daemon** — seeds the schedule and starts DurableScheduler with 6 default tasks (lazy modules are preloaded first)
 11. **Main loop** — alternates between `runAgentLoop()` and sleeping
 
@@ -587,7 +612,7 @@ Limits are per budget (transfer, x402, topup, topup_auto, infra) over rolling wi
 
 Each automaton has a unique EVM or Solana identity (`chainType` in the config):
 
-- **Wallet** (`wallet.ts`): Generated on first run (secp256k1 via `viem`, or an Ed25519 keypair for Solana). Stored at `~/.automaton/wallet.json` (mode 0600). The private key is never exposed to the agent via tools (blocked by path protection rules).
+- **Wallet** (`wallet.ts`): Generated by the setup wizard, `--init` or a child's genesis bootstrap (secp256k1 via `viem`, or an Ed25519 keypair for Solana), never by `--run`. Stored at `~/.automaton/wallet.json` (mode 0600). The private key is never exposed to the agent via tools (blocked by path protection rules).
 - **Provisioning** (`provision.ts`): Signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway API. Receives an API key stored at `~/.automaton/api-key`.
 - **On-chain identity** (`registry/erc8004.ts`): Optional ERC-8004 agent registration on Base. Publishes a JSON-LD agent card with capabilities, services, and contact info. The register transaction is signed and recorded as pending before it is sent, so a lost send response is resumed rather than re-sent; a token the wallet owns from a recorded register (even one marked dropped or replaced) is adopted instead of refused. The system prompt shows the chain of the identity it reports.
 
@@ -638,7 +663,7 @@ The `~/.automaton/` directory is a git repository: `SOUL.md` and `skills/` are c
 
 Children are independent automatons with their own mission. They never execute colony tasks.
 
-1. **Spawn** (`spawn.ts`): counts slot-holding children and inserts the `requested` row in one `BEGIN IMMEDIATE` transaction, so concurrent spawns cannot both take the last slot. Then it creates (or safely reuses) a sandbox sized by `childSandboxMemoryMb`, clones and builds the runtime from `childRuntimeRepo`/`childRuntimeRef` (default: upstream, default branch), writes `genesis.json` and verifies the wallet (`wallet_verified`). It neither funds nor starts the child. A checkout without the genesis bootstrap gets an `automaton.json` written by the parent; production colonies should use a runtime that bootstraps from `genesis.json`. `maxChildren: 0` refuses before anything is bought.
+1. **Spawn** (`spawn.ts`): counts slot-holding children and inserts the `requested` row in one `BEGIN IMMEDIATE` transaction, so concurrent spawns cannot both take the last slot. Then it creates (or safely reuses) a sandbox sized by `childSandboxMemoryMb`, clones and builds the runtime from `childRuntimeRepo`/`childRuntimeRef` (default: `https://github.com/FederalVia/Garry.git`, default branch), writes `genesis.json` and verifies the wallet (`wallet_verified`). It neither funds nor starts the child. A checkout without the genesis bootstrap gets an `automaton.json` written by the parent; production colonies should use a runtime that bootstraps from `genesis.json`. `maxChildren: 0` refuses before anything is bought.
 2. **Status machine** (`lifecycle.ts`, `child-status.ts`): one `children` row per child (unique non-empty address). `children.status` equals the latest `child_lifecycle_events.to_state`; only `ChildLifecycle.transition` writes it. States: `requested -> sandbox_created -> runtime_ready -> wallet_verified -> funded -> starting -> healthy <-> unhealthy`, ending in `stopped` or `failed`, then `cleaned_up` (terminal). All states before `stopped`/`failed` hold a slot; legacy rows without events hold one in `spawning`/`running`/`sleeping`/`unknown`, and `dead` is terminal. Nothing moves an ended child back to a live state.
 3. **Health** (`health.ts`): `ChildHealthMonitor` is the only liveness prober. It runs `pgrep` inside the child's sandbox and applies the result: `starting -> healthy` (seen) or `-> failed` (confirmed gone after 10 min), `healthy <-> unhealthy`, `unhealthy -> failed` after 30 min. Only a confirmed-gone sandbox counts as offline; an API error changes nothing. The `check_child_health` heartbeat (every 10 min) and `check_child_status` use it.
 4. **Stop** (`stopChild` in `lifecycle.ts`, tool `stop_child`): kills the process and verifies it gone before `stopped`; abandons never-started children and stuck spawns to `failed`; `force` marks an unreachable live child `failed` with `processUnverified` in the event metadata.
@@ -814,11 +839,22 @@ AutomatonConfig
   genesisPrompt           Seed instruction from creator
   creatorMessage          Optional creator message (shown on first run)
   creatorAddress          Creator's Ethereum address
-  sandboxId               Conway sandbox ID (empty = local mode)
+  sandboxId               Conway sandbox ID (empty or absent = this machine; ignored in standalone)
   conwayApiUrl            Conway API URL (default: https://api.conway.tech)
-  conwayApiKey            SIWE-provisioned API key
+  conwayApiKey            SIWE-provisioned API key (absent: standalone mode)
   openaiApiKey            Optional BYOK OpenAI key
   anthropicApiKey         Optional BYOK Anthropic key
+  ollamaBaseUrl           Optional Ollama base URL
+  providers               Provider block (wins over the flat fields above):
+    mode                    "conway" | "standalone" (absent: conway when a Conway key resolves)
+    openai                  { apiKey, baseUrl (https, or http on loopback), models: [{ id, inputUsdPerM, outputUsdPerM, tierMinimum }] }
+    anthropic               { apiKey }
+    ollama                  { baseUrl }
+    conway                  { apiKey, apiUrl }
+    survival                { source: "fixed" | "conway", fixedTier (default "normal") }
+    dailyCapCeilingCents    Standalone ceiling on treasuryPolicy.maxInferenceDailyCents (default 200)
+    payments                Standalone: x402, USDC reads and on-chain identity (default false)
+    relayUrl                Standalone: relay URL, wins over socialRelayUrl; the only way to use Conway's relay
   inferenceModel          Default model (default: gpt-5.2)
   maxTokensPerTurn        Max tokens per inference call (default: 4096)
   heartbeatConfigPath     Path to heartbeat.yml
@@ -829,10 +865,10 @@ AutomatonConfig
   skillsDir               Skills directory path
   maxChildren             Slot-holding children (default: 3; 0 disables spawn_child); local workers max(1, maxChildren)
   childSandboxMemoryMb    Child sandbox memory tier (default: 1024)
-  childRuntimeRepo        https git URL a child's runtime is cloned from (default: upstream)
+  childRuntimeRepo        https git URL a child's runtime is cloned from (default: https://github.com/FederalVia/Garry.git)
   childRuntimeRef         Optional branch or tag of childRuntimeRepo
   parentAddress           Parent's address (if this is a child)
-  socialRelayUrl          Social relay URL ("": messaging off; unset: Conway's relay for now; HTTPS or loopback HTTP)
+  socialRelayUrl          Social relay URL (unset or "": messaging off in standalone; Conway mode default social.conway.tech; HTTPS or loopback HTTP)
   relay.conwayCompat      Sign Conway: and also accept it inbound (unset: on only for conway.tech)
   distressWebhookUrl      Optional owner notification on critical/dead (HTTPS or loopback HTTP)
   treasuryPolicy          Financial limits (TreasuryPolicy)
@@ -842,9 +878,9 @@ AutomatonConfig
 
 **Deep-merged fields:** `modelStrategy` and `soulConfig` are merged with defaults so partial overrides work correctly. `treasuryPolicy` goes through `normalizeTreasuryPolicy`: any field that is not a finite number >= 0 (whatever its type) takes its default, with a warning.
 
-**Loading:** `loadConfig()` returns null only when the file is missing and throws `ConfigError` when it cannot be read or parsed.
+**Loading:** `loadConfig()` returns null only when the file is missing and throws `ConfigError` when it cannot be read or parsed, or when the `providers` block is invalid. Each provider value resolves environment first (`CONWAY_API_KEY`, `CONWAY_API_URL`, `OLLAMA_BASE_URL`; `OPENAI_API_KEY` in standalone only), then the `providers` block, then the flat field. Mode defaults (the relay URL, the x402 payee list) and values from the environment are never written back by `saveConfig()`, and clearing the Conway key drops a relay URL or payee list that still holds Conway's default. In standalone, a `socialRelayUrl` or `x402AllowedDomains` equal to Conway's default (older versions saved them for every install) is read as absent.
 
-**Saving:** `saveConfig()` writes the whole file atomically (temp file + rename) and is used by the wizard, `--configure` and `--pick-model`. The running agent never writes its startup snapshot back: `updateConfigFile({ genesisPrompt?, inferenceModel? })` re-reads the file, changes only those keys (and `modelStrategy.inferenceModel` when present), and writes atomically; on a missing or corrupt file it throws and writes nothing.
+**Saving:** `saveConfig()` writes the whole file atomically (temp file + rename) and is used by the wizard, `--configure` and `--pick-model`. `setConwayApiKey()` (used by `--provision`) stores a key without touching an explicit `providers.mode`; only the operator changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone. `--provision`, `--setup`, `--configure` and `--pick-model` exit 1 while another process holds the state database's instance lock, and all but `--provision` (which a new child runs unattended in its sandbox) also need a terminal. The running agent never writes its startup snapshot back: `updateConfigFile({ genesisPrompt?, inferenceModel? })` re-reads the file, changes only those keys (and `modelStrategy.inferenceModel` when present), and writes atomically; on a missing or corrupt file it throws and writes nothing.
 
 ---
 
@@ -860,7 +896,7 @@ The automaton operates under a defense-in-depth security model:
 
 **Layer 4 — Path protection** (filesystem, `src/security/protected-paths.ts`): Protected paths cannot be written (state directory outside its writable entries, secrets, shell startup files, system directories, guard code). Sensitive paths cannot be read (secret files and directories, system secrets, the state directory outside its readable allowlist). Rules are checked on the lexical and the real path; links in the final component are refused. The policy rules check before the call, and `secure-fs.ts` checks again at the moment of I/O for local `read_file`/`write_file`, `edit_own_file`, worker file tools and the runtime's state writers.
 
-**Layer 5 — Command safety** (shell): the exec tripwire denies commands that name secrets, reach into the state directory, glob hidden home paths, dump the environment, recursively read the home or root directory (`.` counts as home, since exec starts there), kill the runtime (including `xargs kill`, backticks, a loop over `pgrep`/`pidof`/`ps` output, its own PID, `kill 0` and `pkill -f` patterns matching its own command line), or write guard files (including through inline interpreters and git rewrite commands). It is a tripwire, not a boundary: exec runs as the wallet's OS user, so a script written to disk, string building, a short glob or a multi-step command gets past it. The recommended deployment runs exec as a separate unprivileged OS user (or in a container or bubblewrap sandbox) without read access to `~/.automaton` or write access to the runtime checkout. Rate limits on self-modification operations.
+**Layer 5 — Command safety** (shell): the exec tripwire denies commands that name secrets, reach into the state directory, glob hidden home paths, dump the environment, recursively read the home or root directory (`.` counts as home, since exec starts there), kill the runtime (including `xargs kill`, backticks, a loop over `pgrep`/`pidof`/`ps` output, its own PID, `kill 0` and `pkill -f` patterns matching its own command line), run the automaton's setup commands (`--provision`, `--setup`, `--configure`, `--pick-model` with an automaton entry point) or the operator CLI's `fund` and `send`, or write guard files (including through inline interpreters and git rewrite commands). It is a tripwire, not a boundary: exec runs as the wallet's OS user, so a script written to disk, string building, a short glob or a multi-step command gets past it. The recommended deployment runs exec as a separate unprivileged OS user (or in a container or bubblewrap sandbox) without read access to `~/.automaton` or write access to the runtime checkout. Rate limits on self-modification operations.
 
 **Layer 5b — Secrets out of reach:** API keys are not copied into `process.env`; every command (agent and workers) gets `childProcessEnv()`, without credential-shaped variables (operator tokens such as `GITHUB_TOKEN` included). Registered secrets are redacted from inference requests and logs (`secret-redaction.ts`).
 

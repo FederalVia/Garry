@@ -257,6 +257,51 @@ export function writeFileSafe(
 }
 
 /**
+ * Create a file that must not exist yet, atomically: write and fsync a temp
+ * file, then hard-link it to the final name, which fails with EEXIST when
+ * anything is already there (a rename would replace it). Two concurrent
+ * creators cannot both succeed. Throws the EEXIST error unchanged.
+ */
+export function createFileExclusive(
+  absPath: string,
+  content: string | Buffer,
+  opts: WriteFileSafeOptions = {},
+): string {
+  const decision = checkWrite(absPath, opts);
+  if (!decision.ok || !decision.real) {
+    throw new UnsafePathError(decision.code ?? "UNRESOLVABLE", decision.reason ?? "write denied");
+  }
+  const final = decision.real;
+  const parent = path.dirname(final);
+  fs.mkdirSync(parent, { recursive: true });
+  if (fs.realpathSync(parent) !== parent) {
+    throw new UnsafePathError("UNRESOLVABLE", `parent of ${absPath} changed while it was being created`);
+  }
+  const mode = opts.mode ?? 0o600;
+  const tmp = `${final}.tmp-${crypto.randomBytes(6).toString("hex")}`;
+  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, mode);
+  try {
+    try {
+      const data = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+      let offset = 0;
+      while (offset < data.length) offset += fs.writeSync(fd, data, offset, data.length - offset);
+      fs.fchmodSync(fd, mode);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.linkSync(tmp, final);
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // already gone
+    }
+  }
+  return final;
+}
+
+/**
  * Write a path the agent chose through one verified file descriptor.
  *
  * writeFileSafe's temp-file-and-rename is atomic, but rename looks the

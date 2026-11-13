@@ -166,6 +166,14 @@ const DENIED = [
   "grep -r privateKey $PWD",
   "grep -r privateKey \"${PWD}\"",
   "grep -r privateKey ~-",
+  // The automaton's operator commands (they rewrite keys and mode)
+  "node dist/index.js --provision",
+  "cd ~/automaton && node dist/index.js --configure < /tmp/answers.txt",
+  "automaton --provision",
+  "npx tsx src/index.ts --setup",
+  "node /opt/automaton/dist/index.js --pick-model",
+  "automaton-cli send hello",
+  "node packages/cli/dist/index.js send hello",
 ];
 
 const ALLOWED = [
@@ -219,6 +227,9 @@ const ALLOWED = [
   "find ~/.automaton/workspace/app -name '*.ts' | xargs grep TODO",
   "echo $(date) > /tmp/now.txt",
   "grep -r TODO ~+/.automaton/workspace/app",
+  "./configure --prefix=/usr/local",
+  "python setup.py install",
+  "node server.js --port 3000",
   // Not caught: the tripwire cannot see inside files (documented limit)
   "patch -p1 < /tmp/x.diff",
 ];

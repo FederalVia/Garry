@@ -8,14 +8,19 @@
  * Usage: automaton --configure
  */
 
+import fs from "fs";
+import path from "path";
 import readline from "readline";
 import chalk from "chalk";
-import { loadConfig, saveConfig, resolvePath, ConfigError } from "../config.js";
+import { loadConfig, saveConfig, resolvePath, ConfigError, dropConwayDefaults } from "../config.js";
 import { DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { AutomatonConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
 import { closePrompts } from "./prompts.js";
 import { createDatabase } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
+import { getAutomatonDir } from "../identity/wallet.js";
+import { writeFileSafe } from "../security/secure-fs.js";
+import { formatInputPrice, pickableModels, providerLabel } from "./model-picker.js";
 
 // ─── Readline helpers ─────────────────────────────────────────────
 
@@ -32,20 +37,23 @@ function ask(prompt: string): Promise<string> {
   return new Promise((resolve) => getRL().question(prompt, (a) => resolve(a.trim())));
 }
 
-/** Prompt for an optional string. Enter = keep current. "-" = clear. */
+/**
+ * Prompt for an optional string. Enter = keep current (undefined when there
+ * is none, so an unset value is never read as a clear). "-" = clear (null).
+ */
 async function askString(
   label: string,
   current: string | undefined,
   required = false,
-): Promise<string | undefined> {
+): Promise<string | null | undefined> {
   const display = current ? maskSecret(current) : chalk.dim("(not set)");
   const hint = required
     ? chalk.dim(" (Enter to keep)")
     : chalk.dim(" (Enter to keep, - to clear)");
   const raw = await ask(`  ${chalk.white("→")} ${label} ${chalk.dim("[" + display + "]")}${hint}: `);
 
-  if (raw === "") return current;
-  if (!required && raw === "-") return undefined;
+  if (raw === "") return current ?? undefined;
+  if (!required && raw === "-") return null;
   return raw;
 }
 
@@ -98,24 +106,16 @@ async function askChoice<T extends string>(
 
 // ─── Model picker ─────────────────────────────────────────────────
 
-const PROVIDER_LABEL: Record<string, string> = {
-  openai: "OpenAI",
-  anthropic: "Anthropic",
-  conway: "Conway",
-  ollama: "Ollama",
-  other: "Other",
-};
-
-function printModelTable(models: ModelEntry[], currentModelId: string): void {
+function printModelTable(models: ModelEntry[], currentModelId: string, config: AutomatonConfig): void {
   const numWidth = String(models.length).length;
   for (let i = 0; i < models.length; i++) {
     const m = models[i];
     const num = String(i + 1).padStart(numWidth);
-    const provider = (PROVIDER_LABEL[m.provider] || m.provider).padEnd(9);
+    const provider = providerLabel(m.provider, config).padEnd(9);
     const cost =
       m.costPer1kInput === 0
         ? chalk.green("free     ")
-        : chalk.dim(`$${((m.costPer1kInput / 100 / 1000) * 1_000_000).toFixed(2)}/M in`);
+        : chalk.dim(formatInputPrice(m.costPer1kInput));
     const active = m.modelId === currentModelId ? chalk.green(" ◀ active") : "";
     const tools = m.supportsTools ? "" : chalk.dim(" (no tools)");
     console.log(
@@ -128,12 +128,13 @@ async function pickFromList(
   label: string,
   current: string,
   models: ModelEntry[],
+  config: AutomatonConfig,
 ): Promise<string> {
   if (models.length === 0) {
     return askRequiredString(label, current);
   }
   console.log(chalk.cyan(`\n  ── Select ${label} ──\n`));
-  printModelTable(models, current);
+  printModelTable(models, current, config);
   console.log("");
   const raw = await ask(
     `  ${chalk.white("→")} Enter number ${chalk.dim("(Enter to keep " + current + ")")}: `,
@@ -174,7 +175,7 @@ function printMainMenu(config: AutomatonConfig): void {
     config.openaiApiKey ? "OpenAI" : null,
     config.anthropicApiKey ? "Anthropic" : null,
     config.ollamaBaseUrl ? "Ollama" : null,
-    "Conway",
+    config.conwayApiKey ? "Conway" : null,
   ].filter(Boolean).join(", ");
 
   const strategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY_CONFIG;
@@ -198,15 +199,40 @@ async function configureProviders(config: AutomatonConfig): Promise<void> {
   console.log(chalk.cyan("\n  ── Inference Providers ─────────────────────────\n"));
   console.log(chalk.dim("  Press Enter to keep the current value. Type - to clear an optional field.\n"));
 
-  config.conwayApiKey = await askRequiredString(
-    "Conway API key",
-    config.conwayApiKey,
-  );
+  // Optional: with no Conway key the next run is standalone.
+  const conwayKey = await askString("Conway API key  (cnwy_k_..., optional)", config.conwayApiKey);
+  if (conwayKey === null) {
+    config.conwayApiKey = "";
+    forgetStoredConwayKey();
+    // An explicit Conway mode with no key would not start.
+    if (config.providers?.mode === "conway") config.providers = { ...config.providers, mode: "standalone" };
+    // Conway's relay and payee defaults must not carry into standalone.
+    dropConwayDefaults(config);
+    // Pinned here, so CONWAY_API_KEY in the environment cannot bring Conway mode back.
+    pinStandaloneWithoutConwayKey(config);
+    console.log(chalk.yellow("  Conway key cleared: the next run is standalone with your own AI provider(s)."));
+  } else if (conwayKey !== undefined) {
+    config.conwayApiKey = conwayKey;
+  }
+
+  // Leaving standalone (and its daily cap ceiling) is only ever this explicit choice.
+  const current = config.providers?.mode ?? "auto";
+  const mode = await askChoice("Mode (auto: Conway when a Conway key is set)", ["auto", "standalone", "conway"], current);
+  if (mode !== current) {
+    const { mode: _mode, ...rest } = config.providers ?? {};
+    config.providers = mode === "auto" ? rest : { ...rest, mode };
+  }
+  if (config.conwayApiKey && config.providers?.mode === "standalone") {
+    console.log(chalk.yellow("  providers.mode is standalone: the Conway key is kept but not used."));
+  }
 
   config.openaiApiKey = await askString("OpenAI API key  (sk-...)", config.openaiApiKey) || undefined;
   config.anthropicApiKey = await askString("Anthropic API key  (sk-ant-...)", config.anthropicApiKey) || undefined;
   config.ollamaBaseUrl = await askString("Ollama base URL  (http://localhost:11434)", config.ollamaBaseUrl) || undefined;
 
+  if (!config.conwayApiKey && !config.openaiApiKey && !config.anthropicApiKey && !config.ollamaBaseUrl) {
+    console.log(chalk.yellow("  No AI provider configured: the automaton will not start until you add one."));
+  }
   console.log("");
 }
 
@@ -228,7 +254,7 @@ async function configureModelStrategy(config: AutomatonConfig): Promise<void> {
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
 
-  const models = registry.getAll().filter((m) => m.enabled);
+  const models = pickableModels(registry.getAll().filter((m) => m.enabled), config);
   db.close();
 
   const s: ModelStrategyConfig = {
@@ -236,10 +262,10 @@ async function configureModelStrategy(config: AutomatonConfig): Promise<void> {
     ...(config.modelStrategy ?? {}),
   };
 
-  config.inferenceModel = await pickFromList("Active model", config.inferenceModel, models);
+  config.inferenceModel = await pickFromList("Active model", config.inferenceModel, models, config);
   s.inferenceModel = config.inferenceModel;
-  s.lowComputeModel = await pickFromList("Low-compute fallback", s.lowComputeModel, models);
-  s.criticalModel = await pickFromList("Critical fallback", s.criticalModel, models);
+  s.lowComputeModel = await pickFromList("Low-compute fallback", s.lowComputeModel, models, config);
+  s.criticalModel = await pickFromList("Critical fallback", s.criticalModel, models, config);
 
 
   const maxTokens = await askNumber("Max tokens per turn", s.maxTokensPerTurn);
@@ -282,6 +308,10 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
     ...DEFAULT_TREASURY_POLICY,
     ...(config.treasuryPolicy ?? {}),
   };
+  // No payee list means the mode's default on load; do not fill in Conway's.
+  if (config.treasuryPolicy && !("x402AllowedDomains" in config.treasuryPolicy)) {
+    delete (t as Partial<TreasuryPolicy>).x402AllowedDomains;
+  }
 
   t.maxSingleTransferCents = await askNumber("Max single transfer", t.maxSingleTransferCents);
   t.maxHourlyTransferCents = await askNumber("Max hourly transfers", t.maxHourlyTransferCents);
@@ -313,10 +343,58 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
     config.logLevel,
   );
   config.maxChildren = await askNumber("Max child automatons", config.maxChildren);
-  config.socialRelayUrl = (await askString("Social relay URL", config.socialRelayUrl)) || undefined;
+  // A cleared relay is stored as "": an absent key would load the default relay again.
+  const relay = await askString("Social relay URL", config.socialRelayUrl);
+  config.socialRelayUrl = relay === null ? "" : relay;
   config.rpcUrl = (await askString("RPC endpoint  (Base chain, e.g. https://mainnet.base.org)", config.rpcUrl)) || undefined;
 
   console.log("");
+}
+
+// ─── Save ─────────────────────────────────────────────────────────
+
+/**
+ * With no Conway key, "auto" would let a key stored later (by --provision or
+ * another tool) switch the next start to Conway mode, which has no daily cap
+ * ceiling. An explicit standalone mode survives that; only the Mode question
+ * leaves it. Returns true when it set the mode.
+ */
+export function pinStandaloneWithoutConwayKey(config: AutomatonConfig): boolean {
+  if ((config.conwayApiKey ?? "").trim() !== "") return false;
+  if (config.providers?.mode === "conway" || config.providers?.mode === "standalone") return false;
+  config.providers = { ...(config.providers ?? {}), mode: "standalone" };
+  return true;
+}
+
+function saveConfigured(config: AutomatonConfig): void {
+  if (pinStandaloneWithoutConwayKey(config)) {
+    console.log(chalk.dim('  providers.mode saved as "standalone": an API key for a hosted account added later stays unused until you change the mode.'));
+  }
+  saveConfig(config);
+}
+
+// ─── Stored Conway key ────────────────────────────────────────────
+
+/**
+ * Drop the provisioned key from ~/.automaton/config.json. The runtime falls
+ * back to that file when automaton.json has no key, so clearing only
+ * automaton.json would leave the next run in Conway mode. The wallet address
+ * recorded there is kept. Returns true when a key was removed.
+ */
+export function forgetStoredConwayKey(): boolean {
+  const configPath = path.join(getAutomatonDir(), "config.json");
+  let data: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    data = parsed as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (!("apiKey" in data)) return false;
+  delete data.apiKey;
+  writeFileSafe(configPath, JSON.stringify(data, null, 2), { trustedWriter: true, mode: 0o600 });
+  return true;
 }
 
 // ─── Entry point ──────────────────────────────────────────────────
@@ -345,22 +423,22 @@ export async function runConfigure(): Promise<void> {
     switch (choice) {
       case "1":
         await configureProviders(config);
-        saveConfig(config);
+        saveConfigured(config);
         console.log(chalk.green("  ✓ Providers saved.\n"));
         break;
       case "2":
         await configureModelStrategy(config);
-        saveConfig(config);
+        saveConfigured(config);
         console.log(chalk.green("  ✓ Model strategy saved.\n"));
         break;
       case "3":
         await configureTreasury(config);
-        saveConfig(config);
+        saveConfigured(config);
         console.log(chalk.green("  ✓ Treasury policy saved.\n"));
         break;
       case "4":
         await configureGeneral(config);
-        saveConfig(config);
+        saveConfigured(config);
         console.log(chalk.green("  ✓ General settings saved.\n"));
         break;
       case "q":
