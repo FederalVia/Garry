@@ -14,6 +14,7 @@ import type { AutomatonDatabase, ChildAutomaton } from "../types.js";
 import type { FundingProtocol } from "./types.js";
 import { LEGACY_LIVE, LIVE, PRE_START, parseDbTimestamp } from "../replication/child-status.js";
 import { isValidWalletAddress } from "../replication/spawn.js";
+import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 
 const logger = createLogger("orchestration.health-monitor");
 
@@ -107,6 +108,9 @@ export class HealthMonitor {
       const child = this.db.getChildren().find((c) => c.address === agent.address);
       if (!child || !FUNDABLE_STATUSES.has(child.status)) continue;
       if (!isValidWalletAddress(child.address, child.chainType)) continue;
+      // A cancelled heartbeat task starts no further transfer (autoFund is
+      // off in the heartbeat today; this keeps it so if it is turned on).
+      throwIfCancelled();
       actions.push(await this.fundAgent(agent));
     }
 
@@ -179,6 +183,7 @@ export class HealthMonitor {
       }
       return Math.max(0, Math.floor(balance));
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.warn("Failed to read child balance", {
         address,
         error: normalizeError(error).message,
@@ -203,6 +208,7 @@ export class HealthMonitor {
         success: result.success,
       };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.warn("Auto-funding failed", {
         address: agent.address,
         error: normalizeError(error).message,

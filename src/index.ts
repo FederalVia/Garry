@@ -24,6 +24,7 @@ import {
 } from "./heartbeat/config.js";
 import { consumeNextWakeEvent } from "./state/database.js";
 import { runAgentLoop, shutdownWorkerPools } from "./agent/loop.js";
+import { shutdownMcpServers } from "./mcp/manager.js";
 import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
@@ -888,6 +889,7 @@ async function run(): Promise<void> {
         spendTracker,
         ollamaBaseUrl,
         shouldStop: () => ctl.stopping,
+        shutdownSignal: ctl.signal,
         wakeEvents,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
@@ -957,6 +959,7 @@ async function run(): Promise<void> {
     stopHeartbeat: () => hb.stop(),
     drainHeartbeat: (ms) => hb.drain(ms),
     drainWorkers: (ms) => shutdownWorkerPools(ms),
+    closeMcp: (ms) => shutdownMcpServers(ms),
     leaveState,
     releaseLock: () => instanceLock.release(),
     closeDb: () => db.close(),

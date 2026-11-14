@@ -22,6 +22,7 @@ const PROTECTED_PATHS = [
   "heartbeat.yml",
   "wallet.json",
   "config.json",
+  "mcp-servers.json",
   "policy-engine",
   "policy-rules",
   "injection-defense",
@@ -307,6 +308,31 @@ function createInboxAllowListRule(): PolicyRule {
 }
 
 /**
+ * Third-party tools (MCP) run code or services the runtime does not control
+ * and return text someone else chose. Same treatment as the shell tools:
+ * denied on inbox and unknown sources, allowed on source-less, heartbeat and
+ * elevated turns. The inbox allow-list (priority 50) already denies them on
+ * inbox turns; this also covers unknown source strings.
+ */
+function createThirdPartyToolRule(): PolicyRule {
+  return {
+    id: "authority.third_party_tools",
+    description: "Deny third-party (MCP) tools on inbox and unknown-source turns",
+    priority: 400,
+    appliesTo: { by: "risk", levels: ["third_party"] },
+    evaluate(request: PolicyRequest): PolicyRuleResult | null {
+      const source = request.turnContext.inputSource;
+      if (!isInboxOrUnknownSource(source)) return null;
+      return deny(
+        "authority.third_party_tools",
+        "EXTERNAL_THIRD_PARTY_TOOL",
+        `Untrusted input (source: ${source || "undefined"}) cannot use third-party tool "${request.tool.name}"`,
+      );
+    },
+  };
+}
+
+/**
  * Create all authority policy rules.
  */
 export function createAuthorityRules(): PolicyRule[] {
@@ -314,5 +340,6 @@ export function createAuthorityRules(): PolicyRule[] {
     createInboxAllowListRule(),
     createExternalToolRestrictionRule(),
     createSelfModFromExternalRule(),
+    createThirdPartyToolRule(),
   ];
 }

@@ -214,7 +214,9 @@ export type ToolCategory =
   | "git"
   | "registry"
   | "replication"
-  | "memory";
+  | "memory"
+  // Tools served by an external MCP server (names start with mcp__).
+  | "mcp";
 
 export interface ToolContext {
   identity: AutomatonIdentity;
@@ -603,7 +605,8 @@ export interface ModelInfo {
 // ─── Policy Engine ───────────────────────────────────────────────
 
 // Risk level for tool classification — replaces `dangerous?: boolean`
-export type RiskLevel = 'safe' | 'caution' | 'dangerous' | 'forbidden';
+// third_party: runs code or services the runtime does not control (MCP tools).
+export type RiskLevel = 'safe' | 'caution' | 'dangerous' | 'forbidden' | 'third_party';
 
 // Policy evaluation result action
 export type PolicyAction = 'allow' | 'deny' | 'quarantine';

@@ -1,7 +1,7 @@
 /**
  * Installed tools: a tool name the providers reject, or a duplicate name,
- * would fail every inference request. MCP tools cannot be invoked, so they
- * are not offered to the model at all.
+ * would fail every inference request. MCP rows are not offered here: the MCP
+ * manager starts approved servers and offers their tools as mcp__<server>__*.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -47,7 +47,9 @@ describe("install_mcp_server", () => {
   it("refuses an invalid name and a builtin name before running npm", async () => {
     const scoped = await install({ name: "@modelcontextprotocol/server-github", package: "@modelcontextprotocol/server-github" });
     const builtin = await install({ name: "exec", package: "some-mcp-server" });
-    expect(scoped).toMatch(/^Blocked: tool name must match/);
+    const prefixed = await install({ name: "mcp__github", package: "some-mcp-server" });
+    expect(scoped).toMatch(/^Blocked: server name must match/);
+    expect(prefixed).toMatch(/^Blocked: server name must match/);
     expect(builtin).toMatch(/^Blocked: "exec" is the name of a built-in tool/);
     expect(conway.execCalls).toHaveLength(0);
     expect(db.getInstalledTools()).toHaveLength(0);
@@ -60,11 +62,11 @@ describe("install_mcp_server", () => {
     expect(conway.execCalls).toHaveLength(0);
   });
 
-  it("says the package installed but is not available as a tool", async () => {
+  it("refuses to install with a remote sandbox, where a local server would escape it", async () => {
     const out = await install({ name: "github", package: "@modelcontextprotocol/server-github" });
-    expect(out).toContain("MCP invocation is not supported yet");
-    expect(out).not.toMatch(/MCP server installed/);
-    expect(conway.execCalls).toHaveLength(1);
+    expect(out).toMatch(/^Blocked: agent-installed MCP servers run only where exec runs locally/);
+    expect(conway.execCalls).toHaveLength(0);
+    expect(db.getInstalledTools()).toHaveLength(0);
   });
 });
 
@@ -75,6 +77,7 @@ describe("loadInstalledTools", () => {
     row("slack", "mcp", "c");
     row("my_tool", "custom", "d");
     row("my_tool", "custom", "e");
+    row("mcp__fake__tool", "custom", "f");
 
     const sent = toolsToInferenceFormat(loadInstalledTools(db)).map((t) => t.function.name);
     expect(sent).toEqual(["my_tool"]);

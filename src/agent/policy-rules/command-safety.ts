@@ -24,6 +24,7 @@ import {
   SENSITIVE_COMMAND_FRAGMENTS,
   homeDir,
 } from "../../security/protected-paths.js";
+import { parseRegistrySpec, validateAgentLaunchValues } from "../../mcp/config.js";
 
 // Shell metacharacters that could enable injection when interpolated
 const SHELL_METACHAR_RE = /[;|&$`\n(){}<>]/;
@@ -702,6 +703,27 @@ export function isForbiddenCommand(command: string): boolean {
   return getForbiddenCommandMatch(command) !== null;
 }
 
+/**
+ * Tripwire for the arguments of a tool call that reaches a program the
+ * agent chose (agent-installed MCP servers): those run as the runtime user,
+ * outside path protection, so arguments naming a secret, the state dir
+ * outside its allowed entries, or guard code are refused. A guard file is
+ * refused whatever the verb, because the tool's action is not known.
+ */
+export function getArgumentTripwireMatch(text: string): { description: string; pattern: string } | null {
+  const normalized = normalizeCommand(text);
+  for (const { re, label } of SENSITIVE_COMMAND_FRAGMENTS) {
+    if (re.test(normalized)) return { description: `References ${label}`, pattern: re.source };
+  }
+  const stateToken = automatonTokenMatch(normalized);
+  if (stateToken) {
+    return { description: "References the state directory outside its allowed entries", pattern: stateToken.slice(0, 80) };
+  }
+  const guardFragment = GUARD_COMMAND_FRAGMENTS.find((f) => normalized.includes(f));
+  if (guardFragment) return { description: `References guard file (${guardFragment})`, pattern: guardFragment };
+  return null;
+}
+
 function deny(rule: string, reasonCode: string, humanMessage: string): PolicyRuleResult {
   return { rule, action: "deny", reasonCode, humanMessage };
 }
@@ -772,9 +794,66 @@ function createForbiddenPatternsRule(): PolicyRule {
   };
 }
 
+/**
+ * install_mcp_server gets the checks exec gets: the install command and the
+ * server's launch line go through the forbidden patterns and the tripwire,
+ * every arg is free of shell metacharacters, the package is a registry
+ * name, and env names cannot carry credentials or hijack program loading.
+ */
+function createMcpServerCommandRule(): PolicyRule {
+  return {
+    id: "command.mcp_server_command",
+    description: "Apply exec's command checks to the MCP server an agent installs",
+    priority: 300,
+    appliesTo: { by: "name", names: ["install_mcp_server"] },
+    evaluate(request: PolicyRequest): PolicyRuleResult | null {
+      const refuse = (why: string) => deny("command.mcp_server_command", "MCP_SERVER_COMMAND", `Blocked: ${why}`);
+      const pkg = request.args.package;
+      if (typeof pkg !== "string" || !parseRegistrySpec(pkg)) {
+        return refuse("package must be an npm registry name (name or @scope/name, optionally @<exact version>)");
+      }
+      const launch = mcpLaunchValuesFromArgs(request.args);
+      if ("error" in launch) return refuse(launch.error);
+      const checked = validateAgentLaunchValues(launch.args, launch.env);
+      if ("error" in checked) return refuse(checked.error);
+      for (const command of [`npm install -g --ignore-scripts ${pkg}`, [pkg, ...checked.args].join(" ")]) {
+        const match = getForbiddenCommandMatch(command);
+        if (match) return refuse(`${match.description} (pattern: ${match.pattern})`);
+      }
+      return null;
+    },
+  };
+}
+
+/** args and env of install_mcp_server: direct parameters, else the legacy config JSON. */
+export function mcpLaunchValuesFromArgs(
+  args: Record<string, unknown>,
+): { error: string } | { args: unknown; env: unknown } {
+  let launchArgs: unknown = args.args;
+  let env: unknown = args.env;
+  if (args.config !== undefined && args.config !== "") {
+    let parsed: unknown;
+    try {
+      parsed = typeof args.config === "string" ? JSON.parse(args.config) : args.config;
+    } catch (err) {
+      return { error: `config is not a valid JSON object: ${(err as Error).message}` };
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: "config is not a valid JSON object" };
+    }
+    const cfg = parsed as Record<string, unknown>;
+    const unknownKeys = Object.keys(cfg).filter((k) => k !== "args" && k !== "env");
+    if (unknownKeys.length > 0) return { error: `config accepts only args and env (got ${unknownKeys.join(", ").slice(0, 80)})` };
+    if (launchArgs === undefined) launchArgs = cfg.args;
+    if (env === undefined) env = cfg.env;
+  }
+  return { args: launchArgs ?? [], env: env ?? {} };
+}
+
 export function createCommandSafetyRules(): PolicyRule[] {
   return [
     createShellInjectionRule(),
     createForbiddenPatternsRule(),
+    createMcpServerCommandRule(),
   ];
 }

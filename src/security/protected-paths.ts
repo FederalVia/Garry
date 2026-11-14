@@ -155,6 +155,8 @@ const SECRET_NAMES = new Set([
   "relay.db-wal",
   "relay.db-shm",
   "relay.db-journal",
+  // MCP server launch commands, env tokens and headers.
+  "mcp-servers.json",
 ]);
 
 const ENV_EXAMPLE_NAMES = new Set([".env.example", ".env.sample", ".env.template", ".env.dist"]);
@@ -311,6 +313,7 @@ const PROTECTED_NAMES = new Set([
   "injection-defense.d.ts",
   "heartbeat.yml",
   "inference-providers.json",
+  "mcp-servers.json",
 ]);
 
 const HOME_STARTUP_FILES = new Set([
@@ -393,7 +396,8 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "heartbeat/tasks",
   // Balance snapshot the heartbeat's topup and survival decisions read.
   "heartbeat/tick-context",
-  // Decides which heartbeat tasks run in each mode.
+  // Decides which heartbeat tasks run in each mode, when they run, whether a
+  // lease is held and when a task is aborted.
   "heartbeat/scheduler",
   // Wires survival tier and chain-read options into the scheduler.
   "heartbeat/daemon",
@@ -411,6 +415,8 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "audit-log",
   // Signs ERC-8004 transactions with the wallet key (gas paid in ETH).
   "registry/erc8004",
+  // Decides which addresses MCP HTTP servers (with operator headers) may reach.
+  "registry/safe-fetch",
   // Helpers guard code decides with: injection-defense folds text with
   // text-normalize; the logger and the operator CLI escape with terminal-safe.
   "agent/text-normalize",
@@ -419,6 +425,11 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "social/**",
   // Survival notification and its fixed-field outflow rule.
   "notify/distress",
+  // Abort classification, and so ledger settlement of aborted paid calls.
+  "runtime/cancellation",
+  "runtime/shutdown",
+  // Heals children by funding them (fundChild).
+  "orchestration/health-monitor",
 ]);
 
 /**
@@ -437,6 +448,8 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "operator",
   // Runtime mode, survival source, the daily cap ceiling and tool visibility.
   "providers",
+  // MCP: env scrubbing, address checks and operator approvals.
+  "mcp",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
 // packages/ holds the workspace packages the root build compiles after the
@@ -558,6 +571,7 @@ export const SENSITIVE_COMMAND_FRAGMENTS: readonly { re: RegExp; label: string }
   { re: /automaton\.json/, label: "automaton.json" },
   { re: /state\.db/, label: "state database" },
   { re: /inference-providers/, label: "provider config" },
+  { re: /mcp-servers\.json/, label: "MCP server config" },
   { re: /(?:^|[^a-z0-9_])\.ssh(?:$|[^a-z0-9_])/, label: "SSH directory" },
   { re: /id_(?:rsa|ed25519|ecdsa|dsa)/, label: "SSH key" },
   { re: /\.gnupg/, label: "GPG keys" },
@@ -612,6 +626,7 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "conway/balance",
   "conway/transfer-status",
   "registry/erc8004",
+  "registry/safe-fetch",
   "heartbeat/tick-context",
   "heartbeat/scheduler",
   // Wires survival tier and chain-read options into the scheduler.
@@ -631,6 +646,12 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "social/protocol",
   "social/settings",
   "notify/distress",
+  "src/mcp/",
+  "dist/mcp/",
+  "runtime/cancellation",
+  "runtime/shutdown",
+  "heartbeat/tasks",
+  "orchestration/health-monitor",
   "heartbeat.yml",
   "constitution.md",
   "soul.md",
@@ -712,6 +733,7 @@ function sensitiveInodeCandidates(): string[] {
     path.join(state, "config.json"),
     path.join(state, "state.db"),
     path.join(state, "inference-providers.json"),
+    path.join(state, "mcp-servers.json"),
     path.join(home, ".config", "solana", "id.json"),
     ...runtimeFilePaths,
   ];

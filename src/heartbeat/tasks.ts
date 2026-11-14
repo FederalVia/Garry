@@ -10,6 +10,10 @@
  *
  * Every task runs with the Treasury origin "heartbeat.<task>", so an outflow
  * a task starts is attributed to it (and is never mistaken for a tool call).
+ *
+ * The scheduler runs each task in a cancellation scope (runtime/cancellation).
+ * Every catch starts with rethrowIfCancelled: an abort must never be turned
+ * into state (a backoff, a failure notice, a failed probe).
  */
 
 import type {
@@ -48,6 +52,7 @@ import { DEFAULT_INGESTION_CONFIG } from "../memory/types.js";
 import { WorkingMemoryManager } from "../memory/working.js";
 import { EpisodicMemoryManager } from "../memory/episodic.js";
 import { runWithTreasuryOrigin } from "../treasury/index.js";
+import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 import { ulid } from "ulid";
 import { notifyDistress } from "../notify/distress.js";
 
@@ -155,6 +160,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         source: "heartbeat",
         balanceCents: credits,
       });
+      // notifyDistress swallows its own errors, an abort included; an aborted
+      // task delivers no wake.
+      throwIfCancelled();
 
       return {
         shouldWake: true,
@@ -267,6 +275,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         creditsCents: credits,
         chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
       });
+      // Cancelled before it paid: no notice, no wake (x402 already settled
+      // its ledger row). A topup that committed is reported as usual.
+      if (!result?.success) throwIfCancelled();
 
       // The gate refused for a reason that needs nothing from the agent
       // (credits not actually low, a buy in flight or just made, the gate's
@@ -366,6 +377,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       taskCtx.db.deleteKV("last_social_inbox_error");
       taskCtx.db.deleteKV("social_inbox_backoff_until");
     } catch (err: any) {
+      // An aborted poll is not an outage: no backoff, nothing ingested.
+      rethrowIfCancelled(err);
       taskCtx.db.setKV(
         "last_social_inbox_error",
         JSON.stringify({
@@ -536,9 +549,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
   check_for_updates: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     try {
-      const { checkUpstream, getRepoInfo } = await import("../self-mod/upstream.js");
+      const { checkUpstreamAsync, getRepoInfo } = await import("../self-mod/upstream.js");
       const repo = getRepoInfo();
-      const upstream = checkUpstream();
+      const upstream = await checkUpstreamAsync();
       taskCtx.db.setKV("upstream_status", JSON.stringify({
         ...upstream,
         ...repo,
@@ -560,6 +573,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       }
       return { shouldWake: false };
     } catch (err: any) {
+      rethrowIfCancelled(err);
       // Not a git repo or no remote -- silently skip
       taskCtx.db.setKV("upstream_status", JSON.stringify({
         error: err.message,
@@ -574,6 +588,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     try {
       const { reflectOnSoul } = await import("../soul/reflection.js");
       const reflection = await reflectOnSoul(taskCtx.db.raw);
+      throwIfCancelled();
 
       taskCtx.db.setKV("last_soul_reflection", JSON.stringify({
         alignment: reflection.currentAlignment,
@@ -592,6 +607,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
       return { shouldWake: false };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("soul_reflection failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -601,6 +617,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
   refresh_models: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     try {
       const models = await taskCtx.conway.listModels();
+      throwIfCancelled();
       if (models.length > 0) {
         const { ModelRegistry } = await import("../inference/registry.js");
         const registry = new ModelRegistry(taskCtx.db.raw);
@@ -612,6 +629,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         }));
       }
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("refresh_models failed", error instanceof Error ? error : undefined);
     }
     return { shouldWake: false };
@@ -649,6 +667,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         };
       }
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("check_child_health failed", error instanceof Error ? error : undefined);
     }
     return { shouldWake: false };
@@ -667,6 +686,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         logger.info(`Pruned ${pruned} dead children`);
       }
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("prune_dead_children failed", error instanceof Error ? error : undefined);
     }
     return { shouldWake: false };
@@ -676,6 +696,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     // Check that the sandbox is healthy
     try {
       const result = await taskCtx.conway.exec("echo alive", 5000);
+      throwIfCancelled();
       if (result.exitCode !== 0) {
         // Only wake on first failure, not repeated failures
         const prevStatus = taskCtx.db.getKV("health_check_status");
@@ -689,6 +710,8 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         return { shouldWake: false };
       }
     } catch (err: any) {
+      // An aborted probe says nothing about the sandbox.
+      rethrowIfCancelled(err);
       // Only wake on first failure, not repeated failures
       const prevStatus = taskCtx.db.getKV("health_check_status");
       if (prevStatus !== "failing") {
@@ -758,6 +781,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         message: firedAlerts.length ? `${firedAlerts.length} alerts fired` : undefined,
       };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("report_metrics failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -772,6 +796,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       const monitor = await createHealthMonitor(taskCtx);
       const report = await monitor.checkAll();
       const actions = await monitor.autoHeal(report);
+      throwIfCancelled();
 
       const { unhealthySignature } = await import("../orchestration/health-monitor.js");
       const previousRaw = taskCtx.db.getKV("last_colony_health_report");
@@ -799,6 +824,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
           : undefined,
       };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("colony_health_check failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -863,6 +889,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
       taskCtx.db.setKV("last_colony_financial_report", JSON.stringify(report));
       return { shouldWake: false };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("colony_financial_report failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -920,6 +947,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
       return { shouldWake: false };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("agent_pool_optimize failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -942,6 +970,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
       return { shouldWake: false };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("knowledge_store_prune failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
@@ -950,12 +979,15 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
   /**
    * Retention for the tables the agent writes every turn or that untrusted
    * senders feed. Each step runs on its own, so one failure does not stop
-   * the rest; the counts are kept in KV last_memory_maintenance.
+   * the rest; the counts are kept in KV last_memory_maintenance. Each step
+   * is synchronous, so an abort (timeout, shutdown) stops it between steps;
+   * every step is idempotent and the next run finishes the work.
    */
   memory_maintenance: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     const raw = taskCtx.db.raw;
     const counts: Record<string, number | string> = {};
     const step = (name: string, fn: () => number): void => {
+      throwIfCancelled();
       try {
         counts[name] = fn();
       } catch (error) {
@@ -984,6 +1016,7 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     step("spend_records", () => pruneSpendRecords(raw, spendCutoff));
     step("inference_costs", () => inferencePruneCosts(raw, MEMORY_RETENTION.inferenceCostDays));
 
+    throwIfCancelled();
     try {
       taskCtx.db.setKV("last_memory_maintenance", JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -1018,20 +1051,24 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
       return { shouldWake: false };
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error("dead_agent_cleanup failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
   },
 };
 
-/** The heartbeat tasks, each run with its own Treasury origin. */
+/** The heartbeat tasks, each run with its own Treasury origin; none starts once cancelled. */
 export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = withTreasuryOrigins(TASKS);
 
 function withTreasuryOrigins(tasks: Record<string, HeartbeatTaskFn>): Record<string, HeartbeatTaskFn> {
   const wrapped: Record<string, HeartbeatTaskFn> = {};
   for (const [name, fn] of Object.entries(tasks)) {
     wrapped[name] = (ctx, taskCtx) =>
-      runWithTreasuryOrigin({ type: "auto", name: `heartbeat.${name}` }, () => fn(ctx, taskCtx));
+      runWithTreasuryOrigin({ type: "auto", name: `heartbeat.${name}` }, async () => {
+        throwIfCancelled();
+        return fn(ctx, taskCtx);
+      });
   }
   return wrapped;
 }

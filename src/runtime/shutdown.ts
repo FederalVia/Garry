@@ -156,6 +156,8 @@ export interface ShutdownSteps {
   drainHeartbeat(ms: number): Promise<unknown>;
   /** Aborts the in-process workers and waits for them to settle. */
   drainWorkers(ms: number): Promise<unknown>;
+  /** Closes the MCP servers (rejects their calls, stops their processes). */
+  closeMcp?(ms: number): Promise<unknown>;
   /** Leaves the agent state as a stopped runtime should. */
   leaveState(): void;
   releaseLock(): void;
@@ -186,6 +188,13 @@ export async function finishShutdown(steps: ShutdownSteps): Promise<void> {
     Promise.resolve().then(() => steps.drainWorkers(steps.remainingMs())),
     steps.remainingMs(),
   );
+  if (steps.closeMcp) {
+    const closeMcp = steps.closeMcp;
+    await withDeadline(
+      Promise.resolve().then(() => closeMcp(steps.remainingMs())),
+      steps.remainingMs(),
+    );
+  }
   attempt("Saving the agent state", () => steps.leaveState());
   attempt("Releasing the instance lock", () => steps.releaseLock());
   attempt("Closing the database", () => steps.closeDb());

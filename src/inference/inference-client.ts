@@ -3,6 +3,7 @@ import { ulid } from "ulid";
 import type { ChatMessage } from "../types.js";
 import { redactChatMessages } from "../security/secret-redaction.js";
 import { createLogger } from "../observability/logger.js";
+import { currentCancellationSignal, mergeSignals } from "../runtime/cancellation.js";
 import {
   currentInferenceScope,
   getInstalledInferenceGate,
@@ -274,6 +275,11 @@ export class UnifiedInferenceClient {
     params: SharedChatParams,
     ctx: CallContext,
   ): Promise<UnifiedInferenceResult> {
+    // A heartbeat task's cancellation aborts the call like the caller's own
+    // signal. It must replace params.signal, so an abort is classified as the
+    // caller's (no failover, unknown once sent), not as a provider fault.
+    const merged = mergeSignals(params.signal, currentCancellationSignal());
+    if (merged !== params.signal) params = { ...params, signal: merged };
     if (params.signal?.aborted) {
       throw abortError("Inference call aborted before it was sent");
     }

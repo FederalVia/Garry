@@ -28,6 +28,13 @@ export interface FeatureSet {
    * configured provider can serve the planner and workers.
    */
   orchestration: boolean;
+  /**
+   * MCP tools and install_mcp_server. On in both modes: servers are
+   * operator-configured, and a local stdio server needs no Conway. Whether
+   * any MCP tool appears is decided by the MCP manager (config, approval,
+   * connection), not here.
+   */
+  mcp: boolean;
 }
 
 /** Conway mode: nothing is hidden. */
@@ -42,6 +49,7 @@ export const ALL_FEATURES: Readonly<FeatureSet> = Object.freeze({
   payments: true,
   onchainIdentity: true,
   orchestration: true,
+  mcp: true,
 });
 
 /** Standalone mode: only the relay and payments can be switched on. */
@@ -57,6 +65,7 @@ export function standaloneFeatures(opts: { relay: boolean; payments: boolean; or
     payments: opts.payments,
     onchainIdentity: opts.payments,
     orchestration: opts.orchestration ?? true,
+    mcp: true,
   };
 }
 
@@ -97,7 +106,13 @@ export const TOOL_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[
   get_plan: ["orchestration"],
   complete_task: ["orchestration"],
   orchestrator_status: ["orchestration"],
+  install_mcp_server: ["mcp"],
 });
+
+/** Prefix of MCP tool names (mcp__<server>__<tool>); same as MCP_TOOL_PREFIX in mcp/tools. */
+export const MCP_TOOL_NAME_PREFIX = "mcp__";
+/** What every MCP tool needs; their names are dynamic, so they are not in TOOL_FEATURES. */
+export const MCP_TOOL_FEATURES: readonly (keyof FeatureSet)[] = Object.freeze(["mcp"]);
 
 /** Every feature a heartbeat task function needs, keyed on the resolved function name. */
 export const TASK_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[]>> = Object.freeze({
@@ -115,16 +130,21 @@ function allowed(needs: readonly (keyof FeatureSet)[] | undefined, f: FeatureSet
   return !needs || needs.every((k) => f[k]);
 }
 
+function toolNeeds(name: string): readonly (keyof FeatureSet)[] | undefined {
+  if (Object.prototype.hasOwnProperty.call(TOOL_FEATURES, name)) return TOOL_FEATURES[name];
+  return name.startsWith(MCP_TOOL_NAME_PREFIX) ? MCP_TOOL_FEATURES : undefined;
+}
+
 /**
  * The tools this runtime offers. Applies to installed tools too, so an
  * installed tool cannot bring back a hidden built-in name.
  */
 export function visibleTools<T extends { name: string }>(tools: T[], f: FeatureSet): T[] {
-  return tools.filter((t) => allowed(TOOL_FEATURES[t.name], f));
+  return tools.filter((t) => allowed(toolNeeds(t.name), f));
 }
 
 export function toolAllowed(name: string, f: FeatureSet): boolean {
-  return allowed(TOOL_FEATURES[name], f);
+  return allowed(toolNeeds(name), f);
 }
 
 export function taskAllowed(taskFnName: string, f: FeatureSet): boolean {

@@ -49,7 +49,7 @@ export interface HeartbeatDaemon {
   stop(): void;
   isRunning(): boolean;
   forceRun(taskName: string): Promise<void>;
-  /** Wait for the current tick and any still-running task, at most timeoutMs. */
+  /** Wait for the current tick and any still-running (aborted) task, at most timeoutMs. */
   drain(timeoutMs: number): Promise<void>;
 }
 
@@ -135,7 +135,8 @@ export function createHeartbeatDaemon(
       clearTimeout(timeoutId);
       timeoutId = null;
     }
-    // A tick in progress finishes its current task and starts no other.
+    // Aborts every running task (a shutdown outcome is recorded when it
+    // settles); a tick in progress starts no other task.
     scheduler.stop();
     logger.info("Daemon stopped.");
   };

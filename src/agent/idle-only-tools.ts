@@ -47,5 +47,6 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 export function isMutatingTool(name: string): boolean {
-  return MUTATING_TOOLS.has(name);
+  // MCP tools can do anything their server does; treat every call as work.
+  return MUTATING_TOOLS.has(name) || (typeof name === "string" && name.startsWith("mcp__"));
 }

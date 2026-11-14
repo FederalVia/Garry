@@ -61,6 +61,8 @@ import {
   MIGRATION_V16_RETIRE_BLOCKED,
   MIGRATION_V17,
   REGISTRY_CHAIN_KEY_REBUILD,
+  MIGRATION_V18_POLICY_DECISIONS,
+  MIGRATION_V18_MCP_CALLS,
   CHILDREN_ADDRESS_INDEX,
 } from "./schema.js";
 import { STATIC_MODEL_BASELINE } from "../inference/types.js";
@@ -721,6 +723,12 @@ function applyMigrations(db: DatabaseType): void {
       // TEXT trust/priority values the memory tools used to store.
       apply: () => { db.exec(MIGRATION_V17); },
     },
+    {
+      version: 18,
+      // Rebuilds policy_decisions so decisions on third_party tools (MCP) are
+      // logged, and adds the MCP call log.
+      apply: () => { migratePolicyRiskLevels(db); },
+    },
   ];
 
   for (const m of migrations) {
@@ -782,6 +790,21 @@ export function migrateInboxVerification(db: DatabaseType): void {
   }
   db.exec(MIGRATION_V16);
   if (have.has("status")) db.exec(MIGRATION_V16_RETIRE_BLOCKED);
+}
+
+/**
+ * Version 18: policy_decisions.risk_level accepts 'third_party' (a CHECK
+ * cannot be altered, so the table is rebuilt with its rows and indexes), and
+ * mcp_calls exists. Does nothing to a table whose CHECK already has it.
+ */
+export function migratePolicyRiskLevels(db: DatabaseType): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'policy_decisions'")
+    .get() as { sql: string } | undefined;
+  if (row && !row.sql.includes("third_party")) {
+    db.exec(MIGRATION_V18_POLICY_DECISIONS);
+  }
+  db.exec(MIGRATION_V18_MCP_CALLS);
 }
 
 /**

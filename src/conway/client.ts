@@ -32,6 +32,18 @@ import type { Address, PrivateKeyAccount } from "viem";
 import { randomUUID } from "crypto";
 import type { ChainType, ChainIdentity } from "../identity/chain.js";
 import { childProcessEnv } from "../security/child-env.js";
+import { createLogger } from "../observability/logger.js";
+import {
+  abortReason,
+  abortableDelay,
+  currentCancellationSignal,
+  isAbortError,
+  rethrowIfCancelled,
+  runShieldedFromTimeout,
+  throwIfCancelled,
+} from "../runtime/cancellation.js";
+
+const logger = createLogger("conway.client");
 
 /** Default command timeout when the caller gives none. */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
@@ -84,16 +96,22 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
  * HOME as cwd. On timeout the whole group is killed (SIGTERM, then SIGKILL
  * after 2 s) and the result has exit code 124. Background jobs (`cmd &`)
  * keep running after the shell exits; their output is discarded.
+ *
+ * signal (default: the ambient cancellation signal) kills the group the
+ * same way and then rejects with the signal's reason: an aborted command is
+ * not an ordinary failure.
  */
 export function execLocalCommand(
   command: string,
   timeoutMs?: number,
-  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
 ): Promise<ExecResult> {
   const timeout = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_EXEC_TIMEOUT_MS;
+  const signal = opts.signal ?? currentCancellationSignal();
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
   installExecExitHook();
 
-  return new Promise<ExecResult>((resolve) => {
+  return new Promise<ExecResult>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn("/bin/sh", ["-c", command], {
@@ -115,6 +133,7 @@ export function execLocalCommand(
     let collecting = true;
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let overflow = false;
     let shellExited = false;
     let exitCode: number | null = null;
@@ -145,8 +164,13 @@ export function execLocalCommand(
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       if (closeTimer) clearTimeout(closeTimer);
+      signal?.removeEventListener("abort", onAbort);
       if (pid !== undefined) activeExecGroups.delete(pid);
       detachPipes();
+      if (aborted && signal) {
+        reject(abortReason(signal));
+        return;
+      }
       const stdout = Buffer.concat(out).toString("utf8");
       let stderr = Buffer.concat(errOut).toString("utf8");
       if (overflow) {
@@ -171,9 +195,10 @@ export function execLocalCommand(
       resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
     };
 
-    const stopGroup = (reason: "timeout" | "overflow") => {
+    const stopGroup = (reason: "timeout" | "overflow" | "abort") => {
       if (settled) return;
       if (reason === "timeout") timedOut = true;
+      else if (reason === "abort") aborted = true;
       else overflow = true;
       collecting = false;
       if (pid === undefined) {
@@ -202,6 +227,10 @@ export function execLocalCommand(
     child.stderr?.on("data", collect(errOut, "err"));
 
     const timer = setTimeout(() => stopGroup("timeout"), timeout);
+    function onAbort(): void {
+      stopGroup("abort");
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     child.on("error", (err) => {
       if (settled) return;
@@ -214,7 +243,7 @@ export function execLocalCommand(
       shellExited = true;
       exitCode = code;
       exitSignal = signal;
-      if (timedOut || overflow) {
+      if (timedOut || overflow || aborted) {
         // Finish as soon as the whole group is gone; else the kill timer does.
         if (pid === undefined || !groupAlive(pid)) finish();
         return;
@@ -224,7 +253,7 @@ export function execLocalCommand(
     });
 
     child.on("close", () => {
-      if (shellExited && !timedOut && !overflow) finish();
+      if (shellExited && !timedOut && !overflow && !aborted) finish();
     });
   });
 }
@@ -274,7 +303,7 @@ export function createCreditBalanceReader(options: {
       });
       if (resp.status !== 404 || attempt >= max404Retries) break;
       await resp.body?.cancel().catch(() => {});
-      await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+      await abortableDelay(delayMs * (attempt + 1), currentCancellationSignal());
     }
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
@@ -349,37 +378,45 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
     // that did the work would otherwise repeat it.
     const resendable = IDEMPOTENT_METHODS.has(method.toUpperCase()) || !!requestOptions?.idempotencyKey;
     const max404Retries = resendable ? (requestOptions?.retries404 ?? 3) : 0;
+    // An abort before onSend leaves the reservation unsent, so the treasury
+    // releases it instead of holding an unknown outcome.
+    throwIfCancelled();
     requestOptions?.onSend?.();
-    for (let attempt = 0; attempt <= max404Retries; attempt++) {
-      const resp = await httpClient.request(`${apiUrl}${path}`, {
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: apiKey,
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        idempotencyKey: requestOptions?.idempotencyKey,
-        retries: requestOptions?.retries,
-        ...(requestOptions?.timeout !== undefined ? { timeout: requestOptions.timeout } : {}),
-        ...(requestOptions?.redirect ? { redirect: requestOptions.redirect } : {}),
-      });
+    const send = async (): Promise<any> => {
+      for (let attempt = 0; attempt <= max404Retries; attempt++) {
+        const resp = await httpClient.request(`${apiUrl}${path}`, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: apiKey,
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          idempotencyKey: requestOptions?.idempotencyKey,
+          retries: requestOptions?.retries,
+          ...(requestOptions?.timeout !== undefined ? { timeout: requestOptions.timeout } : {}),
+          ...(requestOptions?.redirect ? { redirect: requestOptions.redirect } : {}),
+        });
 
-      if (resp.status === 404 && attempt < max404Retries) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
+        if (resp.status === 404 && attempt < max404Retries) {
+          await abortableDelay(1000 * (attempt + 1), currentCancellationSignal());
+          continue;
+        }
+
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw httpError(method, path, resp.status, text);
+        }
+
+        return resp.headers.get("content-type")?.includes("application/json")
+          ? resp.json()
+          : resp.text();
       }
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw httpError(method, path, resp.status, text);
-      }
-
-      return resp.headers.get("content-type")?.includes("application/json")
-        ? resp.json()
-        : resp.text();
-    }
-
-    throw new Error("Unreachable");
+      throw new Error("Unreachable");
+    };
+    // A paid request already marked sent obeys shutdown only: a task timeout
+    // would just turn its outcome into 'unknown'.
+    return requestOptions?.onSend ? runShieldedFromTimeout(send) : send();
   }
 
   const canonicalizePayload = (payload: Record<string, string>): string => {
@@ -432,6 +469,10 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
         exitCode: result.exit_code ?? result.exitCode ?? -1,
       };
     } catch (err: any) {
+      if (isAbortError(err) && currentCancellationSignal()?.aborted) {
+        // No cancel API: the command may still be running remotely.
+        logger.info(`Remote exec aborted with its heartbeat task; the command may still run in sandbox ${sandboxId}`);
+      }
       // SECURITY: Never silently fall back to local execution on auth failure.
       // A 403 indicates a credentials mismatch — falling back to local exec
       // would bypass the sandbox security boundary entirely.
@@ -637,45 +678,50 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
     const paths = ["/v1/credits/transfer", "/v1/credits/transfers"];
 
     let last404: { path: string; text: string } | undefined;
+    // Before markSent: an abort here releases the reservation.
+    throwIfCancelled();
     opts?.onSend?.();
 
-    for (const path of paths) {
-      const resp = await httpClient.request(`${apiUrl}${path}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: apiKey,
-        },
-        body: JSON.stringify(payload),
-        idempotencyKey,
-        retries: 0, // Mutating: do not auto-retry transfers
-        // A redirect is not followed: it would re-send the transfer elsewhere,
-        // and a failure on the second hop would look like nothing was sent.
-        redirect: "manual",
-      });
+    // Sent: only shutdown aborts it from here (see request()).
+    return runShieldedFromTimeout(async () => {
+      for (const path of paths) {
+        const resp = await httpClient.request(`${apiUrl}${path}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: apiKey,
+          },
+          body: JSON.stringify(payload),
+          idempotencyKey,
+          retries: 0, // Mutating: do not auto-retry transfers
+          // A redirect is not followed: it would re-send the transfer elsewhere,
+          // and a failure on the second hop would look like nothing was sent.
+          redirect: "manual",
+        });
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        // Try next known endpoint shape before failing.
-        if (resp.status === 404) {
-          last404 = { path, text };
-          continue;
+        if (!resp.ok) {
+          const text = await resp.text();
+          // Try next known endpoint shape before failing.
+          if (resp.status === 404) {
+            last404 = { path, text };
+            continue;
+          }
+          throw httpError("POST", path, resp.status, text);
         }
-        throw httpError("POST", path, resp.status, text);
+
+        const data = await resp.json().catch(() => ({}) as any);
+        return {
+          transferId: data.transfer_id || data.id || "",
+          status: data.status || "submitted",
+          toAddress: data.to_address || toAddress,
+          amountCents: data.amount_cents ?? amountCents,
+          balanceAfterCents:
+            data.balance_after_cents ?? data.new_balance_cents ?? undefined,
+        };
       }
 
-      const data = await resp.json().catch(() => ({}) as any);
-      return {
-        transferId: data.transfer_id || data.id || "",
-        status: data.status || "submitted",
-        toAddress: data.to_address || toAddress,
-        amountCents: data.amount_cents ?? amountCents,
-        balanceAfterCents:
-          data.balance_after_cents ?? data.new_balance_cents ?? undefined,
-      };
-    }
-
-    throw httpError("POST", "/v1/credits/transfer", 404, last404?.text ?? "Unknown transfer error");
+      throw httpError("POST", "/v1/credits/transfer", 404, last404?.text ?? "Unknown transfer error");
+    });
   };
 
   const registerAutomaton = async (params: {
@@ -889,7 +935,9 @@ function createRawConwayClient(options: ConwayClientOptions): ConwayClient {
                 0,
             },
           }));
-      } catch {
+      } catch (err) {
+        // An abort is not a missing endpoint: do not fall through to an empty list.
+        rethrowIfCancelled(err);
         continue;
       }
     }

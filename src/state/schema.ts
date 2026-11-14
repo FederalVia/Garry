@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -971,4 +971,45 @@ export const MIGRATION_V17 = `
   UPDATE relationship_memory SET trust_score = MAX(0.0, MIN(1.0, trust_score)) WHERE trust_score < 0 OR trust_score > 1;
   UPDATE working_memory SET priority = 0.5 WHERE typeof(priority) NOT IN ('real', 'integer');
   UPDATE working_memory SET priority = MAX(0.0, MIN(1.0, priority)) WHERE priority < 0 OR priority > 1;
+`;
+
+// === Third-party risk level and MCP call log ===
+// Applied by the version 18 entry of applyMigrations (database.ts). MIGRATION_V4
+// stays as it was; fresh databases run V4 and then this rebuild. The rebuild is
+// skipped when the CHECK already lists third_party, so it is safe to renumber.
+
+export const MIGRATION_V18_POLICY_DECISIONS = `
+  CREATE TABLE policy_decisions_v18 (
+    id TEXT PRIMARY KEY,
+    turn_id TEXT,
+    tool_name TEXT NOT NULL,
+    tool_args_hash TEXT NOT NULL,
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('safe','caution','dangerous','forbidden','third_party')),
+    decision TEXT NOT NULL CHECK(decision IN ('allow','deny','quarantine')),
+    rules_evaluated TEXT NOT NULL DEFAULT '[]',
+    rules_triggered TEXT NOT NULL DEFAULT '[]',
+    reason TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  INSERT INTO policy_decisions_v18
+    (id, turn_id, tool_name, tool_args_hash, risk_level, decision, rules_evaluated, rules_triggered, reason, latency_ms, created_at)
+    SELECT id, turn_id, tool_name, tool_args_hash, risk_level, decision, rules_evaluated, rules_triggered, reason, latency_ms, created_at
+      FROM policy_decisions;
+  DROP TABLE policy_decisions;
+  ALTER TABLE policy_decisions_v18 RENAME TO policy_decisions;
+  CREATE INDEX IF NOT EXISTS idx_policy_decisions_turn ON policy_decisions(turn_id);
+  CREATE INDEX IF NOT EXISTS idx_policy_decisions_tool ON policy_decisions(tool_name);
+  CREATE INDEX IF NOT EXISTS idx_policy_decisions_decision ON policy_decisions(decision);
+`;
+
+// One row per MCP tools/call actually sent, for the per-server hourly cap.
+export const MIGRATION_V18_MCP_CALLS = `
+  CREATE TABLE IF NOT EXISTS mcp_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_mcp_calls_server_sent ON mcp_calls(server, sent_at);
 `;
