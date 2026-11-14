@@ -20,6 +20,13 @@ import { base, baseSepolia } from "viem/chains";
 import { ResilientHttpClient } from "./http-client.js";
 import type { ChainType } from "../identity/chain.js";
 import { createLogger } from "../observability/logger.js";
+import {
+  currentCancellationSignal,
+  raceWithSignal,
+  rethrowIfCancelled,
+  runShieldedFromTimeout,
+  throwIfCancelled,
+} from "../runtime/cancellation.js";
 import { BalanceUnavailableError } from "./balance.js";
 import {
   TreasuryDeniedError,
@@ -389,12 +396,16 @@ export async function getUsdcBalanceDetailed(
       transport: http(rpcUrl, { timeout: 10_000 }),
     });
 
-    const balance = await client.readContract({
-      address: usdcAddress,
-      abi: BALANCE_OF_ABI,
-      functionName: "balanceOf",
-      args: [address],
-    });
+    // Read-only: an abort stops the wait; the RPC timeout bounds the read.
+    const balance = await raceWithSignal(
+      client.readContract({
+        address: usdcAddress,
+        abi: BALANCE_OF_ABI,
+        functionName: "balanceOf",
+        args: [address],
+      }),
+      currentCancellationSignal(),
+    );
 
     // USDC has 6 decimals
     return {
@@ -403,6 +414,8 @@ export async function getUsdcBalanceDetailed(
       ok: true,
     };
   } catch (err: any) {
+    // An aborted read is not a failed one.
+    rethrowIfCancelled(err);
     return {
       balance: 0,
       network,
@@ -504,6 +517,8 @@ export async function x402Fetch(
   }
 
   const httpClient = payment.purpose === "topup" ? topupHttpClient : x402HttpClient;
+  // An aborted heartbeat task pays nothing; the probe carries the signal too.
+  throwIfCancelled();
 
   // Probe (non-mutating for GET, uses the resilient client). The body is
   // read exactly once, so a non-JSON answer is returned as text. Redirects
@@ -520,6 +535,7 @@ export async function x402Fetch(
     });
     initialBody = await readBody(initialResp, { timeoutMs: X402_BODY_TIMEOUT_MS });
   } catch (err: any) {
+    rethrowIfCancelled(err);
     return { success: false, error: err?.message || String(err), settlement: "none" };
   }
 
@@ -671,6 +687,18 @@ export async function x402Fetch(
     };
   }
 
+  // Last point where nothing has left: an abort releases the reservation.
+  const cancel = currentCancellationSignal();
+  if (cancel?.aborted) {
+    treasury.settle(reservation, { outcome: "released", reason: "not sent: aborted" });
+    return {
+      success: false,
+      error: "Payment not sent: the task was cancelled",
+      reservationId: reservation.id,
+      settlement: "released",
+    };
+  }
+
   try {
     treasury.markSent(reservation);
   } catch (err) {
@@ -685,19 +713,23 @@ export async function x402Fetch(
 
   let paidResp: Response;
   try {
-    paidResp = await httpClient.request(url, {
-      method,
-      headers: {
-        ...headers,
-        "Content-Type": "application/json",
-        "X-Payment": paymentHeader,
-      },
-      body,
-      retries: 0, // Paid request: do not auto-retry (payment already signed)
-      // Never forward X-Payment to another URL. With redirects off, a refused
-      // connection can only come from this first hop, before anything arrived.
-      redirect: "manual",
-    });
+    // Sent: a task timeout would only make the outcome unknown, so only
+    // shutdown aborts it; its own HTTP deadline still bounds it.
+    paidResp = await runShieldedFromTimeout(() =>
+      httpClient.request(url, {
+        method,
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+          "X-Payment": paymentHeader,
+        },
+        body,
+        retries: 0, // Paid request: do not auto-retry (payment already signed)
+        // Never forward X-Payment to another URL. With redirects off, a refused
+        // connection can only come from this first hop, before anything arrived.
+        redirect: "manual",
+      }),
+    );
   } catch (err) {
     // Released only when nothing can have reached the server.
     const outcome = classifySendError(err, { sent: true });

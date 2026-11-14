@@ -21,6 +21,7 @@ import { DEFAULT_CHILD_HEALTH_CONFIG } from "../types.js";
 import type { ChildLifecycle } from "./lifecycle.js";
 import { latestLifecycleEventMs } from "./child-status.js";
 import { isLocalSandboxId } from "../conway/client.js";
+import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 
 export { DEFAULT_CHILD_HEALTH_CONFIG };
 
@@ -46,7 +47,8 @@ export class ChildHealthMonitor {
   }
 
   /**
-   * Check health of a single child. Never throws.
+   * Check health of a single child. Never throws, except when the
+   * heartbeat task it runs in is cancelled: an aborted probe learned nothing.
    */
   async checkHealth(childId: string): Promise<HealthCheckResult> {
     const issues: string[] = [];
@@ -94,6 +96,8 @@ export class ChildHealthMonitor {
         }
       }
     } catch (error) {
+      // An aborted probe is not a failed one: no gone-check, no last_checked.
+      rethrowIfCancelled(error);
       issues.push(`health check error: ${error instanceof Error ? error.message : String(error)}`);
       // The exec failed. Only a sandbox the API says is gone or not running
       // proves the process is gone; anything else is unknown.
@@ -132,6 +136,8 @@ export class ChildHealthMonitor {
       const batchResults = await Promise.all(
         batch.map((child) => this.checkHealth(child.id)),
       );
+      // A cancelled task applies no probe result (none would be trusted).
+      throwIfCancelled();
 
       for (const result of batchResults) {
         const child = allChildren.find((c) => c.id === result.childId);
@@ -210,7 +216,8 @@ export async function sandboxConfirmedGone(conway: ConwayClient, sandboxId: stri
     const match = sandboxes.find((s) => s.id === sandboxId);
     if (!match) return true;
     return match.status !== "running" && match.status !== "unknown";
-  } catch {
+  } catch (error) {
+    rethrowIfCancelled(error);
     return false;
   }
 }
@@ -234,7 +241,8 @@ export async function sandboxGoneAfterExecError(
     const sandboxes = await conway.listSandboxes();
     const match = sandboxes.find((s) => s.id === sandboxId);
     return !match || (match.status !== "running" && match.status !== "unknown");
-  } catch {
+  } catch (err) {
+    rethrowIfCancelled(err);
     return false;
   }
 }
@@ -271,6 +279,8 @@ export async function killChildProcess(
     if (last === "alive") return { outcome: "alive", detail: "process still running after TERM and KILL" };
     return { outcome: "unknown", detail: `unexpected reply: ${last.slice(0, 120) || "(empty)"}` };
   } catch (error) {
+    // Cancelled: nothing was verified, and the caller must stop, not record it.
+    rethrowIfCancelled(error);
     const message = error instanceof Error ? error.message : String(error);
     if (await sandboxGoneAfterExecError(conway, sandboxId, error)) {
       return { outcome: "stopped", detail: `sandbox ${sandboxId} is not running (${message})` };

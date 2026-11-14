@@ -86,6 +86,7 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool, isMutatingTool } from "./idle-only-tools.js";
+import { loadMcpTools } from "../mcp/manager.js";
 import {
   INBOX_ALLOWED_TOOLS,
   INBOX_HISTORY_LIMIT,
@@ -218,6 +219,8 @@ export interface AgentLoopOptions {
    * true the loop saves what ran and returns without changing the state.
    */
   shouldStop?: () => boolean;
+  /** Aborted when a runtime shutdown starts: in-flight MCP calls are rejected at once. */
+  shutdownSignal?: AbortSignal;
   /** Wake events the runtime consumed while sleeping; shown as wake reasons. */
   wakeEvents?: WakeEventRow[];
 }
@@ -300,9 +303,30 @@ export async function runAgentLoop(
   // Standalone gets descriptions that do not promise Conway services.
   const builtinTools = createBuiltinTools(identity.sandboxId, { standalone: runtime.mode === "standalone" });
   const installedTools = loadInstalledTools(db);
-  // Tools that cannot work in this mode are not offered. This one list feeds
-  // the model, the inbox tools, the worker catalog and the tool context.
-  const tools = visibleTools([...builtinTools, ...installedTools], features);
+  // Tools that cannot work in this mode are not offered. baseTools is the
+  // worker catalog; with the MCP tools it is the model's list, the inbox
+  // tools' source and the tool context.
+  const baseTools = visibleTools([...builtinTools, ...installedTools], features);
+  // MCP tools: only for this loop's own turns, never inbox turns (inboxTools
+  // filters by name), local workers (they get baseTools) or children.
+  let mcpTools: AutomatonTool[] = [];
+  if (features.mcp) {
+    try {
+      mcpTools = await loadMcpTools({
+        db,
+        identity,
+        // The provider limit applies to what is sent, so count the visible list.
+        otherToolCount: baseTools.length,
+        reservedNames: new Set([...builtinTools, ...installedTools].map((t) => t.name)),
+        shouldStop,
+        shutdownSignal: options.shutdownSignal,
+      });
+    } catch (err) {
+      logger.warn(`MCP servers could not be loaded: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (shouldStop()) return;
+  }
+  const tools = [...baseTools, ...visibleTools(mcpTools, features)];
   const toolNames = new Set(tools.map((t) => t.name));
   const inboxTools = tools.filter((t) => INBOX_ALLOWED_TOOLS.includes(t.name));
   const sessionSpend = spendTracker ?? NOOP_SPEND_TRACKER;
@@ -441,7 +465,7 @@ export async function runAgentLoop(
           harnessRegistry,
           identity,
           config,
-          tools,
+          tools: baseTools,
           toolContext,
           policyEngine,
           spendTracker,

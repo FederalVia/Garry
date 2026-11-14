@@ -59,39 +59,9 @@ export async function installNpmPackage(
   return { success: true };
 }
 
-/**
- * Install an MCP server.
- * The automaton can add new capabilities by installing MCP servers.
- */
-export async function installMcpServer(
-  conway: ConwayClient,
-  db: AutomatonDatabase,
-  name: string,
-  command: string,
-  args?: string[],
-  env?: Record<string, string>,
-): Promise<{ success: boolean; error?: string }> {
-  // Record in database
-  const tool: InstalledTool = {
-    id: ulid(),
-    name: `mcp:${name}`,
-    type: "mcp",
-    config: { command, args, env },
-    installedAt: new Date().toISOString(),
-    enabled: true,
-  };
-
-  db.installTool(tool);
-
-  logModification(
-    db,
-    "mcp_install",
-    `Installed MCP server: ${name} (${command})`,
-    { reversible: true },
-  );
-
-  return { success: true };
-}
+// MCP servers are installed with the install_mcp_server tool (agent rows that
+// start only after operator approval) or configured by the operator in
+// mcp-servers.json; see src/mcp.
 
 /**
  * List all installed tools.

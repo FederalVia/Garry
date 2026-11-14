@@ -5,7 +5,7 @@
  * routing matrix, message transformation, schema migration.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
 import type BetterSqlite3 from "better-sqlite3";
 import { MIGRATION_V6 } from "../state/schema.js";
@@ -27,6 +27,7 @@ import { InferenceRouter } from "../inference/router.js";
 import { InferenceGate } from "../inference/gate.js";
 import { resolveInferencePolicy } from "../inference/policy.js";
 import { InferenceCallError } from "../inference/errors.js";
+import { TaskAbortedError, currentCancellationSignal, runWithCancellation } from "../runtime/cancellation.js";
 import {
   STATIC_MODEL_BASELINE,
   DEFAULT_ROUTING_MATRIX,
@@ -414,6 +415,35 @@ describe("InferenceRouter", () => {
       expect(reservationId).toBeTruthy();
       expect(openDuringCall).toBe(true);
       expect(gate.isOpen(reservationId!)).toBe(false);
+    });
+
+    it("an ambient-only abort of a sent call: one unknown row, no failover", async () => {
+      // A heartbeat task's scope aborts; the request itself carries no signal.
+      const task = new AbortController();
+      const models: string[] = [];
+      const chat = async (_msgs: any[], opts: any) => {
+        models.push(opts.model);
+        // The HTTP client honours the router's signal and the ambient one.
+        const signals = [opts.signal as AbortSignal, currentCancellationSignal()].filter(Boolean) as AbortSignal[];
+        return await new Promise<never>((_, reject) => {
+          const fail = () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" }));
+          for (const sig of signals) {
+            if (sig.aborted) fail();
+            else sig.addEventListener("abort", fail, { once: true });
+          }
+        });
+      };
+      const call = runWithCancellation(task.signal, () =>
+        router.route(
+          { messages: [{ role: "user", content: "Hi" }], taskType: "agent_turn", tier: "normal", sessionId: "ambient" },
+          chat,
+        ),
+      ).catch((e) => e);
+      await vi.waitFor(() => expect(models).toHaveLength(1));
+      task.abort(new TaskAbortedError("timeout", "heartbeat task timed out"));
+      expect(await call).toBeInstanceOf(InferenceCallError);
+      expect(models).toEqual(["gpt-5.2"]);
+      expect(ledger().map((r) => [r.model, r.status])).toEqual([["gpt-5.2", "unknown"]]);
     });
 
     it("returns a NO_MODEL refusal for the dead tier when no local model exists", async () => {

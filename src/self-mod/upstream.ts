@@ -10,6 +10,7 @@
 import { execFile, execFileSync } from "child_process";
 import { createHash } from "crypto";
 import { promisify } from "util";
+import { execLocalCommand } from "../conway/client.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -80,6 +81,37 @@ export function checkUpstream(): {
 } {
   git(["fetch", "origin", "main", "--quiet"]);
   const log = git(["log", "HEAD..origin/main", "--oneline"]);
+  if (!log) return { behind: 0, commits: [] };
+  const commits = log.split("\n").map((line) => {
+    const [hash, ...rest] = line.split(" ");
+    return { hash, message: rest.join(" ") };
+  });
+  return { behind: commits.length, commits };
+}
+
+/** One constant git command for checkUpstreamAsync; a non-zero exit throws. */
+async function gitInGroup(command: string): Promise<string> {
+  // Its own process group, killed when the heartbeat task is cancelled. The
+  // full environment is kept, as execFileSync did: credential helpers may need it.
+  const result = await execLocalCommand(command, 15_000, { cwd: process.cwd(), env: process.env });
+  if (result.exitCode !== 0) {
+    const detail = stripCredentials(result.stderr.trim()).slice(0, 500);
+    throw new Error(`${command} failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`);
+  }
+  return result.stdout.trim();
+}
+
+/**
+ * checkUpstream without blocking the event loop (a slow fetch would stop
+ * every timer, the task timeout included) and cancellable with its task.
+ * getRepoInfo stays synchronous: its git calls are local and short.
+ */
+export async function checkUpstreamAsync(): Promise<{
+  behind: number;
+  commits: { hash: string; message: string }[];
+}> {
+  await gitInGroup("git fetch origin main --quiet");
+  const log = await gitInGroup("git log HEAD..origin/main --oneline");
   if (!log) return { behind: 0, commits: [] };
   const commits = log.split("\n").map((line) => {
     const [hash, ...rest] = line.split(" ");

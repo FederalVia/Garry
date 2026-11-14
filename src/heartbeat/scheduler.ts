@@ -34,6 +34,14 @@ import {
   releaseScheduleLease,
 } from "./schedule-store.js";
 import { createLogger } from "../observability/logger.js";
+import {
+  TaskAbortedError,
+  isAbortError,
+  linkedAbortController,
+  runWithCancellation,
+  type CancelReason,
+  type CancellationState,
+} from "../runtime/cancellation.js";
 
 type DatabaseType = BetterSqlite3.Database;
 const logger = createLogger("heartbeat.scheduler");
@@ -42,10 +50,16 @@ const DEFAULT_TASK_TIMEOUT_MS = 30_000;
 const LEASE_TTL_MS = 60_000;
 /**
  * A task still running this long after it started is given up on: its lease
- * is released and it may start again. Its late result is still handled.
+ * is released and it may start again. Only a task that ignores its abort
+ * gets this far.
  */
 const ABANDON_AFTER_MIN_MS = 10 * 60_000;
 const ABANDON_AFTER_TIMEOUTS = 10;
+/**
+ * How long an aborted task gets to settle before it is treated as one that
+ * ignores the abort: the exec kill grace (2 s) plus pipe close and margin.
+ */
+export const ABORT_SETTLE_GRACE_MS = 5_000;
 /** A last run this far in the future means the clock stepped back. */
 const CLOCK_SKEW_TOLERANCE_MS = 60_000;
 const HISTORY_ID_COUNTER = { value: 0 };
@@ -95,6 +109,35 @@ interface InFlightTask {
   settled: boolean;
   timedOut: boolean;
   abandoned: boolean;
+  /** Aborted on timeout, or by the scheduler's root on shutdown. */
+  controller: AbortController;
+  /** Detaches controller from the root once the run settles. */
+  unlink: () => void;
+  cancellation: CancellationState;
+}
+
+export interface DurableSchedulerOptions {
+  /** How long an aborted task gets to settle (default ABORT_SETTLE_GRACE_MS). */
+  abortSettleGraceMs?: number;
+}
+
+function cancelReasonOf(signal: AbortSignal): CancelReason | undefined {
+  if (!signal.aborted) return undefined;
+  return signal.reason instanceof TaskAbortedError ? signal.reason.why : "shutdown";
+}
+
+/** Resolves true when p settles within ms, false otherwise. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.then(
+      () => true,
+      () => true,
+    ),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), Math.max(0, ms));
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 export class DurableScheduler {
@@ -104,6 +147,9 @@ export class DurableScheduler {
   private readonly ownerId: string;
   private readonly inFlight = new Map<string, InFlightTask>();
   private readonly warnedMissing = new Set<string>();
+  /** Aborted by stop(): every running task and tick is linked to it. */
+  private root = new AbortController();
+  private readonly abortSettleGraceMs: number;
 
   constructor(
     private readonly db: DatabaseType,
@@ -111,8 +157,10 @@ export class DurableScheduler {
     private readonly tasks: Map<string, HeartbeatTaskFn>,
     private readonly legacyContext: HeartbeatLegacyContext,
     private readonly onWakeRequest?: (reason: string) => void,
+    options: DurableSchedulerOptions = {},
   ) {
     this.ownerId = `scheduler-${Date.now().toString(36)}`;
+    this.abortSettleGraceMs = options.abortSettleGraceMs ?? ABORT_SETTLE_GRACE_MS;
   }
 
   /**
@@ -132,42 +180,66 @@ export class DurableScheduler {
   }
 
   private async runTick(): Promise<void> {
+    const rootSignal = this.root.signal;
+    // One controller per tick, linked to the root and unlinked when the tick
+    // ends, so requests merge only with a short-lived signal.
+    const tick = linkedAbortController(rootSignal);
     try {
-      // Clear any expired leases first
-      clearExpiredScheduleLeases(this.db);
+      await runWithCancellation(
+        tick.controller.signal,
+        async () => {
+          // Clear any expired leases first
+          clearExpiredScheduleLeases(this.db);
 
-      // Build shared context (single API call for balance)
-      const context = await buildTickContext(
-        this.db,
-        this.legacyContext.conway,
-        this.config,
-        this.legacyContext.identity.address,
-        this.legacyContext.identity.chainType,
-        tickOptionsFor(this.legacyContext),
+          // Build shared context (single API call for balance)
+          const context = await buildTickContext(
+            this.db,
+            this.legacyContext.conway,
+            this.config,
+            this.legacyContext.identity.address,
+            this.legacyContext.identity.chainType,
+            tickOptionsFor(this.legacyContext),
+          );
+
+          // Get tasks that are due
+          const dueTasks = this.getDueTasks(context);
+
+          for (const task of dueTasks) {
+            if (this.stopped) break;
+            await this.executeTask(task.taskName, context);
+          }
+
+          // Periodic cleanup
+          pruneExpiredDedupKeys(this.db);
+        },
+        { shutdownSignal: rootSignal },
       );
-
-      // Get tasks that are due
-      const dueTasks = this.getDueTasks(context);
-
-      for (const task of dueTasks) {
-        if (this.stopped) break;
-        await this.executeTask(task.taskName, context);
-      }
-
-      // Periodic cleanup
-      pruneExpiredDedupKeys(this.db);
     } catch (err: any) {
-      logger.error("Tick failed", err instanceof Error ? err : undefined);
+      if (rootSignal.aborted && isAbortError(err)) {
+        logger.info("Tick cancelled: runtime shutdown");
+      } else {
+        logger.error("Tick failed", err instanceof Error ? err : undefined);
+      }
+    } finally {
+      tick.release();
     }
   }
 
-  /** No new task starts after this; a running task is not interrupted. */
+  /**
+   * No new task starts after this, and every running task is aborted
+   * (its exec groups killed, its HTTP requests destroyed). drain() waits for
+   * them to settle.
+   */
   stop(): void {
     this.stopped = true;
+    if (!this.root.signal.aborted) {
+      this.root.abort(new TaskAbortedError("shutdown", "cancelled: runtime shutdown"));
+    }
   }
 
   resume(): void {
     this.stopped = false;
+    if (this.root.signal.aborted) this.root = new AbortController();
   }
 
   /**
@@ -288,10 +360,12 @@ export class DurableScheduler {
   /**
    * Execute a single task with timeout and lease.
    *
-   * On timeout the timeout is recorded, but the task cannot be cancelled:
-   * the lease stays held and no second copy starts until it settles. Its
-   * late result is then handled (a wake is still delivered). A task that
-   * never settles is given up on after max(10 x timeout, 10 min).
+   * The task runs in a cancellation scope. On timeout the timeout is
+   * recorded, the retry scheduled, and the task aborted; once it settles
+   * (within the settle grace) its lease is released and this returns. Its
+   * late result writes nothing and delivers no wake. A task that ignores the
+   * abort keeps its lease until it settles or is given up on after
+   * max(10 x timeout, 10 min).
    */
   async executeTask(taskName: string, ctx: TickContext): Promise<void> {
     const entryName = taskName;
@@ -328,11 +402,16 @@ export class DurableScheduler {
       );
     }
 
+    // Nothing starts after shutdown began.
+    const rootSignal = this.root.signal;
+    if (rootSignal.aborted) return;
+
     // Acquire lease
     if (!this.acquireLease(entryName)) return;
 
     const startedAt = new Date().toISOString();
     const startMs = Date.now();
+    const link = linkedAbortController(rootSignal);
     const flight: InFlightTask = {
       done: Promise.resolve(),
       startedMs: startMs,
@@ -340,8 +419,15 @@ export class DurableScheduler {
       settled: false,
       timedOut: false,
       abandoned: false,
+      controller: link.controller,
+      unlink: link.release,
+      cancellation: { shielded: 0 },
     };
-    const run = Promise.resolve().then(() => taskFn(ctx, this.legacyContext));
+    const run = runWithCancellation(
+      link.controller.signal,
+      () => Promise.resolve().then(() => taskFn(ctx, this.legacyContext)),
+      { shutdownSignal: rootSignal, state: flight.cancellation },
+    );
     flight.done = run.then(
       (result) => this.onTaskSettled(entryName, resolvedTask, flight, startedAt, { ok: true, result }),
       (error) => this.onTaskSettled(entryName, resolvedTask, flight, startedAt, { ok: false, error }),
@@ -362,10 +448,30 @@ export class DurableScheduler {
           "timeout",
         );
         this.scheduleRetryIfAllowed(entryName, schedule);
-        // Keep the lease until the task settles (or is given up on).
-        extendScheduleLease(this.db, entryName, this.ownerId, Math.max(flight.abandonAt - Date.now(), LEASE_TTL_MS));
       } catch (err) {
         logger.error(`Recording timeout of '${entryName}' failed`, err instanceof Error ? err : undefined);
+      }
+
+      flight.controller.abort(new TaskAbortedError("timeout", `cancelled: timed out after ${timeoutMs} ms`));
+      // Settled in time: onTaskSettled released the lease, so the retry or
+      // the next due task can start.
+      if (await settlesWithin(flight.done, this.abortSettleGraceMs)) return;
+      if (flight.settled) return;
+
+      if (flight.cancellation.shielded > 0) {
+        logger.warn(
+          `Task '${entryName}' is finishing a paid request that was already sent; its lease is held until it settles`,
+        );
+      } else {
+        logger.error(
+          `Task '${entryName}' did not settle ${this.abortSettleGraceMs} ms after it was aborted; ` +
+            "its lease is held until it settles or is given up on",
+        );
+      }
+      try {
+        extendScheduleLease(this.db, entryName, this.ownerId, Math.max(flight.abandonAt - Date.now(), LEASE_TTL_MS));
+      } catch (err) {
+        logger.error(`Extending the lease of '${entryName}' failed`, err instanceof Error ? err : undefined);
       }
     }
   }
@@ -378,11 +484,23 @@ export class DurableScheduler {
     outcome: { ok: true; result: TaskResult } | { ok: false; error: unknown },
   ): void {
     flight.settled = true;
+    flight.unlink();
     if (this.inFlight.get(entryName) === flight) this.inFlight.delete(entryName);
     const late = flight.timedOut || flight.abandoned;
+    const cancelled = cancelReasonOf(flight.controller.signal);
     try {
       if (!late) {
-        if (outcome.ok) {
+        if (cancelled === "shutdown" && !outcome.ok && isAbortError(outcome.error)) {
+          // Cut short by shutdown: not a failure, no retry, due again after
+          // restart. A run that completed anyway is recorded as it ended.
+          this.recordCancelled(
+            entryName,
+            Date.now() - flight.startedMs,
+            startedAt,
+            `cancelled: runtime shutdown after ${Date.now() - flight.startedMs} ms`,
+            outcome.error,
+          );
+        } else if (outcome.ok) {
           this.recordSuccess(entryName, Date.now() - flight.startedMs, startedAt);
         } else {
           const err = outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
@@ -399,7 +517,15 @@ export class DurableScheduler {
 
       if (outcome.ok && outcome.result?.shouldWake) {
         const reason = outcome.result.message || `Heartbeat task '${entryName}' requested wake`;
-        this.deliverWake(reason, entryName, resolvedTask);
+        if (late || cancelled === "timeout") {
+          // An aborted run's result is not trusted to wake the agent.
+          logger.info(`Dropped wake from '${entryName}', which settled after it was aborted: ${reason}`);
+        } else if (cancelled === "shutdown") {
+          // Completed despite the shutdown: keep the wake row for the next start.
+          this.deliverWake(reason, entryName, resolvedTask, false);
+        } else {
+          this.deliverWake(reason, entryName, resolvedTask);
+        }
       }
     } catch (err) {
       logger.error(`Handling the result of '${entryName}' failed`, err instanceof Error ? err : undefined);
@@ -415,10 +541,11 @@ export class DurableScheduler {
   }
 
   /** The scheduler is the only writer of heartbeat wake events; the callback only notifies. */
-  private deliverWake(reason: string, entryName: string, resolvedTask: string): void {
+  private deliverWake(reason: string, entryName: string, resolvedTask: string, notify = true): void {
     const payload: Record<string, string> = { taskName: resolvedTask };
     if (entryName !== resolvedTask) payload.entryName = entryName;
     insertWakeEvent(this.db, "heartbeat", reason, payload);
+    if (!notify) return;
     try {
       this.onWakeRequest?.(reason);
     } catch (err) {
@@ -515,6 +642,33 @@ export class DurableScheduler {
   }
 
   /**
+   * Record a run cut short by shutdown: history 'skipped', no fail_count
+   * increment, no retry, and last_run_at unchanged so the task is due again
+   * after the restart.
+   */
+  recordCancelled(taskName: string, durationMs: number, startedAt: string, message: string, cause?: unknown): void {
+    const now = new Date().toISOString();
+    insertHeartbeatHistory(this.db, {
+      id: generateId(),
+      taskName,
+      startedAt,
+      completedAt: now,
+      result: "skipped",
+      durationMs,
+      error: message,
+      idempotencyKey: null,
+    });
+    updateHeartbeatSchedule(this.db, taskName, {
+      lastResult: "skipped",
+      lastError: message,
+    });
+    const detail = cause !== undefined && !isAbortError(cause)
+      ? ` (${cause instanceof Error ? cause.message : String(cause)})`
+      : "";
+    logger.info(`Task '${taskName}' ${message}${detail}`);
+  }
+
+  /**
    * Prune old history entries.
    */
   pruneHistory(retentionDays: number): number {
@@ -558,6 +712,8 @@ export class DurableScheduler {
     let count = 0;
     for (const row of rows) {
       if (row.result === "success") break;
+      // A run cut short by shutdown is neither a failure nor a success.
+      if (row.result === "skipped") continue;
       count++;
     }
     return count;

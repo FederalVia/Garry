@@ -1,8 +1,9 @@
 /**
  * Heartbeat runtime behaviour: seeding keeps run state, runtime schedule
  * changes reach the scheduler and survive restarts, aliases run, retries
- * and the low-compute multiplier work, timed-out tasks keep their lease and
- * deliver late wakes, and balance-driven tasks ignore unread balances.
+ * and the low-compute multiplier work, timed-out tasks are aborted and drop
+ * their late wakes (only a task that ignores the abort keeps its lease), and
+ * balance-driven tasks ignore unread balances.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +21,8 @@ vi.mock("../conway/topup.js", async (importOriginal) => {
 });
 
 import { createHeartbeatDaemon } from "../heartbeat/daemon.js";
-import { DurableScheduler } from "../heartbeat/scheduler.js";
+import { DurableScheduler, type DurableSchedulerOptions } from "../heartbeat/scheduler.js";
+import { abortableDelay, currentCancellationSignal } from "../runtime/cancellation.js";
 import { buildTickContext } from "../heartbeat/tick-context.js";
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import { acquireScheduleLease, clearExpiredScheduleLeases } from "../heartbeat/schedule-store.js";
@@ -114,8 +116,12 @@ function seedRow(name: string, overrides: Partial<HeartbeatScheduleRow> = {}): v
   });
 }
 
-function scheduler(tasks: Record<string, HeartbeatTaskFn>, onWake?: (r: string) => void) {
-  return new DurableScheduler(db.raw, hbConfig([]), new Map(Object.entries(tasks)), legacy(), onWake);
+function scheduler(
+  tasks: Record<string, HeartbeatTaskFn>,
+  onWake?: (r: string) => void,
+  options?: DurableSchedulerOptions,
+) {
+  return new DurableScheduler(db.raw, hbConfig([]), new Map(Object.entries(tasks)), legacy(), onWake, options);
 }
 
 function modifyHeartbeat(args: Record<string, unknown>): Promise<string> {
@@ -259,41 +265,47 @@ describe("low compute multiplier", () => {
 });
 
 describe("timeouts", () => {
-  it("holds the lease until the task settles and delivers its late wake once", async () => {
+  it("aborts on timeout, releases the lease when it settles, drops the late wake", async () => {
     seedRow("slow", { timeoutMs: 50 });
     let starts = 0;
+    let aborted = 0;
     const wakes: string[] = [];
     const sched = scheduler(
       {
         slow: async () => {
           starts++;
-          await new Promise((r) => setTimeout(r, 300));
+          try {
+            await abortableDelay(5_000, currentCancellationSignal());
+          } catch (err) {
+            aborted++;
+            throw err;
+          }
           return { shouldWake: true, message: "late result" };
         },
       },
       (r) => wakes.push(r),
     );
 
+    const t0 = Date.now();
     await sched.executeTask("slow", tick());
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(aborted).toBe(1);
     expect(row("slow")!.lastResult).toBe("timeout");
-    expect(row("slow")!.leaseOwner).not.toBeNull();
+    // Settled within the grace: the lease is free and a second run starts.
+    expect(row("slow")!.leaseOwner).toBeNull();
+    expect(sched.getInFlightTasks()).toEqual([]);
 
     await sched.executeTask("slow", tick());
-    expect(starts).toBe(1);
-
-    await new Promise((r) => setTimeout(r, 400));
-    expect(row("slow")!.leaseOwner).toBeNull();
-    const events = db.raw.prepare("SELECT reason, payload FROM wake_events").all() as { reason: string; payload: string }[];
-    expect(events).toHaveLength(1);
-    expect(events[0].reason).toBe("late result");
-    expect(JSON.parse(events[0].payload).taskName).toBe("slow");
-    expect(wakes).toEqual(["late result"]);
+    expect(starts).toBe(2);
+    expect(db.raw.prepare("SELECT COUNT(*) AS n FROM wake_events").get()).toEqual({ n: 0 });
+    expect(wakes).toEqual([]);
   });
 
   it("gives up on a task that never settles, so it can run again", async () => {
     seedRow("stuck", { timeoutMs: 50 });
     let starts = 0;
-    const sched = scheduler({ stuck: () => (starts++, new Promise(() => {})) });
+    // The task ignores its abort, so after the settle grace it keeps its lease.
+    const sched = scheduler({ stuck: () => (starts++, new Promise(() => {})) }, undefined, { abortSettleGraceMs: 30 });
     await sched.executeTask("stuck", tick());
     await sched.executeTask("stuck", tick());
     expect(starts).toBe(1);
@@ -307,7 +319,12 @@ describe("timeouts", () => {
   it("drain waits for a task past its timeout", async () => {
     seedRow("slow", { timeoutMs: 20 });
     let done = false;
-    const sched = scheduler({ slow: async () => { await new Promise((r) => setTimeout(r, 150)); done = true; return { shouldWake: false }; } });
+    // Ignores the abort and outlasts the settle grace.
+    const sched = scheduler(
+      { slow: async () => { await new Promise((r) => setTimeout(r, 150)); done = true; return { shouldWake: false }; } },
+      undefined,
+      { abortSettleGraceMs: 20 },
+    );
     await sched.executeTask("slow", tick());
     expect(done).toBe(false);
     await sched.drain(2_000);

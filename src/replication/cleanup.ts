@@ -11,6 +11,7 @@ import type { ChildLifecycle } from "./lifecycle.js";
 import { createLogger } from "../observability/logger.js";
 import { killChildProcess } from "./health.js";
 import { isEnded } from "./child-status.js";
+import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 const logger = createLogger("replication.cleanup");
 
 export class SandboxCleanup {
@@ -84,10 +85,12 @@ export class SandboxCleanup {
     let cleaned = 0;
 
     for (const child of [...stopped, ...failed]) {
+      throwIfCancelled();
       try {
         await this.cleanup(child.id);
         cleaned++;
       } catch (error) {
+        rethrowIfCancelled(error);
         logger.error(`Failed to clean up child ${child.id}`, error instanceof Error ? error : undefined);
       }
     }
@@ -110,10 +113,12 @@ export class SandboxCleanup {
 
     let cleaned = 0;
     for (const child of stale) {
+      throwIfCancelled();
       try {
         await this.cleanup(child.id);
         cleaned++;
       } catch (error) {
+        rethrowIfCancelled(error);
         logger.error(`Failed to clean up stale child ${child.id}`, error instanceof Error ? error : undefined);
       }
     }

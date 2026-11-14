@@ -9,6 +9,7 @@
 
 import type { HttpClientConfig } from "../types.js";
 import { DEFAULT_HTTP_CLIENT_CONFIG } from "../types.js";
+import { abortableDelay, currentCancellationSignal, mergeSignals } from "../runtime/cancellation.js";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
@@ -170,7 +171,9 @@ export class ResilientHttpClient {
     // caller vouches that the server deduplicates it.
     const mayRetry = IDEMPOTENT_METHODS.has(method) || retryUnsafe === true;
     const maxRetries = mayRetry ? Math.max(0, retries ?? this.config.maxRetries) : 0;
-    const callerSignal = init.signal ?? undefined;
+    // A heartbeat task's cancellation scope aborts the request like the
+    // caller's own signal; outside a scope this is just init.signal.
+    const callerSignal = mergeSignals(init.signal ?? undefined, currentCancellationSignal());
     const headers: Record<string, string> = { ...headerRecord(init.headers) };
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
 
@@ -192,7 +195,7 @@ export class ResilientHttpClient {
           this.recordFailure(circuit);
           if (attempt < maxRetries && !callerSignal?.aborted) {
             await response.body?.cancel().catch(() => {});
-            await this.backoff(attempt);
+            await this.backoff(attempt, callerSignal);
             continue;
           }
           return response;
@@ -208,7 +211,7 @@ export class ResilientHttpClient {
         if (callerSignal?.aborted) throw error;
         this.recordFailure(circuit);
         if (attempt >= maxRetries) throw error;
-        await this.backoff(attempt);
+        await this.backoff(attempt, callerSignal);
       }
     }
 
@@ -296,14 +299,14 @@ export class ResilientHttpClient {
     }
   }
 
-  private async backoff(attempt: number): Promise<void> {
+  private async backoff(attempt: number, signal?: AbortSignal): Promise<void> {
     const delay = Math.min(
       this.config.backoffBase *
         Math.pow(2, attempt) *
         (0.5 + Math.random()),
       this.config.backoffMax,
     );
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    await abortableDelay(delay, signal);
   }
 
   /** With a URL: is that origin's breaker open. Without: is any open. */

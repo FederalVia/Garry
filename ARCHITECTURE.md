@@ -158,7 +158,7 @@ The standalone system prompt says where the agent runs and what it can pay for, 
 
 **Single instance.** `src/state/instance-lock.ts` takes an exclusive SQLite lock (a kernel advisory lock) on `<dbPath>.lock` (mode 0600) before the database is opened, and records `{pid, startedAt, argv}` in it. A holder makes `--run` exit 1 naming its pid and the lock path. The OS drops the lock when the holder exits or is killed, so it cannot go stale and there is no takeover race; the file is never deleted. Startup recovery of stranded inbox claims relies on this: claims of a batch whose tools had started (KV `inbox.tools_started`) are marked processed, the rest are re-queued or failed by retry count.
 
-**Shutdown.** `src/runtime/shutdown.ts` gives the main loop a stop flag and interruptible sleeps. The first SIGTERM/SIGINT requests a stop and arms a forced exit after `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). The agent loop checks the flag at the top of each iteration, before claiming inbox messages, between tool calls of a main turn (the remaining calls are recorded as skipped and the turn is saved) and after saving. The in-flight tool or inference call is not cancelled, and an inbox turn always runs to the end. Then `heartbeat.stop()` (no new task starts), `heartbeat.drain()` (the running tick and any task past its timeout are awaited), `shutdownWorkerPools()` (workers aborted and awaited), state `sleeping` (a `dead` state is kept), lock released, database closed, exit 0. A second signal or the deadline does the last steps best-effort and exits 1.
+**Shutdown.** `src/runtime/shutdown.ts` gives the main loop a stop flag and interruptible sleeps. The first SIGTERM/SIGINT requests a stop and arms a forced exit after `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). The agent loop checks the flag at the top of each iteration, before claiming inbox messages, between tool calls of a main turn (the remaining calls are recorded as skipped and the turn is saved) and after saving. The in-flight tool or inference call is not cancelled (an MCP tool call is: the runtime's shutdown signal rejects it and sends `notifications/cancelled`), and an inbox turn always runs to the end. Then `heartbeat.stop()` (no new task starts and the scheduler's root signal aborts the running ones: HTTP requests destroyed, local exec process groups killed, remote exec abandoned; a run cut short is recorded `skipped`, `cancelled: runtime shutdown after N ms`, with no failure count, retry or wake; a run that completes anyway is recorded as a success and keeps its wake row for the next start, without notifying), `heartbeat.drain()` (the running tick and its aborted tasks are awaited), `shutdownWorkerPools()` (workers aborted and awaited), `closeMcp` (`shutdownMcpServers()`: stdio process groups terminated, HTTP sessions ended), state `sleeping` (a `dead` state is kept), lock released, database closed, exit 0. A second signal or the deadline does the last steps best-effort and exits 1.
 
 **Restart after rebuild.** Tools that rebuild `dist/` set KV `restart_required` (`src/self-mod/restart-notice.ts`); the runtime shows it in the system prompt and logs it until the next start, which deletes it. Lazy modules are preloaded at startup (`src/runtime/preload.ts`), so a rebuild never mixes new modules into the running process.
 
@@ -173,7 +173,8 @@ src/
   config.ts                Config load (throws ConfigError on a corrupt file), save, runtime patch (updateConfigFile)
 
   runtime/                 Process lifecycle
-    shutdown.ts            Stop flag, interruptible sleep, deadline helper
+    shutdown.ts            Stop flag, interruptible sleep, deadline helper, finishShutdown steps
+    cancellation.ts        AsyncLocalStorage cancellation scope for heartbeat tasks (timeout vs shutdown, shielded paid sends)
     preload.ts             LAZY_MODULES + preloadLazyModules() (one code version per process)
 
   security/                Guard code shared by tools, workers and loaders
@@ -181,6 +182,16 @@ src/
     secure-fs.ts           readFileSafe (O_NOFOLLOW, inode check, 2 MB cap), writeFileSafe (temp file + rename)
     secret-redaction.ts    Registered secrets redacted from inference requests and logs
     child-env.ts           Environment for commands: credential-shaped variables removed
+
+  mcp/                     MCP client (guard code)
+    config.ts              ~/.automaton/mcp-servers.json validation, secrets, agent-row approvals (sha256 of the launch spec and package-file hash)
+    manager.ts             Server lifecycle: connect, backoff, circuit, shutdown; McpCaller for the tools
+    jsonrpc.ts             JSON-RPC session: initialize, tools/list, tools/call, refusal of server requests (bounded)
+    stdio-transport.ts     Newline JSON over a child's stdio (scrubbed env, process group, 4 MiB line, 1 MiB stdin backlog)
+    http-transport.ts      Streamable HTTP: public addresses only unless local, pinned address, no redirects, 4 MiB
+    process.ts             Spawn, terminate and kill server process groups
+    schema.ts              Input schema normalisation, description sanitising, argument validation
+    tools.ts               mcp__<server>__<tool> tools: budgets, argument checks, hourly cap, result and error labelling
 
   agent/                   Core agent intelligence
     loop.ts                ReAct loop (think -> act -> observe -> persist)
@@ -219,7 +230,7 @@ src/
 
   heartbeat/               Background daemon
     daemon.ts              Daemon lifecycle (start/stop/drain/forceRun)
-    scheduler.ts           DurableScheduler (DB-backed, leased, cron, low-compute stretch, late results)
+    scheduler.ts           DurableScheduler (DB-backed, leased, cron, low-compute stretch, per-task abort on timeout and shutdown)
     schedule-store.ts      heartbeat.yml seeding that keeps run state, runtime changes, task aliases, leases
     tasks.ts               11 built-in heartbeat tasks
     config.ts              heartbeat.yml load/save/merge
@@ -304,7 +315,7 @@ src/
     code.ts                Safe file editing with protection checks
     restart-notice.ts      KV restart_required + the notice rebuild tools return
     upstream.ts            Git upstream monitoring + cherry-pick
-    tools-manager.ts       Dynamic tool/MCP server installation
+    tools-manager.ts       Older installed-tool helpers (MCP installation lives in agent/tools.ts and mcp/)
     audit-log.ts           Modification audit trail
 
   git/                     Version control
@@ -419,7 +430,7 @@ The automaton has **57 built-in tools** organized into 10 categories:
 | **replication** | 9 | `spawn_child`, `list_children`, `fund_child`, `check_child_status`, `start_child`, `message_child`, `verify_child_constitution`, `prune_dead_children`, `send_message` |
 | **memory** | 13 | `update_soul`, `reflect_on_soul`, `view_soul`, `view_soul_history`, `remember_fact`, `recall_facts`, `set_goal`, `complete_goal`, `save_procedure`, `recall_procedure`, `note_about_agent`, `review_memory`, `forget` |
 
-Each tool has a `riskLevel`: `safe`, `caution`, `dangerous`, or `forbidden`. Every tool call flows through the policy engine before execution.
+Each tool has a `riskLevel`: `safe`, `caution`, `dangerous`, `forbidden`, or `third_party` (MCP tools: allowed on the agent's own, heartbeat, wakeup and creator turns, denied on inbox turns and unknown sources by `authority.third_party_tools` as well as the inbox allow-list). Every tool call flows through the policy engine before execution.
 
 **Tool execution flow:**
 ```
@@ -537,11 +548,19 @@ Every tick (default 60s):
      d. Execute task function, racing its timeout
      e. Record result in heartbeat_history; schedule a retry while
         consecutive failures <= maxRetries
-     f. Release lease, unless the task timed out: then the lease is held
-        and the task is not restarted until it settles (given up on
-        after max(10 min, 10 x timeout))
-  4. If task returns shouldWake=true (also late, after a timeout):
-     insert wake event {taskName}, then notify onWakeRequest
+     f. On timeout: record `timeout`, abort the task's signal (HTTP
+        requests destroyed; local exec process group killed, remote exec
+        abandoned while the command may keep running in the sandbox; a
+        sent inference call settled `unknown`) and wait up to 5 s for it
+        to settle, then release the lease. A treasury transfer or x402
+        payment already sent is not cut short by a timeout (only by
+        shutdown, then `unknown`) and goes on to commit. A task that
+        ignores the abort keeps the lease until max(10 min, 10 x
+        timeout), then is given up on.
+  4. If task returns shouldWake=true in time: insert wake event
+     {taskName}, then notify onWakeRequest. A timed-out run delivers no
+     wake. A run that completes despite a shutdown is recorded as a
+     success and keeps its wake row for the next start, without notifying.
 ```
 
 **Schedule store** (`schedule-store.ts`): `heartbeat.yml` seeds `heartbeat_schedule` at startup without touching run state. A YAML value replaces a row's cron/enabled/task only when it differs from the snapshot of the previous seed (KV `heartbeat.seed.<name>`), i.e. when the operator edited the file; otherwise runtime changes made with `modify_heartbeat` are kept. Entries whose task differs from their name store the mapping in KV `heartbeat.task.<name>`. A last run in the future (clock stepped back) is cleared. Lease expiry compares with `julianday()`, so ISO timestamps and SQLite times compare correctly. The legacy `heartbeat_entries` table only mirrors the schedule for `--status`.
@@ -650,7 +669,8 @@ The automaton can modify its own code:
 - **Revert** (`tools.ts`): `revert_last_edit` reverts the newest recorded sha (`git revert --no-edit <sha>`, with the same fallback identity as the edit's commit) after checking it is an ancestor of HEAD and touches no protected file. A revert git applied but could not commit is rolled back with `git reset --merge`. Failed, stale or refused entries are dropped with a message, so a bad entry never blocks older ones. Operator commits are never reverted. `reset_to_upstream` clears the list.
 - **Restart notice** (`restart-notice.ts`): every tool that rebuilds says the running process keeps the old code and sets KV `restart_required`.
 - **Upstream pulls** (`upstream.ts`): `check_for_updates` heartbeat task monitors the git remote. `review_upstream_changes` returns an index of upstream commits (flagging protected and guard files and install/build inputs: package files, lockfile, `.npmrc`, `.pnpmfile.*`, `tsconfig*.json`, `scripts/`) and then each commit's full `git show` diff in 8,000-character pages, recording which pages were read and a hash of each diff in KV (`upstream.review`). `pull_upstream` cherry-picks individual commits (hex hashes only) that were fully read and are unchanged, or fast-forwards to the reviewed target commit only when every commit up to it was read and HEAD is on the target's first-parent history, so the reviewed first-parent diffs add up to the fast-forward (never `git pull`). Review pages show invisible characters as visible escapes. It runs every command with `cd` into the runtime's repo (`process.cwd()`), and aborts a failed cherry-pick. `reset_to_upstream` is two calls: a plan, then a reset to the confirmed target hash. Installs run with dependency scripts off, then a native rebuild from a fixed list, then the build, each with its own timeout; the build runs upstream-defined scripts, so applying upstream code trusts origin. The automaton is not obligated to accept all upstream changes.
-- **Tool installation** (`agent/tools.ts`; `tools-manager.ts` holds older helpers no tool calls): `install_npm_package` adds packages. `install_mcp_server` validates the tool name (`^[a-zA-Z0-9_-]{1,64}$`, not a builtin, not installed) and installs the package, but MCP tools are not offered to the model: there is no MCP client. `loadInstalledTools` skips invalid, duplicate, builtin-colliding and MCP entries.
+- **Tool installation** (`agent/tools.ts`; `tools-manager.ts` holds older helpers no tool calls): `install_npm_package` adds packages. `install_mcp_server` validates the server name, an npm registry spec and the args and env (same checks as exec, plus a denylist of loader variables), runs `npm install -g --ignore-scripts`, resolves the installed program, hashes the installed package tree (file contents and modes, link targets, its `node_modules`) and records `{package, version, bin, contentHash, args, env, installedBy: "agent"}`. The server starts only when the operator's `agentServers[name]` in `mcp-servers.json` equals the sha256 of that record; the logged approval line shows the program, args, env and package-file hash. Each refresh checks the installed `package.json` name and version against the row, and each spawn also re-hashes the tree, so code swapped in after approval does not start (a same-user tripwire: a swap between the check and the spawn is not caught). MCP tools come from `src/mcp/` (next item). `loadInstalledTools` skips invalid, duplicate, builtin-colliding and MCP entries.
+- **MCP client** (`src/mcp/`, an in-house JSON-RPC client, no SDK): at the start of each wake cycle the agent loop calls `loadMcpTools`, which re-reads `~/.automaton/mcp-servers.json` (operator servers: stdio or streamable HTTP; approved agent rows), connects missing servers outside any cancellation scope, lists their tools and returns them as `mcp__<server>__<tool>` AutomatonTools (category `mcp`, risk `third_party`), within per-server, global, 128-per-request and 64 KiB definition budgets. Definition text is screened like an inbound message (`screenInbound`) and for registered secrets: a failing description is replaced by a placeholder, a failing nested description or default is dropped, and a failing property name, enum or const value drops the tool. The system prompt lists MCP tools by name only, under an untrusted-third-party note; their descriptions travel only in the tools array. They are offered only when a server is configured, enabled and ready, and never on inbox turns. A call checks the schema, a 64 KiB size cap, a 10-level depth cap, registered secrets in any key or string, the exec argument tripwire for agent servers and the hourly cap, then goes out through the manager; results and server error text are redacted, capped, labelled as external content and screened before `executeTool` sanitises them. Servers that crash, break the protocol (oversized messages, request floods, unread input) or time out repeatedly are restarted with backoff and switched off after 5 restarts in an hour.
 - **Audit log** (`audit-log.ts`): Every modification is recorded with timestamp, type, diff, and hash for creator review.
 
 The `~/.automaton/` directory is a git repository: `SOUL.md` and `skills/` are committed on each soul update and skill install, creation or removal (`WORKLOG.md` and `heartbeat.yml` ride along). Code edits are committed in the runtime repo instead. The git tools default to it, expanding `~` before the path is quoted, and treat a failing git command as an error.

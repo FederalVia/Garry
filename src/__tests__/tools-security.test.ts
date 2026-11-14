@@ -667,10 +667,12 @@ describe("package install inline validation", () => {
     });
   }
 
-  it("install_mcp_server quotes the spec after --", async () => {
+  it("install_mcp_server quotes the spec after -- and skips lifecycle scripts", async () => {
     const tool = tools.find((t) => t.name === "install_mcp_server")!;
-    await tool.execute({ package: "@modelcontextprotocol/server-github", name: "github" }, ctx);
-    expect(conway.execCalls[0].command).toBe("npm install -g -- '@modelcontextprotocol/server-github'");
+    // Agent-installed servers run only where exec is local (empty sandbox id).
+    const local = { ...ctx, identity: { ...ctx.identity, sandboxId: "" } };
+    await tool.execute({ package: "@modelcontextprotocol/server-github", name: "github" }, local);
+    expect(conway.execCalls[0].command).toBe("npm install -g --ignore-scripts -- '@modelcontextprotocol/server-github'");
   });
 
   it("install_npm_package allows scoped packages", async () => {

@@ -21,6 +21,7 @@ import type { SandboxCleanup } from "./cleanup.js";
 import { deleteChild } from "../state/database.js";
 import { LEGACY_LIVE, LIVE, isEnded, parseDbTimestamp } from "./child-status.js";
 import { createLogger } from "../observability/logger.js";
+import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 const logger = createLogger("replication.lineage");
 
 /**
@@ -105,11 +106,14 @@ export async function pruneDeadChildren(
   let removed = 0;
 
   for (const { child, state } of toRemove) {
+    throwIfCancelled();
     try {
       if (cleanup && state !== "cleaned_up" && state !== "dead") {
         try {
           await cleanup.cleanup(child.id);
         } catch (error) {
+          // Cancelled: stop here; the child being cleaned keeps its row.
+          rethrowIfCancelled(error);
           logger.warn(`Keeping child ${child.id}: cleanup failed`, {
             error: error instanceof Error ? error.message : String(error),
           });
@@ -121,6 +125,7 @@ export async function pruneDeadChildren(
       deleteChild(db.raw, child.id);
       removed++;
     } catch (error) {
+      rethrowIfCancelled(error);
       logger.error(`Failed to prune child ${child.id}`, error instanceof Error ? error : undefined);
     }
   }

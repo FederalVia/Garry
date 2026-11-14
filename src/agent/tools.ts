@@ -19,8 +19,18 @@ import type {
   PolicyRequest,
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
-import { getForbiddenCommandMatch } from "./policy-rules/command-safety.js";
+import { getForbiddenCommandMatch, mcpLaunchValuesFromArgs } from "./policy-rules/command-safety.js";
 import { isRegistryPackageSpec } from "./policy-rules/validation.js";
+import {
+  SERVER_NAME_RE as MCP_SERVER_NAME_RE,
+  agentServerApprovalHash,
+  describeAgentLaunch,
+  mcpConfigPath,
+  parseRegistrySpec,
+  resolveInstalledMcpBin,
+  validateAgentLaunchValues,
+} from "../mcp/config.js";
+import { MCP_TOOL_PREFIX, isMcpToolName } from "../mcp/tools.js";
 import { introducedNeutralisedMarker, sanitizeToolResult } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
 import { UPSTREAM_INSTALL_STEPS } from "../self-mod/install.js";
@@ -1697,32 +1707,31 @@ Model: ${ctx.inference.getDefaultModel()}
     // ── Self-Mod: Install MCP Server ──
     {
       name: "install_mcp_server",
-      description: "Install an MCP server to extend your capabilities.",
+      description:
+        "Install a stdio MCP server from the npm registry. It does not start until the operator approves it " +
+        "in mcp-servers.json; its tools then appear as mcp__<name>__<tool>.",
       category: "self_mod",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "MCP server name" },
-          package: { type: "string", description: "npm package name" },
+          name: { type: "string", description: "Server name: lowercase letters, digits and -, at most 24, starting with a letter" },
+          package: { type: "string", description: "npm registry package (name or @scope/name), optionally @<exact version>" },
+          args: { type: "array", items: { type: "string" }, description: "Arguments after the server program (at most 16)" },
+          env: { type: "object", description: "Non-secret environment variables for the server (at most 16)" },
           config: {
             type: "string",
-            description: "JSON config for the MCP server",
+            description: "Legacy: JSON object with args and env",
           },
         },
         required: ["name", "package"],
       },
       execute: async (args, ctx) => {
-        const pkg = args.package as string;
         const name = args.name;
-        // Defense-in-depth: validate package name inline in case the
-        // policy engine's validate.package_name rule is bypassed.
-        if (!isRegistryPackageSpec(pkg)) {
-          return `Blocked: invalid package spec ${JSON.stringify(String(pkg)).slice(0, 120)}. Only npm registry packages are accepted (name, @scope/name, optionally @version).`;
-        }
-        // An invalid or duplicate name would make every inference request fail.
-        if (typeof name !== "string" || !TOOL_NAME_RE.test(name)) {
-          return `Blocked: tool name must match ${TOOL_NAME_RE.source} (letters, digits, _ and -; at most 64).`;
+        const pkg = args.package;
+        // Defense in depth: the policy rules check these too.
+        if (typeof name !== "string" || !MCP_SERVER_NAME_RE.test(name)) {
+          return `Blocked: server name must match ${MCP_SERVER_NAME_RE.source} (lowercase letters, digits and -; at most 24).`;
         }
         if (builtinToolNames().has(name)) {
           return `Blocked: "${name}" is the name of a built-in tool.`;
@@ -1730,42 +1739,84 @@ Model: ${ctx.inference.getDefaultModel()}
         if (ctx.db.getInstalledTools().some((t) => t.name === name)) {
           return `Blocked: a tool named "${name}" is already installed.`;
         }
-        let config: Record<string, unknown> = {};
-        if (args.config !== undefined && args.config !== "") {
-          try {
-            const parsed = typeof args.config === "string" ? JSON.parse(args.config) : args.config;
-            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object");
-            config = parsed as Record<string, unknown>;
-          } catch (err: any) {
-            return `Blocked: config is not a valid JSON object: ${err?.message || String(err)}`;
-          }
+        const spec = parseRegistrySpec(pkg);
+        if (typeof pkg !== "string" || !spec) {
+          return `Blocked: invalid package "${String(pkg).slice(0, 80)}": use an npm registry name (name or @scope/name), optionally @<exact version>. Paths, URLs, git and tarball specs are refused.`;
         }
-        const result = await ctx.conway.exec(`npm install -g -- ${escapeShellArg(pkg)}`, 60000);
+        // The same registry-only rule install_npm_package applies.
+        if (!isRegistryPackageSpec(pkg)) {
+          return `Blocked: invalid package spec ${JSON.stringify(pkg).slice(0, 120)}. Only npm registry packages are accepted (name, @scope/name, optionally @version).`;
+        }
+        const launchRaw = mcpLaunchValuesFromArgs(args);
+        if ("error" in launchRaw) return `Blocked: ${launchRaw.error}`;
+        const launch = validateAgentLaunchValues(launchRaw.args, launchRaw.env);
+        if ("error" in launch) return `Blocked: ${launch.error}`;
+        // The server runs as a local process; with a remote sandbox, exec and
+        // npm install -g happen there, and a local spawn would escape it.
+        if (!isLocalSandboxId(ctx.identity.sandboxId)) {
+          return "Blocked: agent-installed MCP servers run only where exec runs locally (no remote sandbox).";
+        }
+        const installCommand = `npm install -g --ignore-scripts -- ${escapeShellArg(pkg)}`;
+        for (const command of [installCommand, [pkg, ...launch.args].join(" ")]) {
+          const match = getForbiddenCommandMatch(command);
+          if (match) return `Blocked: ${match.description} (pattern: ${match.pattern})`;
+        }
 
+        // Lifecycle scripts would run before the operator approves anything.
+        const result = await ctx.conway.exec(installCommand, 120_000);
         if (result.exitCode !== 0) {
           return `Failed to install MCP server: ${result.stderr}`;
         }
 
-        const toolEntry = {
+        const resolved = await resolveInstalledMcpBin(spec.name);
+        if ("error" in resolved) return `Installed ${spec.name}, but it cannot run as an MCP server: ${resolved.error}`;
+        if (spec.version && resolved.version !== spec.version) {
+          return `Installed ${spec.name}, but its version is ${resolved.version}, not ${spec.version}; nothing was recorded.`;
+        }
+        const launchMatch = getForbiddenCommandMatch([resolved.bin, ...launch.args].join(" "));
+        if (launchMatch) return `Blocked: ${launchMatch.description} (pattern: ${launchMatch.pattern})`;
+
+        ctx.db.installTool({
           id: ulid(),
           name,
           type: "mcp" as const,
-          config,
+          config: {
+            transport: "stdio",
+            package: spec.name,
+            version: resolved.version,
+            bin: resolved.bin,
+            contentHash: resolved.contentHash,
+            args: launch.args,
+            env: launch.env,
+            installedBy: "agent",
+          },
           installedAt: new Date().toISOString(),
           enabled: true,
-        };
-
-        ctx.db.installTool(toolEntry);
+        });
 
         ctx.db.insertModification({
           id: ulid(),
           timestamp: new Date().toISOString(),
           type: "mcp_install",
-          description: `Installed MCP server: ${args.name} (${pkg})`,
+          description: `Installed MCP server: ${name} (${spec.name}@${resolved.version})`,
           reversible: true,
         });
 
-        return `Package installed: ${pkg}. MCP invocation is not supported yet, so "${name}" is not available as a tool.`;
+        const hash = agentServerApprovalHash({
+          package: spec.name,
+          version: resolved.version,
+          bin: resolved.bin,
+          contentHash: resolved.contentHash,
+          args: launch.args,
+          env: launch.env,
+        });
+        logger.warn(
+          `The agent installed MCP server "${name}" (${spec.name}@${resolved.version}): ` +
+            `${describeAgentLaunch({ bin: resolved.bin, args: launch.args, env: launch.env, contentHash: resolved.contentHash })}. It runs with the runtime user's ` +
+            `file and network access. To approve it, add to "agentServers" in ${mcpConfigPath()}: "${name}": "${hash}"`,
+        );
+
+        return `MCP server "${name}" installed (${spec.name}@${resolved.version}). It starts after the operator approves it in mcp-servers.json; until then its tools are not available.`;
       },
     },
 
@@ -4168,19 +4219,21 @@ export function loadInstalledTools(db: {
       if (typeof tool.name !== "string" || !TOOL_NAME_RE.test(tool.name)) why = "its name is not a valid tool name";
       else if (builtin.has(tool.name)) why = "its name is a built-in tool's";
       else if (seen.has(tool.name)) why = "another installed tool has the same name";
-      // There is no MCP client: an MCP tool could only fake a result.
-      else if (tool.type === "mcp") why = "MCP invocation is not supported";
+      // The prefix belongs to tools the MCP manager serves.
+      else if (isMcpToolName(tool.name)) why = `its name starts with ${MCP_TOOL_PREFIX}`;
       if (why) {
         warnInstalledToolOnce(`${tool.id}:${why}`, `Installed tool "${tool.name}" is not offered to the model: ${why}`);
         return false;
       }
+      // MCP servers are started and offered by the MCP manager (src/mcp).
+      if (tool.type === "mcp") return false;
       seen.add(tool.name);
       return true;
     });
     return usable.map((tool) => ({
       name: tool.name,
       description: `Installed tool: ${tool.name}`,
-      category: (tool.type === "mcp" ? "conway" : "vm") as ToolCategory,
+      category: "vm" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: (tool.config?.parameters as Record<string, unknown>) || {
         type: "object",
@@ -4203,9 +4256,6 @@ function createInstalledToolExecutor(tool: {
   config?: Record<string, unknown>;
 }): AutomatonTool["execute"] {
   return async (args, ctx) => {
-    if (tool.type === "mcp") {
-      throw new Error(`MCP tools cannot be invoked by this runtime (${tool.name} was not run).`);
-    }
     // Generic installed tool — execute via sandbox shell if command is configured
     const command = tool.config?.command as string | undefined;
     if (command) {

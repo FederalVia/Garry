@@ -12,12 +12,15 @@ import { INBOX_ALLOWED_TOOLS } from "../agent/inbox-isolation.js";
 import { runAgentLoop, getSharedWorkerPool, shutdownWorkerPools } from "../agent/loop.js";
 import { createHeartbeatDaemon } from "../heartbeat/daemon.js";
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
+import { MCP_TOOL_PREFIX } from "../mcp/tools.js";
 import {
   ALL_FEATURES,
+  MCP_TOOL_NAME_PREFIX,
   TASK_FEATURES,
   TOOL_FEATURES,
   standaloneFeatures,
   taskAllowed,
+  toolAllowed,
   visibleTools,
 } from "../providers/features.js";
 import { resolveRuntime } from "../providers/mode.js";
@@ -55,8 +58,9 @@ describe("tool lists per feature set", () => {
   it("standalone default", () => {
     const f = resolveRuntime(createTestConfig({ conwayApiKey: "", socialRelayUrl: "", openaiApiKey: "sk" })).features;
     expect(names(f)).toEqual(STANDALONE_DEFAULT);
-    // Every gated tool is hidden except the goal tools, which need only a planner-capable provider.
-    const gated = Object.keys(TOOL_FEATURES).filter((n) => TOOL_FEATURES[n].join() !== "orchestration");
+    // Every gated tool is hidden except the goal tools, which need only a
+    // planner-capable provider, and install_mcp_server, which needs no Conway.
+    const gated = Object.keys(TOOL_FEATURES).filter((n) => !["orchestration", "mcp"].includes(TOOL_FEATURES[n].join()));
     expect(names(f)).toHaveLength(builtinNames().length - gated.length);
   });
 
@@ -98,6 +102,26 @@ describe("tool lists per feature set", () => {
     expect(visibleTools(installed, standaloneFeatures({ relay: false, payments: false })).map((t) => t.name)).toEqual([
       "my_tool",
     ]);
+  });
+
+  it("MCP tools and install_mcp_server are offered in both modes, and only with the mcp feature", () => {
+    const mcp = [{ name: "mcp__fixture__echo" }, { name: "install_mcp_server" }, { name: "my_tool" }];
+    const standalone = resolveRuntime(createTestConfig({ conwayApiKey: "", socialRelayUrl: "", openaiApiKey: "sk" })).features;
+    expect(standalone.mcp).toBe(true);
+    expect(visibleTools(mcp, standalone)).toEqual(mcp);
+    expect(visibleTools(mcp, { ...ALL_FEATURES })).toEqual(mcp);
+    const off = { ...standalone, mcp: false };
+    expect(visibleTools(mcp, off).map((t) => t.name)).toEqual(["my_tool"]);
+    expect(toolAllowed("mcp__fixture__echo", off)).toBe(false);
+    expect(toolAllowed("mcp__fixture__echo", standalone)).toBe(true);
+    // The table keys on the prefix the MCP manager names its tools with.
+    expect(MCP_TOOL_NAME_PREFIX).toBe(MCP_TOOL_PREFIX);
+  });
+
+  it("a tool named like an Object.prototype member is not treated as gated", () => {
+    expect(visibleTools([{ name: "constructor" }, { name: "toString" }], standaloneFeatures({ relay: false, payments: false })).map((t) => t.name)).toEqual(
+      ["constructor", "toString"],
+    );
   });
 
   it("inbox turns get no tool when send_message is hidden", () => {

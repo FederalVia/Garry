@@ -38,6 +38,7 @@ import {
   type InferenceScope,
 } from "./gate.js";
 import { registryPrice } from "./policy.js";
+import { currentCancellationSignal, mergeSignals } from "../runtime/cancellation.js";
 import {
   InferenceCallError,
   InferenceRefusedError,
@@ -130,6 +131,10 @@ export class InferenceRouter {
    * candidate. Throws InferenceCallError when the attempts failed with errors.
    */
   async route(request: InferenceRequest, inferenceChat: ChatFn): Promise<InferenceResult> {
+    // A heartbeat task's cancellation acts as the caller's signal, so an
+    // abort is classified as the caller's (no failover), not a provider fault.
+    const merged = mergeSignals(request.signal, currentCancellationSignal());
+    if (merged !== request.signal) request = { ...request, signal: merged };
     const { messages, taskType, tier, tools } = request;
     const survival = request.survival === true;
     const caller: InferenceCaller = survival ? "survival_turn" : request.caller ?? "agent_turn";

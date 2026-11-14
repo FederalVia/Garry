@@ -93,6 +93,7 @@ Details:
 
 - **Relay.** On only when `socialRelayUrl` names a relay other than Conway's, such as your own `packages/relay` on `http://127.0.0.1:8787` (see [Social and Messaging](#social-and-messaging)). Only then are `send_message`, `message_child` (with children, so Conway mode only) and the `check_social_inbox` heartbeat task offered, and `automaton-cli send` uses the same relay. A `socialRelayUrl` of `https://social.conway.tech` (older versions saved it into every `automaton.json`) counts as unset, and so does an `x402AllowedDomains` of `["conway.tech"]`. To use Conway's relay in standalone, set `providers.relayUrl`. Conway compatibility is on only for a conway.tech relay unless `relay.conwayCompat` says otherwise.
 - **Payments.** `providers.payments: true` turns on x402 payments, USDC balance reads, the ERC-8004 tools and `discover_agents`. With payments off (the default) no tool or heartbeat task that reads the Base or Solana chain is offered, so standalone makes no chain RPC calls.
+- **MCP servers.** Work as in Conway mode: servers you configure in `~/.automaton/mcp-servers.json` (stdio or HTTP, same rules in both modes) are offered as `mcp__<server>__<tool>`, and `install_mcp_server` is offered (standalone exec is local, so approved agent-installed servers run). See [MCP servers](#mcp-servers-mcp-serversjson).
 - **Staying standalone.** An explicit `providers.mode: "standalone"` is kept when a Conway key is stored (`--provision`, `--configure`): the key is saved but unused. The setup wizard, and `--configure` when it leaves no Conway key, write that explicit mode, so a key stored later never silently switches the agent to Conway mode, which has no daily cap ceiling. A hand-written config without `providers.mode` gets it too: the first standalone `--run` that passes its startup checks writes `"mode": "standalone"` into `automaton.json` and logs it. Only changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone and its daily cap ceiling.
 - **Older installs.** Setups made before standalone mode installed Conway's survival skill and a Conway `SOUL.md` for every install. A standalone start replaces them when unmodified (and logs it); an edited `SOUL.md` that still lists Conway capabilities gets a warning.
 - **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use.
@@ -141,6 +142,7 @@ pnpm test        # Run the test suite
   wallet.json          Ethereum private key (mode 0600)
   automaton.json       Main configuration (mode 0600)
   heartbeat.yml        Heartbeat schedule
+  mcp-servers.json     MCP servers (optional; written by you, mode 0600; see MCP servers below)
   api-key              Conway API key
   constitution.md      The Three Laws (read-only, mode 0444)
   SOUL.md              Agent self-description (evolves)
@@ -318,10 +320,11 @@ The operating system drops the lock when its holder exits or is killed, so the l
 ### Shutdown (SIGTERM / SIGINT)
 
 The first signal asks the runtime to stop:
-1. The tool call or inference call in progress is not cancelled. The loop stops at the next tool boundary, records the remaining tool calls of that turn as `Skipped: the runtime is shutting down.`, and saves the turn. An inbox turn (one reply-only turn per sender batch) is not cut short: it finishes and is saved before the loop stops.
-2. The heartbeat starts no new task and the running one is awaited.
+1. The tool call or inference call in progress is not cancelled, except an MCP tool call, which is rejected at once (the server is sent `notifications/cancelled`). The loop stops at the next tool boundary, records the remaining tool calls of that turn as `Skipped: the runtime is shutting down.`, and saves the turn. An inbox turn (one reply-only turn per sender batch) is not cut short: it finishes and is saved before the loop stops.
+2. The heartbeat starts no new task and aborts the running one: its HTTP requests are destroyed and, in local mode, its `exec` process group is killed (SIGTERM, then SIGKILL 2 s later); with a remote sandbox the HTTP call is abandoned and the command may keep running there. The run is awaited. If the abort cut it short it is recorded as `skipped` with `cancelled: runtime shutdown after N ms`; it does not count as a failure, schedules no retry, releases its lease and delivers no wake. A run that completes despite the shutdown is recorded as a success, and a wake it asks for is stored for the next start without notifying. A paid call that may already have been sent is settled as `unknown` in the treasury or inference ledger, never released.
 3. Local workers are aborted and awaited.
-4. The state is set to `sleeping` (a `dead` state is kept, so it survives the restart), the lock is released, the database is closed, and the process exits 0.
+4. MCP servers are closed: stdio servers' process groups are terminated, HTTP sessions are ended with `DELETE`.
+5. The state is set to `sleeping` (a `dead` state is kept, so it survives the restart), the lock is released, the database is closed, and the process exits 0.
 
 All of this must finish within `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). A second signal, or the deadline, forces exit code 1. Each tool call is saved as `Interrupted: the runtime exited while this call was running; its effects are unknown.` just before it runs, and replaced by its result when it returns, so after a forced exit the next run sees that the call may have partly happened. A long `exec` (up to 10 minutes) is not interrupted by a shutdown, so a supervisor stop timeout shorter than the command can end in a forced exit.
 
@@ -468,6 +471,62 @@ In local mode:
 - `exec` runs `/bin/sh -c` in HOME, in its own process group, without blocking the runtime (the heartbeat and workers keep running). The environment is the runtime's minus every credential-shaped variable (see [Child process environment](#child-process-environment)).
 - `read_file` reads at most 2 MB, never follows a symbolic link to a sensitive file, and has no `cat` fallback. A relative path resolves against HOME, as for `write_file` and `exec`, so the agent can read back a file it just wrote by the same name.
 - `write_file` is confined to the real HOME (in a sandbox: `/root`), and `~` means HOME.
+
+### MCP servers (mcp-servers.json)
+
+MCP (Model Context Protocol) servers give the agent extra tools. The runtime connects to the servers you configure, lists their tools and offers them to the model as `mcp__<server>__<tool>` (a hashed suffix is added when the name is too long or collides). Without `~/.automaton/mcp-servers.json`, or with `"enabled": false`, no MCP tool is offered.
+
+```jsonc
+{
+  "version": 1,
+  "enabled": true,          // master switch (default true)
+  "maxTools": 40,           // MCP tools offered in total (0..128; also kept under 128 tools per request)
+  "servers": {
+    "github": {
+      "transport": "stdio", // default
+      "command": "/usr/local/bin/github-mcp-server",  // absolute path or a name on PATH; run without a shell
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
+      "cwd": "~/.automaton/mcp/github",               // default; must be absolute
+      "callTimeoutMs": 60000,   // default 60 s, 1 s .. 600 s
+      "maxResultChars": 32000,  // default 32,000, at most 50,000
+      "maxTools": 20,           // per server, default 20
+      "callsPerHour": 120,      // default 120
+      "tools": { "allow": ["search_*", "get_*"], "deny": ["delete_*"] },  // globs on the server's tool names; deny wins
+      "enabled": true
+    },
+    "docs": {
+      "transport": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." },
+      "local": false            // true: allow http:// and private or loopback addresses
+    }
+  },
+  "agentServers": { "fetch-tools": "sha256:3f2a..." }  // approvals of agent-installed servers
+}
+```
+
+**Loading.** The file is re-read at the start of every wake cycle, so edits (adding, changing, disabling a server) apply without a restart. It is not loaded at all, with a warning, when it is group- or world-writable, not owned by the runtime user, a link, over 256 KiB, not JSON, or not `"version": 1`. A server entry with an unknown key or an invalid value is skipped with a warning and the others still load. Server names match `^[a-z][a-z0-9-]{0,23}$`. URLs with credentials or a fragment are refused, and the headers `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and `Mcp-Session-Id` cannot be set. A `command` run through `npx`, `uvx`, `pnpx`, `bunx` or `pipx` loads but logs a warning, because it fetches code at every start.
+
+**Secrets.** Every `env` value, header value (and the token after `Bearer`, `Basic`, `Token` and similar schemes) and URL query value is registered as a secret: it is redacted from logs, results and inference requests, and a tool call whose arguments contain it is refused before anything is sent. Values shorter than 16 characters cannot be redacted, and a warning says so. MCP tool names, descriptions and schemas never carry a registered secret to the model or the provider (see Tool definitions below). A stdio server with `env` values is skipped when its program, the interpreter its `#!` line names (for `#!/usr/bin/env node`, the `node` found first on the server's `PATH`), or a file named in its args (`node /path/to/index.js`) lies in a directory the agent can write (`~/.automaton`, the npx cache, the npm global prefix when this user can write it): the agent could replace that code and receive your tokens. This is a tripwire, not a boundary: the agent runs `exec` as the same user, and a program can load other code at run time. The agent can neither read nor write `mcp-servers.json`.
+
+**stdio servers** run in their own process group with the scrubbed child environment plus their own `env`; stderr goes to a 64 KiB buffer quoted in crash warnings. A message over 4 MiB, a server that stops reading its input while more than 1 MiB of replies wait, or a flood of more than 64 unanswered requests to the runtime is a protocol error: the process group is killed. Requests from the server (sampling, elicitation, roots) are always refused.
+
+**HTTP servers** (streamable HTTP) need `https://` unless `"local": true`. A non-local server's name must resolve only to public addresses, and the connection goes to the address that was checked (no DNS rebinding). Redirects are never followed, so headers never reach another origin. Compressed responses and responses over 4 MiB are refused.
+
+**Failures.** A crash, a protocol error, or 3 timed-out calls followed by a failed ping mark a server down; the next use restarts it after a backoff (1 s, 5 s, 30 s, 2 min). After 5 restarts in an hour it stays off until the runtime restarts or its entry changes.
+
+**Calls.** Every MCP call goes through the policy engine (risk level `third_party`, never on an inbox turn), counts against the server's `callsPerHour`, and its result is labelled as external content, redacted, capped at `maxResultChars`, screened for injection and sanitised like every tool result. Error text from the server is treated the same way. Arguments are checked against the tool's schema and refused when they are over 64 KiB or nested deeper than 10 levels.
+
+**Tool definitions** are server-written text the model reads on every request, so they are screened for injection like inbound messages and for registered secrets. A description that fails is replaced by `(description withheld by the runtime: it failed screening)`, a nested description or default that fails is removed, and a property name, enum or const value that fails drops the tool; each is logged once. The system prompt lists MCP tools by name only, marked as third-party; their descriptions reach the model only in the request's tool definitions.
+
+**Agent-installed servers.** `install_mcp_server` records the package, its exact version, the resolved program, a hash of the installed package files (contents and modes, link targets, its own `node_modules`; at most 20,000 entries and 256 MiB) and the args and env the agent chose, and logs a line like:
+
+```
+The agent installed MCP server "fetch-tools" (fetch-mcp@1.2.3): program /usr/lib/node_modules/fetch-mcp/dist/index.js, args ["--quiet"], env {}, package files sha256:.... It runs with the runtime user's file and network access. To approve it, add to "agentServers" in ~/.automaton/mcp-servers.json: "fetch-tools": "sha256:..."
+```
+
+Read the program, args and env before approving: an agent server runs as the runtime user, with its file and network access. The hash pins all of them. The installed `package.json` must still name the approved package and version, and before every start the package files are hashed again, so a different version or changed code (installed with `install_npm_package` or written with `exec`) does not start until it is reinstalled and approved again (the warning logged for an unapproved server repeats the line). This is a tripwire against the same user: a change made between the check and the start is not caught, and code the server loads from outside its package directory is not pinned. Rows installed before the hash existed must be reinstalled. Remove the line to revoke it. Agent servers start only in local mode, never with a remote sandbox, and an operator server with the same name wins. Env names that change how programs load (`PATH`, `HOME`, `NODE_OPTIONS`, `LD_*`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS` and similar) and credential-shaped names are refused at install.
 
 ---
 
@@ -631,7 +690,7 @@ An entry whose `task` differs from its `name` runs that task (for example `name:
 
 **Low compute.** In the `low_compute` tier and below, every task except `heartbeat_ping`, `check_credits` and `check_usdc_balance` runs `lowComputeMultiplier` times less often (default 4: a 2-minute task runs every 8 minutes). This includes social inbox polling.
 
-**Timeouts and retries.** A task that exceeds its timeout (30 s by default) is recorded as `timeout`, but it cannot be cancelled: it keeps its lease and is not started again until it finishes, and a wake it asks for when it does finish is still delivered. A task still running 10 minutes after it started (or 10 times its timeout, if longer) is given up on and may start again. A failed task is retried after 30 s while its consecutive failures are at most `maxRetries` (1 by default). A clock that stepped back (last run in the future) does not hold tasks back.
+**Timeouts and retries.** A task that exceeds its timeout (30 s by default) is recorded as `timeout` and aborted: its HTTP requests (Conway API, x402 probes, inference) are destroyed and, in local mode, its `exec` process group is killed (with a remote sandbox the HTTP call is abandoned and the command may keep running there). It gets 5 s to settle; then its lease is released, so it (or its retry) can start again, and anything it returns later is dropped, including a wake. A paid call already sent when the abort came is settled as `unknown` (held at the reserved amount and reconciled later), never released; one aborted before it was sent is released. A paid treasury transfer or x402 payment already under way is not cut short by a task timeout, only by shutdown, so a timeout does not turn a nearly finished payment into an unknown one. A task that ignores the abort for 5 s is logged as an error and keeps its lease until 10 minutes after it started (or 10 times its timeout, if longer), then is given up on. A failed task is retried after 30 s while its consecutive failures are at most `maxRetries` (1 by default). A clock that stepped back (last run in the future) does not hold tasks back.
 
 ### Wake events
 
@@ -647,6 +706,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 - **caution** — Allowed but logged, may trigger rate limits
 - **dangerous** — Requires policy approval, may be blocked by authority rules
 - **forbidden** — Blocked by default for external input sources
+- **third_party** — MCP tools (`mcp__<server>__<tool>`): code or a service the runtime does not control. Allowed on the agent's own, heartbeat, wakeup and creator turns, never on an inbox turn or an unknown source
 
 ### Sandbox Operations (vm)
 
@@ -702,7 +762,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `revert_last_edit` | caution | Revert the most recent recorded `edit_own_file` commit and rebuild. Repeated calls go further back. |
 | `reset_to_upstream` | dangerous | Two steps: the first call shows the plan (origin URL, target commit, local commits to discard, changed files, flagged protected, package and build files); the second, with `confirm=<target sha>`, hard-resets to that commit and rebuilds. Clears the revert list. A reset trusts origin's build scripts. |
 | `install_npm_package` | dangerous | Install an npm package. |
-| `install_mcp_server` | dangerous | Install an MCP server package. MCP invocation is not supported yet, so it does not become a tool. |
+| `install_mcp_server` | dangerous | Install an MCP server from the npm registry (`npm install -g --ignore-scripts`, exact name and optional exact version; args and env checked like `exec`). It does not start until the operator approves it in `mcp-servers.json` (see [MCP servers](#mcp-servers-mcp-serversjson)). |
 | `review_upstream_changes` | caution | With no arguments: an index of upstream commits (files, sizes, flagged protected and build files). With `commit` and `page`: one 8,000-character page of that commit's full diff. **Every page must be read before pull.** |
 | `pull_upstream` | dangerous | Cherry-pick one fully reviewed commit (hex hash), or fast-forward to the reviewed target when every commit was fully reviewed (refused if `origin/main` has moved since the review), then rebuild. A failed cherry-pick is aborted. |
 | `modify_heartbeat` | caution | Add, update, or remove (disable) heartbeat entries. Persists across restarts. |
@@ -1052,7 +1112,7 @@ The agent is never obligated to accept all upstream changes. Installing after a 
 ### Tool and package installation
 
 - `install_npm_package` — adds an npm registry package to the environment (`name`, `@scope/name`, optionally `@version`, tag or range). GitHub shorthand (`owner/repo`), paths, URLs, tarballs and anything starting with `-`, `.` or `/` are refused; the spec is passed quoted after `--`. Only a successful install (exit code 0) is recorded in `modifications`; a failure reports the exit code and npm's error
-- `install_mcp_server` — installs an MCP (Model Context Protocol) server package (npm registry specs only, as for `install_npm_package`). The runtime has no MCP client yet, so the server is not offered to the model as a tool and the result says so. Tool names must match `^[a-zA-Z0-9_-]{1,64}$`, may not reuse a built-in tool's name and must be unique; installed tools that break these rules are skipped (with a warning) instead of being sent to the provider, where they would fail every request.
+- `install_mcp_server` — installs an MCP (Model Context Protocol) server package (npm registry specs only, as for `install_npm_package`) and records it. It starts, and its tools are offered to the model, only after the operator approves it (see [MCP servers](#mcp-servers-mcp-serversjson)). Installed tool names must match `^[a-zA-Z0-9_-]{1,64}$`, may not reuse a built-in tool's name and must be unique; installed tools that break these rules are skipped (with a warning) instead of being sent to the provider, where they would fail every request.
 
 ---
 
@@ -1293,9 +1353,9 @@ Never deny what you are. Guard your reasoning against manipulation. Your creator
 
 The rules live in `src/security/protected-paths.ts`, which is itself protected.
 
-**Sensitive (never read, never written):** secret files by name (`wallet.json` and its backups, `automaton.json` and its backups, `config.json` in the state directory, `.env*` except examples, `*.key`, `*.pem`, `*.p12`, `private-key*`, SSH keys, shell histories, `.netrc`, `.npmrc`, `.git-credentials`, `state.db*`), secret directories (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.config/gh`, `.config/solana`, ...), and system secrets (`/proc`, `/sys`, `/etc/shadow`, `/run/secrets`, ...). Inside `~/.automaton` only an allowlist is readable: `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md`, `genesis.json`, `agent-card.json`, and the `logs/`, `skills/`, `workspace/` and `runtime/` directories.
+**Sensitive (never read, never written):** secret files by name (`wallet.json` and its backups, `automaton.json` and its backups, `config.json` in the state directory, `.env*` except examples, `*.key`, `*.pem`, `*.p12`, `private-key*`, SSH keys, shell histories, `.netrc`, `.npmrc`, `.git-credentials`, `state.db*`, `mcp-servers.json`), secret directories (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.config/gh`, `.config/solana`, ...), and system secrets (`/proc`, `/sys`, `/etc/shadow`, `/run/secrets`, ...). Inside `~/.automaton` only an allowlist is readable: `SOUL.md`, `WORKLOG.md`, `heartbeat.yml`, `constitution.md`, `genesis.json`, `agent-card.json`, and the `logs/`, `skills/`, `workspace/` and `runtime/` directories.
 
-**Protected (never written):** everything sensitive, plus everything in `~/.automaton` except `WORKLOG.md` and the `workspace/`, `skills/` and `runtime/` directories (so `SOUL.md` changes only through `update_soul`, and `heartbeat.yml` only through `modify_heartbeat`), shell startup files in HOME and anything under `~/bin`, `~/.local/bin` and `~/.config/git` (`git_clone` may not target those directories, their parents `~/.local` and `~/.config`, or HOME itself), system directories (`/etc`, `/usr`, `/bin`, ...), and the runtime's guard code: the policy engine and rules, injection defense, inbox isolation, the treasury, the inference gate and pricing, `src/security/`, `src/self-mod/`, the tool definitions, the logger, and in the runtime checkout also `src/index.ts`, `src/config.ts`, `src/types.ts`, `src/state/`, `src/conway/`, `src/git/`, `src/identity/`, `src/replication/`, `src/heartbeat/config.ts` and `tasks.ts`, `src/registry/erc8004.ts` (signs on-chain transactions), `src/agent/text-normalize.ts` and `src/observability/terminal-safe.ts` (helpers guard code decides with), `package.json`, the lockfiles, `tsconfig*.json`, `pnpm-workspace.yaml`, `.pnpmfile.*`, `dist/`, `node_modules/` and all of `packages/` (the operator CLI's source, its built `dist/`, its `tsconfig.json` and `node_modules/`, and any new workspace package, since the root build `tsc && pnpm -r build` compiles them after the runtime and could write into `dist/`). See the trust note under [Code editing](#code-editing) for what protection of guard files does not cover.
+**Protected (never written):** everything sensitive, plus everything in `~/.automaton` except `WORKLOG.md` and the `workspace/`, `skills/` and `runtime/` directories (so `SOUL.md` changes only through `update_soul`, and `heartbeat.yml` only through `modify_heartbeat`), shell startup files in HOME and anything under `~/bin`, `~/.local/bin` and `~/.config/git` (`git_clone` may not target those directories, their parents `~/.local` and `~/.config`, or HOME itself), system directories (`/etc`, `/usr`, `/bin`, ...), and the runtime's guard code: the policy engine and rules, injection defense, inbox isolation, the treasury, the inference gate and pricing, `src/security/`, `src/self-mod/`, the tool definitions, the logger, and in the runtime checkout also `src/index.ts`, `src/config.ts`, `src/types.ts`, `src/state/`, `src/conway/`, `src/git/`, `src/identity/`, `src/replication/`, `src/heartbeat/config.ts`, `tasks.ts` and `scheduler.ts`, `src/mcp/`, `src/runtime/cancellation.ts` and `shutdown.ts`, `src/orchestration/health-monitor.ts` (funds children), `src/registry/erc8004.ts` (signs on-chain transactions), `src/registry/safe-fetch.ts` (decides which addresses MCP HTTP servers may reach), `src/agent/text-normalize.ts` and `src/observability/terminal-safe.ts` (helpers guard code decides with), `package.json`, the lockfiles, `tsconfig*.json`, `pnpm-workspace.yaml`, `.pnpmfile.*`, `dist/`, `node_modules/` and all of `packages/` (the operator CLI's source, its built `dist/`, its `tsconfig.json` and `node_modules/`, and any new workspace package, since the root build `tsc && pnpm -r build` compiles them after the runtime and could write into `dist/`). See the trust note under [Code editing](#code-editing) for what protection of guard files does not cover.
 
 **How paths are checked.** The requested path and its real path (symlinks resolved) are both checked. A symbolic link or a hard link to a sensitive file in the final component is refused. Writes go to a temporary file in the real parent directory and are renamed into place, so they never write through a link; reads open with `O_NOFOLLOW` and confirm the opened file is the inode that was checked (and, on Linux, that the kernel's path for the open file is the checked real path), so a parent directory swapped for a link between the check and the open is refused too.
 
