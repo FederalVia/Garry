@@ -15,7 +15,8 @@ import { loadConfig, resolvePath, getConfigPath, ConfigError, pinStandaloneModeI
 import { RESTART_REQUIRED_KEY, getRestartRequired } from "./self-mod/restart-notice.js";
 import { createDatabase, recoverStrandedInboxClaims } from "./state/database.js";
 import { createConwayClient, createCreditBalanceReader } from "./conway/client.js";
-import { createInferenceClient } from "./conway/inference.js";
+import { createInferenceClient, modelRouteOf } from "./conway/inference.js";
+import { resolveProviderTable } from "./providers/table.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import type { HeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
@@ -113,13 +114,20 @@ Environment:
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
   OPENAI_API_KEY           OpenAI key when automaton.json has none: main loop in standalone mode only,
                            planner and workers in both modes
-  OPENAI_BASE_URL          Base URL for the planner and workers' OpenAI calls (not used with
-                           providers.openai.baseUrl or when Ollama models were discovered)
+  OPENAI_BASE_URL          Base URL for the planner and workers' OpenAI calls in Conway mode
+                           (ignored in standalone)
+  AUTOMATON_PROVIDER_<ID>_API_KEY  Key for providers.compatible entry <id> (upper case, - as _)
+                           when the entry has no apiKey
   AUTOMATON_SHUTDOWN_GRACE_MS  Time a stop may take before exit is forced (default 30000)
 
 Providers (automaton.json "providers" block, all optional):
   mode: "standalone" | "conway" (default: conway with a Conway key, else standalone);
-  openai {apiKey, baseUrl, models}, anthropic {apiKey}, ollama {baseUrl}, conway {apiKey, apiUrl};
+  openai {apiKey, baseUrl, models, discover, free}, anthropic {apiKey, models, effort, discover},
+  ollama {baseUrl, discover}, conway {apiKey, apiUrl};
+  compatible [{id, baseUrl, apiKey, models, discover, free, allowUnpriced, orchestration, priority}]
+  for any OpenAI-compatible server (an aggregator, Groq, Together, vLLM, LM Studio); free only on a
+  loopback baseUrl; models [{id, inputUsdPerM, outputUsdPerM, tierMinimum}] prices models and, on a
+  custom baseUrl or compatible entry, limits it to those models;
   survival {fixedTier}, dailyCapCeilingCents (standalone, default 200), payments (default false),
   relayUrl (standalone: the only way to use Conway's relay). Only an explicit mode change leaves
   standalone; a new Conway key does not.
@@ -367,8 +375,8 @@ async function run(): Promise<void> {
   if (runtime.mode === "standalone" && !hasOwnAiProvider(runtime)) {
     fail(
       "No AI provider configured. Set providers.openai.apiKey (optionally providers.openai.baseUrl for any " +
-        "OpenAI-compatible server), providers.anthropic.apiKey, providers.ollama.baseUrl, or a Conway key " +
-        "(automaton --provision).",
+        "OpenAI-compatible server), providers.anthropic.apiKey, providers.ollama.baseUrl, a providers.compatible " +
+        "entry (with an apiKey, or on this machine), or a Conway key (automaton --provision).",
     );
   }
   // Checked before the database: an empty identity field would otherwise
@@ -664,13 +672,13 @@ async function run(): Promise<void> {
 
   // Create inference client — pass a live registry lookup so model names like
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
-  const modelRegistry = new ModelRegistry(db.raw);
+  // The provider table both AI stacks use: who serves a model, with which key.
+  const providerTable = resolveProviderTable(config);
+  const modelRegistry = new ModelRegistry(db.raw, { table: providerTable, config });
   modelRegistry.initialize();
-  if (runtime.mode === "standalone") {
-    if (runtime.providers.anthropic) modelRegistry.seedProviderModels(["anthropic"]);
-    const listed = config.providers?.openai?.models;
-    if (runtime.providers.openai && Array.isArray(listed)) modelRegistry.upsertConfiguredModels(listed);
-  }
+  // Seeds the built-in providers' rows in standalone only (a Conway install
+  // routes as before), then the owner models.
+  modelRegistry.seedFromPriceTable(providerTable);
   {
     const criticalId = config.modelStrategy?.criticalModel || "gpt-5-mini";
     const critical = modelRegistry.get(criticalId);
@@ -702,6 +710,8 @@ async function run(): Promise<void> {
     // Standalone: what no configured provider can serve is refused, not sent to Conway.
     conwayFallback: runtime.mode === "conway",
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
+    table: providerTable,
+    getModelRoute: (modelId) => modelRouteOf(modelRegistry.get(modelId)),
   });
 
   if (ollamaBaseUrl) {

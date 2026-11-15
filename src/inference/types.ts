@@ -44,7 +44,10 @@ export const TASK_TIMEOUTS: Record<string, number> = {
 };
 
 // === Static Model Baseline ===
-// Known models with realistic pricing (hundredths of cents per 1k tokens)
+// Known models with realistic pricing (hundredths of cents per 1k tokens).
+// The price table (providers/price-table.ts) holds every model's price; these
+// rows must stay at or below it (a test checks), and the gate's charge for
+// an unknown price is the table's highest, not this baseline's.
 
 export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | "updatedAt">[] = [
   {

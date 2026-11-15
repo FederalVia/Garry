@@ -3,7 +3,9 @@
 // JSON line {method, host, path, jsonrpc}. Answers: OpenAI-compatible
 // /chat/completions and Anthropic /v1/messages follow RECORDER_SCRIPT
 // ({chat: [{text?, tools?}], credits?}); Ollama /api/tags lists
-// RECORDER_SCRIPT.ollamaModels; Conway credit balance returns credits and the
+// RECORDER_SCRIPT.ollamaModels; OpenAI-compatible and Anthropic GET /v1/models
+// list RECORDER_SCRIPT.models (default: a few priced ids for that host);
+// Conway credit balance returns credits and the
 // SIWE provisioning endpoints mint a stub key; JSON-RPC
 // gets a zero result; anything else {}. http/https.request are recorded and
 // refused, so no non-fetch egress goes unseen.
@@ -55,6 +57,19 @@ globalThis.fetch = async (input, init = {}) => {
   if (u.pathname.endsWith("/v1/auth/api-keys")) return json({ key: "cnwy_k_stub_provisioned", key_prefix: "cnwy_k_st" });
   if (u.pathname.endsWith("/api/tags")) {
     return json({ models: (SCRIPT.ollamaModels ?? []).map((name) => ({ name, model: name, modified_at: "", size: 1 })) });
+  }
+  if (method === "GET" && u.pathname.endsWith("/models")) {
+    if (u.host === "api.anthropic.com") {
+      const ids = SCRIPT.models ?? ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5", "claude-unpriced-test"];
+      return json({
+        data: ids.map((id) => ({ type: "model", id, display_name: id, max_input_tokens: 200000, max_tokens: 64000 })),
+        has_more: false,
+        first_id: ids[0] ?? null,
+        last_id: ids[ids.length - 1] ?? null,
+      });
+    }
+    const ids = SCRIPT.models ?? ["gpt-5.2", "gpt-5-mini", "gpt-4.1", "unpriced-test-model"];
+    return json({ object: "list", data: ids.map((id) => ({ id, object: "model", owned_by: "test" })) });
   }
   if (u.pathname.endsWith("/chat/completions")) {
     const { i, step } = nextStep();

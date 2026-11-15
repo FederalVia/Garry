@@ -6,10 +6,11 @@
  * or invalid (the same approach as normalizeTreasuryPolicy).
  */
 
-import type { ModelEntry, ModelStrategyConfig } from "../types.js";
+import type { AutomatonConfig, ModelEntry, ModelStrategyConfig } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import { STATIC_MODEL_BASELINE } from "./types.js";
 import { createLogger } from "../observability/logger.js";
+import { maxKnownPrice } from "../providers/price-table.js";
 
 const logger = createLogger("inference.policy");
 
@@ -39,7 +40,7 @@ export interface ResolvedInferencePolicy {
   sessionCooldownMs: number;
   maxTokensPerTurn: number;
   enableModelFallback: boolean;
-  /** Charged for a non-local model with a zero or missing price. */
+  /** Charged for a non-local model with a zero or missing price: the highest known price. */
   unknownPrice: { inputUsdPerM: number; outputUsdPerM: number };
 }
 
@@ -49,7 +50,7 @@ export const DEFAULT_SURVIVAL_MIN_INTERVAL_MS = 30 * 60_000;
 export const DEFAULT_SESSION_COOLDOWN_MS = 30 * 60_000;
 const DEFAULT_MAX_TOKENS_PER_TURN = 4096;
 
-/** The most expensive baseline prices, in USD per 1M tokens. */
+/** The most expensive baseline prices, in USD per 1M tokens (the gate charges maxKnownPrice instead). */
 export function maxBaselinePrice(): { inputUsdPerM: number; outputUsdPerM: number } {
   let input = 0;
   let output = 0;
@@ -86,6 +87,8 @@ function nonNegativeNumber(
 export interface InferencePolicySource {
   modelStrategy?: Partial<ModelStrategyConfig> | null;
   maxTokensPerTurn?: number;
+  /** Owner prices above the price table raise the unknown price. */
+  providers?: AutomatonConfig["providers"];
 }
 
 /**
@@ -160,16 +163,22 @@ export function resolveInferencePolicy(
     }),
     maxTokensPerTurn,
     enableModelFallback: ms.enableModelFallback === undefined ? true : ms.enableModelFallback !== false,
-    unknownPrice: maxBaselinePrice(),
+    unknownPrice: maxKnownPrice(config),
   };
 }
 
-/** Registry prices are hundredths of a cent per 1k tokens, which is USD per 1M x 10. */
-export function registryPrice(entry: Pick<ModelEntry, "provider" | "costPer1kInput" | "costPer1kOutput">): ModelPrice {
+/**
+ * Registry prices are hundredths of a cent per 1k tokens, which is USD per
+ * 1M x 10. `free` comes from a registry built with the provider table (a
+ * loopback server, or Ollama); without it only Ollama models are free.
+ */
+export function registryPrice(
+  entry: Pick<ModelEntry, "provider" | "costPer1kInput" | "costPer1kOutput"> & { free?: boolean },
+): ModelPrice {
   return {
     inputUsdPerM: Number(entry.costPer1kInput) / 10,
     outputUsdPerM: Number(entry.costPer1kOutput) / 10,
-    local: entry.provider === "ollama",
+    local: entry.free ?? entry.provider === "ollama",
   };
 }
 

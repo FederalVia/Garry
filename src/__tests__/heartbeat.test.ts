@@ -924,6 +924,59 @@ describe("Heartbeat Tasks", () => {
       const parsed = JSON.parse(refresh!);
       expect(parsed.count).toBeGreaterThan(0);
     });
+
+    it("Conway mode with no new settings asks Conway only, as before", async () => {
+      const realFetch = globalThis.fetch;
+      const fetchSpy = vi.fn(async () => new Response("{}", { status: 200 }));
+      globalThis.fetch = fetchSpy as any;
+      const listSpy = vi.spyOn(conway, "listModels");
+      try {
+        const taskCtx: HeartbeatLegacyContext = { identity: createTestIdentity(), config: createTestConfig(), db, conway };
+        await BUILTIN_TASKS.refresh_models(createMockTickContext(db), taskCtx);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+      expect(listSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("runs in standalone, per provider: one failing does not stop the next", async () => {
+      const realFetch = globalThis.fetch;
+      const urls: string[] = [];
+      globalThis.fetch = vi.fn(async (input: any) => {
+        const url = String(typeof input === "string" ? input : input.url);
+        urls.push(url);
+        if (url.startsWith("https://broken.example")) return new Response("down", { status: 500 });
+        return new Response(JSON.stringify({ data: [{ id: "house-model" }, { id: "other-model" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as any;
+      const listSpy = vi.spyOn(conway, "listModels");
+      const config = createTestConfig({
+        conwayApiKey: "",
+        providers: {
+          compatible: [
+            { id: "broken", baseUrl: "https://broken.example/v1", apiKey: "b" },
+            { id: "works", baseUrl: "https://works.example/v1", apiKey: "w" },
+          ],
+        },
+      } as any);
+      try {
+        const taskCtx: HeartbeatLegacyContext = { identity: createTestIdentity(), config, db, conway };
+        const result = await BUILTIN_TASKS.refresh_models(createMockTickContext(db), taskCtx);
+        expect(result.shouldWake).toBe(false);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(urls.some((u) => u.startsWith("https://broken.example/v1/models"))).toBe(true);
+      expect(urls.some((u) => u.startsWith("https://works.example/v1/models"))).toBe(true);
+      expect(JSON.parse(db.getKV("model_discovery:broken")!).ok).toBe(false);
+      expect(JSON.parse(db.getKV("model_discovery:works")!)).toMatchObject({ ok: true, count: 2 });
+      const row = db.raw.prepare("SELECT model_id, provider FROM model_registry WHERE model_id = ?").get("works/house-model") as any;
+      expect(row).toMatchObject({ model_id: "works/house-model", provider: "openai" });
+    });
   });
 
   // ─── Shared Tick Context ────────────────────────────────────

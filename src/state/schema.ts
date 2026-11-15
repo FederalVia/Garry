@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -1013,3 +1013,17 @@ export const MIGRATION_V18_MCP_CALLS = `
   );
   CREATE INDEX IF NOT EXISTS idx_mcp_calls_server_sent ON mcp_calls(server, sent_at);
 `;
+
+// === Model registry provider columns ===
+// Applied by the version 19 entry of applyMigrations (database.ts) through
+// migrateModelRegistryProviders, which adds each column only when it is
+// missing, so running it again changes nothing.
+// No backfill: a NULL provider_id is derived from provider, so legacy rows
+// route as before.
+export const MODEL_REGISTRY_PROVIDER_COLUMNS: ReadonlyArray<[string, string]> = [
+  ["provider_id", "ALTER TABLE model_registry ADD COLUMN provider_id TEXT"],
+  ["remote_id", "ALTER TABLE model_registry ADD COLUMN remote_id TEXT"],
+  ["listed", "ALTER TABLE model_registry ADD COLUMN listed INTEGER NOT NULL DEFAULT 1"],
+  ["price_source", "ALTER TABLE model_registry ADD COLUMN price_source TEXT"],
+  ["capabilities", "ALTER TABLE model_registry ADD COLUMN capabilities TEXT"],
+];

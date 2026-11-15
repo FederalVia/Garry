@@ -201,6 +201,17 @@ export const GATE_SQL = {
 
 // ─── Gate ──────────────────────────────────────────────────────
 
+/** A model's long-prompt price tier (ModelCapabilities.longPrompt). */
+export interface LongPromptTier {
+  aboveInputTokens: number;
+  inputUsdPerM: number;
+  outputUsdPerM: number;
+}
+
+function validTierPrice(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 export interface ReserveRequest {
   callId: string;
   attempt: number;
@@ -485,13 +496,15 @@ export class InferenceGate {
   /**
    * Settle at actual usage. Missing or partial usage on a paid model commits
    * the reserved amount; `outputText` (content plus tool-call arguments) sets
-   * a floor under reported output tokens.
+   * a floor under reported output tokens. `longPrompt` is the model's
+   * long-prompt tier: reported input above its threshold settles at the tier
+   * price even when the estimate reserved at the base price.
    */
   commit(
     id: string,
     usage: { inputTokens: number; outputTokens: number } | null,
     latencyMs: number,
-    opts: { outputText?: string } = {},
+    opts: { outputText?: string; longPrompt?: LongPromptTier | null } = {},
   ): { costMicroUsd: number } {
     if (this.unrecordedLocal.delete(id)) return { costMicroUsd: 0 };
     try {
@@ -524,7 +537,14 @@ export class InferenceGate {
           );
           outTok = Math.max(outTok, floor);
         }
-        cost = Math.ceil(inTok * row.price_in_usd_per_m + outTok * row.price_out_usd_per_m);
+        let priceIn = row.price_in_usd_per_m;
+        let priceOut = row.price_out_usd_per_m;
+        const tier = opts.longPrompt;
+        if (tier && tier.aboveInputTokens > 0 && inTok > tier.aboveInputTokens) {
+          priceIn = Math.max(priceIn, validTierPrice(tier.inputUsdPerM));
+          priceOut = Math.max(priceOut, validTierPrice(tier.outputUsdPerM));
+        }
+        cost = Math.ceil(inTok * priceIn + outTok * priceOut);
         if (row.est_input_tokens > 0 && inTok > row.est_input_tokens * 1.25) {
           logger.warn(
             `Inference input for ${row.model} was ${(inTok / row.est_input_tokens).toFixed(2)}x the estimate ` +

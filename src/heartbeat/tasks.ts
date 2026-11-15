@@ -55,6 +55,8 @@ import { runWithTreasuryOrigin } from "../treasury/index.js";
 import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 import { ulid } from "ulid";
 import { notifyDistress } from "../notify/distress.js";
+import { resolveProviderTable, type ProviderTable } from "../providers/table.js";
+import { refreshProviderModels } from "../providers/discovery.js";
 
 const logger = createLogger("heartbeat.tasks");
 
@@ -615,22 +617,50 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
 
   // === Phase 2.3: Model Registry Refresh ===
   refresh_models: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    let table: ProviderTable;
+    let registry: import("../inference/registry.js").ModelRegistry;
     try {
-      const models = await taskCtx.conway.listModels();
-      throwIfCancelled();
-      if (models.length > 0) {
-        const { ModelRegistry } = await import("../inference/registry.js");
-        const registry = new ModelRegistry(taskCtx.db.raw);
-        registry.initialize(); // seed if empty
-        registry.refreshFromApi(models);
-        taskCtx.db.setKV("last_model_refresh", JSON.stringify({
-          count: models.length,
-          timestamp: new Date().toISOString(),
-        }));
-      }
+      const { ModelRegistry } = await import("../inference/registry.js");
+      table = resolveProviderTable(taskCtx.config);
+      registry = new ModelRegistry(taskCtx.db.raw, { table, config: taskCtx.config });
+      registry.initialize(); // seed if empty
     } catch (error) {
       rethrowIfCancelled(error);
       logger.error("refresh_models failed", error instanceof Error ? error : undefined);
+      return { shouldWake: false };
+    }
+
+    // Conway mode: Conway's own listing, as before.
+    if (table.mode === "conway") {
+      try {
+        const models = await taskCtx.conway.listModels();
+        throwIfCancelled();
+        if (models.length > 0) {
+          registry.refreshFromApi(models);
+          taskCtx.db.setKV("last_model_refresh", JSON.stringify({
+            count: models.length,
+            timestamp: new Date().toISOString(),
+          }));
+        }
+      } catch (error) {
+        rethrowIfCancelled(error);
+        logger.error("refresh_models failed", error instanceof Error ? error : undefined);
+      }
+    }
+
+    // Each provider's own list, one at a time, so one failure does not stop
+    // the rest. Conway mode lists only entries the owner added or asked to list.
+    for (const entry of table.entries) {
+      if (!entry.discover || entry.kind === "conway") continue;
+      try {
+        throwIfCancelled();
+        await refreshProviderModels(table, registry, taskCtx.db, { providerIds: [entry.id] });
+      } catch (error) {
+        rethrowIfCancelled(error);
+        logger.warn(
+          `refresh_models: ${entry.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
     return { shouldWake: false };
   },

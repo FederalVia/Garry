@@ -17,6 +17,7 @@ import type {
   GenesisConfig,
   RiskLevel,
   PolicyRequest,
+  ModelEntry,
 } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { getForbiddenCommandMatch, mcpLaunchValuesFromArgs } from "./policy-rules/command-safety.js";
@@ -58,6 +59,9 @@ import {
   setTaskAlias,
 } from "../heartbeat/schedule-store.js";
 import { updateConfigFile } from "../config.js";
+import { resolveRuntime } from "../providers/mode.js";
+import { canServeModel, providerIdForRow, resolveProviderTable } from "../providers/table.js";
+import { registryPrice } from "../inference/policy.js";
 import cronParser from "cron-parser";
 import { notifyDistress } from "../notify/distress.js";
 
@@ -2949,6 +2953,9 @@ Model: ${ctx.inference.getDefaultModel()}
         required: [],
       },
       execute: async (_args, ctx) => {
+        if (resolveRuntime(ctx.config).mode === "standalone") {
+          return listServableModels(ctx);
+        }
         // Try registry first for richer data
         try {
           const { modelRegistryGetAll } = await import("../state/database.js");
@@ -4472,4 +4479,80 @@ function resolveGitRepoPath(value: unknown, ctx: ToolContext, fallback = "~/.aut
 /** Escape a string for safe shell interpolation. */
 function escapeShellArg(arg: string): string {
   return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/** Rows shown per provider by list_models; the rest are counted. */
+const LIST_MODELS_PER_PROVIDER = 40;
+
+function usdPerM(registryUnits: number): string {
+  // Registry units are USD per 1M x 10.
+  return `$${Number((registryUnits / 10).toFixed(4))}`;
+}
+
+/**
+ * Standalone list_models: only the models a configured provider can serve,
+ * grouped by provider, with prices per 1M tokens and each provider's last
+ * model-list refresh. Never asks Conway.
+ */
+async function listServableModels(ctx: ToolContext): Promise<string> {
+  const { ModelRegistry } = await import("../inference/registry.js");
+  const table = resolveProviderTable(ctx.config);
+  const registry = new ModelRegistry(ctx.db.raw, { table, config: ctx.config });
+  const canServe = (m: ModelEntry): boolean =>
+    ctx.inference.canServe ? ctx.inference.canServe(m) : canServeModel(table, m);
+  const rows = registry.getAll().filter((m) => m.enabled && m.listed !== false && canServe(m));
+
+  const sections: string[] = [];
+  let total = 0;
+  for (const entry of table.entries) {
+    if (entry.kind === "conway") continue;
+    const mine = rows.filter((m) => providerIdForRow(m) === entry.id);
+    total += mine.length;
+    const lines = [`${entry.label} [${entry.id}]: ${mine.length} model(s)`];
+    for (const m of mine.slice(0, LIST_MODELS_PER_PROVIDER)) {
+      const priced = Number(m.costPer1kInput) > 0 && Number(m.costPer1kOutput) > 0;
+      const price = registryPrice(m).local
+        ? "free"
+        : priced
+          ? `${usdPerM(m.costPer1kInput)}/${usdPerM(m.costPer1kOutput)} per 1M (in/out)`
+          : entry.allowUnpriced
+            ? "no price: charged at the highest known price"
+            : "no price: skipped";
+      const source = m.priceSource ? ` | price from ${m.priceSource}` : "";
+      lines.push(
+        `  ${m.modelId} (${m.provider}) - ${price}${source} | tier: ${m.tierMinimum} | ctx: ${m.contextWindow}` +
+          (m.supportsTools ? "" : " | no tools"),
+      );
+    }
+    if (mine.length > LIST_MODELS_PER_PROVIDER) {
+      lines.push(`  ... and ${mine.length - LIST_MODELS_PER_PROVIDER} more`);
+    }
+    const status = discoveryStatusLine(ctx.db.getKV(`model_discovery:${entry.id}`));
+    if (status) lines.push(`  ${status}`);
+    sections.push(lines.join("\n"));
+  }
+  if (sections.length === 0) return "No AI provider is configured, so no model can be served.";
+  return `Models your providers can serve (${total}):\n${sections.join("\n")}`;
+}
+
+function discoveryStatusLine(raw: string | undefined): string | null {
+  if (!raw) return null;
+  let v: any;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!v || typeof v !== "object") return null;
+  const at = typeof v.at === "number" ? new Date(v.at).toISOString() : typeof v.at === "string" ? v.at : "unknown time";
+  if (v.ok === false) return `Model list: last refresh failed at ${at}: ${String(v.error ?? "unknown error").slice(0, 200)}`;
+  const unpriced = Number(v.unpricedCount) || 0;
+  const sample =
+    Array.isArray(v.unpricedSample) && v.unpricedSample.length > 0
+      ? ` (e.g. ${v.unpricedSample.slice(0, 5).map(String).join(", ")})`
+      : "";
+  return (
+    `Model list: refreshed ${at}, ${Number(v.count) || 0} listed` +
+    (unpriced > 0 ? `; ${unpriced} not imported for want of a price${sample}` : "")
+  );
 }

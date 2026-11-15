@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestConfig } from "./mocks.js";
-import { resolveRuntime, describeRuntime, DEFAULT_OPENAI_BASE_URL } from "../providers/mode.js";
+import { resolveRuntime, describeRuntime, hasOwnAiProvider, DEFAULT_OPENAI_BASE_URL } from "../providers/mode.js";
 
 const savedHome = process.env.HOME;
 let home: string;
@@ -243,6 +243,34 @@ describe("validation", () => {
     ["negative ceiling", { dailyCapCeilingCents: -1 }],
     ["model without id", { openai: { models: [{ inputUsdPerM: 1 }] } }],
     ["http relay URL off loopback", { relayUrl: "http://relay.example" }],
+    ["compatible that is not a list", { compatible: { id: "groq" } }],
+    ["compatible id with capitals", { compatible: [{ id: "Groq", baseUrl: "https://api.groq.com/openai/v1" }] }],
+    ["compatible id too long", { compatible: [{ id: "a".repeat(33), baseUrl: "https://x.example/v1" }] }],
+    ["compatible id missing", { compatible: [{ baseUrl: "https://x.example/v1" }] }],
+    ["reserved compatible id openai", { compatible: [{ id: "openai", baseUrl: "https://x.example/v1" }] }],
+    ["reserved compatible id local", { compatible: [{ id: "local", baseUrl: "http://127.0.0.1:1234/v1" }] }],
+    ["reserved compatible id conway", { compatible: [{ id: "conway", baseUrl: "https://x.example/v1" }] }],
+    [
+      "duplicate compatible id",
+      { compatible: [{ id: "a", baseUrl: "https://a.example/v1" }, { id: "a", baseUrl: "https://b.example/v1" }] },
+    ],
+    ["compatible without baseUrl", { compatible: [{ id: "a" }] }],
+    ["compatible http base URL off loopback", { compatible: [{ id: "a", baseUrl: "http://llm.example/v1" }] }],
+    ["compatible base URL with userinfo", { compatible: [{ id: "a", baseUrl: "https://u:p@llm.example/v1" }] }],
+    ["compatible free on a LAN host", { compatible: [{ id: "a", baseUrl: "https://192.168.1.5/v1", free: true }] }],
+    ["compatible free on a remote host", { compatible: [{ id: "a", baseUrl: "https://api.example/v1", free: true }] }],
+    ["compatible non-boolean flag", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", discover: "yes" }] }],
+    ["compatible non-boolean allowUnpriced", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", allowUnpriced: 1 }] }],
+    ["compatible bad priority", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", priority: -1 }] }],
+    ["compatible apiKey not a string", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", apiKey: 5 }] }],
+    ["compatible bad model price", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", models: [{ id: "m", inputUsdPerM: -1 }] }] }],
+    ["compatible bad model tier", { compatible: [{ id: "a", baseUrl: "https://a.example/v1", models: [{ id: "m", tierMinimum: "dead" }] }] }],
+    ["openai free on the public endpoint", { openai: { apiKey: "k", free: true } }],
+    ["openai free on a LAN host", { openai: { apiKey: "k", baseUrl: "https://192.168.1.5/v1", free: true } }],
+    ["openai non-boolean discover", { openai: { discover: "no" } }],
+    ["unknown anthropic effort", { anthropic: { effort: "extreme" } }],
+    ["anthropic bad model tier", { anthropic: { models: [{ id: "claude-opus-5-5", tierMinimum: "best" }] } }],
+    ["ollama non-boolean discover", { ollama: { discover: 1 } }],
   ];
   for (const [what, providers] of bad) {
     it(`refuses ${what}`, () => {
@@ -267,7 +295,78 @@ describe("validation", () => {
   });
 });
 
+describe("compatible providers", () => {
+  it("accepts a valid compatible list, free on loopback (IPv4 and bracketed IPv6) and owner models", () => {
+    write({
+      providers: {
+        mode: "standalone",
+        compatible: [
+          { id: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "sk-or-0123456789abcdef" },
+          {
+            id: "groq",
+            name: "Groq",
+            baseUrl: "https://api.groq.com/openai/v1",
+            models: [{ id: "llama-3.3-70b-versatile", inputUsdPerM: 0.59, outputUsdPerM: 0.79, tierMinimum: "low_compute" }],
+            priority: 5,
+            orchestration: false,
+          },
+          { id: "lmstudio", baseUrl: "http://127.0.0.1:1234/v1", free: true },
+          { id: "vllm6", baseUrl: "http://[::1]:1234/v1", free: true, allowUnpriced: true, discover: false },
+        ],
+        anthropic: { apiKey: "sk-ant-x", effort: "medium", models: [{ id: "claude-opus-5-5", tierMinimum: "normal" }] },
+        openai: { apiKey: "k", baseUrl: "http://localhost:8080/v1", free: true, discover: true },
+      },
+    });
+    const r = resolveRuntime(load());
+    expect(r.providers.compatible?.map((c) => [c.id, c.free])).toEqual([
+      ["openrouter", false],
+      ["groq", false],
+      ["lmstudio", true],
+      ["vllm6", true],
+    ]);
+    expect(r.providers.compatible?.[1].models).toEqual(["llama-3.3-70b-versatile"]);
+  });
+
+  it("saveConfig keeps compatible[] as written", () => {
+    const compatible = [
+      { id: "groq", baseUrl: "https://api.groq.com/openai/v1", models: [{ id: "m", inputUsdPerM: 1, outputUsdPerM: 2 }] },
+      { id: "lmstudio", baseUrl: "http://127.0.0.1:1234/v1", free: true },
+    ];
+    write({ providers: { mode: "standalone", compatible } });
+    const config = load();
+    cfg.saveConfig(config);
+    expect(disk().providers.compatible).toEqual(compatible);
+    expect(load().providers?.compatible).toEqual(compatible);
+  });
+
+  it("a compatible-only owner counts as having an AI provider; a remote keyless one does not", () => {
+    write({ providers: { mode: "standalone", compatible: [{ id: "lmstudio", baseUrl: "http://127.0.0.1:1234/v1" }] } });
+    expect(hasOwnAiProvider(resolveRuntime(load(), {}))).toBe(true);
+    write({ providers: { mode: "standalone", compatible: [{ id: "groq", baseUrl: "https://api.groq.com/openai/v1" }] } });
+    expect(hasOwnAiProvider(resolveRuntime(load(), {}))).toBe(false);
+    expect(hasOwnAiProvider(resolveRuntime(load(), { AUTOMATON_PROVIDER_GROQ_API_KEY: "gsk_0123456789abcdef" }))).toBe(true);
+  });
+});
+
 describe("describeRuntime", () => {
+  it("names each compatible entry with its key source, never the key", () => {
+    write({
+      providers: {
+        mode: "standalone",
+        compatible: [
+          { id: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "sk-or-SECRET-0123456789" },
+          { id: "groq", baseUrl: "https://api.groq.com/openai/v1" },
+          { id: "lmstudio", baseUrl: "http://127.0.0.1:1234/v1", free: true },
+        ],
+      },
+    });
+    const line = describeRuntime(resolveRuntime(load(), { AUTOMATON_PROVIDER_GROQ_API_KEY: "gsk_SECRET_0123456789" }));
+    expect(line).toContain("openrouter (key from providers.compatible[openrouter].apiKey, https://openrouter.ai/api/v1)");
+    expect(line).toContain("groq (key from AUTOMATON_PROVIDER_GROQ_API_KEY, https://api.groq.com/openai/v1)");
+    expect(line).toContain("lmstudio (http://127.0.0.1:1234/v1, free)");
+    expect(line).not.toMatch(/SECRET/);
+  });
+
   it("names sources and never prints a key", () => {
     write({
       conwayApiKey: "cnwy_k_SECRET_VALUE",

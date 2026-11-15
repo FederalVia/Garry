@@ -2,6 +2,13 @@ import path from "node:path";
 import OpenAI from "openai";
 import { readRegularFileNoFollow } from "../security/secure-fs.js";
 import { createLogger } from "../observability/logger.js";
+import { isLoopbackHost } from "../conway/http-client.js";
+import { InferenceHttpError, InferenceResponseError, parseRetryAfter } from "./errors.js";
+import {
+  ANTHROPIC_MESSAGES_URL,
+  anthropicHeaders,
+  type AnthropicEffort,
+} from "./anthropic.js";
 
 const logger = createLogger("inference.providers");
 
@@ -17,6 +24,14 @@ export interface ProviderConfig {
   maxTokensPerMinute: number;
   priority: number;
   enabled: boolean;
+  /** Wire protocol. Default "openai". */
+  kind?: "openai" | "anthropic";
+  /** Free only on a loopback base URL (see isLocalProvider). */
+  free?: boolean;
+  /** A loopback server that needs no key. */
+  noKeyRequired?: boolean;
+  /** Anthropic effort for agent-like calls (providers.anthropic.effort). */
+  effort?: AnthropicEffort;
 }
 
 export interface ModelConfig {
@@ -29,12 +44,32 @@ export interface ModelConfig {
   supportsTools: boolean;
   supportsVision: boolean;
   supportsStreaming: boolean;
+  /** Id sent on the wire when it differs from id (a compatible entry's qualified id). */
+  remoteId?: string;
+  /** Floor for max_tokens: thinking counts toward it. */
+  minOutputTokens?: number;
+  capabilities?: ModelConfigCapabilities;
+}
+
+/** The capability fields orchestration reads; prices in USD per 1M tokens. */
+export interface ModelConfigCapabilities {
+  effort?: boolean;
+  minOutputTokens?: number;
+  longPrompt?: { aboveInputTokens: number; inputUsdPerM: number; outputUsdPerM: number };
+}
+
+/** Posts one Messages API body; the key stays in its closure. No retries. */
+export interface AnthropicTransport {
+  send(body: Record<string, unknown>, opts: { signal: AbortSignal; timeoutMs: number }): Promise<unknown>;
 }
 
 export interface ResolvedModel {
   provider: ProviderConfig;
   model: ModelConfig;
-  client: OpenAI;
+  /** Set for kind "openai". */
+  client?: OpenAI;
+  /** Set for kind "anthropic". */
+  anthropic?: AnthropicTransport;
 }
 
 interface TierDefault {
@@ -249,6 +284,11 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
 ];
 
+/** The built-in models of a default provider ("openai", "groq", ...), copied. */
+export function stockProviderModels(id: string): ModelConfig[] {
+  return (DEFAULT_PROVIDERS.find((p) => p.id === id)?.models ?? []).map((m) => ({ ...m }));
+}
+
 /**
  * Known providers keep their endpoint and key variable whatever the config
  * file says: the file is not trusted to redirect a credential elsewhere.
@@ -276,11 +316,6 @@ export function customProviderKeyEnvVar(id: string): string {
   return `AUTOMATON_PROVIDER_${id.toUpperCase().replace(/-/g, "_")}_API_KEY`;
 }
 
-function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return h === "localhost" || h === "127.0.0.1" || h === "::1";
-}
-
 /** https with no userinfo, or http on loopback. */
 function isAcceptableBaseUrl(raw: unknown, allowLoopbackHttp: boolean, requireLoopback = false): raw is string {
   if (typeof raw !== "string" || raw.length === 0) return false;
@@ -297,22 +332,28 @@ function isAcceptableBaseUrl(raw: unknown, allowLoopbackHttp: boolean, requireLo
   return url.protocol === "http:" && allowLoopbackHttp && loopback;
 }
 
-/**
- * True for the built-in "local" provider on a loopback address. Only such a
- * provider is free; a zero price anywhere else is treated as unknown.
- */
-export function isLocalProvider(provider: Pick<ProviderConfig, "id" | "baseUrl">): boolean {
-  if (provider.id !== "local") return false;
+function isLoopbackUrl(raw: string): boolean {
   try {
-    return isLoopbackHost(new URL(provider.baseUrl).hostname);
+    return isLoopbackHost(new URL(raw).hostname);
   } catch {
     return false;
   }
 }
 
+/**
+ * Free only on a loopback address, and only for the old file's "local"
+ * provider or one marked free. A zero price anywhere else is unknown.
+ */
+export function isLocalProvider(provider: Pick<ProviderConfig, "id" | "baseUrl" | "free">): boolean {
+  if (provider.id !== "local" && provider.free !== true) return false;
+  return isLoopbackUrl(provider.baseUrl);
+}
+
 /** Keys by env var name, handed in so the runtime never copies them into process.env. */
 export interface ProviderRegistryOptions {
   keys?: Record<string, string | undefined>;
+  /** Transport for both SDK clients and the Anthropic transport (tests). */
+  fetch?: typeof fetch;
 }
 
 export class ProviderRegistry {
@@ -320,6 +361,7 @@ export class ProviderRegistry {
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
   private readonly keys: Record<string, string | undefined>;
+  private readonly fetchImpl?: typeof fetch;
 
   constructor(
     providers: ProviderConfig[],
@@ -327,6 +369,7 @@ export class ProviderRegistry {
     options: ProviderRegistryOptions = {},
   ) {
     this.keys = { ...(options.keys ?? {}) };
+    this.fetchImpl = options.fetch;
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
       .sort((a, b) => a.priority - b.priority);
@@ -522,17 +565,25 @@ export class ProviderRegistry {
     if (apiKey === null) {
       throw new Error(`Provider '${provider.id}' has no API key`);
     }
+    if (provider.kind === "anthropic") {
+      return {
+        provider: deepCloneProvider(provider),
+        model: cloneModel(model),
+        anthropic: createAnthropicTransport(apiKey, this.fetchImpl),
+      };
+    }
     // Retries live in exactly one layer (the unified client), never in the SDK.
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
       maxRetries: 0,
       timeout: PROVIDER_CLIENT_TIMEOUT_MS,
+      ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}),
     });
 
     return {
       provider: deepCloneProvider(provider),
-      model: { ...model },
+      model: cloneModel(model),
       client,
     };
   }
@@ -545,7 +596,7 @@ export class ProviderRegistry {
     }
 
     // Local servers usually need no key; "local" must still be enabled explicitly.
-    if (provider.id === "local") {
+    if (provider.id === "local" || (provider.noKeyRequired === true && isLoopbackUrl(provider.baseUrl))) {
       return "local";
     }
 
@@ -753,10 +804,63 @@ function normalizeTierDefault(input: Partial<TierDefault> | undefined, fallback:
   };
 }
 
+function cloneModel(model: ModelConfig): ModelConfig {
+  return {
+    ...model,
+    ...(model.capabilities
+      ? {
+          capabilities: {
+            ...model.capabilities,
+            ...(model.capabilities.longPrompt ? { longPrompt: { ...model.capabilities.longPrompt } } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 function deepCloneProvider(provider: ProviderConfig): ProviderConfig {
   return {
     ...provider,
-    models: provider.models.map((model) => ({ ...model })),
+    models: provider.models.map(cloneModel),
+  };
+}
+
+/**
+ * The orchestration transport for Anthropic: the pinned endpoint, the key in
+ * this closure only, the caller's signal and timeout, no retries, and no
+ * redirects (a redirect would carry x-api-key to another host).
+ */
+function createAnthropicTransport(apiKey: string, fetchImpl?: typeof fetch): AnthropicTransport {
+  return {
+    async send(body, opts) {
+      const doFetch = fetchImpl ?? fetch;
+      const signal = AbortSignal.any([opts.signal, AbortSignal.timeout(Math.max(1, opts.timeoutMs))]);
+      const resp = await doFetch(ANTHROPIC_MESSAGES_URL, {
+        method: "POST",
+        headers: anthropicHeaders(apiKey),
+        body: JSON.stringify(body),
+        signal,
+        redirect: "error",
+      });
+      if (!resp.ok) {
+        let text = "";
+        try {
+          text = await resp.text();
+        } catch {
+          /* the status is what matters */
+        }
+        throw new InferenceHttpError("anthropic", resp.status, text, parseRetryAfter(resp.headers?.get?.("retry-after")));
+      }
+      try {
+        return await resp.json();
+      } catch (err) {
+        if ((err as any)?.name === "AbortError") throw err;
+        // A 2xx that may have been billed.
+        throw new InferenceResponseError(
+          `Unreadable inference response: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
   };
 }
 

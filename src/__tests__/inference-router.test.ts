@@ -191,7 +191,9 @@ describe("ModelRegistry", () => {
 
     const entry = registry.get("new-api-model");
     expect(entry).toBeDefined();
-    expect(entry!.provider).toBe("conway");
+    // Rewritten on purpose: Conway's listing is labelled "other" (never
+    // "conway"); routing to Conway goes by provider_id.
+    expect(entry!.provider).toBe("other");
     expect(entry!.costPer1kInput).toBe(15);
   });
 
@@ -489,7 +491,9 @@ describe("InferenceRouter", () => {
       expect(result.length).toBe(3);
     });
 
-    it("handles Anthropic format: merges consecutive tool messages", () => {
+    // Rewritten on purpose: tool messages stay tool messages for Anthropic, so
+    // the codec can send them as tool_result blocks after the tool_use.
+    it("Anthropic: tool messages are kept for the codec, not flattened into user text", () => {
       const messages = [
         { role: "user" as const, content: "Do something" },
         {
@@ -504,17 +508,9 @@ describe("InferenceRouter", () => {
         { role: "tool" as const, content: "result2", tool_call_id: "tc2" },
       ];
       const result = router.transformMessagesForProvider(messages, "anthropic");
-
-      // The two tool messages should be merged into one user message
-      const userMessages = result.filter((m) => m.role === "user");
-      // Original user + merged tool results = 2 user messages
-      expect(userMessages.length).toBe(2);
-
-      // The merged tool result message should contain both results
-      const lastUser = result[result.length - 1];
-      expect(lastUser.role).toBe("user");
-      expect(lastUser.content).toContain("result1");
-      expect(lastUser.content).toContain("result2");
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool", "tool"]);
+      expect(result.slice(2).map((m) => m.tool_call_id)).toEqual(["tc1", "tc2"]);
+      expect(result.some((m) => m.role === "user" && m.content.includes("[tool_result:"))).toBe(false);
     });
 
     it("Anthropic: alternating user/assistant maintained", () => {

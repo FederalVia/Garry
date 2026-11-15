@@ -5,6 +5,7 @@
  * This is the automaton's consciousness. When this runs, it is alive.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
@@ -97,7 +98,13 @@ import {
 import { CREDIT_TRANSFER_TOOLS } from "./policy-rules/financial.js";
 import { resolveRuntime, type ResolvedRuntime } from "../providers/mode.js";
 import { visibleTools, type FeatureSet } from "../providers/features.js";
-import { buildStandaloneProviderRegistry, ensureServableStrategy } from "../providers/model-defaults.js";
+import {
+  buildOrchestrationRegistry,
+  ensureServableStrategy,
+  highestKnownPrice,
+} from "../providers/model-defaults.js";
+import { allowsUnpriced, keepsConwaySurvivalRule, resolveProviderTable, type ProviderTable } from "../providers/table.js";
+import { refreshProviderModels } from "../providers/discovery.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -166,23 +173,25 @@ const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
 /** Orchestration cannot run with the configured providers (said once per process). */
 class OrchestrationUnavailable extends Error {}
 let orchestrationOffLogged = false;
+let legacyProvidersFileWarned = false;
 
 /**
- * Standalone: seed Anthropic rows when its key exists, register the models
- * listed for a custom OpenAI-compatible endpoint, and substitute a servable
- * model for any strategy slot nobody can serve (in memory only).
+ * Standalone: the owner's models (which win over discovered prices) and a
+ * servable model for any strategy slot nobody can serve (in memory only).
+ * Seeding from the price table runs before discovery.
  */
 function prepareStandaloneModels(
   config: AutomatonConfig,
   registry: ModelRegistry,
   runtime: ResolvedRuntime,
+  table: ProviderTable,
   inference: InferenceClient,
 ): void {
-  if (runtime.providers.anthropic) registry.seedProviderModels(["anthropic"]);
-  const listed = config.providers?.openai?.models;
-  if (runtime.providers.openai && Array.isArray(listed)) registry.upsertConfiguredModels(listed);
+  for (const entry of table.entries) {
+    if (entry.models.length > 0) registry.upsertOwnerModels(entry);
+  }
   const canServe = inference.canServe ? (m: ModelEntry) => inference.canServe!(m) : () => true;
-  const { substitutions, unservable } = ensureServableStrategy(config, registry, canServe, runtime);
+  const { substitutions, unservable } = ensureServableStrategy(config, registry, canServe, table);
   for (const sub of substitutions) {
     logger.warn(`${sub.slot} ${sub.from} cannot be served by your providers; using ${sub.to} for this run.`);
   }
@@ -194,7 +203,7 @@ function prepareStandaloneModels(
     if (fixed && unservable.includes(slot)) {
       logger.error(
         `The fixed survival tier "${fixed}" uses ${slot}, and no model your providers serve is allowed at that tier. ` +
-          `Give a model in providers.openai.models tierMinimum "${fixed}", or set providers.survival.fixedTier to "normal".`,
+          `Give a model in a provider's models list tierMinimum "${fixed}", or set providers.survival.fixedTier to "normal".`,
       );
     }
   }
@@ -271,25 +280,56 @@ export async function runAgentLoop(
   // One mode for the whole cycle: tools, money, survival and providers agree.
   const runtime = resolveRuntime(config);
   const fixedTier = runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined;
+  // One provider table for the cycle: the main loop and orchestration agree
+  // on who serves a model, its key and whether it is free.
+  const table = resolveProviderTable(config);
 
   // Discover Ollama models if configured
-  let ollamaModelIds: string[] = [];
   if (ollamaBaseUrl) {
     const { discoverOllamaModels } = await import("../ollama/discover.js");
-    ollamaModelIds = await discoverOllamaModels(ollamaBaseUrl, db.raw);
+    await discoverOllamaModels(ollamaBaseUrl, db.raw);
+  }
+
+  // Read on every route, so switch_model and --pick-model apply at once.
+  const liveStrategy = (): ModelStrategyConfig => ({
+    ...DEFAULT_MODEL_STRATEGY_CONFIG,
+    ...(config.modelStrategy ?? {}),
+    inferenceModel:
+      config.inferenceModel || config.modelStrategy?.inferenceModel || DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel,
+  });
+  const modelRegistry = new ModelRegistry(db.raw, { table, config });
+  modelRegistry.initialize();
+  // Seeds the built-in providers' rows in standalone only (a Conway install
+  // routes as before), and every compatible entry's owner models.
+  modelRegistry.seedFromPriceTable(table);
+  // Model lists, at most once a day per provider. Conway mode lists only
+  // entries the owner added or asked to list. Ollama was read above.
+  const discoverIds = table.entries
+    .filter((e) => e.discover && e.kind !== "ollama" && e.kind !== "conway")
+    .map((e) => e.id);
+  if (discoverIds.length > 0) {
+    try {
+      await refreshProviderModels(table, modelRegistry, db, { providerIds: discoverIds });
+    } catch (err) {
+      logger.warn(`Model discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (runtime.mode === "standalone") {
+    prepareStandaloneModels(config, modelRegistry, runtime, table, inference);
   }
 
   // Keys go to the registry directly, never into process.env, where every
   // child process would inherit them.
   const providersPath = path.join(process.env.HOME || process.cwd(), ".automaton", "inference-providers.json");
-  // Standalone: the creator's own providers only; the Conway key is never
-  // lent. Built before the tool list, since without it the goal tools and
-  // the orchestration prompt could only mislead.
-  let standaloneProviders: ReturnType<typeof buildStandaloneProviderRegistry> | undefined;
+  // Standalone: the owner's own providers from the table; the Conway key is
+  // never lent. Built before the tool list, since without it the goal tools
+  // and the orchestration prompt could only mislead.
+  let standaloneProviders: ReturnType<typeof buildOrchestrationRegistry> | undefined;
   let standaloneProvidersError: unknown;
   if (runtime.mode === "standalone" && hasTable(db.raw, "goals")) {
+    warnLegacyProviderSettings(providersPath);
     try {
-      standaloneProviders = buildStandaloneProviderRegistry({ config, runtime, ollamaModelIds, providersPath });
+      standaloneProviders = buildOrchestrationRegistry({ table, registry: modelRegistry, strategy: liveStrategy(), config });
     } catch (err) {
       // Reported where orchestration starts; the cycle runs without it.
       standaloneProvidersError = err;
@@ -342,23 +382,21 @@ export async function runAgentLoop(
   // Inference spend gate: one per process, installed by index.ts, or here
   // for embedded use and tests, so every route passes through one.
   const inferenceGate = ensureInferenceGate(db, config, runtime);
-  // Read on every route, so switch_model and --pick-model apply at once.
-  const liveStrategy = (): ModelStrategyConfig => ({
-    ...DEFAULT_MODEL_STRATEGY_CONFIG,
-    ...(config.modelStrategy ?? {}),
-    inferenceModel:
-      config.inferenceModel || config.modelStrategy?.inferenceModel || DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel,
-  });
   // One budget session per wake cycle, separate from memory's session id.
   const budgetSessionId = ulid();
-  const modelRegistry = new ModelRegistry(db.raw);
-  modelRegistry.initialize();
-
-  if (runtime.mode === "standalone") {
-    prepareStandaloneModels(config, modelRegistry, runtime, inference);
-  }
   const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, inferenceGate, liveStrategy, {
     canServe: inference.canServe ? (m) => inference.canServe!(m) : undefined,
+    // Off for every provider unless its entry sets allowUnpriced.
+    allowUnpriced: (m) => allowsUnpriced(table, m),
+    legacySurvivalRow: (m) => keepsConwaySurvivalRule(table, m),
+    unknownPrice: () => {
+      const highest = highestKnownPrice(config, modelRegistry);
+      const policy = inferenceGate.policy.unknownPrice;
+      return {
+        inputUsdPerM: Math.max(highest.inputUsdPerM, policy.inputUsdPerM),
+        outputUsdPerM: Math.max(highest.outputUsdPerM, policy.outputUsdPerM),
+      };
+    },
   });
 
   /**
@@ -1759,6 +1797,29 @@ function toWakeReason(ev: WakeEventRow): WakeReason {
     // A malformed payload just has no task name.
   }
   return { source: String(ev.source ?? ""), reason: String(ev.reason ?? ""), taskName };
+}
+
+/**
+ * Standalone takes its providers from the providers block only: say once
+ * that the old orchestration file and the Groq/Together env keys are ignored.
+ */
+function warnLegacyProviderSettings(providersPath: string): void {
+  if (legacyProvidersFileWarned) return;
+  const ignored: string[] = [];
+  try {
+    if (fs.existsSync(providersPath)) ignored.push(providersPath);
+  } catch {
+    /* unreadable: nothing to report */
+  }
+  for (const name of ["GROQ_API_KEY", "TOGETHER_API_KEY"]) {
+    if (process.env[name]) ignored.push(name);
+  }
+  if (ignored.length === 0) return;
+  legacyProvidersFileWarned = true;
+  logger.warn(
+    `Standalone mode ignores ${ignored.join(" and ")} for the planner and workers: ` +
+      "the providers block in automaton.json (providers.compatible for other servers) replaces it.",
+  );
 }
 
 /**

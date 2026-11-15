@@ -37,6 +37,7 @@ import { detectChainType } from "../identity/chain.js";
 import {
   SCHEMA_VERSION,
   CREATE_TABLES,
+  MODEL_REGISTRY_PROVIDER_COLUMNS,
   MIGRATION_V2,
   MIGRATION_V3,
   MIGRATION_V4,
@@ -729,6 +730,12 @@ function applyMigrations(db: DatabaseType): void {
       // logged, and adds the MCP call log.
       apply: () => { migratePolicyRiskLevels(db); },
     },
+    {
+      version: 19,
+      // Adds the model_registry provider columns (provider_id, remote_id,
+      // listed, price_source, capabilities).
+      apply: () => { migrateModelRegistryProviders(db); },
+    },
   ];
 
   for (const m of migrations) {
@@ -771,6 +778,21 @@ export function migrateModelRegistryOrigin(db: DatabaseType): void {
         AND provider NOT IN ('ollama', 'other')
         AND model_id NOT IN (${placeholders})`,
   ).run(...known);
+}
+
+/**
+ * The provider columns of model_registry (provider_id, remote_id, listed,
+ * price_source, capabilities). Version 19. Adds only the missing ones;
+ * running it again changes nothing.
+ */
+export function migrateModelRegistryProviders(db: DatabaseType): void {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_registry'").get()) {
+    return;
+  }
+  const have = modelRegistryColumns(db);
+  for (const [column, sql] of MODEL_REGISTRY_PROVIDER_COLUMNS) {
+    if (!have.has(column)) db.exec(sql);
+  }
 }
 
 /**
@@ -2752,16 +2774,29 @@ export function inferencePruneCosts(db: DatabaseType, retentionDays: number): nu
 /** Where a model_registry row came from; initialize() disables only 'baseline' rows. */
 export type ModelOrigin = "baseline" | "api" | "ollama" | "manual";
 
+function modelRegistryColumns(db: DatabaseType): Set<string> {
+  const cols = db.prepare("PRAGMA table_info(model_registry)").all() as Array<{ name: string }>;
+  return new Set(cols.map((c) => c.name));
+}
+
 /** Whether model_registry has the origin column (schema version 15+). */
 export function modelRegistryHasOrigin(db: DatabaseType): boolean {
-  const cols = db.prepare("PRAGMA table_info(model_registry)").all() as Array<{ name: string }>;
-  return cols.some((c) => c.name === "origin");
+  return modelRegistryColumns(db).has("origin");
+}
+
+const PROVIDER_COLUMNS = ["provider_id", "remote_id", "listed", "price_source", "capabilities"] as const;
+
+/** Whether model_registry has the provider columns (schema version 19+). */
+export function modelRegistryHasProviderColumns(db: DatabaseType): boolean {
+  const have = modelRegistryColumns(db);
+  return PROVIDER_COLUMNS.every((c) => have.has(c));
 }
 
 /**
- * Insert or replace a model row. `origin` sets the row's origin; when it is
- * omitted the stored origin is kept (INSERT OR REPLACE would otherwise reset
- * it), and a new row gets 'api'.
+ * Insert or update a model row. `origin` sets the row's origin; when it is
+ * omitted the stored origin is kept and a new row gets 'api'. The provider
+ * fields (providerId, remoteId, listed, priceSource, capabilities) are
+ * written only when given: undefined keeps the stored value.
  */
 export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow, origin?: ModelOrigin): void {
   const values = [
@@ -2780,7 +2815,8 @@ export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow, o
     entry.createdAt,
     entry.updatedAt,
   ];
-  if (!modelRegistryHasOrigin(db)) {
+  const cols = modelRegistryColumns(db);
+  if (!cols.has("origin")) {
     db.prepare(
       `INSERT OR REPLACE INTO model_registry
        (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
@@ -2789,13 +2825,68 @@ export function modelRegistryUpsert(db: DatabaseType, entry: ModelRegistryRow, o
     ).run(...values);
     return;
   }
+  const base =
+    "model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output, " +
+    "max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at, origin";
+  const updates = [
+    "provider = excluded.provider",
+    "display_name = excluded.display_name",
+    "tier_minimum = excluded.tier_minimum",
+    "cost_per_1k_input = excluded.cost_per_1k_input",
+    "cost_per_1k_output = excluded.cost_per_1k_output",
+    "max_tokens = excluded.max_tokens",
+    "context_window = excluded.context_window",
+    "supports_tools = excluded.supports_tools",
+    "supports_vision = excluded.supports_vision",
+    "parameter_style = excluded.parameter_style",
+    "enabled = excluded.enabled",
+    "created_at = excluded.created_at",
+    "updated_at = excluded.updated_at",
+    // An upsert without an origin keeps the stored one.
+    "origin = COALESCE(?, model_registry.origin)",
+  ];
+  const extraCols: string[] = [];
+  const extraValues: unknown[] = [];
+  if (PROVIDER_COLUMNS.every((c) => cols.has(c))) {
+    const fields: Array<[string, unknown]> = [
+      ["provider_id", entry.providerId],
+      ["remote_id", entry.remoteId],
+      ["listed", entry.listed === undefined ? undefined : entry.listed ? 1 : 0],
+      ["price_source", entry.priceSource],
+      ["capabilities", entry.capabilities === undefined ? undefined : entry.capabilities === null ? null : JSON.stringify(entry.capabilities)],
+    ];
+    for (const [col, value] of fields) {
+      if (value === undefined) continue;
+      extraCols.push(col);
+      extraValues.push(value);
+      updates.push(`${col} = excluded.${col}`);
+    }
+  }
+  const placeholders = new Array(15 + extraCols.length).fill("?").join(", ");
   db.prepare(
-    `INSERT OR REPLACE INTO model_registry
-     (model_id, provider, display_name, tier_minimum, cost_per_1k_input, cost_per_1k_output,
-      max_tokens, context_window, supports_tools, supports_vision, parameter_style, enabled, created_at, updated_at, origin)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       COALESCE(?, (SELECT origin FROM model_registry WHERE model_id = ?), 'api'))`,
-  ).run(...values, origin ?? null, entry.modelId);
+    `INSERT INTO model_registry (${base}${extraCols.length ? ", " + extraCols.join(", ") : ""})
+     VALUES (${placeholders})
+     ON CONFLICT(model_id) DO UPDATE SET ${updates.join(", ")}`,
+  ).run(...values, origin ?? "api", ...extraValues, origin ?? null);
+}
+
+/** Mark a row listed or not by its provider's model list. No-op without the listed column. */
+export function modelRegistrySetListed(db: DatabaseType, modelId: string, listed: boolean): void {
+  if (!modelRegistryColumns(db).has("listed")) return;
+  db.prepare("UPDATE model_registry SET listed = ?, updated_at = datetime('now') WHERE model_id = ?").run(
+    listed ? 1 : 0,
+    modelId,
+  );
+}
+
+/** Every row's origin, keyed by model id (empty before schema 15). */
+export function modelRegistryOrigins(db: DatabaseType): Map<string, ModelOrigin> {
+  if (!modelRegistryHasOrigin(db)) return new Map();
+  const rows = db.prepare("SELECT model_id, origin FROM model_registry").all() as Array<{
+    model_id: string;
+    origin: ModelOrigin;
+  }>;
+  return new Map(rows.map((r) => [r.model_id, r.origin]));
 }
 
 /** The stored origin of a model, or undefined (no row, or a pre-15 schema). */
@@ -2878,7 +2969,22 @@ function deserializeModelRegistryRow(row: any): ModelRegistryRow {
     enabled: !!row.enabled,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(row.provider_id !== undefined ? { providerId: row.provider_id ?? null } : {}),
+    ...(row.remote_id !== undefined ? { remoteId: row.remote_id ?? null } : {}),
+    ...(row.listed !== undefined && row.listed !== null ? { listed: !!row.listed } : {}),
+    ...(row.price_source !== undefined ? { priceSource: row.price_source ?? null } : {}),
+    ...(row.capabilities !== undefined ? { capabilities: parseCapabilities(row.capabilities) } : {}),
   };
+}
+
+function parseCapabilities(raw: unknown): ModelRegistryRow["capabilities"] {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 function deserializeGoalRow(row: any): GoalRow {

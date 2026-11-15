@@ -139,6 +139,8 @@ async function stop(run: Running): Promise<number | null> {
 
 const chatTo = (home: string, host: string) =>
   requests(home).filter((r) => r.host === host && /\/(chat\/completions|v1\/messages)$/.test(r.path));
+const modelListsFrom = (home: string, host: string) =>
+  requests(home).filter((r) => r.host === host && r.method === "GET" && r.path === "/v1/models");
 
 describe("standalone startup matrix", () => {
   let home: string;
@@ -216,11 +218,14 @@ describe("standalone startup matrix", () => {
     await waitUntil(() => chatTo(home, "api.openai.com").length >= 1, 45_000, "a chat request to OpenAI", running);
     expect(running.output()).toContain("openai (key from automaton.json, https://api.openai.com/v1)");
     expect(chatTo(home, "api.openai.com")[0].path).toBe("/v1/chat/completions");
+    // One model list per provider at startup (cached for a day).
+    expect(modelListsFrom(home, "api.openai.com")).toHaveLength(1);
     expect(await stop(running)).toBe(0);
   });
 
-  it("Anthropic only: starts, calls Anthropic and says orchestration is off", { timeout: 60_000 }, async () => {
-    // The model tries a goal tool; with orchestration off it is not offered.
+  // Rewritten on purpose: an Anthropic-only owner now gets the planner and
+  // workers, and the substitution defaults are Sonnet 5.5 and Haiku 5.5.
+  it("Anthropic only: starts, calls Anthropic, and create_goal works", { timeout: 60_000 }, async () => {
     writeHome(
       home,
       { anthropicApiKey: "sk-ant-test" },
@@ -228,21 +233,29 @@ describe("standalone startup matrix", () => {
     );
     running = start(home);
     await waitUntil(() => chatTo(home, "api.anthropic.com").length >= 2, 45_000, "two chat requests to Anthropic", running);
-    expect(running.output()).toContain("Orchestration is off: planner and workers need an OpenAI-compatible or Ollama provider");
-    expect(running.output()).toMatch(/inferenceModel gpt-5\.2 cannot be served by your providers; using claude-sonnet-4-6/);
+    expect(running.output()).not.toContain("Orchestration is off");
+    expect(running.output()).toMatch(/inferenceModel gpt-5\.2 cannot be served by your providers; using claude-sonnet-5-5/);
     expect(running.output()).not.toMatch(/criticalModel .* using claude-sonnet/);
     expect(await stop(running)).toBe(0);
+    expect(modelListsFrom(home, "api.anthropic.com")).toHaveLength(1);
+    expect(requests(home).filter((r) => r.host !== "api.anthropic.com")).toEqual([]);
     const Database = (await import("better-sqlite3")).default;
     const db = new Database(path.join(home, ".automaton", "state.db"), { readonly: true });
     try {
-      expect((db.prepare("SELECT COUNT(*) AS n FROM goals").get() as { n: number }).n).toBe(0);
-      // An unoffered name is recorded under a placeholder, with the refusal.
-      const calls = db.prepare("SELECT name, result, error FROM tool_calls").all() as Array<{
-        name: string;
-        result: string;
-        error: string | null;
+      expect((db.prepare("SELECT COUNT(*) AS n FROM goals").get() as { n: number }).n).toBe(1);
+      const calls = db.prepare("SELECT name, error FROM tool_calls").all() as Array<{ name: string; error: string | null }>;
+      expect(calls.some((c) => c.name === "create_goal" && !c.error)).toBe(true);
+      // Every AI call was priced: no row is charged at an unknown price.
+      const ledger = db.prepare("SELECT model, price_in_usd_per_m AS price_in, price_out_usd_per_m AS price_out FROM inference_ledger").all() as Array<{
+        model: string;
+        price_in: number;
+        price_out: number;
       }>;
-      expect(calls.some((c) => c.name !== "create_goal" && /Unknown tool: create_goal/.test(`${c.result} ${c.error}`))).toBe(true);
+      expect(ledger.length).toBeGreaterThan(0);
+      for (const r of ledger) {
+        expect(r.model).toMatch(/^claude-/);
+        expect(r.price_in).toBeGreaterThan(0);
+      }
     } finally {
       db.close();
     }
@@ -287,6 +300,36 @@ describe("standalone startup matrix", () => {
     expect(chatTo(home, "llm.example.test")[0].path).toBe("/v1/chat/completions");
     expect(chatTo(home, "api.openai.com")).toEqual([]);
     expect(await stop(running)).toBe(0);
+  });
+
+  it("allowUnpriced keeps an unpriced inferenceModel at startup and charges it at the table maximum", { timeout: 60_000 }, async () => {
+    const providers = {
+      ollama: { baseUrl: "http://127.0.0.1:11434" },
+      compatible: [{ id: "agg", baseUrl: "https://agg.stub.test/v1", apiKey: "sk-agg-0123456789", allowUnpriced: true }],
+    };
+    writeHome(
+      home,
+      { inferenceModel: "agg/vendor/mystery-2", providers },
+      { ollamaModels: ["llama3.1:8b"], models: ["vendor/mystery-2"] },
+    );
+    running = start(home);
+    await waitUntil(() => chatTo(home, "agg.stub.test").length >= 1, 45_000, "a chat request to the compatible host", running);
+    expect(running.output()).not.toMatch(/inferenceModel .* cannot be served/);
+    expect(await stop(running)).toBe(0);
+    expect(chatTo(home, "127.0.0.1:11434")).toEqual([]);
+    const { maxKnownPrice } = await import("../providers/price-table.js");
+    const top = maxKnownPrice({ providers } as any);
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(path.join(home, ".automaton", "state.db"), { readonly: true });
+    try {
+      const ledger = db
+        .prepare("SELECT model, price_in_usd_per_m AS pin, price_out_usd_per_m AS pout FROM inference_ledger WHERE caller = 'agent_turn'")
+        .all() as Array<{ model: string; pin: number; pout: number }>;
+      expect(ledger.length).toBeGreaterThan(0);
+      for (const r of ledger) expect(r).toEqual({ model: "agg/vendor/mystery-2", pin: top.inputUsdPerM, pout: top.outputUsdPerM });
+    } finally {
+      db.close();
+    }
   });
 
   it("a Conway key alone: Conway mode, registration and credit balance as before", { timeout: 60_000 }, async () => {

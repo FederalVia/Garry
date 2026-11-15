@@ -37,7 +37,8 @@ import {
   type InferenceCaller,
   type InferenceScope,
 } from "./gate.js";
-import { registryPrice } from "./policy.js";
+import { registryPrice, type ModelPrice } from "./policy.js";
+import { longPromptPrice } from "../providers/price-table.js";
 import { currentCancellationSignal, mergeSignals } from "../runtime/cancellation.js";
 import {
   InferenceCallError,
@@ -69,6 +70,19 @@ type ChatFn = (messages: any[], options: any) => Promise<any>;
 export interface InferenceRouterOptions {
   /** Whether a backend can serve a model (legacy client's canServe). Default: all. */
   canServe?: (model: ModelEntry) => boolean;
+  /**
+   * Whether this model's provider lets its unpriced models through
+   * (allowUnpriced). Default: none, so a paid model with no price is skipped.
+   */
+  allowUnpriced?: (model: ModelEntry) => boolean;
+  /**
+   * Rows the survival fallback picks by the old rule (cheapest servable paid
+   * model, no tool or tier-floor check), so a Conway install without new
+   * settings behaves as before. Default: none.
+   */
+  legacySurvivalRow?: (model: ModelEntry) => boolean;
+  /** USD per 1M an allowed unpriced model reserves at. Default: the gate's unknown price. */
+  unknownPrice?: () => { inputUsdPerM: number; outputUsdPerM: number };
   /** Overrides the per-caller deadline (tests). */
   deadlineMs?: number;
   now?: () => number;
@@ -185,12 +199,17 @@ export class InferenceRouter {
         while (true) {
           if (attempts >= MAX_ATTEMPTS_PER_CALL || deadline.signal.aborted) break candidateLoop;
 
-          const desired = survival
-            ? SURVIVAL_MAX_TOKENS
-            : request.maxTokens || preference?.maxTokens || model.maxTokens;
+          // Thinking counts toward max_tokens, so a thinking model gets a
+          // floor; the gate may clamp the reservation but not below it.
+          const floor = outputFloor(model);
+          const desired = Math.max(
+            survival ? SURVIVAL_MAX_TOKENS : request.maxTokens || preference?.maxTokens || model.maxTokens,
+            floor,
+          );
           const maxTokens = Math.max(1, Math.min(desired, policy.maxTokensPerTurn, model.maxTokens || desired));
-          const minTokens = Math.min(survival ? SURVIVAL_MIN_TOKENS : TURN_MIN_TOKENS, maxTokens);
+          const minTokens = Math.min(Math.max(survival ? SURVIVAL_MIN_TOKENS : TURN_MIN_TOKENS, floor), maxTokens);
           const transformed = this.transformMessagesForProvider(messages, model.provider);
+          const estInputTokens = this.gate.estimateInputTokens(transformed, tools);
 
           let reservation;
           try {
@@ -200,8 +219,8 @@ export class InferenceRouter {
               provider: model.provider,
               model: model.modelId,
               tier,
-              price: registryPrice(model),
-              estInputTokens: this.gate.estimateInputTokens(transformed, tools),
+              price: this.reservationPrice(model, estInputTokens),
+              estInputTokens,
               maxOutputTokens: maxTokens,
               minOutputTokens: minTokens,
               extraCeilingCents:
@@ -235,6 +254,8 @@ export class InferenceRouter {
                   tools,
                   signal: attemptSignal,
                   reservationId: reservation.id,
+                  // Survival turns think as little as the model allows.
+                  ...(survival ? { effort: "low" } : {}),
                 }),
               ),
               attemptSignal,
@@ -245,7 +266,10 @@ export class InferenceRouter {
             const outputText =
               (response?.message?.content || "") +
               (response?.toolCalls ?? []).map((tc: any) => String(tc?.function?.arguments ?? "")).join("");
-            const { costMicroUsd } = this.gate.commit(reservation.id, usage, now() - attemptStart, { outputText });
+            const { costMicroUsd } = this.gate.commit(reservation.id, usage, now() - attemptStart, {
+              outputText,
+              longPrompt: capabilitiesOf(model).longPrompt,
+            });
             return {
               content: response?.message?.content || "",
               model: model.modelId,
@@ -261,7 +285,7 @@ export class InferenceRouter {
           } catch (err) {
             const callerAborted = request.signal?.aborted === true;
             const cls = classifyInferenceError(err, { callerAborted });
-            this.settle(reservation.id, err, cls);
+            this.settle(reservation.id, err, cls, capabilitiesOf(model).longPrompt);
             lastError = err;
             lastClass = cls;
             logger.warn(`Inference attempt failed on ${model.modelId}: ${cls.kind}${cls.status ? ` ${cls.status}` : ""}`);
@@ -310,14 +334,19 @@ export class InferenceRouter {
     });
   }
 
-  private settle(reservationId: string, err: unknown, cls: ErrorClassification): void {
+  private settle(
+    reservationId: string,
+    err: unknown,
+    cls: ErrorClassification,
+    longPrompt?: RouteCapabilities["longPrompt"],
+  ): void {
     const usage = (err as any)?.usage;
     if (cls.settle === "release") {
       this.gate.release(reservationId, cls.kind + (cls.status ? `:${cls.status}` : ""));
     } else if (cls.settle === "unknown") {
       if (usage && typeof usage.inputTokens === "number") {
         // A 2xx with usage but no usable completion: billed at its usage.
-        this.gate.commit(reservationId, usage, 0);
+        this.gate.commit(reservationId, usage, 0, { longPrompt });
       } else {
         this.gate.markUnknown(reservationId, cls.kind + (cls.status ? `:${cls.status}` : ""));
       }
@@ -343,8 +372,9 @@ export class InferenceRouter {
   private servable(entry: ModelEntry | undefined): entry is ModelEntry {
     if (!entry || !entry.enabled) return false;
     // A paid model without a known price cannot be capped: any assumed price
-    // may be below the real one.
-    if (!this.isLocal(entry) && !hasKnownPrice(entry)) {
+    // may be below the real one. Its provider may opt in (allowUnpriced); it
+    // then reserves at the highest known price.
+    if (!this.isLocal(entry) && !hasKnownPrice(entry) && !this.opts.allowUnpriced?.(entry)) {
       if (!this.unpricedWarned.has(entry.modelId)) {
         this.unpricedWarned.add(entry.modelId);
         logger.warn(`Skipping ${entry.modelId}: no known price, so its spend cannot be capped`);
@@ -356,6 +386,29 @@ export class InferenceRouter {
 
   private isLocal(entry: ModelEntry): boolean {
     return registryPrice(entry).local;
+  }
+
+  /**
+   * The price an attempt reserves at: the registry price, the highest known
+   * price for an allowed unpriced model, and a long-prompt tier once the
+   * estimated prompt reaches 70% of its threshold.
+   */
+  reservationPrice(entry: ModelEntry, estInputTokens: number): ModelPrice {
+    const base = registryPrice(entry);
+    if (base.local) return base;
+    if (!hasKnownPrice(entry)) {
+      const unknown = this.opts.unknownPrice?.() ?? this.gate.policy.unknownPrice;
+      return { inputUsdPerM: unknown.inputUsdPerM, outputUsdPerM: unknown.outputUsdPerM, local: false };
+    }
+    const tier = longPromptPrice(capabilitiesOf(entry), estInputTokens);
+    if (tier) {
+      return {
+        inputUsdPerM: Math.max(base.inputUsdPerM, tier.inputUsdPerM),
+        outputUsdPerM: Math.max(base.outputUsdPerM, tier.outputUsdPerM),
+        local: false,
+      };
+    }
+    return base;
   }
 
   /**
@@ -433,10 +486,23 @@ export class InferenceRouter {
     if (tier === "dead") return out;
     const critical = strategy.criticalModel ? this.registry.get(strategy.criticalModel) : undefined;
     if (this.servable(critical)) push(critical);
+    // Cheap checks first, so a large imported catalog is sorted once and
+    // canServe runs only until the first servable row. A survival turn
+    // needs tools, and a model below its own tier floor is no fallback:
+    // otherwise any imported catalog's cheapest model would be picked.
+    const tierRank = TIER_ORDER[tier] ?? 0;
     const cheapest = this.registry
       .getAll()
-      .filter((e) => this.servable(e) && !this.isLocal(e) && e.costPer1kOutput > 0)
-      .sort((a, b) => a.costPer1kOutput - b.costPer1kOutput || a.costPer1kInput - b.costPer1kInput)[0];
+      .filter(
+        (e) =>
+          e.enabled &&
+          hasKnownPrice(e) &&
+          !this.isLocal(e) &&
+          (this.opts.legacySurvivalRow?.(e) === true ||
+            (e.supportsTools && tierRank >= (TIER_ORDER[e.tierMinimum] ?? 99))),
+      )
+      .sort((a, b) => a.costPer1kOutput - b.costPer1kOutput || a.costPer1kInput - b.costPer1kInput)
+      .find((e) => this.servable(e));
     if (cheapest) push(cheapest);
     return out;
   }
@@ -447,77 +513,15 @@ export class InferenceRouter {
   }
 
   /**
-   * Transform messages for a specific provider.
-   * Handles Anthropic's alternating-role requirement.
+   * Merge consecutive same-role messages for every provider. Tool messages
+   * stay tool messages: the Anthropic codec turns them into tool_result
+   * blocks, which the API requires after a tool_use.
    */
-  transformMessagesForProvider(messages: ChatMessage[], provider: ModelProvider): ChatMessage[] {
+  transformMessagesForProvider(messages: ChatMessage[], _provider: ModelProvider): ChatMessage[] {
     if (messages.length === 0) {
       throw new Error("Cannot route inference with empty message array");
     }
-
-    if (provider === "anthropic") {
-      return this.fixAnthropicMessages(messages);
-    }
-
-    // For OpenAI/Conway, merge consecutive same-role messages
     return this.mergeConsecutiveSameRole(messages);
-  }
-
-  /**
-   * Fix messages for Anthropic's API requirements:
-   * 1. Extract system messages
-   * 2. Merge consecutive same-role messages
-   * 3. Merge consecutive tool messages into a single user message
-   *    with multiple tool_result content blocks
-   */
-  private fixAnthropicMessages(messages: ChatMessage[]): ChatMessage[] {
-    const result: ChatMessage[] = [];
-
-    for (const msg of messages) {
-      // System messages are handled separately by the Anthropic client
-      if (msg.role === "system") {
-        result.push(msg);
-        continue;
-      }
-
-      // Tool messages become user messages with tool_result content
-      if (msg.role === "tool") {
-        const last = result[result.length - 1];
-        // If previous message was also a tool (now a user), merge into it
-        if (last && last.role === "user" && (last as any)._toolResultMerged) {
-          // Append to the merged content
-          last.content = last.content + "\n[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content;
-          continue;
-        }
-        // Otherwise create a new user message
-        const userMsg: ChatMessage & { _toolResultMerged?: boolean } = {
-          role: "user",
-          content: "[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content,
-          _toolResultMerged: true,
-        };
-        result.push(userMsg);
-        continue;
-      }
-
-      // For user/assistant: merge with previous if same role
-      const last = result[result.length - 1];
-      if (last && last.role === msg.role) {
-        last.content = (last.content || "") + "\n" + (msg.content || "");
-        if (msg.tool_calls) {
-          last.tool_calls = [...(last.tool_calls || []), ...msg.tool_calls];
-        }
-        continue;
-      }
-
-      result.push({ ...msg });
-    }
-
-    // Clean up internal markers
-    for (const msg of result) {
-      delete (msg as any)._toolResultMerged;
-    }
-
-    return result;
   }
 
   /**
@@ -544,6 +548,29 @@ export class InferenceRouter {
   private getPreference(tier: SurvivalTier, taskType: InferenceTaskType): ModelPreference | undefined {
     return DEFAULT_ROUTING_MATRIX[tier]?.[taskType];
   }
+}
+
+interface RouteCapabilities {
+  minOutputTokens?: number;
+  longPrompt?: { aboveInputTokens: number; inputUsdPerM: number; outputUsdPerM: number };
+}
+
+/** The capability fields routing reads (stored as JSON on the registry row). */
+function capabilitiesOf(entry: ModelEntry): RouteCapabilities {
+  let caps: unknown = (entry as { capabilities?: unknown }).capabilities;
+  if (typeof caps === "string") {
+    try {
+      caps = JSON.parse(caps);
+    } catch {
+      caps = undefined;
+    }
+  }
+  return caps && typeof caps === "object" ? (caps as RouteCapabilities) : {};
+}
+
+function outputFloor(entry: ModelEntry): number {
+  const floor = Number(capabilitiesOf(entry).minOutputTokens ?? 0);
+  return Number.isFinite(floor) && floor > 0 ? Math.floor(floor) : 0;
 }
 
 function hasKnownPrice(entry: ModelEntry): boolean {

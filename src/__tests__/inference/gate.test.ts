@@ -22,7 +22,8 @@ import {
   type InferenceScope,
   type ReserveRequest,
 } from "../../inference/gate.js";
-import { resolveInferencePolicy, type ResolvedInferencePolicy } from "../../inference/policy.js";
+import { registryPrice, resolveInferencePolicy, type ResolvedInferencePolicy } from "../../inference/policy.js";
+import { maxKnownPrice } from "../../providers/price-table.js";
 import {
   InferenceHttpError,
   InferenceRefusedError,
@@ -112,7 +113,9 @@ describe("policy resolution", () => {
     expect(p.survivalAllowanceCents).toBe(25);
     expect(p.survivalMinIntervalMs).toBe(30 * 60_000);
     expect(p.sessionCooldownMs).toBe(30 * 60_000);
-    expect(p.unknownPrice).toEqual({ inputUsdPerM: 2, outputUsdPerM: 14 });
+    // The highest known price (the price table), not the old $2/$14 baseline maximum.
+    expect(p.unknownPrice).toEqual(maxKnownPrice());
+    expect(p.unknownPrice).toEqual({ inputUsdPerM: 10, outputUsdPerM: 50 });
   });
 
   it("clamps an explicit hourly cap to the daily cap and falls back on invalid values", () => {
@@ -252,10 +255,30 @@ describe("per-call ceiling (F125, D4)", () => {
 });
 
 describe("prices", () => {
-  it("charges a remote model with a zero price at the conservative price (D10)", () => {
+  it("charges a remote model with a zero price at the highest known price (D10)", () => {
     const g = newGate(policy({ daily: 50_000 }));
     const r = g.reserve(req(0, MAIN, { price: { inputUsdPerM: 0, outputUsdPerM: 0, local: false }, estInputTokens: 1000, maxOutputTokens: 1000, minOutputTokens: 1000 }));
-    expect(r.reservedMicroUsd).toBe(1000 * 2 + 1000 * 14);
+    expect(r.reservedMicroUsd).toBe(1000 * 10 + 1000 * 50);
+    const row = raw
+      .prepare("SELECT price_in_usd_per_m AS pin, price_out_usd_per_m AS pout FROM inference_ledger WHERE id = ?")
+      .get(r.id) as { pin: number; pout: number };
+    expect(row).toEqual({ pin: 10, pout: 50 });
+  });
+
+  it("an owner price above the table raises the unknown price", () => {
+    const p = resolveInferencePolicy(
+      { modelStrategy: {} as any, providers: { openai: { models: [{ id: "x", inputUsdPerM: 30, outputUsdPerM: 90 }] } } },
+      { maxInferenceDailyCents: 50_000 },
+    );
+    expect(p.unknownPrice).toEqual({ inputUsdPerM: 30, outputUsdPerM: 90 });
+  });
+
+  it("registryPrice: free from the provider table, else only Ollama", () => {
+    const row = { provider: "openai" as const, costPer1kInput: 0, costPer1kOutput: 0 };
+    expect(registryPrice(row).local).toBe(false);
+    expect(registryPrice({ ...row, free: true }).local).toBe(true);
+    expect(registryPrice({ ...row, free: false, provider: "ollama" as const }).local).toBe(false);
+    expect(registryPrice({ ...row, provider: "ollama" as const }).local).toBe(true);
   });
 
   it("commits at actual usage, and at the reserved amount when a paid response has no usage", () => {
@@ -265,6 +288,18 @@ describe("prices", () => {
     const b = g.reserve(req(0, MAIN, { estInputTokens: 1000, maxOutputTokens: 1000, minOutputTokens: 1000 }));
     expect(g.commit(b.id, null, 5).costMicroUsd).toBe(b.reservedMicroUsd);
     expect(g.isOpen(a.id)).toBe(false);
+  });
+
+  it("settles at the long-prompt tier when reported input crosses its threshold, whatever the reservation price", () => {
+    const g = newGate(policy({ daily: 50_000 }));
+    const longPrompt = { aboveInputTokens: 100_000, inputUsdPerM: 0.5, outputUsdPerM: 2.5 };
+    const base = { inputUsdPerM: 0.1, outputUsdPerM: 0.5, local: false };
+    // Reserved at the base price from an estimate under 70% of the threshold.
+    const a = g.reserve(req(0, MAIN, { price: base, estInputTokens: 69_000, maxOutputTokens: 1000, minOutputTokens: 100 }));
+    expect(g.commit(a.id, { inputTokens: 140_000, outputTokens: 1000 }, 1, { longPrompt }).costMicroUsd).toBe(72_500);
+    // At or under the threshold the reservation price stands.
+    const b = g.reserve(req(0, MAIN, { price: base, estInputTokens: 69_000, maxOutputTokens: 1000, minOutputTokens: 100 }));
+    expect(g.commit(b.id, { inputTokens: 100_000, outputTokens: 1000 }, 1, { longPrompt }).costMicroUsd).toBe(10_500);
   });
 });
 

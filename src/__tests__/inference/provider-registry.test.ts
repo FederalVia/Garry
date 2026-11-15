@@ -442,6 +442,63 @@ describe("ProviderRegistry", () => {
     expect(isLocalProvider({ id: "custom", baseUrl: "http://127.0.0.1:8000/v1" })).toBe(false);
   });
 
+  it("isLocalProvider accepts the bracketed IPv6 loopback, for local and for a free entry", () => {
+    expect(isLocalProvider({ id: "local", baseUrl: "http://[::1]:11434/v1" })).toBe(true);
+    expect(isLocalProvider({ id: "lmstudio", baseUrl: "http://[::1]:1234/v1", free: true })).toBe(true);
+    expect(isLocalProvider({ id: "lmstudio", baseUrl: "http://127.0.0.1:1234/v1", free: true })).toBe(true);
+    // Free needs loopback; loopback alone is not free.
+    expect(isLocalProvider({ id: "lan", baseUrl: "http://192.168.1.5:1234/v1", free: true })).toBe(false);
+    expect(isLocalProvider({ id: "lmstudio", baseUrl: "http://[::1]:1234/v1" })).toBe(false);
+  });
+
+  it("a keyless free loopback entry is usable without a key; a remote one is not", () => {
+    const provider = (id: string, baseUrl: string): ProviderConfig => ({
+      id,
+      name: id,
+      baseUrl,
+      apiKeyEnvVar: `AUTOMATON_PROVIDER_${id.toUpperCase()}_API_KEY`,
+      models: [{ id: "m", tier: "cheap", contextWindow: 8000, maxOutputTokens: 1000, costPerInputToken: 0, costPerOutputToken: 0, supportsTools: true, supportsVision: false, supportsStreaming: true }],
+      maxRequestsPerMinute: 10,
+      maxTokensPerMinute: 1000,
+      priority: 1,
+      enabled: true,
+      free: true,
+      noKeyRequired: true,
+    });
+    const local = new ProviderRegistry([provider("lmstudio", "http://[::1]:1234/v1")]);
+    expect(local.resolveCandidates("cheap").map((c) => c.provider.id)).toEqual(["lmstudio"]);
+    const remote = new ProviderRegistry([provider("remote", "https://llm.example/v1")]);
+    expect(remote.resolveCandidates("cheap")).toEqual([]);
+  });
+
+  it("builds an Anthropic transport, not an OpenAI client, for an anthropic provider", () => {
+    const registry = new ProviderRegistry(
+      [
+        {
+          id: "anthropic",
+          name: "Anthropic",
+          baseUrl: "https://api.anthropic.com",
+          apiKeyEnvVar: "ANTHROPIC_API_KEY",
+          kind: "anthropic",
+          models: [{ id: "claude-haiku-5-5", tier: "cheap", contextWindow: 200000, maxOutputTokens: 8192, costPerInputToken: 0.1, costPerOutputToken: 0.5, supportsTools: true, supportsVision: true, supportsStreaming: true }],
+          maxRequestsPerMinute: 10,
+          maxTokensPerMinute: 1000,
+          priority: 1,
+          enabled: true,
+        },
+      ],
+      undefined,
+      { keys: { ANTHROPIC_API_KEY: "sk-ant-x" } },
+    );
+    const ctorCalls = openAiCtor.mock.calls.length;
+    const [resolved] = registry.resolveCandidates("cheap");
+    expect(resolved.anthropic).toBeDefined();
+    expect(resolved.client).toBeUndefined();
+    expect(openAiCtor.mock.calls.length).toBe(ctorCalls);
+    // The key lives in the transport's closure, not on anything serialisable.
+    expect(JSON.stringify(resolved)).not.toContain("sk-ant-x");
+  });
+
   it("builds SDK clients with no SDK retries and an explicit timeout", () => {
     const registry = createRegistryFromDefaults();
     registry.resolveModel("reasoning");

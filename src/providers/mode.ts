@@ -11,6 +11,7 @@ import type { AutomatonConfig, ResolvedTreasuryPolicy } from "../types.js";
 import { createLogger } from "../observability/logger.js";
 import { ALL_FEATURES, standaloneFeatures, FeatureDisabledError, type FeatureSet } from "./features.js";
 import { resolveSurvivalSource, type SurvivalSource } from "./survival-source.js";
+import { isLoopbackHost } from "../conway/http-client.js";
 
 const logger = createLogger("providers");
 
@@ -18,6 +19,9 @@ export type RuntimeMode = "conway" | "standalone";
 
 /** Where a resolved value came from. Only sources are ever logged, never values. */
 export type ValueSource = "env" | "providers" | "flat" | "config.json";
+
+/** A provider key's source; "provider-env" is AUTOMATON_PROVIDER_<ID>_API_KEY. */
+export type KeySource = ValueSource | "provider-env";
 
 export const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 export const DEFAULT_DAILY_CAP_CEILING_CENTS = 200;
@@ -50,6 +54,8 @@ export interface ResolvedRuntime {
     anthropic?: { keySource: ValueSource };
     ollama?: { baseUrl: string; source: ValueSource };
     conway?: { keySource: ValueSource; apiUrl: string };
+    /** providers.compatible entries, in config order. */
+    compatible?: Array<{ id: string; baseUrl: string; keySource: KeySource | null; free: boolean; models: string[] }>;
   };
   survival: SurvivalSource;
   /** Standalone: the most the daily AI cap may be. Conway mode: null (never clamped). */
@@ -77,7 +83,24 @@ export function configuredOpenAiModelIds(config: Pick<AutomatonConfig, "provider
   return models.map((m) => (m && typeof m.id === "string" ? m.id.trim() : "")).filter(Boolean);
 }
 
-export function resolveRuntime(config: AutomatonConfig): ResolvedRuntime {
+function isLoopbackUrl(url: string): boolean {
+  try {
+    return isLoopbackHost(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** The one environment variable that may hold a compatible provider's key. */
+export function providerKeyEnvVar(id: string): string {
+  return `AUTOMATON_PROVIDER_${id.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+}
+
+export const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+/** Ids a compatible entry may not take: the built-in entries, and the old file's free "local". */
+export const RESERVED_PROVIDER_IDS: ReadonlySet<string> = new Set(["openai", "anthropic", "ollama", "conway", "local"]);
+
+export function resolveRuntime(config: AutomatonConfig, env: NodeJS.ProcessEnv = process.env): ResolvedRuntime {
   const p = config.providers ?? {};
   const src = configSources(config);
   const conwayKey = nonEmpty(config.conwayApiKey);
@@ -111,6 +134,28 @@ export function resolveRuntime(config: AutomatonConfig): ResolvedRuntime {
   if (conwayKey) {
     providers.conway = { keySource: src.conwayApiKey ?? "flat", apiUrl: config.conwayApiUrl };
   }
+  const compatible: NonNullable<ResolvedRuntime["providers"]["compatible"]> = [];
+  for (const c of Array.isArray(p.compatible) ? p.compatible : []) {
+    if (!c || typeof c.id !== "string" || !PROVIDER_ID_PATTERN.test(c.id) || RESERVED_PROVIDER_IDS.has(c.id)) continue;
+    if (compatible.some((e) => e.id === c.id)) continue;
+    const baseUrl = nonEmpty(c.baseUrl)?.replace(/\/+$/, "");
+    if (!baseUrl) continue;
+    const keySource: KeySource | null = nonEmpty(c.apiKey)
+      ? "providers"
+      : nonEmpty(env[providerKeyEnvVar(c.id)])
+        ? "provider-env"
+        : null;
+    compatible.push({
+      id: c.id,
+      baseUrl,
+      keySource,
+      free: c.free === true && isLoopbackUrl(baseUrl),
+      models: Array.isArray(c.models)
+        ? c.models.map((m) => (m && typeof m.id === "string" ? m.id.trim() : "")).filter(Boolean)
+        : [],
+    });
+  }
+  if (compatible.length > 0) providers.compatible = compatible;
 
   const relayUrl = nonEmpty(config.socialRelayUrl) ?? "";
   const payments = mode === "conway" ? true : p.payments === true;
@@ -134,7 +179,9 @@ export function resolveRuntime(config: AutomatonConfig): ResolvedRuntime {
 
 /** True when some AI provider other than Conway is configured. */
 export function hasOwnAiProvider(r: ResolvedRuntime): boolean {
-  return !!(r.providers.openai || r.providers.anthropic || r.providers.ollama);
+  if (r.providers.openai || r.providers.anthropic || r.providers.ollama) return true;
+  // A compatible server counts when it can be called: a key, or on this machine.
+  return (r.providers.compatible ?? []).some((c) => c.keySource !== null || isLoopbackUrl(c.baseUrl));
 }
 
 const SOURCE_LABELS: Record<keyof ConfigSources, Record<ValueSource, string>> = {
@@ -171,6 +218,18 @@ export function describeRuntime(r: ResolvedRuntime, relayLabel?: string): string
   }
   if (anthropic) parts.push(`anthropic (key from ${SOURCE_LABELS.anthropicApiKey[anthropic.keySource]})`);
   if (ollama) parts.push(`ollama (${ollama.baseUrl}, from ${SOURCE_LABELS.ollamaBaseUrl[ollama.source]})`);
+  for (const c of r.providers.compatible ?? []) {
+    const key =
+      c.keySource === "providers"
+        ? `key from providers.compatible[${c.id}].apiKey, `
+        : c.keySource === "provider-env"
+          ? `key from ${providerKeyEnvVar(c.id)}, `
+          : isLoopbackUrl(c.baseUrl)
+            ? ""
+            : "no key: serves nothing, ";
+    const extras = [c.models.length > 0 ? `${c.models.length} configured model(s)` : "", c.free ? "free" : ""].filter(Boolean);
+    parts.push(`${c.id} (${key}${c.baseUrl}${extras.length > 0 ? `, ${extras.join(", ")}` : ""})`);
+  }
   if (conway && r.mode === "conway") parts.push(`conway (${conway.apiUrl})`);
   if (conway && r.mode === "standalone") parts.push("conway key present but unused (providers.mode is standalone)");
   const survival = r.survival.kind === "fixed" ? `fixed (${r.survival.tier})` : "Conway credit balance";

@@ -388,6 +388,16 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "inference/router",
   // Model prices the inference gate charges.
   "inference/registry",
+  // Baseline prices and routing ceilings the gate charges and enforces.
+  "inference/types",
+  // The Anthropic request codec: what a paid call sends and how its usage is billed.
+  "inference/anthropic",
+  // The provider table (keys, free loopback servers), the price table,
+  // model discovery and the free Ollama rows it writes.
+  "providers/table",
+  "providers/price-table",
+  "providers/discovery",
+  "ollama/discover",
   "observability/logger",
   "soul/validator",
   "soul/tools",
@@ -409,6 +419,8 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   "setup/configure",
   // Writes providers.mode "standalone" for a keyless install (the sticky cap ceiling).
   "setup/wizard",
+  // Picks the models the agent runs on and writes them into the config.
+  "setup/model-picker",
   // The operator CLI signs and moves the operator's money.
   "packages/cli/src/commands/fund",
   "packages/cli/src/commands/send",
@@ -446,10 +458,13 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "replication",
   "survival",
   "operator",
-  // Runtime mode, survival source, the daily cap ceiling and tool visibility.
+  // Runtime mode, survival source, the daily cap ceiling and tool visibility;
+  // the provider table, prices and model discovery.
   "providers",
   // MCP: env scrubbing, address checks and operator approvals.
   "mcp",
+  // The inference gate, router, clients, prices and routing ceilings.
+  "inference",
 ]);
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
 // packages/ holds the workspace packages the root build compiles after the
@@ -607,6 +622,8 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "inference/router",
   // Model prices the inference gate charges.
   "inference/registry",
+  "inference/types",
+  "inference/anthropic",
   "conway/inference",
   "conway/http-client",
   "registry/erc8004",
@@ -637,9 +654,15 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "providers/survival-source",
   "providers/features",
   "providers/model-defaults",
+  // The provider table, prices, discovery and the free Ollama rows.
+  "providers/table",
+  "providers/price-table",
+  "providers/discovery",
+  "ollama/discover",
   "operator/fund",
   "operator/send",
   "setup/operator-command",
+  "setup/model-picker",
   "orchestration/simple-tracker",
   "social/inbound",
   "social/signing",

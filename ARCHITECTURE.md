@@ -141,14 +141,18 @@ The runtime alternates between two states: **running** (the agent loop is active
 | `conwayCredits` | on | off | `check_credits`, `transfer_credits`, `heartbeat_ping`, `distress_signal` |
 | `topups` | on | off | `topup_credits`, bootstrap and inline topups |
 | `domains` | on | off | domain and DNS tools |
-| `conwayModels` | on | off | `refresh_models` |
+| `conwayModels` | on | off | Conway's own listing inside `refresh_models` (the task runs in both modes and refreshes each configured provider's model list) |
 | `relay` | on | `socialRelayUrl` set (not Conway's default) or `providers.relayUrl` | `send_message`, `message_child` (with `children`), inbox polling |
 | `payments` / `onchainIdentity` | on | `providers.payments` | `x402_fetch`, `check_usdc_balance`, ERC-8004 tools including `discover_agents` |
-| `orchestration` | on | an OpenAI-compatible or Ollama provider | goal tools and the orchestration prompt |
+| `orchestration` | on | a provider with a usable model (Anthropic, OpenAI, Ollama or a `providers.compatible` entry: tool support and a price, or a free loopback server) | goal tools and the orchestration prompt |
 
 `discover_agents` needs `onchainIdentity` like the other ERC-8004 tools, so standalone with payments off offers no tool that reads a chain; with payments on, its standalone description says each uncached call makes read-only JSON-RPC requests to the Base chain. The agent card claims `x402Support` only when payments are on.
 
 The standalone system prompt says where the agent runs and what it can pay for, and never mentions Conway or a sandbox. At startup, standalone replaces the Conway survival skill and the Conway capability lines of `SOUL.md` that older setups installed for every install, when they are unmodified (an edited `SOUL.md` that still names Conway gets a warning). The planner is given the daily AI cap, today's spend and the orchestration share instead of a credit balance; Conway mode keeps its planner text. Strategy slots no configured provider can serve get a substitute the router accepts at that slot's tier, in memory only (`src/providers/model-defaults.ts`).
+
+**Provider table.** The main loop's router and client (`src/inference/router.ts`, `src/conway/inference.ts`) take their providers from one table (`src/providers/table.ts`) in both modes; in standalone the planner and workers' unified client (`src/inference/inference-client.ts`) is built from the same table (`buildOrchestrationRegistry`), while in Conway mode it keeps `inference-providers.json` with the OpenAI key, else the Conway key. Entries: `openai` (any OpenAI-compatible endpoint through `providers.openai.baseUrl`), `anthropic` (always `https://api.anthropic.com`), `ollama`, any number of `providers.compatible` entries (an aggregator, Groq, Together, vLLM, LM Studio; registry ids `<id>/<model>`), and in Conway mode `conway`. A key goes only to its own entry's base URL; a compatible entry's key comes from its `apiKey` or `AUTOMATON_PROVIDER_<ID>_API_KEY`. One serve rule (`canServeModel`) decides what each entry can serve; an entry with a `models` list on a custom endpoint serves only those models. `list_models` in standalone lists only models a configured provider can serve.
+
+Prices: the owner's `models` prices win, then the larger of the price the provider's model list reports and the local price table (`src/providers/price-table.ts`), which holds Anthropic's current models and OpenAI's baseline (valid only on OpenAI's own endpoint) and a few hosted prices keyed by host. `refresh_models` reads each entry's model list (`/v1/models`, Anthropic's models endpoint, Ollama's `/api/tags`) at most once a day after a success and once an hour after a failure (`src/providers/discovery.ts`); built-in OpenAI and Anthropic import only priced models, imported rows are labelled by their provider (never `conway`), a row of another configured provider is never overwritten, and a row left by a provider that is no longer configured is taken over. The router skips a paid model without a price; with `allowUnpriced` on its entry it is used and reserved at the highest known price (the price table's or a listed row's maximum, at least $10/$50 per 1M). A listed price below $0.01 per 1M on either side is taken as a listing in other units (USD per token) and that model counts as unpriced. A failed discovery keeps the known rows, except after the entry's base URL changed: then the rows the old endpoint listed are unlisted. A model is free only on Ollama (any host for the main loop; the planner and workers use Ollama only on loopback) or on a loopback entry marked `free`. Claude Haiku 5.5's long-prompt price is reserved once the local estimate reaches 70% of 100K input tokens, since the estimate runs short of Claude's tokenizer, and a call whose reported input is over 100K settles at that price whatever was reserved. The survival fallback's cheapest paid model must support tools and allow the current tier; Conway's own rows in Conway mode keep the old rule (cheapest priced row). The Anthropic codec (`src/inference/anthropic.ts`) serves both stacks and sends what current Claude models accept (no sampling parameters or prefill; `effort` only where the model takes it; tool-call ids from other providers rewritten to unique valid ids).
 
 **State transitions** (`AgentState`):
 - `setup` -> `waking` -> `running` -> `sleeping` -> `waking` (cycle)
@@ -867,9 +871,13 @@ AutomatonConfig
   ollamaBaseUrl           Optional Ollama base URL
   providers               Provider block (wins over the flat fields above):
     mode                    "conway" | "standalone" (absent: conway when a Conway key resolves)
-    openai                  { apiKey, baseUrl (https, or http on loopback), models: [{ id, inputUsdPerM, outputUsdPerM, tierMinimum }] }
-    anthropic               { apiKey }
-    ollama                  { baseUrl }
+    openai                  { apiKey, baseUrl (https, or http on loopback), models: [{ id, inputUsdPerM, outputUsdPerM, tierMinimum }],
+                              discover (default: on in standalone), free (loopback baseUrl only) }
+    anthropic               { apiKey, models (owner prices and tier floors), effort, discover }
+    ollama                  { baseUrl, discover }
+    compatible              [{ id, name, baseUrl, apiKey (else AUTOMATON_PROVIDER_<ID>_API_KEY), models (allowlist),
+                               discover (default true), free (loopback only), allowUnpriced (default false),
+                               orchestration (default true), priority (default 100) }]
     conway                  { apiKey, apiUrl }
     survival                { source: "fixed" | "conway", fixedTier (default "normal") }
     dailyCapCeilingCents    Standalone ceiling on treasuryPolicy.maxInferenceDailyCents (default 200)

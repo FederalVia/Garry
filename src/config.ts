@@ -17,6 +17,8 @@ import { registerSecret } from "./security/secret-redaction.js";
 import type { ChainType } from "./identity/chain.js";
 import { setConfigSources, type ValueSource } from "./providers/mode.js";
 import { isFixedSurvivalTier } from "./providers/survival-source.js";
+import { isLoopbackHost } from "./conway/http-client.js";
+import { RESERVED_PROVIDER_IDS, PROVIDER_ID_PATTERN, providerKeyEnvVar } from "./providers/table.js";
 
 const logger = createLogger("config");
 const CONFIG_FILENAME = "automaton.json";
@@ -65,10 +67,6 @@ function isPlainObject(v: unknown): v is Raw {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return h === "localhost" || h === "127.0.0.1" || h === "::1";
-}
 
 /** https, or http on loopback, with no userinfo. */
 function isAcceptableBaseUrl(raw: string): boolean {
@@ -81,6 +79,14 @@ function isAcceptableBaseUrl(raw: string): boolean {
   if (url.username || url.password) return false;
   if (url.protocol === "https:") return true;
   return url.protocol === "http:" && isLoopbackHost(url.hostname);
+}
+
+function isLoopbackUrl(raw: string): boolean {
+  try {
+    return isLoopbackHost(new URL(raw).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /** Refuse a providers block that would be read wrongly. */
@@ -111,21 +117,70 @@ function validateProviders(block: unknown, configPath: string): void {
     const key = p[name]?.apiKey;
     if (key !== undefined && typeof key !== "string") fail(`${name}.apiKey must be a string`);
   }
-  const models = p.openai?.models;
-  if (models !== undefined) {
-    if (!Array.isArray(models)) fail("openai.models must be a list");
-    models.forEach((m: unknown, i: number) => {
-      if (!isPlainObject(m) || typeof m.id !== "string" || m.id.trim() === "") fail(`openai.models[${i}] needs an id`);
+  const checkModels = (models: unknown, where: string): void => {
+    if (models === undefined) return;
+    if (!Array.isArray(models)) fail(`${where} must be a list`);
+    (models as unknown[]).forEach((m: unknown, i: number) => {
+      if (!isPlainObject(m) || typeof m.id !== "string" || m.id.trim() === "") fail(`${where}[${i}] needs an id`);
       for (const k of ["inputUsdPerM", "outputUsdPerM"]) {
         const v = (m as Raw)[k];
         if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
-          fail(`openai.models[${i}].${k} must be a number >= 0`);
+          fail(`${where}[${i}].${k} must be a number >= 0`);
         }
       }
       const tier = (m as Raw).tierMinimum;
       if (tier !== undefined && !["high", "normal", "low_compute", "critical"].includes(tier)) {
-        fail(`openai.models[${i}].tierMinimum must be high, normal, low_compute or critical`);
+        fail(`${where}[${i}].tierMinimum must be high, normal, low_compute or critical`);
       }
+    });
+  };
+  const checkFlag = (v: unknown, where: string): void => {
+    if (v !== undefined && typeof v !== "boolean") fail(`${where} must be true or false`);
+  };
+  checkModels(p.openai?.models, "openai.models");
+  checkModels(p.anthropic?.models, "anthropic.models");
+  checkFlag(p.openai?.discover, "openai.discover");
+  checkFlag(p.openai?.free, "openai.free");
+  checkFlag(p.anthropic?.discover, "anthropic.discover");
+  if (p.ollama !== undefined) checkFlag(p.ollama.discover, "ollama.discover");
+  // Free means loopback: a remote server always costs someone money.
+  if (p.openai?.free === true) {
+    const url = typeof p.openai.baseUrl === "string" ? p.openai.baseUrl.trim() : "";
+    if (!url || !isLoopbackUrl(url)) fail("openai.free needs a loopback baseUrl (localhost, 127.0.0.1 or ::1)");
+  }
+  const effort = p.anthropic?.effort;
+  if (effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    fail("anthropic.effort must be low, medium, high, xhigh or max");
+  }
+  if (p.compatible !== undefined) {
+    if (!Array.isArray(p.compatible)) fail("compatible must be a list");
+    const seen = new Set<string>();
+    (p.compatible as unknown[]).forEach((c: unknown, i: number) => {
+      if (!isPlainObject(c)) fail(`compatible[${i}] must be an object`);
+      const entry = c as Raw;
+      const id = entry.id;
+      if (typeof id !== "string" || !PROVIDER_ID_PATTERN.test(id)) {
+        fail(`compatible[${i}].id must match ${PROVIDER_ID_PATTERN} (lowercase letters, digits and hyphens)`);
+      }
+      if (RESERVED_PROVIDER_IDS.has(id)) fail(`compatible[${i}].id "${id}" is reserved for a built-in provider`);
+      if (seen.has(id)) fail(`compatible[${i}].id "${id}" is used twice`);
+      seen.add(id);
+      const where = `compatible[${id}]`;
+      if (entry.name !== undefined && typeof entry.name !== "string") fail(`${where}.name must be a string`);
+      const url = entry.baseUrl;
+      if (typeof url !== "string" || url.trim() === "" || !isAcceptableBaseUrl(url.trim())) {
+        fail(`${where}.baseUrl must be an https URL, or http on localhost`);
+      }
+      if (entry.apiKey !== undefined && typeof entry.apiKey !== "string") fail(`${where}.apiKey must be a string`);
+      for (const flag of ["discover", "free", "allowUnpriced", "orchestration"]) checkFlag(entry[flag], `${where}.${flag}`);
+      if (entry.free === true && !isLoopbackUrl(url.trim())) {
+        fail(`${where}.free needs a loopback baseUrl (localhost, 127.0.0.1 or ::1)`);
+      }
+      const prio = entry.priority;
+      if (prio !== undefined && (typeof prio !== "number" || !Number.isInteger(prio) || prio < 0)) {
+        fail(`${where}.priority must be a whole number >= 0`);
+      }
+      checkModels(entry.models, `${where}.models`);
     });
   }
   if (p.survival !== undefined) {
@@ -232,6 +287,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AutomatonConfi
   }
   for (const v of [block.openai?.apiKey, raw.openaiApiKey, env.OPENAI_API_KEY]) registerSecret(v, "openai-api-key");
   for (const v of [block.anthropic?.apiKey, raw.anthropicApiKey]) registerSecret(v, "anthropic-api-key");
+  // Compatible providers: the file's key and the fixed per-provider env var.
+  for (const c of Array.isArray(block.compatible) ? block.compatible : []) {
+    if (!isPlainObject(c) || typeof c.id !== "string") continue;
+    registerSecret(c.apiKey, `provider-${c.id}-api-key`);
+    registerSecret(env[providerKeyEnvVar(c.id)], `provider-${c.id}-api-key`);
+  }
 
   const derived = new Map<string, Derived>();
   const resolved = (field: string, r: { value?: string; source?: ValueSource }, fallback?: string): string | undefined => {
