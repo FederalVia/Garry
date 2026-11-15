@@ -21,7 +21,11 @@ COPY packages/cli/package.json packages/cli/
 COPY packages/relay/package.json packages/relay/
 RUN pnpm install --frozen-lockfile
 COPY . .
-RUN pnpm run build && CI=true pnpm prune --prod
+# A fresh production install rather than `pnpm prune --prod`: prune empties
+# packages/cli/node_modules, which drops the CLI's link to the runtime.
+RUN pnpm run build \
+ && rm -rf node_modules packages/*/node_modules \
+ && CI=true pnpm install --frozen-lockfile --prod --filter @conway/automaton --filter @conway/automaton-cli
 
 FROM ${NODE_IMAGE} AS runtime
 RUN apt-get update \

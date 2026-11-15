@@ -92,6 +92,10 @@ suite("security: container image smoke test", () => {
     fs.writeFileSync(path.join(cfg, "inference-providers.json"), "{}");
     fs.writeFileSync(path.join(cfg, "mcp-servers.json"), '{ "version": 1, "enabled": false }');
     fs.copyFileSync(path.join(ROOT, "constitution.md"), path.join(cfg, "constitution.md"));
+    // Writable by anyone on the host, so the read-only mount is the only thing
+    // that can refuse the agent's writes below (not file ownership).
+    for (const f of fs.readdirSync(cfg)) fs.chmodSync(path.join(cfg, f), 0o666);
+    fs.chmodSync(path.join(dir, "owner"), 0o777);
     // The image's user is 10001; it needs to write the state folder.
     if (process.getuid?.() === 0) {
       fs.chownSync(path.join(dir, "state"), 10001, 10001);
