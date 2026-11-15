@@ -132,7 +132,7 @@ The runtime alternates between two states: **running** (the agent loop is active
   +------+      Waits for funding
 ```
 
-**Standalone mode.** With no Conway key (or `providers.mode: "standalone"`) the same lifecycle runs on this machine with the creator's own AI providers. `resolveRuntime` (`src/providers/mode.ts`) decides the mode once, before anything starts, and the rest of startup follows it: the Conway client is the standalone facade (`src/providers/standalone-client.ts`: local exec, files and ports; every Conway-only call throws `FEATURE_DISABLED` before any I/O), the daily AI cap is clamped to `providers.dailyCapCeilingCents` (default 200 cents, with a loud warning when the config asks for more), survival is a fixed tier (`providers.survival.fixedTier`, default `normal`), registration with Conway and the bootstrap topup are skipped, the social relay starts only when `socialRelayUrl` is set to something other than Conway's default (a self-hosted `packages/relay` on loopback works; Conway's relay only through `providers.relayUrl`; the protocol follows `relay.conwayCompat`, by default Conway compatibility only for a conway.tech relay), and x402 payments, USDC balance reads and pending-payment reconciliation run only with `providers.payments: true`. A Conway egress fence (`assertConwayAllowed`) refuses Conway API calls in standalone. An explicit `providers.mode: "standalone"` is sticky, and the setup wizard and `--configure` write it whenever they leave no Conway key: storing a Conway key (`--provision`, `--configure`, `setConwayApiKey`) never removes it, and the operator commands that write `automaton.json` refuse while an agent holds the state database (`src/setup/operator-command.ts`), so the agent cannot leave standalone, and its cap ceiling, by running them through `exec`. Tools and heartbeat tasks that cannot work are hidden, not offered to fail (`src/providers/features.ts`):
+**Standalone mode.** With no Conway key (or `providers.mode: "standalone"`) the same lifecycle runs on this machine with the creator's own AI providers. `resolveRuntime` (`src/providers/mode.ts`) decides the mode once, before anything starts, and the rest of startup follows it: the Conway client is the standalone facade (`src/providers/standalone-client.ts`: local exec, files and ports; every Conway-only call throws `FEATURE_DISABLED` before any I/O), the daily AI cap is clamped to `providers.dailyCapCeilingCents` (default 200 cents, with a loud warning when the config asks for more), survival follows the owner's budget when a `budget` block is set (survival source `budget`, see Financial System) and is otherwise a fixed tier (`providers.survival.fixedTier`, default `normal`), registration with Conway and the bootstrap topup are skipped, the social relay starts only when `socialRelayUrl` is set to something other than Conway's default (a self-hosted `packages/relay` on loopback works; Conway's relay only through `providers.relayUrl`; the protocol follows `relay.conwayCompat`, by default Conway compatibility only for a conway.tech relay), and x402 payments, USDC balance reads and pending-payment reconciliation run only with `providers.payments: true`. A Conway egress fence (`assertConwayAllowed`) refuses Conway API calls in standalone. An explicit `providers.mode: "standalone"` is sticky, and the setup wizard and `--configure` write it whenever they leave no Conway key: storing a Conway key (`--provision`, `--configure`, `setConwayApiKey`) never removes it, and the operator commands that write `automaton.json` refuse while an agent holds the state database (`src/setup/operator-command.ts`), so the agent cannot leave standalone, and its cap ceiling, by running them through `exec`. Tools and heartbeat tasks that cannot work are hidden, not offered to fail (`src/providers/features.ts`):
 
 | Feature | Conway | Standalone | Tools and tasks it gates |
 |---|---|---|---|
@@ -148,7 +148,7 @@ The runtime alternates between two states: **running** (the agent loop is active
 
 `discover_agents` needs `onchainIdentity` like the other ERC-8004 tools, so standalone with payments off offers no tool that reads a chain; with payments on, its standalone description says each uncached call makes read-only JSON-RPC requests to the Base chain. The agent card claims `x402Support` only when payments are on.
 
-The standalone system prompt says where the agent runs and what it can pay for, and never mentions Conway or a sandbox. At startup, standalone replaces the Conway survival skill and the Conway capability lines of `SOUL.md` that older setups installed for every install, when they are unmodified (an edited `SOUL.md` that still names Conway gets a warning). The planner is given the daily AI cap, today's spend and the orchestration share instead of a credit balance; Conway mode keeps its planner text. Strategy slots no configured provider can serve get a substitute the router accepts at that slot's tier, in memory only (`src/providers/model-defaults.ts`).
+The standalone system prompt says where the agent runs and what it can pay for, and never mentions Conway or a sandbox. At startup, standalone replaces the Conway survival skill and the Conway capability lines of `SOUL.md` that older setups installed for every install, when they are unmodified (an edited `SOUL.md` that still names Conway gets a warning). The planner is given the daily AI cap, today's spend (what is left is limited by the budget's remainder, from the gate's `usage().remaining.periodCents`) and the orchestration share instead of a credit balance; Conway mode keeps its planner text. Strategy slots no configured provider can serve get a substitute the router accepts at that slot's tier, in memory only (`src/providers/model-defaults.ts`).
 
 **Provider table.** The main loop's router and client (`src/inference/router.ts`, `src/conway/inference.ts`) take their providers from one table (`src/providers/table.ts`) in both modes; in standalone the planner and workers' unified client (`src/inference/inference-client.ts`) is built from the same table (`buildOrchestrationRegistry`), while in Conway mode it keeps `inference-providers.json` with the OpenAI key, else the Conway key. Entries: `openai` (any OpenAI-compatible endpoint through `providers.openai.baseUrl`), `anthropic` (always `https://api.anthropic.com`), `ollama`, any number of `providers.compatible` entries (an aggregator, Groq, Together, vLLM, LM Studio; registry ids `<id>/<model>`), and in Conway mode `conway`. A key goes only to its own entry's base URL; a compatible entry's key comes from its `apiKey` or `AUTOMATON_PROVIDER_<ID>_API_KEY`. One serve rule (`canServeModel`) decides what each entry can serve; an entry with a `models` list on a custom endpoint serves only those models. `list_models` in standalone lists only models a configured provider can serve.
 
@@ -223,6 +223,7 @@ src/
     treasury.ts            Treasury: reserve / markSent / settle / guard / reconcile / recover
     registry.ts            Installed instance and outflow origin (AsyncLocalStorage)
     guarded-conway.ts      Conway client wrapper that routes value-moving calls through the Treasury
+    approvals.ts           Large-transfer approval requests, derived states, exactly-once execution, heartbeat step
 
   conway/                  Conway API integration
     client.ts              ConwayClient (sandbox ops, credits, domains)
@@ -236,7 +237,7 @@ src/
     daemon.ts              Daemon lifecycle (start/stop/drain/forceRun)
     scheduler.ts           DurableScheduler (DB-backed, leased, cron, low-compute stretch, per-task abort on timeout and shutdown)
     schedule-store.ts      heartbeat.yml seeding that keeps run state, runtime changes, task aliases, leases
-    tasks.ts               11 built-in heartbeat tasks
+    tasks.ts               13 built-in heartbeat tasks
     config.ts              heartbeat.yml load/save/merge
     tick-context.ts        Per-tick shared context builder
 
@@ -305,6 +306,7 @@ src/
     constitution.ts        Constitution propagation + verification
     genesis.ts             Genesis config generation + validation
     lineage.ts             Parent-child lineage tracking + pruning
+    funding.ts             Child bookkeeping after a committed funding transfer (tool and approved heartbeat execution)
     messaging.ts           Parent-child message relay
 
   orchestration/           Colony goals and tasks
@@ -339,15 +341,22 @@ src/
     registry.ts            Skill CRUD (DB-backed)
     format.ts              Frontmatter serialization
 
-  survival/                Resource management
-    funding.ts             Funding request strategies
-    monitor.ts             Resource status + tier transitions
-    low-compute.ts         Low-compute mode configuration
+  budget/                  The owner's budget (standalone)
+    config.ts              budget block validation, default daily cap (about 1/15), owner database path
+    period.ts              Monthly (reset day, UTC) and one-off periods
+    meter.ts               remaining = allowance + grants - AI spend - treasury spend, in-flight included; rollup before pruning
+    thresholds.ts          Budget thresholds (percent or cents) resolved to the cents getSurvivalTier takes
+    owner-db.ts            owner.db: OwnerDbReader (runtime, read-only) and openOwnerDbForWrite (owner CLI only)
+    index.ts               createBudget / installBudget for the runtime
+
+  healthcheck.ts           Container liveness probe: last heartbeat within 45 minutes (no writes, no network)
 
   notify/
     distress.ts            Optional distress webhook (distressWebhookUrl): fixed fields, 6 h per level and source
 
   operator/                Operator-only actions behind automaton-cli
+    budget.ts              `budget add|remove|show`: grants written to owner.db
+    approvals.ts           `approvals list|approve|reject`: decisions written to owner.db (approve --yes needs --amount and --to)
     send.ts                `send`: socialRelayUrl from the file, else SOCIAL_RELAY_URL, else the runtime default
 
   __tests__/               Test suite (24 test files, 897 tests)
@@ -458,7 +467,7 @@ The policy engine is a rule-based system that evaluates every tool call before e
 
 1. **Authority rules** — blocks dangerous/forbidden tools from external input sources; implements authority hierarchy (creator > self > peer > external)
 2. **Command safety rules** — forbidden command patterns (self-destruction, DB drops, process kills); rate limits on self-modification
-3. **Financial rules** — enforces TreasuryPolicy: per-payment caps, hourly/daily transfer limits, minimum reserve, x402 domain allowlist, inference daily budget. A transfer above `requireConfirmationAboveCents` gets `quarantine`, which `executeTool` treats as a refusal (no approval flow exists); the default `maxSingleTransferCents` equals that threshold, and a larger configured value logs a startup warning
+3. **Financial rules** — enforces TreasuryPolicy: per-payment caps, hourly/daily transfer limits, minimum reserve, x402 domain allowlist, inference daily budget. A transfer above `requireConfirmationAboveCents` and up to `maxSingleTransferCents` (the approval band) passes the rule, which only describes the band; the Treasury then denies it `APPROVAL_REQUIRED` once every other check passes and the tool records a pending request for the owner (see Financial System). Above `maxSingleTransferCents` the rule denies. With the defaults (both $10) there is no band; a configured band is described by a startup info line
 4. **Path protection rules** — blocks writes to protected files (constitution, wallet, DB, config); blocks reads of sensitive files (private key, API keys)
 5. **Rate limit rules** — caps on spawns (3/day), own-code edits (10/hour) and genesis prompt changes (1/day), counted from effects (children rows, sandbox creations with an unknown outcome, `modifications` rows), never from logged `allow` decisions
 6. **Validation rules** — input format validation (package names, URLs, domains, git hashes, recipient addresses: `transfer_credits`/`fund_child` on the automaton's own chain, `send_message` EVM or Solana, zero/system addresses refused)
@@ -491,7 +500,7 @@ InferenceRouter.route(request)
 
 **Budget tracker:** Enforces hourly, daily, and per-call cost ceilings. Prevents runaway inference spend.
 
-**Inference gate** (`src/inference/gate.ts`): the one process-wide enforcement point. Every HTTP attempt, from the main loop's router and from the unified client used by the planner, the orchestrator and workers, first reserves its worst-case cost (prompt tokens plus `maxTokensPerTurn` at the model's price, or the most expensive baseline price for an unpriced model) in the `inference_ledger` table, in one immediate transaction that checks the daily cap (`treasuryPolicy.maxInferenceDailyCents`), the hourly cap, the session and per-call caps, per-task caps and the orchestration share. It settles afterwards: committed at actual usage, released when the provider provably did not bill, held at the reserved amount when unknown. A refused call is never sent and raises `InferenceRefusedError` with a code and `retryAfterMs`; the main loop then persists nothing, runs at most one survival turn from the survival allowance, or sleeps until the refusal clears (doubling 10..60 min backoff when it never clears by itself). Caps come from `resolveInferencePolicy` (`src/inference/policy.ts`).
+**Inference gate** (`src/inference/gate.ts`): the one process-wide enforcement point. Every HTTP attempt, from the main loop's router and from the unified client used by the planner, the orchestrator and workers, first reserves its worst-case cost (prompt tokens plus `maxTokensPerTurn` at the model's price, or the most expensive baseline price for an unpriced model) in the `inference_ledger` table, in one immediate transaction that first checks the owner's budget (`PERIOD_CAP`: what is left this period, for every kind of call, survival turns included; free local models pass) and then the daily cap (`treasuryPolicy.maxInferenceDailyCents`), the hourly cap, the session and per-call caps, per-task caps and the orchestration share. It settles afterwards: committed at actual usage, released when the provider provably did not bill, held at the reserved amount when unknown. A refused call is never sent and raises `InferenceRefusedError` with a code and `retryAfterMs`; the main loop then persists nothing, runs at most one survival turn from the survival allowance, or sleeps until the refusal clears (doubling 10..60 min backoff when it never clears by itself). Caps come from `resolveInferencePolicy` (`src/inference/policy.ts`).
 
 ---
 
@@ -569,12 +578,14 @@ Every tick (default 60s):
 
 **Schedule store** (`schedule-store.ts`): `heartbeat.yml` seeds `heartbeat_schedule` at startup without touching run state. A YAML value replaces a row's cron/enabled/task only when it differs from the snapshot of the previous seed (KV `heartbeat.seed.<name>`), i.e. when the operator edited the file; otherwise runtime changes made with `modify_heartbeat` are kept. Entries whose task differs from their name store the mapping in KV `heartbeat.task.<name>`. A last run in the future (clock stepped back) is cleared. Lease expiry compares with `julianday()`, so ISO timestamps and SQLite times compare correctly. The legacy `heartbeat_entries` table only mirrors the schedule for `--status`.
 
-**Built-in tasks (11):**
+**Built-in tasks (13):**
 
 | Task | Default Schedule | Purpose |
 |---|---|---|
 | `heartbeat_ping` | `*/15 * * * *` | Record a local status ping, distress on critical/dead (and the `distressWebhookUrl` notice when set) |
 | `check_credits` | `0 */6 * * *` | Monitor tier, manage 1hr dead grace period |
+| `check_budget` | `*/5 * * * *` | With a budget: dead after an hour at zero (unless `budget.dead` is false), revival on a grant or a new period, grant and tier notices (essential) |
+| `execute_approved_transfers` | `*/5 * * * *` | Runs transfers the owner approved once through the Treasury, reports rejections, expiries and outcomes (essential; Conway mode) |
 | `check_usdc_balance` | `*/5 * * * *` | $5 survival topup when credits are critical and USDC >= $5 (EVM only); wake on success, failures deduplicated per 6 h |
 | `check_for_updates` | `0 */4 * * *` | Git upstream monitoring (dedup: only new commits) |
 | `health_check` | `*/30 * * * *` | Sandbox liveness (dedup: only first failure) |
@@ -622,6 +633,14 @@ Each outflow is a row in `treasury_ledger` that moves `reserved -> sent -> commi
 - `settle` records the outcome. A commit writes the `transactions` row and the `spend_tracking` mirror in the same SQLite transaction and never records less than was reserved. An `unknown` row (sent, no reliable answer) keeps counting.
 
 Limits are per budget (transfer, x402, topup, topup_auto, infra) over rolling windows with no upper bound, so a backward clock step cannot reset them. The reserve floor subtracts every credit outflow that may not yet show in the balance. Outflows from untrusted input sources are refused. At startup, rows left open by an earlier process are closed (`reserved -> released`, `sent -> unknown`) using a per-process boot id, and unknown x402 payments are reconciled on chain. Every row records its origin (tool name or automatic caller) and input source.
+
+Treasury deny codes added for the owner flows: `APPROVAL_REQUIRED` (in the approval band; everything else passed), `APPROVAL_INVALID` (no approved, unexpired owner decision matching kind, recipient and amount), `APPROVAL_USED` (the approval already ran or is running) and `BUDGET_EXHAUSTED` (more than the owner's budget has left, when `budget.countTreasury` is on).
+
+**Owner budget** (`src/budget/`, standalone): the `budget` block sets an allowance (monthly with a reset day, or one-off from a start date that is today or earlier), whether treasury spending counts, survival thresholds and whether `dead` applies. `remaining = allowance + grants - AI spend - treasury spend` over the current period, with in-flight reservations counted; totals are rolled up into `inference_spend_rollup` before the 30-day ledger pruning so a long period still counts them. The inference gate refuses a call that does not fit (`PERIOD_CAP`), inside its existing transaction; the 25-cent survival allowance is checked against the same period cap. The standalone client's `getCreditsBalance` returns the remaining budget, so heartbeat, loop, tools and the Treasury see it unchanged (the reserve floor and half-balance rule read it for credit outflows, which standalone does not have yet; its x402 payments are limited by `BUDGET_EXHAUSTED` only), and `getSurvivalTier` (`src/conway/credits.ts`) takes thresholds, which runtime callers get from `currentSurvivalThresholds()` (the budget's, resolved against this period's total). The default daily AI cap is about 1/15 of the allowance (the standalone default of 200 cents for a zero allowance, so grants can be spent). `distress_signal` and the funding hints point to `automaton-cli budget add`. With a fixed survival source and a budget, the system prompt still states the budget. Every spend figure lives in `state.db`, which the agent can write in any layout: the period cap holds against the agent's tools and shell tripwire, not against a script that rewrites that database; the provider-side spending limit is the backstop.
+
+**Owner database** (`~/.automaton/owner/owner.db`, `ownerDbPath`): budget grants and approval decisions. The runtime opens it read-only (`OwnerDbReader`); only the owner CLI, the wizard and `--configure` import the writer, and a static test enforces that. It uses a rollback journal (never WAL) so a read-only mount works.
+
+**Large-transfer approvals** (`src/treasury/approvals.ts`): a credit transfer in the approval band is denied `APPROVAL_REQUIRED`; the tool records a request in `state.db` (`transfer_approval_requests`: amount, recipient, unverified reason, origin and, for `fund_child`, the child id; 24 h expiry; at most 3 open and 10 a day; none from inbox-driven turns or automatic origins). The owner decides with `automaton-cli approvals approve|reject`, which writes `approval_decisions` in the owner database with its own copy of recipient and amount. The approved transfer runs once, through every normal cap, on the agent's retry or in `execute_approved_transfers`, bound to the decision row and to `treasury_ledger.approval_id` inside the Treasury's transaction; the decision must be used within 2 hours. Once-only rests on the ledger in `state.db`: a script that deletes the ledger row can reuse an approval inside that window. `approvals list` and `approve` accept only rows whose id is `apr_` plus a ULID and whose recipient is a valid address (other rows are shown `MALFORMED` and never decidable), and the printed approve command single-quotes every value; `createApprovalRequest` refuses a recipient that is not an address. A request's state is derived from the request, the decision and the ledger rows. When the heartbeat executes an approved `fund_child`, it records the child as funded as the tool would. `execute_approved_transfers` runs in the heartbeat's cancellation scope like every task: a cancellation records nothing in the request, because the ledger already holds the outcome (released before the send; once sent, a timeout lets the transfer finish and shutdown leaves the row `unknown`, which only a replay with the same idempotency key can follow), and the next tick reports it.
 
 **Treasury policy** (`TreasuryPolicy` in config): the limits above, normalized once by `normalizeTreasuryPolicy`. The policy engine's financial rules still give early denials for model tool calls; the Treasury is authoritative.
 
@@ -806,7 +825,7 @@ Step-by-step instructions for the agent...
 
 **Engine:** SQLite via `better-sqlite3` (synchronous, WAL mode, journal_mode=WAL).
 
-**Schema version:** 16 (applied incrementally via migration runner)
+**Schema version:** 20 (applied incrementally via migration runner). The owner database (`~/.automaton/owner/owner.db`: budget grants, approval decisions) has its own schema (`src/budget/owner-db.ts`), written only by owner commands.
 
 **Tables (22):**
 
@@ -828,7 +847,9 @@ Step-by-step instructions for the agent...
 | `inbox_messages` | v3 | Social messages with processing state machine; v16 adds `verified`, `sig_hash` (unique), `signed_at`, `relay_created_at`, `screen`, `available_at` and the `deferred`/`blocked`/`rate_limited` statuses |
 | `policy_decisions` | v4 | Tool call policy audit trail |
 | `spend_tracking` | v4 | Spend mirror by calendar window (written by the Treasury on commit) |
-| `treasury_ledger` | v12 | Every outflow attempt and its state (reserved, sent, committed, released, unknown, denied) |
+| `treasury_ledger` | v12 | Every outflow attempt and its state (reserved, sent, committed, released, unknown, denied); v20 adds `approval_id` |
+| `inference_spend_rollup` | v20 | Inference spend per UTC day and budget class, rolled up before the 30-day ledger prune |
+| `transfer_approval_requests` | v20 | Transfer approval requests the agent made (the owner's decisions live in the owner database) |
 | `heartbeat_schedule` | v4 | Durable scheduler config (cron, leases, tier minimums) |
 | `heartbeat_history` | v4 | Task execution history |
 | `wake_events` | v4 | Atomic wake signals (source, reason, consumed flag) |
@@ -879,10 +900,12 @@ AutomatonConfig
                                discover (default true), free (loopback only), allowUnpriced (default false),
                                orchestration (default true), priority (default 100) }]
     conway                  { apiKey, apiUrl }
-    survival                { source: "fixed" | "conway", fixedTier (default "normal") }
+    survival                { source: "fixed" | "conway", fixedTier (default "normal") }; standalone with a budget block follows the budget unless source is "fixed"
     dailyCapCeilingCents    Standalone ceiling on treasuryPolicy.maxInferenceDailyCents (default 200)
     payments                Standalone: x402, USDC reads and on-chain identity (default false)
     relayUrl                Standalone: relay URL, wins over socialRelayUrl; the only way to use Conway's relay
+  budget                  Standalone owner budget: { allowanceCents, period: "monthly" | "one-off", resetDay, startDate, countTreasury, thresholds: { unit: "percent" | "cents", high, normal, lowCompute }, dead }
+  ownerDbPath             Owner database (default ~/.automaton/owner/owner.db)
   inferenceModel          Default model (default: gpt-5.2)
   maxTokensPerTurn        Max tokens per inference call (default: 4096)
   heartbeatConfigPath     Path to heartbeat.yml
@@ -932,6 +955,8 @@ The automaton operates under a defense-in-depth security model:
 
 **Fail closed:** a policy rule that throws denies the call (`POLICY_RULE_ERROR`), `executeTool` turns a failing policy evaluation into an error result without running the tool, and a tool exception is recorded as that call's error, so a bad argument never discards a turn whose earlier tools already ran.
 
+**Contained deployment** (`Dockerfile`, `deploy/`, `scripts/lock-owner-files.sh`, `docs/deployment.md`): layers 4 and 5 are guards inside one OS user. The container makes the owner's files a boundary: the agent runs as uid 10001 with a read-only root filesystem and no capabilities; `automaton.json`, `wallet.json`, `config.json`, `heartbeat.yml`, `constitution.md`, `inference-providers.json`, `mcp-servers.json` and the owner folder are read-only binds over the read-write state folder, and `deploy/entrypoint.sh` refuses to start when any of them could be written, replaced or created. The owner's `setup` and `configure` services edit those files in a private tmpfs `~/.automaton` and move them to `data/config`, never touching `data/state`, where the agent's binds sit. The dedicated-user layout does the same with root-owned files in a sticky, root-owned state folder and a systemd unit (`deploy/automaton.service`). In plain local mode the agent can do anything its user can.
+
 **Layer 7 — Authority hierarchy** (trust levels): Creator input has highest trust. Self-generated input is trusted. Peer/external input has reduced trust and cannot invoke dangerous tools.
 
 ---
@@ -976,7 +1001,8 @@ pnpm typecheck   # tsc --noEmit
 **CI** (`.github/workflows/ci.yml`):
 - Triggers on push and PR
 - Matrix: Node 20, 22
-- Steps: install, typecheck, test, security-grep tests
+- Steps: install, typecheck, test, security-grep tests, and (Node 22) the read-only layout tests as root
+- Separate `container-smoke` job: pins the base image digest when the committed one is the placeholder, builds the image and runs its entrypoint
 - Separate `security-audit` job: `pnpm audit`
 
 **Release** (`.github/workflows/release.yml`):

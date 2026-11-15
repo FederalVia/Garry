@@ -35,6 +35,22 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       enabled: true,
     },
     {
+      // The owner's budget: dead after an hour at zero, revival, grant notices.
+      // Runs only with a budget (standalone).
+      name: "check_budget",
+      schedule: "*/5 * * * *",
+      task: "check_budget",
+      enabled: true,
+    },
+    {
+      // Transfers the owner approved run here without waiting for the agent.
+      // Runs only where credit transfers exist (Conway mode).
+      name: "execute_approved_transfers",
+      schedule: "*/5 * * * *",
+      task: "execute_approved_transfers",
+      enabled: true,
+    },
+    {
       name: "check_usdc_balance",
       schedule: USDC_TOPUP_FAST_SCHEDULE,
       task: "check_usdc_balance",

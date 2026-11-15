@@ -105,6 +105,94 @@ describe("system prompt golden text", () => {
     expect(wakeup).toMatchSnapshot("standalone-wakeup");
   });
 
+  it("standalone with the owner's budget: remaining, total, reset date and tier (golden)", async () => {
+    const { buildSystemPrompt, buildWakeupPrompt } = await import("../agent/system-prompt.js");
+    const { createTestDb, createTestIdentity, createTestConfig } = await import("./mocks.js");
+    const { createBudget, installBudget } = await import("../budget/index.js");
+    const { InferenceGate } = await import("../inference/gate.js");
+    const { resolveInferencePolicy } = await import("../inference/policy.js");
+    const db = createTestDb();
+    const now = () => Date.parse(FIXED_DATE) + 9 * 86_400_000; // 2026-01-10
+    const config = createTestConfig({
+      conwayApiKey: undefined,
+      sandboxId: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk-test-openai",
+      creatorMessage: "Hello from the creator.",
+      providers: { mode: "standalone" },
+      budget: { allowanceCents: 2500, period: "monthly" },
+      ownerDbPath: path.join(tmp, "owner", "owner.db"),
+    });
+    const budget = createBudget(db.raw, config, { now })!;
+    installBudget(budget);
+    try {
+      // $15.50 of AI spend leaves $9.50 of $25.00: normal (high > $12.50, normal > $3.75).
+      const gate = new InferenceGate({ db: db.raw, policy: resolveInferencePolicy({}, { maxInferenceDailyCents: 100_000 }), now, budget: budget.meter });
+      const r = gate.reserve({
+        callId: "c",
+        attempt: 1,
+        provider: "openai",
+        model: "gpt-4.1",
+        price: { inputUsdPerM: 2, outputUsdPerM: 8, local: false },
+        estInputTokens: 1550 * 5000,
+        maxOutputTokens: 0,
+        minOutputTokens: 0,
+        scope: { caller: "agent_turn" },
+      });
+      gate.commit(r.id, null, 1);
+      const identity = { ...createTestIdentity(), createdAt: FIXED_DATE, sandboxId: "" };
+      const financial: FinancialState = { creditsCents: 950, usdcBalance: null, credits: "live", usdc: "unknown", lastChecked: FIXED_DATE };
+      const system = buildSystemPrompt({ identity, config, financial, state: "running", db, tools: TOOLS, skills: [], isFirstRun: true });
+      const wakeup = buildWakeupPrompt({ identity, config, financial, db });
+      for (const text of [system, wakeup]) {
+        expect(text).not.toMatch(/conway/i);
+        expect(text).not.toMatch(/sandbox/i);
+      }
+      expect(system).toContain("Your creator gives you a budget of $25.00 monthly, resets day 1 UTC, under a daily cap of $1.67.");
+      expect(system).toContain("Budget: $9.50 remaining of $25.00 this period (resets 2026-02-01 UTC)");
+      expect(system).toContain("Survival tier: normal");
+      expect(system).not.toContain("(fixed)");
+      expect(system).not.toContain("Credits: not tracked");
+      expect(wakeup).toContain("budget: $9.50 remaining of $25.00 this period");
+      expect(system).toMatchSnapshot("budget-system");
+      expect(wakeup).toMatchSnapshot("budget-wakeup");
+    } finally {
+      installBudget(null);
+      budget.owner.close();
+      db.close();
+    }
+  });
+
+  it("standalone with a fixed tier and a budget still tells the agent the budget caps its spend", async () => {
+    const { buildSystemPrompt } = await import("../agent/system-prompt.js");
+    const { createTestDb, createTestIdentity, createTestConfig } = await import("./mocks.js");
+    const db = createTestDb();
+    try {
+      const system = buildSystemPrompt({
+        identity: { ...createTestIdentity(), sandboxId: "" },
+        config: createTestConfig({
+          conwayApiKey: undefined,
+          sandboxId: "",
+          socialRelayUrl: "",
+          openaiApiKey: "sk-test-openai",
+          providers: { mode: "standalone", survival: { source: "fixed", fixedTier: "low_compute" } },
+          budget: { allowanceCents: 2500, period: "monthly" },
+          ownerDbPath: path.join(tmp, "owner", "owner.db"),
+        }),
+        financial: { creditsCents: null, usdcBalance: null, credits: "fixed", usdc: "unknown", fixedTier: "low_compute", lastChecked: FIXED_DATE } as FinancialState,
+        state: "running",
+        db,
+        tools: TOOLS,
+        skills: [],
+        isFirstRun: true,
+      });
+      expect(system).toContain("Your creator gives you a budget of $25.00 monthly, resets day 1 UTC, under a daily cap of $1.67.");
+      expect(system).toContain("Your survival tier is fixed at low_compute by your creator, but the budget still applies");
+    } finally {
+      db.close();
+    }
+  });
+
   it("standalone with payments on describes the x402 wallet, still without Conway", async () => {
     const { buildSystemPrompt } = await import("../agent/system-prompt.js");
     const { createTestDb, createTestIdentity, createTestConfig } = await import("./mocks.js");

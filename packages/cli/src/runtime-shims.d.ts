@@ -154,3 +154,29 @@ declare module "@conway/automaton/operator/turn-log.js" {
   export function formatTurnLines(turn: CliTurn): string[];
   export function formatActivityLine(turn: Pick<CliTurn, "timestamp" | "thinking" | "toolCalls">): string;
 }
+
+declare module "@conway/automaton/operator/budget.js" {
+  export interface CliIo {
+    log: (line: string) => void;
+    confirm: (question: string) => Promise<boolean | null>;
+  }
+  // Opaque here: the CLI only passes these between runtime calls.
+  export type BudgetContext = { readonly __budgetContext: unique symbol };
+  export type BudgetReport = { readonly __budgetReport: unique symbol };
+
+  export function budgetContext(): BudgetContext;
+  export function budgetReport(ctx: BudgetContext, nowMs?: number): BudgetReport;
+  export function budgetStatusLine(r: BudgetReport): string;
+  export function standaloneFundRefusal(): string | null;
+  export function runBudgetCli(args: string[], io: CliIo): Promise<number>;
+}
+
+declare module "@conway/automaton/operator/approvals.js" {
+  import type { CliIo } from "@conway/automaton/operator/budget.js";
+
+  export type ApprovalsContext = { readonly __approvalsContext: unique symbol };
+
+  export function approvalsContext(): ApprovalsContext;
+  export function pendingApprovalCount(ctx: ApprovalsContext, nowMs?: number): number;
+  export function runApprovalsCli(args: string[], io: CliIo): Promise<number>;
+}

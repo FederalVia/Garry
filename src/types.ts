@@ -95,6 +95,30 @@ export interface AutomatonConfig {
    * writes the resolved values back into them.
    */
   providers?: ProvidersConfig;
+  /**
+   * The owner's budget (standalone only): the money the agent may spend per
+   * period. Ignored, with a warning, in Conway mode.
+   */
+  budget?: BudgetConfig;
+  /** The owner database (budget grants, approval decisions). Default ~/.automaton/owner/owner.db. */
+  ownerDbPath?: string;
+}
+
+/** The owner's budget block in automaton.json. Validated by resolveBudget (src/budget/config.ts). */
+export interface BudgetConfig {
+  /** Per period (monthly) or in total (one-off), whole cents >= 0. */
+  allowanceCents: number;
+  period: "monthly" | "one-off";
+  /** Monthly only: 1..28, UTC midnight. Default 1. */
+  resetDay?: number;
+  /** One-off only: "YYYY-MM-DD" (UTC). Required for one-off. */
+  startDate?: string;
+  /** Treasury outflows count against the budget. Default true. */
+  countTreasury?: boolean;
+  /** Default { unit: "percent", high: 50, normal: 15, lowCompute: 5 }. */
+  thresholds?: { unit: "percent" | "cents"; high: number; normal: number; lowCompute: number };
+  /** Dead after an hour at zero. Default true; false idles at critical. */
+  dead?: boolean;
 }
 
 /** A model a provider serves, optionally priced and tiered by the operator. */
@@ -598,6 +622,11 @@ export interface PortInfo {
 export interface OutflowRequestOptions {
   idempotencyKey?: string;
   onSend?: () => void;
+  /**
+   * Credit transfers only: the owner-approved request this transfer executes.
+   * The guarded client turns it into the treasury quote; raw clients ignore it.
+   */
+  approvalId?: string;
 }
 
 export interface CreateSandboxOptions extends OutflowRequestOptions {
@@ -772,7 +801,10 @@ export interface TreasuryPolicy {
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
-  /** Transfers above this are refused (no approval flow exists). */
+  /**
+   * Transfers above this (and not above maxSingleTransferCents) need the
+   * owner's approval (automaton-cli approvals approve <id>).
+   */
   requireConfirmationAboveCents: number;
   /** Largest single credit topup bought by a tool or a sandbox 402 handler. */
   maxTopupSingleCents?: number;
@@ -796,6 +828,10 @@ export interface TreasuryPolicy {
   balanceLagMs?: number;
   /** Automatic child funding: at most one transfer per address per this window. */
   autoFundCounterpartyCooldownMs?: number;
+  /** A transfer approval request expires this long after it is made. */
+  approvalTtlMs?: number;
+  /** An approved transfer must execute within this long of the owner's decision. */
+  approvalExecuteWindowMs?: number;
   /**
    * Address every credit topup must pay (survival buys included). When unset,
    * the payTo of the last committed manual or sandbox topup is trusted for
@@ -831,6 +867,8 @@ export const DEFAULT_TREASURY_POLICY: Required<Omit<TreasuryPolicy, "topupPayTo"
   unknownInflightMs: 3_600_000,
   balanceLagMs: 60_000,
   autoFundCounterpartyCooldownMs: 1_800_000,
+  approvalTtlMs: 86_400_000,
+  approvalExecuteWindowMs: 7_200_000,
 };
 
 // ─── Phase 1: Inbox Message Status ──────────────────────────────

@@ -12,6 +12,8 @@ import { createLogger } from "../observability/logger.js";
 import { ALL_FEATURES, standaloneFeatures, FeatureDisabledError, type FeatureSet } from "./features.js";
 import { resolveSurvivalSource, type SurvivalSource } from "./survival-source.js";
 import { isLoopbackHost } from "../conway/http-client.js";
+import { defaultDailyCapCents, describeBudget, resolveBudget, type ResolvedBudget } from "../budget/config.js";
+import { DEFAULT_SURVIVAL_ALLOWANCE_CENTS } from "../inference/policy.js";
 
 const logger = createLogger("providers");
 
@@ -60,6 +62,15 @@ export interface ResolvedRuntime {
   survival: SurvivalSource;
   /** Standalone: the most the daily AI cap may be. Conway mode: null (never clamped). */
   dailyCapCeilingCents: number | null;
+  /** The owner's budget (standalone only); null without one and in Conway mode. */
+  budget: ResolvedBudget | null;
+  /** True when automaton.json has a budget that Conway mode ignores. */
+  budgetIgnored: boolean;
+  /**
+   * With a budget: survival turns may use this much above the daily cap
+   * ceiling (always inside the period cap). Null otherwise.
+   */
+  survivalRoomCents: number | null;
   features: FeatureSet;
   /** The social relay URL in use; "" when the relay is off. */
   relayUrl: string;
@@ -160,18 +171,29 @@ export function resolveRuntime(config: AutomatonConfig, env: NodeJS.ProcessEnv =
   const relayUrl = nonEmpty(config.socialRelayUrl) ?? "";
   const payments = mode === "conway" ? true : p.payments === true;
   const ceiling = p.dailyCapCeilingCents;
+  // loadConfig refuses an invalid block, so this only throws for a config built in code.
+  const configured = resolveBudget(config.budget);
+  const budget = mode === "standalone" ? configured : null;
   return {
     mode,
     reason,
     providers,
-    survival: resolveSurvivalSource(config, mode),
+    survival: resolveSurvivalSource(config, mode, budget !== null),
     dailyCapCeilingCents:
       mode === "conway"
         ? null
         : typeof ceiling === "number" && Number.isInteger(ceiling) && ceiling >= 0
           ? ceiling
-          : DEFAULT_DAILY_CAP_CEILING_CENTS,
-    features: mode === "conway" ? { ...ALL_FEATURES } : standaloneFeatures({ relay: relayUrl !== "", payments }),
+          : budget
+            ? defaultDailyCapCents(budget)
+            : DEFAULT_DAILY_CAP_CEILING_CENTS,
+    budget,
+    budgetIgnored: mode === "conway" && configured !== null,
+    survivalRoomCents: budget ? DEFAULT_SURVIVAL_ALLOWANCE_CENTS : null,
+    features:
+      mode === "conway"
+        ? { ...ALL_FEATURES }
+        : standaloneFeatures({ relay: relayUrl !== "", payments, budget: budget !== null }),
     relayUrl,
     payments,
   };
@@ -232,7 +254,12 @@ export function describeRuntime(r: ResolvedRuntime, relayLabel?: string): string
   }
   if (conway && r.mode === "conway") parts.push(`conway (${conway.apiUrl})`);
   if (conway && r.mode === "standalone") parts.push("conway key present but unused (providers.mode is standalone)");
-  const survival = r.survival.kind === "fixed" ? `fixed (${r.survival.tier})` : "Conway credit balance";
+  const survival =
+    r.survival.kind === "fixed"
+      ? `fixed (${r.survival.tier})${r.budget ? `; budget ${describeBudget(r.budget)} still caps spend` : ""}`
+      : r.survival.kind === "budget" && r.budget
+        ? `budget (${describeBudget(r.budget)})`
+        : "Conway credit balance";
   const cap = r.dailyCapCeilingCents === null ? "from treasuryPolicy" : `at most ${cents(r.dailyCapCeilingCents)}`;
   const relay = r.relayUrl ? relayLabel || r.relayUrl : "off";
   return (

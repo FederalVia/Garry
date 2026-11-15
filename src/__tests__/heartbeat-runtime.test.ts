@@ -159,6 +159,51 @@ describe("seeding (restart)", () => {
   });
 });
 
+describe("the owner's heartbeat tasks", () => {
+  it("are default entries, merged into an existing heartbeat.yml, every 5 minutes and never slowed", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const nodePath = await import("node:path");
+    const { loadHeartbeatConfig } = await import("../heartbeat/config.js");
+    const { ESSENTIAL_HEARTBEAT_TASKS } = await import("../heartbeat/scheduler.js");
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "hb-owner-"));
+    try {
+      const file = nodePath.join(dir, "heartbeat.yml");
+      // An older file that knows nothing of them.
+      fs.writeFileSync(file, "entries:\n  - name: heartbeat_ping\n    schedule: '*/15 * * * *'\n    task: heartbeat_ping\n");
+      const merged = loadHeartbeatConfig(file).entries;
+      for (const name of ["check_budget", "execute_approved_transfers"]) {
+        expect(merged.find((e) => e.name === name), name).toMatchObject({ schedule: "*/5 * * * *", task: name, enabled: true });
+        expect(ESSENTIAL_HEARTBEAT_TASKS.has(name), name).toBe(true);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("modify_heartbeat cannot disable, reschedule or redirect them", async () => {
+    daemon([
+      { name: "check_budget", schedule: "*/5 * * * *", task: "check_budget", enabled: true },
+      { name: "execute_approved_transfers", schedule: "*/5 * * * *", task: "execute_approved_transfers", enabled: true },
+      { name: "check_credits", schedule: "0 */6 * * *", task: "check_credits", enabled: true },
+    ]);
+    for (const args of [
+      { action: "remove", name: "check_budget" },
+      { action: "update", name: "check_budget", enabled: false },
+      { action: "update", name: "check_budget", schedule: "0 0 1 1 *" },
+      { action: "update", name: "execute_approved_transfers", task: "health_check" },
+      { action: "remove", name: "execute_approved_transfers" },
+      // Pointing another entry at an owner task's name is refused too.
+      { action: "update", name: "check_credits", task: "check_budget" },
+    ]) {
+      const out = await modifyHeartbeat(args);
+      expect(out, JSON.stringify(args)).toMatch(/owner heartbeat task/);
+    }
+    expect(row("check_budget")).toMatchObject({ enabled: 1, cronExpression: "*/5 * * * *" });
+    expect(row("execute_approved_transfers")).toMatchObject({ enabled: 1, cronExpression: "*/5 * * * *" });
+  });
+});
+
 describe("modify_heartbeat reaches the scheduler", () => {
   const entries = [
     { name: "check_credits", schedule: "0 */6 * * *", task: "check_credits", enabled: true },

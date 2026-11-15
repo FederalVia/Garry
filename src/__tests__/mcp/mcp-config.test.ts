@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentServerApprovalHash,
   agentWritableRoots,
@@ -61,6 +61,27 @@ describe("operator file", () => {
     const cfg = loadMcpConfig({ path: cfgPath });
     expect(cfg.present).toBe(false);
     expect(cfg.warnings.join()).toMatch(/group- or world-writable/);
+  });
+
+  // A dedicated-user install locks the owner's files as root:<group> 0640.
+  it.skipIf(process.getuid?.() !== 0)("accepts a root-owned file and refuses one another user owns", () => {
+    const uid = vi.spyOn(process, "getuid").mockReturnValue(10001);
+    try {
+      write({ version: 1, enabled: false }, 0o640);
+      fs.chownSync(cfgPath, 0, 0);
+      const locked = loadMcpConfig({ path: cfgPath });
+      expect(locked.present).toBe(true);
+      expect(locked.enabled).toBe(false);
+      expect(locked.warnings).toEqual([]);
+
+      fs.chownSync(cfgPath, 12345, 12345);
+      const foreign = loadMcpConfig({ path: cfgPath });
+      expect(foreign.present).toBe(false);
+      expect(foreign.warnings.join()).toMatch(/not owned by the runtime user or root/);
+    } finally {
+      uid.mockRestore();
+      fs.chownSync(cfgPath, 0, 0);
+    }
   });
 
   it("refuses a file with another hard link", () => {

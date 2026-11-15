@@ -69,6 +69,9 @@ export const ESSENTIAL_HEARTBEAT_TASKS: ReadonlySet<string> = new Set([
   "heartbeat_ping",
   "check_credits",
   "check_usdc_balance",
+  // The owner's budget timer and approved transfers.
+  "check_budget",
+  "execute_approved_transfers",
 ]);
 
 function generateId(): string {

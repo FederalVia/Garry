@@ -31,17 +31,29 @@ export async function checkFinancialState(
   };
 }
 
+/** Tier boundaries in cents (the owner's budget thresholds, or the Conway defaults). */
+export interface TierThresholds {
+  high: number;
+  normal: number;
+  low_compute: number;
+}
+
 /**
  * Determine the survival tier based on current credits.
  * Thresholds are checked in descending order: high > normal > low_compute > critical > dead.
+ * Runtime callers pass currentSurvivalThresholds(); without thresholds the
+ * Conway defaults apply.
  *
  * Zero credits = "critical" (broke but alive — can still accept funding, send distress).
  * Only negative balance (API-confirmed debt) = "dead".
  */
-export function getSurvivalTier(creditsCents: number): SurvivalTier {
-  if (creditsCents > SURVIVAL_THRESHOLDS.high) return "high";
-  if (creditsCents > SURVIVAL_THRESHOLDS.normal) return "normal";
-  if (creditsCents > SURVIVAL_THRESHOLDS.low_compute) return "low_compute";
+export function getSurvivalTier(
+  creditsCents: number,
+  thresholds: TierThresholds = SURVIVAL_THRESHOLDS,
+): SurvivalTier {
+  if (creditsCents > thresholds.high) return "high";
+  if (creditsCents > thresholds.normal) return "normal";
+  if (creditsCents > thresholds.low_compute) return "low_compute";
   if (creditsCents >= 0) return "critical";
   return "dead";
 }

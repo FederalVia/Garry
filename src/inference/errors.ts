@@ -17,6 +17,8 @@ export type RefusalCode =
   | "ORCHESTRATION_SHARE"
   | "SURVIVAL_ALLOWANCE"
   | "SURVIVAL_TIER"
+  /** The owner's budget for this period is spent. */
+  | "PERIOD_CAP"
   | "NO_MODEL"
   | "GATE_UNAVAILABLE"
   | "UNGATED_CALL";

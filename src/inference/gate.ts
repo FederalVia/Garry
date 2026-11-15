@@ -8,8 +8,10 @@
  * afterwards settles it: committed at actual usage, released when the
  * provider provably did not bill, or held as 'unknown' at the reserved amount.
  *
- * Every cap is bounded by time, session or task. Nothing sums a lifetime, so
- * no bookkeeping state can lock the agent out for good.
+ * Every cap is bounded by time, session or task, with one exception: the
+ * owner's budget (PERIOD_CAP), which sums the current budget period. A
+ * one-off budget sums everything since its start date by design; only an
+ * owner grant or a new budget lifts it.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -159,6 +161,19 @@ export function inferenceGateBootId(): string {
 /** What a row holds against caps. */
 const HELD =
   "CASE status WHEN 'committed' THEN COALESCE(cost_micro_usd, reserved_micro_usd) WHEN 'released' THEN 0 ELSE reserved_micro_usd END";
+/** The same expression, for the budget meter. */
+export const INFERENCE_HELD_SQL = HELD;
+
+/**
+ * Rows about to be pruned, added to the per-day rollup first, so a budget
+ * period longer than 30 days keeps every cent. Runs in one transaction with
+ * GATE_SQL.prune. Kept out of GATE_SQL: it is a write, not a cap check.
+ */
+export const ROLLUP_SQL = `INSERT INTO inference_spend_rollup (day_start_ms, budget_class, held_micro_usd, calls)
+  SELECT (created_at_ms / 86400000) * 86400000, budget_class, SUM(${HELD}), COUNT(*)
+  FROM inference_ledger WHERE created_at_ms < @before GROUP BY 1, 2
+  ON CONFLICT(day_start_ms, budget_class) DO UPDATE SET
+    held_micro_usd = held_micro_usd + excluded.held_micro_usd, calls = calls + excluded.calls`;
 
 /**
  * Every statement the gate runs. Each SUM is bounded by a time window, a
@@ -211,6 +226,17 @@ export interface LongPromptTier {
 function validTierPrice(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 }
+/** The owner's budget as the gate sees it (the BudgetMeter on the same database). */
+export interface GateBudget {
+  remainingMicroUsd(nowMs: number): number;
+  /** Exclusive end of the current period; null for a one-off budget. */
+  periodEndMs(nowMs: number): number | null;
+  /** Initial survival state, so the gate does not start at "unknown". */
+  snapshot?(nowMs?: number): { tier: SurvivalTier; remainingCents: number };
+}
+
+/** A one-off budget has no period end: re-check after this, in case the owner added a grant. */
+export const ONE_OFF_RETRY_MS = 30 * 60_000;
 
 export interface ReserveRequest {
   callId: string;
@@ -264,7 +290,8 @@ export interface InferenceUsageReport {
   };
   lastHour: ClassSpend;
   last24h: ClassSpend;
-  remaining: { hourlyCents: number; dailyCents: number; survivalCents: number };
+  /** periodCents: what is left of the owner's budget, when one is installed. */
+  remaining: { hourlyCents: number; dailyCents: number; survivalCents: number; periodCents?: number };
   unknownCents24h: number;
   openReservations: number;
   byModel24h: Array<{ model: string; cents: number; attempts: number }>;
@@ -333,6 +360,7 @@ export class InferenceGate {
   private readonly fixedTier?: SurvivalTier;
   /** Free local reservations made while the ledger was unavailable (D9). */
   private readonly unrecordedLocal = new Set<string>();
+  private readonly budget?: GateBudget;
   private readonly stmt: { [K in keyof typeof GATE_SQL]: BetterSqlite3.Statement };
 
   constructor(deps: {
@@ -342,9 +370,12 @@ export class InferenceGate {
     bootId?: string;
     /** Survival tier fixed by the creator (no balance source). */
     fixedTier?: SurvivalTier;
+    /** The owner's budget: every paid call is checked against it first (PERIOD_CAP). */
+    budget?: GateBudget;
   }) {
     this.db = deps.db;
     this.policy = deps.policy;
+    this.budget = deps.budget;
     if (deps.fixedTier) {
       this.fixedTier = deps.fixedTier;
       this.survivalState = { tier: deps.fixedTier, creditsCents: null };
@@ -362,7 +393,27 @@ export class InferenceGate {
     const orphans = this.stmt.recoverOrphans.run({ now, bootId: this.bootId }).changes;
     if (orphans > 0) logger.warn(`Held ${orphans} inference reservation(s) from a previous run as unknown`);
     this.clampFuture(now);
-    this.stmt.prune.run({ before: now - PRUNE_AFTER_MS });
+    this.pruneWithRollup(now);
+    if (this.budget?.snapshot && !this.fixedTier) {
+      try {
+        const snap = this.budget.snapshot(now);
+        this.survivalState = { tier: snap.tier, creditsCents: Math.max(0, snap.remainingCents) };
+      } catch (err) {
+        logger.warn(`Budget snapshot failed at startup: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /** Roll rows older than 30 days up per UTC day and class, then delete them, in one transaction. */
+  private pruneWithRollup(now: number): void {
+    const before = now - PRUNE_AFTER_MS;
+    const rollup = this.db.prepare(ROLLUP_SQL);
+    this.db
+      .transaction(() => {
+        rollup.run({ before });
+        this.stmt.prune.run({ before });
+      })
+      .immediate();
   }
 
   /** True when this gate keeps its ledger in `db`. */
@@ -684,6 +735,7 @@ export class InferenceGate {
       ).map((r) => ({ model: r.model, cents: cents(r.held), attempts: r.n })),
       survival: this.survival(),
     };
+    if (this.budget) report.remaining.periodCents = Math.max(0, cents(this.budget.remainingMicroUsd(now)));
     if (opts.sessionId) {
       const row = this.stmt.sumSession.get({ sessionId: opts.sessionId, since: now - DAY_MS }) as { held: number };
       report.session = { id: opts.sessionId, cents: cents(row.held), capCents: p.sessionCapCents };
@@ -724,10 +776,24 @@ export class InferenceGate {
     return ceilings.length > 0 ? Math.min(...ceilings) : null;
   }
 
-  /** Task, session, then window caps, in that order. */
+  /** The owner's budget first (every class, survival too), then task, session and window caps. */
   private evaluate(input: EvalInput): Refusal | null {
     const { cls, scope, needed, now } = input;
     const p = this.policy;
+
+    if (this.budget) {
+      const remaining = this.budget.remainingMicroUsd(now);
+      if (needed > remaining) {
+        const end = this.budget.periodEndMs(now);
+        return {
+          code: "PERIOD_CAP",
+          message:
+            `The owner's budget for this period is spent: ${fmt(Math.max(0, remaining))} left, this call needs ${fmt(needed)}. ` +
+            "Your owner can add more with: automaton-cli budget add <usd>",
+          retryAfterMs: end === null ? ONE_OFF_RETRY_MS : Math.max(1, end - now),
+        };
+      }
+    }
 
     if (scope.taskId && typeof scope.taskCapCents === "number" && scope.taskCapCents >= 0) {
       const spent = (this.stmt.sumTask.get({ taskId: scope.taskId }) as { held: number }).held;

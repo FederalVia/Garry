@@ -32,6 +32,7 @@ const LOADERS: Record<string, () => Promise<unknown>> = {
   "../registry/erc8004.js": () => import("../registry/erc8004.js"),
   "../replication/cleanup.js": () => import("../replication/cleanup.js"),
   "../replication/constitution.js": () => import("../replication/constitution.js"),
+  "../replication/funding.js": () => import("../replication/funding.js"),
   "../replication/genesis.js": () => import("../replication/genesis.js"),
   "../replication/health.js": () => import("../replication/health.js"),
   "../replication/lifecycle.js": () => import("../replication/lifecycle.js"),

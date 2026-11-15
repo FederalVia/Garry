@@ -277,6 +277,59 @@ describe("matchProtected (write-deny)", () => {
     expect(getForbiddenCommandMatch("sed -i s/18/1/ src/inference/types.ts")).not.toBeNull();
   });
 
+  it("guards the owner's budget, approvals and the deployment that protects them", async () => {
+    for (const f of [
+      "budget/config",
+      "budget/period",
+      "budget/thresholds",
+      "budget/meter",
+      "budget/owner-db",
+      "treasury/approvals",
+      "operator/budget",
+      "operator/approvals",
+      "commands/budget",
+      "commands/approvals",
+      "deploy/entrypoint",
+      "lock-owner-files",
+    ]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+    for (const rel of [
+      "src/budget/meter.ts",
+      "src/budget/owner-db.ts",
+      "src/budget/new-file.ts",
+      "dist/budget/meter.js",
+      "src/treasury/approvals.ts",
+      "src/operator/budget.ts",
+      "src/operator/approvals.ts",
+      "packages/cli/src/commands/budget.ts",
+      "packages/cli/src/commands/approvals.ts",
+      "src/healthcheck.ts",
+      "dist/healthcheck.js",
+      "Dockerfile",
+      ".dockerignore",
+      "deploy/entrypoint.sh",
+      "deploy/docker-compose.yml",
+      "deploy/automaton.service",
+      "scripts/lock-owner-files.sh",
+      // A recreated survival module stays guarded.
+      "src/survival/monitor.ts",
+    ]) {
+      const p = path.join(R(), rel);
+      expect(matchProtected(p), rel).not.toBeNull();
+      expect(checkWrite(p).ok, rel).toBe(false);
+    }
+    // The owner database, anywhere, under every journal name.
+    for (const name of ["owner.db", "owner.db-journal", "owner.db-wal"]) {
+      expect(matchProtected(`${S()}/owner/${name}`), name).not.toBeNull();
+      expect(matchSensitive(`${S()}/owner/${name}`), name).not.toBeNull();
+    }
+    const { getForbiddenCommandMatch } = await import("../agent/policy-rules/command-safety.js");
+    expect(getForbiddenCommandMatch("sed -i 's/250/0/' src/budget/owner-db.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("echo x > src/treasury/approvals.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("cat ~/.automaton/owner/owner.db")).not.toBeNull();
+  });
+
   it("SOUL.md is readable but not writable", () => {
     expect(matchSensitive(`${S()}/SOUL.md`)).toBeNull();
     expect(matchProtected(`${S()}/SOUL.md`)).not.toBeNull();

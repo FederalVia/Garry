@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -1027,3 +1027,52 @@ export const MODEL_REGISTRY_PROVIDER_COLUMNS: ReadonlyArray<[string, string]> = 
   ["price_source", "ALTER TABLE model_registry ADD COLUMN price_source TEXT"],
   ["capabilities", "ALTER TABLE model_registry ADD COLUMN capabilities TEXT"],
 ];
+// === Owner budget and transfer approvals ===
+// Applied by the version 20 entry of applyMigrations (database.ts), and
+// again, idempotently, by ensureInferenceLedger / ensureTreasuryLedger, so a
+// gate or treasury built on a bare database has them.
+
+/**
+ * Inference spend rolled up per UTC day and budget class before the gate
+ * prunes ledger rows older than 30 days, so a budget period longer than the
+ * ledger's retention still sums every cent spent in it.
+ */
+export const MIGRATION_V20_ROLLUP = `
+  CREATE TABLE IF NOT EXISTS inference_spend_rollup (
+    day_start_ms INTEGER NOT NULL,
+    budget_class TEXT NOT NULL,
+    held_micro_usd INTEGER NOT NULL,
+    calls INTEGER NOT NULL,
+    PRIMARY KEY (day_start_ms, budget_class)
+  );
+`;
+
+/** Added only when the column is missing (see ensureTreasuryLedger). */
+export const MIGRATION_V20_APPROVAL_COLUMN = "ALTER TABLE treasury_ledger ADD COLUMN approval_id TEXT";
+/** The child a fund_child request is for (added when missing). */
+export const MIGRATION_V20_ORIGIN_REF_COLUMN = "ALTER TABLE transfer_approval_requests ADD COLUMN origin_ref TEXT";
+
+/**
+ * Transfer approval requests the agent made. The owner's decisions live in
+ * the owner database, never here: a request row authorizes nothing.
+ */
+export const MIGRATION_V20_TREASURY = `
+  CREATE INDEX IF NOT EXISTS idx_treasury_approval ON treasury_ledger(approval_id) WHERE approval_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_treasury_created ON treasury_ledger(created_at_ms);
+  CREATE TABLE IF NOT EXISTS transfer_approval_requests (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind = 'credit_transfer'),
+    counterparty TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    reason TEXT,
+    origin_name TEXT,
+    origin_ref TEXT,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    decision_seen TEXT,
+    decision_seen_at_ms INTEGER,
+    executor_note TEXT,
+    executor_attempt_at_ms INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_apr_created ON transfer_approval_requests(created_at_ms);
+`;

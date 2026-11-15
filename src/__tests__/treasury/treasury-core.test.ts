@@ -476,10 +476,15 @@ describe("I1/I2 caps", () => {
     await spend(t, transferQuote(CHILD_ADDRESS, 5000));
   });
 
-  it("uses the confirmation threshold as the transfer single cap", async () => {
+  it("caps a transfer at maxSingleTransferCents; the confirmation threshold is its own step", async () => {
+    // Defaults: single 1000 = confirmation 1000, so there is no approval band.
     const h = harness({ balance: 1_000_000 });
     await expectDenied(h.treasury.reserve(transferQuote(CHILD_ADDRESS, 1001)), "SPEND_LIMIT_EXCEEDED");
     await spend(h.treasury, transferQuote(CHILD_ADDRESS, 1000));
+    // With the single cap raised, the band above the threshold needs the owner.
+    const band = harness({ balance: 1_000_000, policy: { maxSingleTransferCents: 5000 } });
+    await expectDenied(band.treasury.reserve(transferQuote(CHILD_ADDRESS, 1001)), "APPROVAL_REQUIRED");
+    await expectDenied(band.treasury.reserve(transferQuote(CHILD_ADDRESS, 5001)), "SPEND_LIMIT_EXCEEDED");
   });
 
   it("sums x402 windows in atomic units (sub-cent payments are not inflated)", async () => {

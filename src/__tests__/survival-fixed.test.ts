@@ -59,6 +59,44 @@ describe("survival source", () => {
   });
 });
 
+describe("survival source with the owner's budget", () => {
+  it("standalone with a budget follows the budget, unless the creator chose a fixed tier; Conway ignores it", () => {
+    expect(resolveSurvivalSource({ providers: undefined }, "standalone", true)).toEqual({ kind: "budget" });
+    expect(resolveSurvivalSource({ providers: { survival: { source: "fixed", fixedTier: "high" } } }, "standalone", true)).toEqual({
+      kind: "fixed",
+      tier: "high",
+    });
+    expect(resolveSurvivalSource({ providers: undefined }, "conway", true)).toEqual({ kind: "conway" });
+    const budget = { allowanceCents: 2500, period: "monthly" } as never;
+    expect(resolveRuntime(standaloneConfig({ budget })).survival).toEqual({ kind: "budget" });
+    // A fixed tier still has the budget's period cap.
+    const fixed = resolveRuntime(standaloneConfig({ budget, providers: { survival: { source: "fixed" } } }));
+    expect(fixed.survival).toEqual({ kind: "fixed", tier: "normal" });
+    expect(fixed.budget).not.toBeNull();
+  });
+
+  it("the heartbeat reads the budget as the balance: the tick context uses the budget's thresholds", async () => {
+    const { tickOptionsFor } = await import("../heartbeat/scheduler.js");
+    const budget = { allowanceCents: 2500, period: "monthly" } as never;
+    expect(tickOptionsFor({ config: standaloneConfig({ budget }) } as any)).toEqual({ survival: { kind: "budget" }, readUsdc: false });
+    const { installSurvivalThresholds } = await import("../budget/thresholds.js");
+    installSurvivalThresholds(() => ({ high: 1250, normal: 375, low_compute: 125 }));
+    try {
+      const conway = new MockConwayClient();
+      conway.creditsCents = 1000;
+      const ctx = await buildTickContext(db.raw, conway, { entries: [], defaultIntervalMs: 60_000, lowComputeMultiplier: 4 } as any, undefined, "evm", {
+        survival: { kind: "budget" },
+        readUsdc: false,
+      });
+      expect(ctx.creditBalance).toBe(1000);
+      // $10 is "high" by the Conway thresholds, "normal" by the budget's.
+      expect(ctx.survivalTier).toBe("normal");
+    } finally {
+      installSurvivalThresholds(null);
+    }
+  });
+});
+
 describe("inference gate under a fixed tier", () => {
   it("is never unknown: at construction and after an unknown update", () => {
     const gate = new InferenceGate({ db: db.raw, policy: resolveInferencePolicy({}, {}), fixedTier: "normal" });

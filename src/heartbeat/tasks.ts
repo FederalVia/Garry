@@ -28,7 +28,8 @@ import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/heal
 import { LEGACY_LIVE, LIVE, holdsSlot } from "../replication/child-status.js";
 import { screenInbound, serializeScreen, type ScreenVerdict } from "../agent/injection-defense.js";
 import { normalizeSenderAddress } from "../agent/inbox-isolation.js";
-import { getSurvivalTier } from "../conway/credits.js";
+import { installedBudget, type BudgetSnapshot } from "../budget/index.js";
+import { resolveRuntime } from "../providers/mode.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
@@ -51,7 +52,7 @@ import {
 import { DEFAULT_INGESTION_CONFIG } from "../memory/types.js";
 import { WorkingMemoryManager } from "../memory/working.js";
 import { EpisodicMemoryManager } from "../memory/episodic.js";
-import { runWithTreasuryOrigin } from "../treasury/index.js";
+import { executeApprovedTransfers, getInstalledTreasury, runWithTreasuryOrigin } from "../treasury/index.js";
 import { rethrowIfCancelled, throwIfCancelled } from "../runtime/cancellation.js";
 import { ulid } from "ulid";
 import { notifyDistress } from "../notify/distress.js";
@@ -115,6 +116,77 @@ export const COLONY_TASK_INTERVALS_MS = {
   dead_agent_cleanup: 3_600_000,
 } as const;
 
+/**
+ * Tasks only the owner may change (heartbeat.yml): the budget's dead timer
+ * and revival, and approved transfers. modify_heartbeat refuses them.
+ */
+export const OWNER_HEARTBEAT_TASKS: ReadonlySet<string> = new Set(["check_budget", "execute_approved_transfers"]);
+
+/** Dead after this long at a zero balance. */
+export const DEAD_GRACE_PERIOD_MS = 3_600_000;
+const ZERO_SINCE_KEY = "zero_credits_since";
+const BUDGET_LAST_SEEN_KEY = "budget.last_seen";
+/** Where more budget comes from (budget mode). */
+export const BUDGET_FUNDING_HINT = "Ask your owner to run: automaton-cli budget add <usd>";
+
+/**
+ * The zero-balance timer shared by check_credits and check_budget (one KV
+ * key, which tick-context clears on any positive read). At zero: start the
+ * timer, or mark the agent dead once it has run an hour. Above zero (or with
+ * dead switched off): clear it.
+ */
+export function updateZeroBalanceTimer(
+  db: HeartbeatLegacyContext["db"],
+  atZero: boolean,
+  opts: { deadEnabled: boolean; nowMs?: number },
+): { dead: boolean; elapsedMs: number } {
+  const nowMs = opts.nowMs ?? Date.now();
+  if (!atZero || !opts.deadEnabled) {
+    db.deleteKV(ZERO_SINCE_KEY);
+    return { dead: false, elapsedMs: 0 };
+  }
+  const zeroSince = db.getKV(ZERO_SINCE_KEY);
+  const since = zeroSince ? Date.parse(zeroSince) : NaN;
+  if (!zeroSince || !Number.isFinite(since) || since > nowMs) {
+    db.setKV(ZERO_SINCE_KEY, new Date(nowMs).toISOString());
+    return { dead: false, elapsedMs: 0 };
+  }
+  const elapsedMs = nowMs - since;
+  if (elapsedMs >= DEAD_GRACE_PERIOD_MS) {
+    if (db.getAgentState() !== "dead") {
+      db.setAgentState("dead");
+      logger.warn("Agent entering dead state after 1 hour at zero balance", { zeroSince, elapsedMs });
+    }
+    return { dead: true, elapsedMs };
+  }
+  return { dead: false, elapsedMs };
+}
+
+interface BudgetLastSeen {
+  periodStartMs: number;
+  grantCount: number;
+  grantsCents: number;
+  tier: string;
+}
+
+function usd(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/** Wake messages for what changed since the last check_budget run. */
+function budgetChanges(prev: BudgetLastSeen | null, snap: BudgetSnapshot, wasDead: boolean): string[] {
+  const out: string[] = [];
+  const left = Math.max(0, snap.remainingCents);
+  if (prev && prev.periodStartMs !== snap.periodStartMs) {
+    out.push(`A new budget period started: ${usd(left)} available.`);
+  } else if (prev && snap.grantsCents > prev.grantsCents) {
+    out.push(`Your owner added ${usd(snap.grantsCents - prev.grantsCents)} to your budget (${usd(left)} left).`);
+  }
+  if (prev && prev.tier !== snap.tier) out.push(`Survival tier changed from ${prev.tier} to ${snap.tier}.`);
+  if (wasDead && left > 0) out.push(`Budget restored: ${usd(left)} available. You can run again.`);
+  return out;
+}
+
 const TASKS: Record<string, HeartbeatTaskFn> = {
   heartbeat_ping: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
@@ -151,8 +223,9 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
         name: taskCtx.config.name,
         address: taskCtx.identity.address,
         creditsCents: credits,
-        fundingHint:
-          "Use credit transfer API from a creator runtime to top this wallet up.",
+        fundingHint: installedBudget()
+          ? BUDGET_FUNDING_HINT
+          : "Use credit transfer API from a creator runtime to top this wallet up.",
         timestamp: new Date().toISOString(),
       };
       taskCtx.db.setKV("last_distress", JSON.stringify(distressPayload));
@@ -193,33 +266,15 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     const prevTier = taskCtx.db.getKV("prev_credit_tier");
     taskCtx.db.setKV("prev_credit_tier", tier);
 
-    // Dead state escalation: if at zero credits (critical tier) for >1 hour,
-    // transition to dead. This gives the agent time to receive funding before dying.
+    // Dead state escalation: at zero credits (critical tier) for an hour,
+    // the agent is dead. This gives it time to receive funding first.
     // USDC can't go negative, so dead is only reached via this timeout.
-    const DEAD_GRACE_PERIOD_MS = 3_600_000; // 1 hour
-    if (tier === "critical" && credits === 0) {
-      const zeroSince = taskCtx.db.getKV("zero_credits_since");
-      if (!zeroSince) {
-        // First time seeing zero — start the grace period
-        taskCtx.db.setKV("zero_credits_since", now);
-      } else {
-        const elapsed = Date.now() - new Date(zeroSince).getTime();
-        if (elapsed >= DEAD_GRACE_PERIOD_MS) {
-          // Grace period expired — transition to dead
-          taskCtx.db.setAgentState("dead");
-          logger.warn("Agent entering dead state after 1 hour at zero credits", {
-            zeroSince,
-            elapsed,
-          });
-          return {
-            shouldWake: true,
-            message: `Dead: zero credits for ${Math.round(elapsed / 60_000)} minutes. Need funding.`,
-          };
-        }
-      }
-    } else {
-      // Credits are above zero — clear the grace period timer
-      taskCtx.db.deleteKV("zero_credits_since");
+    const timer = updateZeroBalanceTimer(taskCtx.db, tier === "critical" && credits === 0, { deadEnabled: true });
+    if (timer.dead) {
+      return {
+        shouldWake: true,
+        message: `Dead: zero credits for ${Math.round(timer.elapsedMs / 60_000)} minutes. Need funding.`,
+      };
     }
 
     if (prevTier && prevTier !== tier && tier === "critical") {
@@ -230,6 +285,74 @@ const TASKS: Record<string, HeartbeatTaskFn> = {
     }
 
     return { shouldWake: false };
+  },
+
+  /**
+   * The owner's budget (every 5 minutes): the zero-balance timer (dead after
+   * an hour, unless the owner switched dead off), and wake events for a new
+   * grant, a new period, a tier change, or a dead agent whose budget is back.
+   */
+  check_budget: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    const installed = installedBudget();
+    if (!installed) return { shouldWake: false };
+    const snap = installed.meter.snapshot();
+    const db = taskCtx.db;
+    const left = Math.max(0, snap.remainingCents);
+    const wasDead = db.getAgentState() === "dead";
+    const messages: string[] = [];
+
+    let prev: BudgetLastSeen | null = null;
+    try {
+      const raw = db.getKV(BUDGET_LAST_SEEN_KEY);
+      prev = raw ? (JSON.parse(raw) as BudgetLastSeen) : null;
+    } catch {
+      prev = null;
+    }
+    db.setKV(
+      BUDGET_LAST_SEEN_KEY,
+      JSON.stringify({
+        periodStartMs: snap.periodStartMs,
+        grantCount: snap.grantCount,
+        grantsCents: snap.grantsCents,
+        tier: snap.tier,
+        remainingCents: snap.remainingCents,
+        ownerDbStale: snap.ownerDbStale,
+        at: new Date().toISOString(),
+      }),
+    );
+
+    // A fixed survival tier (providers.survival.source "fixed") never dies:
+    // the loop would revive it at once, so the timer would only churn.
+    const deadEnabled = installed.budget.dead && resolveRuntime(taskCtx.config).survival.kind !== "fixed";
+    if (!deadEnabled && wasDead) {
+      // Dead does not apply: the loop revives the agent; wake it now.
+      messages.push("Dead is switched off for this budget: running again (paid calls wait for budget).");
+    } else {
+      messages.push(...budgetChanges(prev, snap, wasDead));
+    }
+    const timer = updateZeroBalanceTimer(db, left === 0, { deadEnabled });
+    if (timer.dead && !wasDead) {
+      messages.push(
+        `Dead: the budget has been spent for ${Math.round(timer.elapsedMs / 60_000)} minutes. ${BUDGET_FUNDING_HINT}`,
+      );
+    }
+    return messages.length > 0 ? { shouldWake: true, message: messages.join(" ") } : { shouldWake: false };
+  },
+
+  /**
+   * Transfers the owner approved: executed once through the treasury, and
+   * rejections and outcomes reported to the agent.
+   */
+  execute_approved_transfers: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    const treasury = getInstalledTreasury();
+    if (!treasury) return { shouldWake: false };
+    const messages = await executeApprovedTransfers({
+      db: taskCtx.db.raw,
+      owner: { decision: (id) => treasury.approvalDecision(id) },
+      conway: taskCtx.conway,
+      now: () => treasury.nowMs(),
+    });
+    return messages.length > 0 ? { shouldWake: true, message: messages.join(" ") } : { shouldWake: false };
   },
 
   check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {

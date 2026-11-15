@@ -242,7 +242,9 @@ describe("Financial Policy Rules", () => {
       expect(decision.action).toBe("allow");
     });
 
-    it("quarantines transfers above confirmation threshold but within single limit", () => {
+    // Inside the approval band the treasury decides (APPROVAL_REQUIRED, then
+    // an owner approval request); the policy rule lets the tool run.
+    it("lets transfers above the confirmation threshold but within the single limit through (approval band)", () => {
       const request = createRequest(
         mockTransferTool(),
         { amount_cents: 4000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
@@ -250,8 +252,7 @@ describe("Financial Policy Rules", () => {
       );
 
       const decision = engine.evaluate(request);
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
+      expect(decision.action).toBe("allow");
     });
 
     it("denies transfers above 5000 cents", () => {
@@ -277,7 +278,7 @@ describe("Financial Policy Rules", () => {
       expect(decision.action).toBe("deny");
     });
 
-    it("quarantines transfers exactly at single limit (above confirmation threshold)", () => {
+    it("lets a transfer exactly at the single limit through (top of the approval band)", () => {
       const request = createRequest(
         mockTransferTool(),
         { amount_cents: 5000, to_address: "0x1234567890abcdef1234567890abcdef12345678" },
@@ -285,9 +286,8 @@ describe("Financial Policy Rules", () => {
       );
 
       const decision = engine.evaluate(request);
-      // 5000 > requireConfirmationAboveCents (1000) so quarantine
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
+      // 5000 > requireConfirmationAboveCents (1000): the owner's approval, enforced by the treasury.
+      expect(decision.action).toBe("allow");
     });
   });
 
@@ -538,10 +538,9 @@ describe("Financial Policy Rules", () => {
       expect(decision.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
     });
 
-    it("quarantines fund_child above the confirmation threshold", () => {
+    it("lets fund_child inside the approval band through to the treasury", () => {
       const decision = engine.evaluate(createRequest(mockFundChildTool(), { child_id: "c", amount_cents: 4000 }, createMockSpendTracker()));
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
+      expect(decision.action).toBe("allow");
     });
 
     it("counts transfers already recorded this hour, whichever tool made them", () => {

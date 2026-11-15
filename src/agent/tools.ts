@@ -40,16 +40,20 @@ import {
   TransferRejectedError,
   TreasuryDeniedError,
   currentTreasuryOrigin,
+  getInstalledTreasury,
   runWithTreasuryOrigin,
+  transferWithApproval,
+  type DecisionSource,
   type TreasuryResultFields,
 } from "../treasury/index.js";
+import { installedBudget, type BudgetSnapshot } from "../budget/index.js";
 import { isRejectedTransferStatus } from "../treasury/guarded-conway.js";
 import { normalizeTreasuryPolicy } from "../treasury/policy.js";
 import { DEFAULT_EXEC_TIMEOUT_MS, isLocalSandboxId } from "../conway/client.js";
 import { readFileSafe, writeFileVerified, UnsafePathError } from "../security/secure-fs.js";
 import { GUARD_COMMAND_FRAGMENTS, homeDir, matchProtected } from "../security/protected-paths.js";
 import { markRestartRequired, RESTART_NOTICE } from "../self-mod/restart-notice.js";
-import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
+import { BUDGET_FUNDING_HINT, BUILTIN_TASKS, OWNER_HEARTBEAT_TASKS } from "../heartbeat/tasks.js";
 import {
   addScheduleEntry,
   resolveTaskName,
@@ -400,6 +404,11 @@ export const NEUTRAL_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = Objec
   read_file: "Read content from a file on the machine you run on (at most 2 MB when running locally).",
   expose_port: LOCAL_EXPOSE_PORT_DESCRIPTION,
   enter_low_compute: "Manually switch to low-compute mode to save on AI spend.",
+  // Offered in standalone only with the owner's budget.
+  check_credits: "Check how much of your owner's budget is left this period.",
+  heartbeat_ping: "Record a heartbeat status ping locally (state, remaining budget, uptime).",
+  distress_signal:
+    "Record a local distress signal asking your owner for more budget, and notify the owner's distress webhook if one is configured (fixed fields only: level, balance, address; never your message). Used when the budget is nearly spent.",
   // Offered in standalone only with on-chain identity on, and says it reads the chain.
   discover_agents:
     "Discover other agents via the ERC-8004 registry with caching. Each uncached call makes read-only " +
@@ -617,6 +626,8 @@ function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
+        const budget = installedBudget();
+        if (budget) return describeBudgetBalance(budget.meter.snapshot());
         const read = await readCredits(ctx.conway);
         if (!read.known) {
           // Surface the failure: an unreadable balance is not $0.00.
@@ -1439,6 +1450,11 @@ function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
         if (args.enabled !== undefined && typeof args.enabled !== "boolean") {
           return "Error: enabled must be true or false.";
         }
+        // The owner's budget timer and approved transfers: the agent may not
+        // stop, slow or redirect them (heartbeat.yml is the owner's).
+        if (OWNER_HEARTBEAT_TASKS.has(name) || (typeof args.task === "string" && OWNER_HEARTBEAT_TASKS.has(args.task) && action !== "add")) {
+          return `Blocked: '${name}' is an owner heartbeat task; only your owner can change it (heartbeat.yml).`;
+        }
         const raw = ctx.db.raw;
         const exists = scheduleEntryExists(raw, name);
         const schedule = args.schedule as string | undefined;
@@ -1605,8 +1621,9 @@ Model: ${ctx.inference.getDefaultModel()}
           address: ctx.identity.address,
           creditsCents: credits,
           message: distressMsg,
-          fundingHint:
-            "Use transfer_credits to top up this automaton from your creator runtime.",
+          fundingHint: installedBudget()
+            ? BUDGET_FUNDING_HINT
+            : "Use transfer_credits to top up this automaton from your creator runtime.",
           timestamp: new Date().toISOString(),
         };
 
@@ -1828,7 +1845,7 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "transfer_credits",
       description:
-        "Transfer Conway compute credits to another address on your own chain (amount in cents). Transfers above the confirmation threshold are refused.",
+        "Transfer Conway compute credits to another address on your own chain (amount in cents). Transfers above the confirmation threshold need your owner's approval: a request is recorded and the transfer runs once the owner approves it.",
       category: "financial",
       riskLevel: "dangerous",
       parameters: {
@@ -1857,12 +1874,17 @@ Model: ${ctx.inference.getDefaultModel()}
         }
 
         // The treasury checks every limit before sending and writes the
-        // transfer_out row when the transfer commits.
-        const transfer = await ctx.conway.transferCredits(
-          args.to_address as string,
-          amount,
-          args.reason as string | undefined,
-        );
+        // transfer_out row when the transfer commits. Above the confirmation
+        // threshold it needs the owner's approval: a request is recorded.
+        const outcome = await transferWithApproval({
+          ...approvalDeps(ctx),
+          to: args.to_address as string,
+          amountCents: amount,
+          note: args.reason as string | undefined,
+          reason: args.reason as string | undefined,
+        });
+        if (outcome.status !== "sent") return outcome.message;
+        const transfer = outcome.transfer;
         if (isRejectedTransferStatus(transfer.status)) {
           throw new TransferRejectedError(transfer.status);
         }
@@ -2622,37 +2644,22 @@ Model: ${ctx.inference.getDefaultModel()}
         // Same gated transfer and shared budget as transfer_credits. A
         // rejected or ambiguous transfer throws, so the child is only marked
         // funded after a committed transfer.
-        const transfer = await ctx.conway.transferCredits(
-          child.address,
-          amount,
-          `fund child ${child.id}`,
-        );
+        const outcome = await transferWithApproval({
+          ...approvalDeps(ctx),
+          to: child.address,
+          amountCents: amount,
+          note: `fund child ${child.id}`,
+          originRef: child.id,
+        });
+        if (outcome.status !== "sent") return outcome.message;
+        const transfer = outcome.transfer;
         if (isRejectedTransferStatus(transfer.status)) {
           throw new TransferRejectedError(transfer.status);
         }
 
-        // Update funded amount
-        ctx.db.raw
-          .prepare(
-            "UPDATE children SET funded_amount_cents = funded_amount_cents + ? WHERE id = ?",
-          )
-          .run(amount, child.id);
-
-        // Transition to funded if wallet_verified
-        if (child.status === "wallet_verified") {
-          try {
-            const { ChildLifecycle } =
-              await import("../replication/lifecycle.js");
-            const lifecycle = new ChildLifecycle(ctx.db.raw);
-            lifecycle.transition(
-              child.id,
-              "funded",
-              `funded with ${amount} cents`,
-            );
-          } catch {
-            // Non-critical: may already be in funded state
-          }
-        }
+        // Funded amount, and wallet_verified -> funded.
+        const { recordChildFunded } = await import("../replication/funding.js");
+        recordChildFunded(ctx.db.raw, child.id, amount);
 
         return `Funded child ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
       },
@@ -4413,6 +4420,35 @@ export function neutralisedWriteRefusal(marker: string): string {
     "and the file on disk does not. Writing it would replace the original text. " +
     "Change only the lines you mean to change, e.g. with sed through exec."
   );
+}
+
+/** What the owner's budget has left, as check_credits reports it. */
+function describeBudgetBalance(snap: BudgetSnapshot): string {
+  const left = Math.max(0, snap.remainingCents);
+  const reset =
+    snap.periodEndMs === null ? "one-off budget, no reset" : `resets ${new Date(snap.periodEndMs).toISOString().slice(0, 10)} UTC`;
+  return (
+    `Remaining budget this period: $${(left / 100).toFixed(2)} of $${(snap.totalCents / 100).toFixed(2)} (${reset}). ` +
+    `Survival tier: ${snap.tier}.${left === 0 ? ` ${BUDGET_FUNDING_HINT}` : ""}`
+  );
+}
+
+/** The approval path's dependencies: the owner's decisions, read-only through the treasury. */
+function approvalDeps(ctx: ToolContext): {
+  conway: ToolContext["conway"];
+  db: ToolContext["db"]["raw"];
+  owner: DecisionSource;
+  policy: { approvalTtlMs?: number };
+  now: () => number;
+} {
+  const treasury = getInstalledTreasury();
+  return {
+    conway: ctx.conway,
+    db: ctx.db.raw,
+    owner: { decision: (id) => treasury?.approvalDecision(id) ?? null },
+    policy: treasury?.policy ?? normalizeTreasuryPolicy(ctx.config.treasuryPolicy),
+    now: () => treasury?.nowMs() ?? Date.now(),
+  };
 }
 
 /** Tool error text; treasury outcomes get wording the model can act on. */

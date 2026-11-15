@@ -30,6 +30,22 @@
       "types": "./dist/operator/turn-log.d.ts",
       "default": "./dist/operator/turn-log.js"
     },
+    "./operator/budget.js": {
+      "types": "./dist/operator/budget.d.ts",
+      "default": "./dist/operator/budget.js"
+    },
+    "./operator/approvals.js": {
+      "types": "./dist/operator/approvals.d.ts",
+      "default": "./dist/operator/approvals.js"
+    },
+    "./budget/*.js": {
+      "types": "./dist/budget/*.d.ts",
+      "default": "./dist/budget/*.js"
+    },
+    "./treasury/approvals.js": {
+      "types": "./dist/treasury/approvals.d.ts",
+      "default": "./dist/treasury/approvals.js"
+    },
     "./observability/terminal-safe.js": {
       "types": "./dist/observability/terminal-safe.d.ts",
       "default": "./dist/observability/terminal-safe.js"

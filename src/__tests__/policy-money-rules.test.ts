@@ -304,24 +304,22 @@ describe("financial.require_confirmation says what it does", () => {
     StructuredLogger.resetSink();
   });
 
-  it("refuses 3000c honestly: no confirmation flow, the operator can raise the threshold", () => {
-    const confirm = rule(createFinancialRules(DEFAULT_TREASURY_POLICY), "financial.require_confirmation");
-    const r = confirm.evaluate(request("transfer_credits", { to_address: EVM_PEER, amount_cents: 3000 }));
-    expect(r?.action).toBe("quarantine");
-    expect(r?.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
-    expect(r?.humanMessage).toContain("$10.00");
-    expect(r?.humanMessage).toContain("no confirmation flow exists");
-    expect(r?.humanMessage).toContain("treasuryPolicy.requireConfirmationAboveCents");
-    expect(r?.humanMessage).not.toMatch(/CONFIRMATION_REQUIRED|awaiting|pending/i);
+  it("lets the approval band through: the treasury asks the owner, and the rule says so", () => {
+    const policy = { ...DEFAULT_TREASURY_POLICY, maxSingleTransferCents: 5000 };
+    const confirm = rule(createFinancialRules(policy), "financial.require_confirmation");
+    expect(confirm.description).toContain("need the owner's approval");
+    expect(confirm.evaluate(request("transfer_credits", { to_address: EVM_PEER, amount_cents: 3000 }))).toBeNull();
     expect(confirm.evaluate(request("transfer_credits", { to_address: EVM_PEER, amount_cents: 1000 }))).toBeNull();
   });
 
-  it("warns once at construction when maxSingleTransferCents is set above the threshold", () => {
+  it("logs the approval band once at construction when maxSingleTransferCents is above the threshold", () => {
     const policy = { ...DEFAULT_TREASURY_POLICY, maxSingleTransferCents: 5000 };
     createFinancialRules(policy);
-    const warnings = entries.filter((e) => e.level === "warn" && /maxSingleTransferCents/.test(e.message));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]!.message).toContain("has no effect above requireConfirmationAboveCents");
+    const lines = entries.filter((e) => /need the owner's approval/.test(e.message));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.level).toBe("info");
+    expect(lines[0]!.message).toContain("$10.01 to $50.00");
+    expect(lines[0]!.message).toContain("automaton-cli approvals approve");
     expect(transferCapWarning(policy)).not.toBeNull();
   });
 

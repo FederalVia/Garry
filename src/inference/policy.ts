@@ -105,6 +105,12 @@ export function resolveInferencePolicy(
      * the room the daily cap leaves under it, so the ceiling is the total.
      */
     ceilingCents?: number | null;
+    /**
+     * With a budget: room for survival turns above the ceiling (25c), so a
+     * critical agent can still ask for budget. Every survival call is still
+     * checked against the budget's period cap first.
+     */
+    survivalRoomCents?: number | null;
   } = {},
 ): ResolvedInferencePolicy {
   const warn: Warn = (m) => {
@@ -153,7 +159,7 @@ export function resolveInferencePolicy(
     }),
     survivalAllowanceCents: Math.min(
       nonNegativeNumber(ms, "survivalAllowanceCents", DEFAULT_SURVIVAL_ALLOWANCE_CENTS, warn),
-      ceiling === null ? Infinity : Math.max(0, ceiling - dailyCapCents),
+      ceiling === null ? Infinity : Math.max(0, ceiling + survivalRoom(opts.survivalRoomCents) - dailyCapCents),
     ),
     survivalMinIntervalMs: nonNegativeNumber(ms, "survivalMinIntervalMs", DEFAULT_SURVIVAL_MIN_INTERVAL_MS, warn, {
       integer: true,
@@ -165,6 +171,10 @@ export function resolveInferencePolicy(
     enableModelFallback: ms.enableModelFallback === undefined ? true : ms.enableModelFallback !== false,
     unknownPrice: maxKnownPrice(config),
   };
+}
+
+function survivalRoom(v: number | null | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
 /**

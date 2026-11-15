@@ -15,6 +15,7 @@ import type {
   TickContext,
 } from "../types.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { currentSurvivalThresholds } from "../budget/thresholds.js";
 import { readCredits, readUsdc, usdcNetworkFor, type BalanceRead } from "../conway/balance.js";
 import { createLogger } from "../observability/logger.js";
 import type { SurvivalSource } from "../providers/survival-source.js";
@@ -88,7 +89,7 @@ export async function buildTickContext(
     survivalTier = fixed;
     survivalTierKnown = true;
   } else if (creditRead.known) {
-    survivalTier = getSurvivalTier(creditRead.value);
+    survivalTier = getSurvivalTier(creditRead.value, currentSurvivalThresholds());
     survivalTierKnown = true;
     kvSet(db, LAST_KNOWN_TIER_KEY, survivalTier);
     kvDelete(db, BALANCE_UNKNOWN_SINCE_KEY);
