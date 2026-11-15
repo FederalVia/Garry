@@ -21,9 +21,9 @@ import { InferenceRouter } from "../inference/router.js";
 import { InferenceGate, installInferenceGate, resetInferenceGateForTests } from "../inference/gate.js";
 import { resolveInferencePolicy } from "../inference/policy.js";
 import { InferenceRefusedError } from "../inference/errors.js";
-import { createInferenceClient } from "../conway/inference.js";
-import { resolveRuntime } from "../providers/mode.js";
-import { buildStandaloneProviderRegistry, ensureServableStrategy } from "../providers/model-defaults.js";
+import { createInferenceClient, modelRouteOf } from "../conway/inference.js";
+import { buildOrchestrationRegistry, ensureServableStrategy } from "../providers/model-defaults.js";
+import { canServeModel, resolveProviderTable } from "../providers/table.js";
 import { createTestConfig } from "./mocks.js";
 
 let tmp: string;
@@ -236,35 +236,58 @@ describe("Anthropic seed", () => {
 });
 
 describe("orchestration providers", () => {
-  const providersPath = () => path.join(tmp, "inference-providers.json");
+  /** A registry the loop would build: baseline, price-table seeds and owner models. */
+  const seeded = (config: ReturnType<typeof createTestConfig>) => {
+    const table = resolveProviderTable(config, {});
+    const registry = new ModelRegistry(db.raw, { table, config });
+    registry.initialize();
+    registry.seedFromPriceTable(table);
+    return { table, registry };
+  };
+  const build = (config: ReturnType<typeof createTestConfig>) => {
+    const { table, registry } = seeded(config);
+    return buildOrchestrationRegistry({ table, registry, strategy: liveStrategyOf(config), config });
+  };
 
   it("standalone never lends the Conway key; OpenAI uses the creator's key", () => {
     const config = createTestConfig({ conwayApiKey: "cnwy_k_SECRET", providers: { mode: "standalone" }, openaiApiKey: "sk-own" });
-    const built = buildStandaloneProviderRegistry({ config, runtime: resolveRuntime(config), ollamaModelIds: [], providersPath: providersPath() });
+    const built = build(config);
     expect(built.registry).not.toBeNull();
     const resolved = built.registry!.resolveCandidates("reasoning");
     expect(resolved.length).toBeGreaterThan(0);
     for (const r of resolved) {
-      expect((r.client as any).apiKey).not.toBe("cnwy_k_SECRET");
+      expect((r.client as any).apiKey).toBe("sk-own");
     }
     expect(resolved[0].provider.baseUrl).not.toContain("conway");
   });
 
-  it("Anthropic only: no registry, with the reason", () => {
-    const config = createTestConfig({ conwayApiKey: "", anthropicApiKey: "ak" });
-    const built = buildStandaloneProviderRegistry({ config, runtime: resolveRuntime(config), ollamaModelIds: [], providersPath: providersPath() });
-    expect(built.registry).toBeNull();
-    expect(built.reason).toContain("OpenAI-compatible or Ollama");
+  // Rewritten on purpose: Anthropic-only owners now get the planner and workers.
+  it("Anthropic only: a registry with Sonnet for reasoning and Haiku for workers", () => {
+    const config = createTestConfig({ conwayApiKey: "", anthropicApiKey: "ak", inferenceModel: "gpt-5.2" });
+    const built = build(config);
+    expect(built.registry).not.toBeNull();
+    const pick = (tier: "reasoning" | "fast" | "cheap") => built.registry!.resolveCandidates(tier)[0];
+    expect(pick("reasoning").model.id).toBe("claude-sonnet-5-5");
+    expect(pick("fast").model.id).toBe("claude-haiku-5-5");
+    expect(pick("cheap").model.id).toBe("claude-haiku-5-5");
+    expect(pick("reasoning").provider.kind).toBe("anthropic");
+    expect(pick("reasoning").anthropic).toBeDefined();
+    expect(pick("reasoning").client).toBeUndefined();
+    // Prices are USD per 1M from the price table.
+    expect(pick("reasoning").model).toMatchObject({ costPerInputToken: 2, costPerOutputToken: 10 });
+    // At tier normal the planner steps down to fast, as before.
+    expect(built.registry!.resolveCandidates("reasoning", true)[0].model.id).toBe("claude-haiku-5-5");
   });
 
   it("Ollama only: workers use the discovered models, not invented ones", () => {
     const config = createTestConfig({ conwayApiKey: "", ollamaBaseUrl: "http://localhost:11434" });
-    const runtime = resolveRuntime(config);
-    expect(buildStandaloneProviderRegistry({ config, runtime, ollamaModelIds: [], providersPath: providersPath() }).registry).toBeNull();
-    const built = buildStandaloneProviderRegistry({ config, runtime, ollamaModelIds: ["qwen3:8b"], providersPath: providersPath() });
+    expect(build(config).registry).toBeNull();
+    const { table, registry } = seeded(config);
+    registry.upsert(ollamaRow("qwen3:8b"));
+    const built = buildOrchestrationRegistry({ table, registry, strategy: liveStrategyOf(config), config });
     for (const tier of ["reasoning", "fast", "cheap"] as const) {
       const [first] = built.registry!.resolveCandidates(tier);
-      expect(first.provider.id).toBe("local");
+      expect(first.provider.id).toBe("ollama");
       expect(first.provider.baseUrl).toBe("http://localhost:11434/v1");
       expect(first.model.id).toBe("qwen3:8b");
     }
@@ -276,30 +299,92 @@ describe("orchestration providers", () => {
       openaiApiKey: "sk",
       providers: { openai: { baseUrl: "https://llm.example/v1", models: [{ id: "house", inputUsdPerM: 1, outputUsdPerM: 2 }] } },
     });
-    const built = buildStandaloneProviderRegistry({ config: listed, runtime: resolveRuntime(listed), ollamaModelIds: [], providersPath: providersPath() });
-    const [first] = built.registry!.resolveCandidates("cheap");
-    expect(first.provider.baseUrl).toBe("https://llm.example/v1");
-    expect(first.model.id).toBe("house");
+    const built = build(listed);
+    for (const tier of ["reasoning", "fast", "cheap"] as const) {
+      const [first] = built.registry!.resolveCandidates(tier);
+      expect(first.provider.baseUrl).toBe("https://llm.example/v1");
+      expect(first.model.id).toBe("house");
+    }
+    // The OpenAI baseline at OpenAI's prices is not sent to another host.
     const unlisted = createTestConfig({ conwayApiKey: "", openaiApiKey: "sk", providers: { openai: { baseUrl: "https://llm.example/v1" } } });
-    expect(
-      buildStandaloneProviderRegistry({ config: unlisted, runtime: resolveRuntime(unlisted), ollamaModelIds: [], providersPath: providersPath() })
-        .registry,
-    ).toBeNull();
+    expect(build(unlisted).registry).toBeNull();
+  });
+
+  it("a custom base URL without a list: a strategy model the endpoint priced serves planner and workers", () => {
+    const config = createTestConfig({
+      conwayApiKey: "",
+      openaiApiKey: "sk",
+      inferenceModel: "house-model",
+      providers: { openai: { baseUrl: "https://llm.example/v1" } },
+    });
+    const { table, registry } = seeded(config);
+    registry.applyDiscovery(table.get("openai")!, [{ remoteId: "house-model", listedPrice: { inputUsdPerM: 0.5, outputUsdPerM: 1 } }]);
+    const built = buildOrchestrationRegistry({ table, registry, strategy: liveStrategyOf(config), config });
+    for (const tier of ["reasoning", "fast", "cheap"] as const) {
+      const [first] = built.registry!.resolveCandidates(tier);
+      expect(first.provider.baseUrl).toBe("https://llm.example/v1");
+      expect(first.model.id).toBe("house-model");
+    }
+  });
+
+  it("a compatible entry takes part with its own key, qualified ids and the remote id on the wire", () => {
+    const config = createTestConfig({
+      conwayApiKey: "",
+      providers: {
+        compatible: [
+          {
+            id: "groq",
+            baseUrl: "https://api.groq.com/openai/v1",
+            apiKey: "gsk-own",
+            models: [{ id: "llama-3.3-70b-versatile", inputUsdPerM: 0.59, outputUsdPerM: 0.79, tierMinimum: "critical" }],
+          },
+        ],
+      },
+    } as any);
+    const built = build(config);
+    const [first] = built.registry!.resolveCandidates("cheap");
+    expect(first.provider.id).toBe("groq");
+    expect(first.model.id).toBe("groq/llama-3.3-70b-versatile");
+    expect(first.model.remoteId).toBe("llama-3.3-70b-versatile");
+    expect((first.client as any).apiKey).toBe("gsk-own");
+  });
+
+  it("no usable model anywhere: null, with the reason", () => {
+    const config = createTestConfig({
+      conwayApiKey: "",
+      providers: { compatible: [{ id: "agg", baseUrl: "https://agg.example/v1", apiKey: "k" }] },
+    } as any);
+    const built = build(config);
+    expect(built.registry).toBeNull();
+    expect(built.reason).toContain("agg");
   });
 });
 
 describe("ensureServableStrategy", () => {
-  it("Anthropic only: sonnet for the main model, haiku for the cheaper slots", () => {
-    const registry = new ModelRegistry(db.raw);
+  const seeded = (config: ReturnType<typeof createTestConfig>) => {
+    const table = resolveProviderTable(config, {});
+    const registry = new ModelRegistry(db.raw, { table, config });
     registry.initialize();
-    registry.seedProviderModels(["anthropic"]);
+    registry.seedFromPriceTable(table);
+    return { table, registry };
+  };
+
+  // Rewritten on purpose: the substitution defaults are now Sonnet 5.5 and Haiku 5.5.
+  it("Anthropic only: Sonnet 5.5 for the main model, Haiku 5.5 for the cheaper slots", () => {
     const config = createTestConfig({ conwayApiKey: "", anthropicApiKey: "ak", inferenceModel: "gpt-5.2" });
-    const client = standaloneClient({ anthropicApiKey: "ak" });
-    const { substitutions } = ensureServableStrategy(config, registry, (e) => client.canServe!(e), resolveRuntime(config));
-    expect(config.inferenceModel).toBe("claude-sonnet-4-6");
-    expect(config.modelStrategy?.lowComputeModel).toBe("claude-haiku-4-5");
-    expect(config.modelStrategy?.criticalModel).toBe("claude-haiku-4-5");
+    const { table, registry } = seeded(config);
+    const { substitutions } = ensureServableStrategy(config, registry, (e) => canServeModel(table, e), table);
+    expect(config.inferenceModel).toBe("claude-sonnet-5-5");
+    expect(config.modelStrategy?.lowComputeModel).toBe("claude-haiku-5-5");
+    expect(config.modelStrategy?.criticalModel).toBe("claude-haiku-5-5");
     expect(substitutions.map((s) => s.slot)).toEqual(["inferenceModel", "lowComputeModel", "criticalModel"]);
+  });
+
+  it("keeps the owner's own servable Anthropic choice", () => {
+    const config = createTestConfig({ conwayApiKey: "", anthropicApiKey: "ak", inferenceModel: "claude-sonnet-4-6" });
+    const { table, registry } = seeded(config);
+    ensureServableStrategy(config, registry, (e) => canServeModel(table, e), table);
+    expect(config.inferenceModel).toBe("claude-sonnet-4-6");
   });
 
   it("Anthropic only at a fixed critical tier: the router has a model to run", async () => {
@@ -310,12 +395,14 @@ describe("ensureServableStrategy", () => {
       )) as any;
     const critGate = new InferenceGate({ db: db.raw, policy: resolveInferencePolicy({}, { maxInferenceDailyCents: 200 }), fixedTier: "critical" });
     installInferenceGate(critGate);
-    const registry = new ModelRegistry(db.raw);
-    registry.initialize();
-    registry.seedProviderModels(["anthropic"]);
     const config = createTestConfig({ conwayApiKey: "", anthropicApiKey: "ak", inferenceModel: "gpt-5.2" });
-    const client = standaloneClient({ anthropicApiKey: "ak", getModelProvider: (id: string) => registry.get(id)?.provider });
-    ensureServableStrategy(config, registry, (e) => client.canServe!(e), resolveRuntime(config));
+    const { table, registry } = seeded(config);
+    const client = standaloneClient({
+      anthropicApiKey: "ak",
+      table,
+      getModelRoute: (id: string) => modelRouteOf(registry.get(id)),
+    });
+    ensureServableStrategy(config, registry, (e) => client.canServe!(e), table);
     const router = new InferenceRouter(db.raw, registry, critGate, () => config.modelStrategy!, {
       canServe: (e) => client.canServe!(e),
     });
@@ -323,12 +410,10 @@ describe("ensureServableStrategy", () => {
       { messages: [{ role: "user", content: "hi" }], taskType: "agent_turn", tier: "critical", sessionId: "s" },
       (msgs, opts) => client.chat(msgs, opts),
     );
-    expect(result.model).toBe("claude-haiku-4-5");
+    expect(result.model).toBe("claude-haiku-5-5");
   });
 
   it("never substitutes a paid model below its tier floor; such a slot is reported unservable", () => {
-    const registry = new ModelRegistry(db.raw);
-    registry.initialize();
     const mk = (tierMinimum?: string) =>
       createTestConfig({
         conwayApiKey: "",
@@ -337,61 +422,104 @@ describe("ensureServableStrategy", () => {
         providers: { openai: { baseUrl: "https://llm.example/v1", models: [{ id: "my-model", inputUsdPerM: 1, outputUsdPerM: 2, ...(tierMinimum ? { tierMinimum } : {}) }] } },
       } as any);
     const normal = mk();
-    registry.upsertConfiguredModels(normal.providers!.openai!.models!);
-    const client = standaloneClient({ openaiApiKey: "sk", openaiBaseUrl: "https://llm.example/v1", openaiModels: ["my-model"], getModelProvider: (id: string) => registry.get(id)?.provider });
-    const r = ensureServableStrategy(normal, registry, (e) => client.canServe!(e), resolveRuntime(normal));
+    const { table, registry } = seeded(normal);
+    const r = ensureServableStrategy(normal, registry, (e) => canServeModel(table, e), table);
     expect(normal.inferenceModel).toBe("my-model");
     expect(r.unservable).toEqual(["lowComputeModel", "criticalModel"]);
     expect(r.substitutions.map((s) => s.slot)).toEqual(["inferenceModel"]);
 
     const critical = mk("critical");
-    registry.upsertConfiguredModels(critical.providers!.openai!.models!);
-    const r2 = ensureServableStrategy(critical, registry, (e) => client.canServe!(e), resolveRuntime(critical));
+    const t2 = resolveProviderTable(critical, {});
+    const reg2 = new ModelRegistry(db.raw, { table: t2, config: critical });
+    reg2.seedFromPriceTable(t2);
+    const r2 = ensureServableStrategy(critical, reg2, (e) => canServeModel(t2, e), t2);
     expect(r2.unservable).toEqual([]);
     expect(critical.modelStrategy?.criticalModel).toBe("my-model");
   });
 
   it("leaves a servable strategy alone, and reports a slot nothing can serve", () => {
-    const registry = new ModelRegistry(db.raw);
-    registry.initialize();
     const openai = createTestConfig({ conwayApiKey: "", openaiApiKey: "sk", inferenceModel: "gpt-5.2" });
-    const client = standaloneClient({ openaiApiKey: "sk" });
-    expect(ensureServableStrategy(openai, registry, (e) => client.canServe!(e), resolveRuntime(openai)).substitutions).toEqual([]);
+    const { table, registry } = seeded(openai);
+    expect(ensureServableStrategy(openai, registry, (e) => canServeModel(table, e), table).substitutions).toEqual([]);
     const nothing = createTestConfig({ conwayApiKey: "", inferenceModel: "gpt-5.2" });
-    const none = standaloneClient();
-    expect(ensureServableStrategy(nothing, registry, (e) => none.canServe!(e), resolveRuntime(nothing)).unservable).toContain(
+    const empty = resolveProviderTable(nothing, {});
+    expect(ensureServableStrategy(nothing, registry, (e) => canServeModel(empty, e), empty).unservable).toContain(
       "inferenceModel",
     );
     expect(nothing.inferenceModel).toBe("gpt-5.2");
   });
 
+  it("keeps an unpriced model the owner names when its provider sets allowUnpriced, and only then", () => {
+    const mk = (allowUnpriced: boolean) =>
+      createTestConfig({
+        conwayApiKey: "",
+        ollamaBaseUrl: "http://127.0.0.1:11434",
+        inferenceModel: "agg/vendor/mystery-2",
+        providers: { compatible: [{ id: "agg", baseUrl: "https://agg.example/v1", apiKey: "agg-key-0123456789", allowUnpriced }] },
+      } as any);
+    for (const allow of [true, false]) {
+      const config = mk(allow);
+      const { table, registry } = seeded(config);
+      registry.upsert(ollamaRow("llama3.1:8b"));
+      registry.applyDiscovery(table.get("agg")!, [{ remoteId: "vendor/mystery-2" }]);
+      const r = ensureServableStrategy(config, registry, (e) => canServeModel(table, e), table);
+      expect(config.inferenceModel).toBe(allow ? "agg/vendor/mystery-2" : "llama3.1:8b");
+      expect(r.substitutions.some((s) => s.slot === "inferenceModel")).toBe(!allow);
+    }
+  });
+
+  it("an allowed unpriced owner model still fills no slot below its tier floor", () => {
+    const config = createTestConfig({
+      conwayApiKey: "",
+      inferenceModel: "gpt-5.2",
+      providers: {
+        compatible: [{ id: "agg", baseUrl: "https://agg.example/v1", apiKey: "agg-key-0123456789", allowUnpriced: true, models: [{ id: "mystery" }] }],
+      },
+    } as any);
+    const { table, registry } = seeded(config);
+    registry.upsertOwnerModels(table.get("agg")!);
+    const r = ensureServableStrategy(config, registry, (e) => canServeModel(table, e), table);
+    expect(config.inferenceModel).toBe("agg/mystery");
+    expect(r.unservable).toEqual(["lowComputeModel", "criticalModel"]);
+  });
+
   it("Ollama: the first discovered model", () => {
-    const registry = new ModelRegistry(db.raw);
-    registry.initialize();
-    const now = new Date().toISOString();
-    registry.upsert({
-      modelId: "llama3.2:latest",
-      provider: "ollama",
-      displayName: "Llama",
-      tierMinimum: "critical",
-      costPer1kInput: 0,
-      costPer1kOutput: 0,
-      maxTokens: 4096,
-      contextWindow: 8192,
-      supportsTools: true,
-      supportsVision: false,
-      parameterStyle: "max_tokens",
-      enabled: true,
-      lastSeen: null,
-      createdAt: now,
-      updatedAt: now,
-    });
     const config = createTestConfig({ conwayApiKey: "", ollamaBaseUrl: "http://localhost:11434" });
-    const client = standaloneClient({ ollamaBaseUrl: "http://localhost:11434" });
-    ensureServableStrategy(config, registry, (e) => client.canServe!(e), resolveRuntime(config));
+    const { table, registry } = seeded(config);
+    registry.upsert(ollamaRow("llama3.2:latest"));
+    ensureServableStrategy(config, registry, (e) => canServeModel(table, e), table);
     expect(config.inferenceModel).toBe("llama3.2:latest");
   });
 });
+
+function ollamaRow(modelId: string) {
+  const now = new Date().toISOString();
+  return {
+    modelId,
+    provider: "ollama" as const,
+    displayName: modelId,
+    tierMinimum: "critical" as const,
+    costPer1kInput: 0,
+    costPer1kOutput: 0,
+    maxTokens: 4096,
+    contextWindow: 8192,
+    supportsTools: true,
+    supportsVision: false,
+    parameterStyle: "max_tokens" as const,
+    enabled: true,
+    lastSeen: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function liveStrategyOf(config: ReturnType<typeof createTestConfig>) {
+  return {
+    ...DEFAULT_MODEL_STRATEGY_CONFIG,
+    ...(config.modelStrategy ?? {}),
+    inferenceModel: config.inferenceModel || DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel,
+  };
+}
 
 describe("x402 payees", () => {
   const savedHome = process.env.HOME;
@@ -424,5 +552,34 @@ describe("x402 payees", () => {
     expect(loadConfig({})!.treasuryPolicy!.x402AllowedDomains).toEqual(["conway.tech"]);
     write({ openaiApiKey: "sk", treasuryPolicy: { x402AllowedDomains: ["pay.example"] } });
     expect(loadConfig({})!.treasuryPolicy!.x402AllowedDomains).toEqual(["pay.example"]);
+  });
+});
+
+describe("long-prompt settlement in the main loop", () => {
+  it("settles at the tier price when the reported input crosses the threshold the estimate missed", async () => {
+    const config = createTestConfig({
+      conwayApiKey: undefined as unknown as string,
+      anthropicApiKey: "sk-ant-longprompt-0123456789",
+      providers: { mode: "standalone" },
+    });
+    const table = resolveProviderTable(config, {});
+    const registry = new ModelRegistry(db.raw, { table, config });
+    registry.initialize();
+    registry.seedFromPriceTable(table);
+    const router = new InferenceRouter(
+      db.raw,
+      registry,
+      gate,
+      () => ({ ...DEFAULT_MODEL_STRATEGY_CONFIG, inferenceModel: "claude-haiku-5-5" }),
+      { canServe: () => true },
+    );
+    const result = await router.route(
+      { messages: [{ role: "user", content: "hi" }], taskType: "agent_turn", tier: "normal", sessionId: "s" },
+      async () => ({ message: { role: "assistant", content: "ok" }, usage: { promptTokens: 140_000, completionTokens: 1000 } }) as any,
+    );
+    expect(result.model).toBe("claude-haiku-5-5");
+    const row = db.raw.prepare("SELECT price_in_usd_per_m AS pin, cost_micro_usd AS cost FROM inference_ledger").get() as any;
+    expect(row.pin).toBe(0.1);
+    expect(row.cost).toBe(140_000 * 0.5 + 1000 * 2.5);
   });
 });

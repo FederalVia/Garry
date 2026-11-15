@@ -13,8 +13,26 @@ import type {
   InferenceToolCall,
   TokenUsage,
   InferenceToolDefinition,
+  ModelCapabilities,
+  ModelEntry,
+  ModelProvider,
+  Effort,
 } from "../types.js";
 import { ResilientHttpClient, isLoopbackHttpUrl } from "./http-client.js";
+import {
+  canServeModel,
+  openAiProtocolBase,
+  providerIdForRow,
+  remoteIdForRow,
+  type ProviderEntry,
+  type ProviderTable,
+} from "../providers/table.js";
+import {
+  ANTHROPIC_MESSAGES_URL,
+  anthropicHeaders,
+  buildAnthropicRequest,
+  parseAnthropicResponse,
+} from "../inference/anthropic.js";
 import { redactChatMessages } from "../security/secret-redaction.js";
 import { getInstalledInferenceGate, currentInferenceScope, budgetClassFor } from "../inference/gate.js";
 import {
@@ -54,25 +72,74 @@ interface InferenceClientOptions {
   conwayFallback?: boolean;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
+  /** The provider table: which entry serves a row, its key and its wire protocol. */
+  table?: ProviderTable;
+  /** Registry lookup for a model's route; used with the table. */
+  getModelRoute?: (modelId: string) => ModelRoute | undefined;
+}
+
+/** What the client needs from a registry row to send to it. */
+export interface ModelRoute {
+  providerId?: string | null;
+  remoteId?: string | null;
+  provider: ModelProvider | string;
+  parameterStyle?: ModelEntry["parameterStyle"];
+  capabilities?: Partial<ModelCapabilities> | null;
+}
+
+/** The route of a registry row, for getModelRoute. */
+export function modelRouteOf(entry: ModelEntry | undefined): ModelRoute | undefined {
+  if (!entry) return undefined;
+  return {
+    providerId: entry.providerId,
+    remoteId: entry.remoteId,
+    provider: entry.provider,
+    parameterStyle: entry.parameterStyle,
+    capabilities: entry.capabilities,
+  };
 }
 
 type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama" | "none";
+
+/** Names that need max_completion_tokens on OpenAI (o-series, gpt-5.x, gpt-4.1). */
+const COMPLETION_TOKENS_RE = /^(o[1-9]|gpt-5|gpt-4\.1)/;
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 export function createInferenceClient(
   options: InferenceClientOptions,
 ): InferenceClient {
-  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider } = options;
+  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider, table, getModelRoute } = options;
   const conwayFallback = options.conwayFallback !== false;
   const openaiBaseUrl = (options.openaiBaseUrl || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, "");
   const customOpenAi = openaiBaseUrl !== DEFAULT_OPENAI_BASE_URL;
   const openaiModels = options.openaiModels && options.openaiModels.length > 0 ? new Set(options.openaiModels) : null;
+  // The per-request host check still applies; this only lets plain http
+  // through to loopback servers someone configured.
   const httpClient = new ResilientHttpClient({
     baseTimeout: INFERENCE_TIMEOUT_MS,
     retryableStatuses: [429, 500, 502, 503, 504],
-    allowHttpOnLoopback: isLoopbackHttpUrl(ollamaBaseUrl) || isLoopbackHttpUrl(openaiBaseUrl),
+    allowHttpOnLoopback:
+      isLoopbackHttpUrl(ollamaBaseUrl) ||
+      isLoopbackHttpUrl(openaiBaseUrl) ||
+      (table?.entries ?? []).some((e) => isLoopbackHttpUrl(e.baseUrl)),
   });
+
+  /**
+   * The table entry for a model, or undefined to use the legacy rules. In
+   * standalone every routed row goes through the table; in Conway mode only
+   * rows that name their provider_id do, so a Conway install is unchanged.
+   */
+  const tableEntryFor = (route: ModelRoute | undefined): ProviderEntry | null | undefined => {
+    if (!table || !route) return undefined;
+    if (!route.providerId && table.mode !== "standalone") return undefined;
+    const id = route.providerId || providerIdForRow({ provider: String(route.provider) });
+    const entry = table.get(id);
+    if (!entry) return null;
+    if (entry.kind === "conway" && table.mode !== "conway") return null;
+    if (!entry.hasKey && !entry.loopback && entry.kind !== "ollama") return null;
+    return entry;
+  };
   let currentModel = options.defaultModel;
   let maxTokens = options.maxTokens;
 
@@ -102,6 +169,31 @@ export function createInferenceClient(
     const model = opts?.model || currentModel;
     const tools = opts?.tools;
 
+    const route = getModelRoute?.(model);
+    const entry = tableEntryFor(route);
+    if (entry === null) {
+      gate.release(opts.reservationId, "no_provider");
+      throw new InferenceRefusedError("NO_MODEL", `No configured provider can serve model ${model}`, {
+        retryAfterMs: null,
+        budgetClass: budgetClassFor(currentInferenceScope().caller),
+      });
+    }
+    if (entry && route) {
+      return chatViaTableEntry({
+        entry,
+        key: table!.key(entry.id),
+        route,
+        model,
+        messages,
+        tools,
+        tokenLimit: opts?.maxTokens || maxTokens,
+        temperature: opts?.temperature,
+        effort: opts?.effort,
+        httpClient,
+        signal: opts.signal,
+      });
+    }
+
     const backend = resolveInferenceBackend(model, {
       openaiApiKey,
       anthropicApiKey,
@@ -121,8 +213,7 @@ export function createInferenceClient(
 
     // Newer models (o-series, gpt-5.x, gpt-4.1) require max_completion_tokens.
     // Ollama always uses max_tokens.
-    const usesCompletionTokens =
-      backend !== "ollama" && /^(o[1-9]|gpt-5|gpt-4\.1)/.test(model);
+    const usesCompletionTokens = backend !== "ollama" && COMPLETION_TOKENS_RE.test(model);
     const tokenLimit = opts?.maxTokens || maxTokens;
 
     const body: Record<string, unknown> = {
@@ -152,7 +243,8 @@ export function createInferenceClient(
         tokenLimit,
         messages,
         tools,
-        temperature: opts?.temperature,
+        effort: opts?.effort,
+        capabilities: route?.capabilities,
         anthropicApiKey: anthropicApiKey as string,
         httpClient,
         signal: opts.signal,
@@ -205,6 +297,12 @@ export function createInferenceClient(
    * listed for it, so the router never picks a model nobody can serve.
    */
   const canServe = (model: { modelId: string; provider: string }): boolean => {
+    // The table's one serve rule, for every row in standalone and for rows
+    // naming their provider in Conway mode.
+    const row = model as ModelEntry;
+    if (table && (table.mode === "standalone" || row.providerId)) {
+      return canServeModel(table, row);
+    }
     if (model.provider === "ollama") return !!ollamaBaseUrl;
     if (conwayFallback) {
       if (model.provider === "anthropic" && anthropicApiKey) return true;
@@ -275,25 +373,105 @@ function resolveInferenceBackend(
 
 }
 
+/**
+ * Send to the table entry serving the row, by the entry's wire protocol. A
+ * key only ever goes to its own entry's base URL (Anthropic's is pinned).
+ */
+async function chatViaTableEntry(params: {
+  entry: ProviderEntry;
+  key: string | undefined;
+  route: ModelRoute;
+  model: string;
+  messages: ChatMessage[];
+  tools?: InferenceToolDefinition[];
+  tokenLimit: number;
+  temperature?: number;
+  effort?: Effort;
+  httpClient: ResilientHttpClient;
+  signal?: AbortSignal;
+}): Promise<InferenceResponse> {
+  const { entry, route } = params;
+  // Conway rows go out exactly as before the table: the registry id on the
+  // wire (an id like "conway/kimi-k2" keeps its prefix) and the token field
+  // chosen from the id alone.
+  const conway = entry.kind === "conway";
+  const remoteId = conway ? params.model : remoteIdForRow({ modelId: params.model, remoteId: route.remoteId }, entry.id);
+  if (entry.kind === "anthropic") {
+    return chatViaAnthropic({
+      model: remoteId,
+      tokenLimit: params.tokenLimit,
+      messages: params.messages,
+      tools: params.tools,
+      effort: params.effort ?? entry.effort,
+      capabilities: route.capabilities,
+      anthropicApiKey: params.key ?? "",
+      httpClient: params.httpClient,
+      signal: params.signal,
+      reportedModel: params.model,
+    });
+  }
+
+  const endpoint =
+    entry.kind === "conway"
+      ? `${entry.baseUrl}/v1/chat/completions`
+      : `${openAiProtocolBase(entry)}/chat/completions`;
+  const body: Record<string, unknown> = {
+    model: remoteId,
+    messages: params.messages.map(formatMessage),
+    stream: false,
+  };
+  const completionTokens = conway
+    ? COMPLETION_TOKENS_RE.test(remoteId)
+    : entry.kind !== "ollama" && (route.parameterStyle === "max_completion_tokens" || COMPLETION_TOKENS_RE.test(remoteId));
+  body[completionTokens ? "max_completion_tokens" : "max_tokens"] = params.tokenLimit;
+  if (params.temperature !== undefined) body.temperature = params.temperature;
+  if (params.tools && params.tools.length > 0) {
+    body.tools = params.tools;
+    body.tool_choice = "auto";
+  }
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (entry.kind === "conway") {
+    if (params.key) headers.Authorization = params.key;
+  } else if (entry.kind === "ollama") {
+    headers.Authorization = `Bearer ${params.key || "ollama"}`;
+  } else if (params.key) {
+    // A keyless loopback server gets no Authorization header.
+    headers.Authorization = `Bearer ${params.key}`;
+  }
+  const response = await chatViaOpenAiCompatible({
+    model: params.model,
+    body,
+    endpoint,
+    headers,
+    backend: entry.id,
+    httpClient: params.httpClient,
+    signal: params.signal,
+  });
+  // The ledger and the loop see the registry id, not the wire id.
+  return { ...response, model: params.model };
+}
+
 async function chatViaOpenAiCompatible(params: {
   model: string;
   body: Record<string, unknown>;
   /** Full chat completions URL. */
   endpoint: string;
-  apiKey: string;
-  backend: "conway" | "openai" | "ollama";
+  apiKey?: string;
+  /** Full headers; when absent they are built from apiKey and backend. */
+  headers?: Record<string, string>;
+  backend: string;
   httpClient: ResilientHttpClient;
   signal?: AbortSignal;
 }): Promise<InferenceResponse> {
   // retries: 0 — a billable POST is never resent here; the router owns retries.
   const resp = await params.httpClient.request(params.endpoint, {
     method: "POST",
-    headers: {
+    headers: params.headers ?? {
       "Content-Type": "application/json",
       Authorization:
         params.backend === "openai" || params.backend === "ollama"
           ? `Bearer ${params.apiKey}`
-          : params.apiKey,
+          : String(params.apiKey),
     },
     body: JSON.stringify(params.body),
     timeout: INFERENCE_TIMEOUT_MS,
@@ -341,50 +519,32 @@ async function chatViaOpenAiCompatible(params: {
   };
 }
 
+/** Through the shared codec: the same request the orchestration transport sends. */
 async function chatViaAnthropic(params: {
   model: string;
   tokenLimit: number;
   messages: ChatMessage[];
   tools?: InferenceToolDefinition[];
-  temperature?: number;
+  effort?: Effort;
+  capabilities?: Partial<ModelCapabilities> | null;
   anthropicApiKey: string;
   httpClient: ResilientHttpClient;
   signal?: AbortSignal;
+  /** The registry id, when the wire id differs. */
+  reportedModel?: string;
 }): Promise<InferenceResponse> {
-  const transformed = transformMessagesForAnthropic(params.messages);
-  const body: Record<string, unknown> = {
+  const body = buildAnthropicRequest({
     model: params.model,
-    max_tokens: params.tokenLimit,
-    messages:
-      transformed.messages.length > 0
-        ? transformed.messages
-        : (() => { throw new Error("Cannot send empty message array to Anthropic API"); })(),
-  };
+    maxTokens: params.tokenLimit,
+    messages: params.messages,
+    tools: params.tools,
+    effort: params.effort,
+    capabilities: params.capabilities,
+  });
 
-  if (transformed.system) {
-    body.system = transformed.system;
-  }
-
-  if (params.temperature !== undefined) {
-    body.temperature = params.temperature;
-  }
-
-  if (params.tools && params.tools.length > 0) {
-    body.tools = params.tools.map((tool) => ({
-      name: tool.function.name,
-      description: tool.function.description,
-      input_schema: tool.function.parameters,
-    }));
-    body.tool_choice = { type: "auto" };
-  }
-
-  const resp = await params.httpClient.request("https://api.anthropic.com/v1/messages", {
+  const resp = await params.httpClient.request(ANTHROPIC_MESSAGES_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": params.anthropicApiKey,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: anthropicHeaders(params.anthropicApiKey),
     body: JSON.stringify(body),
     timeout: INFERENCE_TIMEOUT_MS,
     retries: 0,
@@ -393,55 +553,23 @@ async function chatViaAnthropic(params: {
 
   if (!resp.ok) throw await httpError("anthropic", resp);
 
-  const data = await readJson(resp);
-  const content = Array.isArray(data.content) ? data.content : [];
-  const textBlocks = content.filter((c: any) => c?.type === "text");
-  const toolUseBlocks = content.filter((c: any) => c?.type === "tool_use");
-
-  const toolCalls: InferenceToolCall[] | undefined =
-    toolUseBlocks.length > 0
-      ? toolUseBlocks.map((tool: any) => ({
-          id: tool.id,
-          type: "function" as const,
-          function: {
-            name: tool.name,
-            arguments: JSON.stringify(tool.input || {}),
-          },
-        }))
-      : undefined;
-
-  const textContent = textBlocks
-    .map((block: any) => String(block.text || ""))
-    .join("\n")
-    .trim();
-
-  const promptTokens = data.usage?.input_tokens || 0;
-  const completionTokens = data.usage?.output_tokens || 0;
-
-  if (!textContent && !toolCalls?.length) {
-    throw new InferenceResponseError("No completion content returned from anthropic inference", {
-      inputTokens: promptTokens,
-      outputTokens: completionTokens,
-    });
-  }
-
+  const parsed = parseAnthropicResponse(await readJson(resp), params.model);
   const usage: TokenUsage = {
-    promptTokens,
-    completionTokens,
-    totalTokens: promptTokens + completionTokens,
+    promptTokens: parsed.usage.promptTokens,
+    completionTokens: parsed.usage.completionTokens,
+    totalTokens: parsed.usage.promptTokens + parsed.usage.completionTokens,
   };
-
   return {
-    id: data.id || "",
-    model: data.model || params.model,
+    id: parsed.id,
+    model: params.reportedModel ?? parsed.model,
     message: {
       role: "assistant",
-      content: textContent,
-      tool_calls: toolCalls,
+      content: parsed.content,
+      tool_calls: parsed.toolCalls,
     },
-    toolCalls,
+    toolCalls: parsed.toolCalls,
     usage,
-    finishReason: normalizeAnthropicFinishReason(data.stop_reason),
+    finishReason: parsed.finishReason,
   };
 }
 
@@ -471,106 +599,4 @@ function usageOf(u: TokenUsage): { inputTokens: number; outputTokens: number } |
   return u.promptTokens || u.completionTokens
     ? { inputTokens: u.promptTokens, outputTokens: u.completionTokens }
     : undefined;
-}
-
-function transformMessagesForAnthropic(
-  messages: ChatMessage[],
-): { system?: string; messages: Array<Record<string, unknown>> } {
-  const systemParts: string[] = [];
-  const transformed: Array<Record<string, unknown>> = [];
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      if (msg.content) systemParts.push(msg.content);
-      continue;
-    }
-
-    if (msg.role === "user") {
-      // Merge consecutive user messages
-      const last = transformed[transformed.length - 1];
-      if (last && last.role === "user" && typeof last.content === "string") {
-        last.content = last.content + "\n" + msg.content;
-        continue;
-      }
-      transformed.push({
-        role: "user",
-        content: msg.content,
-      });
-      continue;
-    }
-
-    if (msg.role === "assistant") {
-      const content: Array<Record<string, unknown>> = [];
-      if (msg.content) {
-        content.push({ type: "text", text: msg.content });
-      }
-      for (const toolCall of msg.tool_calls || []) {
-        content.push({
-          type: "tool_use",
-          id: toolCall.id,
-          name: toolCall.function.name,
-          input: parseToolArguments(toolCall.function.arguments),
-        });
-      }
-      if (content.length === 0) {
-        content.push({ type: "text", text: "" });
-      }
-      // Merge consecutive assistant messages
-      const last = transformed[transformed.length - 1];
-      if (last && last.role === "assistant" && Array.isArray(last.content)) {
-        (last.content as Array<Record<string, unknown>>).push(...content);
-        continue;
-      }
-      transformed.push({
-        role: "assistant",
-        content,
-      });
-      continue;
-    }
-
-    if (msg.role === "tool") {
-      // Merge consecutive tool messages into a single user message
-      // with multiple tool_result content blocks
-      const toolResultBlock = {
-        type: "tool_result",
-        tool_use_id: msg.tool_call_id || "unknown_tool_call",
-        content: msg.content,
-      };
-
-      const last = transformed[transformed.length - 1];
-      if (last && last.role === "user" && Array.isArray(last.content)) {
-        // Append tool_result to existing user message with content blocks
-        (last.content as Array<Record<string, unknown>>).push(toolResultBlock);
-        continue;
-      }
-
-      transformed.push({
-        role: "user",
-        content: [toolResultBlock],
-      });
-    }
-  }
-
-  return {
-    system: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
-    messages: transformed,
-  };
-}
-
-function parseToolArguments(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return { value: parsed };
-  } catch {
-    return { _raw: raw };
-  }
-}
-
-function normalizeAnthropicFinishReason(reason: unknown): string {
-  if (typeof reason !== "string") return "stop";
-  if (reason === "tool_use") return "tool_calls";
-  return reason;
 }

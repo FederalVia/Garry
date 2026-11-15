@@ -638,3 +638,222 @@ describe("UnifiedInferenceClient", () => {
     expect(mockState.create).not.toHaveBeenCalled();
   });
 });
+
+describe("UnifiedInferenceClient with the Anthropic transport", () => {
+  const anthropicCalls: Array<{ url: string; headers: Record<string, string>; body: any }> = [];
+  let replies: Array<() => Response>;
+  const fetchStub = vi.fn(async (url: any, init: any) => {
+    anthropicCalls.push({ url: String(url), headers: init.headers, body: JSON.parse(init.body) });
+    const next = replies.shift();
+    if (!next) throw new Error("No Anthropic reply queued");
+    return next();
+  });
+  const ok = (content: unknown[], usage = { input_tokens: 100, output_tokens: 20 }, stop_reason = "end_turn") => () =>
+    new Response(JSON.stringify({ id: "msg", model: "claude-haiku-5-5", content, stop_reason, usage }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  const status = (code: number, headers: Record<string, string> = {}) => () =>
+    new Response(JSON.stringify({ type: "error", error: { type: "x", message: "m" } }), { status: code, headers });
+
+  const anthropicProvider = (models: Partial<import("../../inference/provider-registry.js").ModelConfig>[] = []): ProviderConfig => ({
+    id: "anthropic",
+    name: "Anthropic",
+    baseUrl: "https://api.anthropic.com",
+    apiKeyEnvVar: "ANTHROPIC_API_KEY",
+    kind: "anthropic",
+    effort: "high",
+    models: (["reasoning", "fast", "cheap"] as const).map((tier, i) => ({
+      id: "claude-haiku-5-5",
+      tier,
+      contextWindow: 200000,
+      maxOutputTokens: 64000,
+      costPerInputToken: 0.1,
+      costPerOutputToken: 0.5,
+      supportsTools: true,
+      supportsVision: true,
+      supportsStreaming: true,
+      minOutputTokens: 2048,
+      capabilities: {
+        effort: true,
+        minOutputTokens: 2048,
+        longPrompt: { aboveInputTokens: 100_000, inputUsdPerM: 0.5, outputUsdPerM: 2.5 },
+      },
+      ...(models[i] ?? {}),
+    })),
+    maxRequestsPerMinute: 100,
+    maxTokensPerMinute: 100000,
+    priority: 1,
+    enabled: true,
+  });
+  const openaiFallback = (): ProviderConfig => ({
+    id: "openai",
+    name: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnvVar: "OPENAI_API_KEY",
+    models: (["reasoning", "fast", "cheap"] as const).map((tier) => ({
+      id: "gpt-4.1-mini",
+      tier,
+      contextWindow: 128000,
+      maxOutputTokens: 16384,
+      costPerInputToken: 0.4,
+      costPerOutputToken: 1.6,
+      supportsTools: true,
+      supportsVision: false,
+      supportsStreaming: true,
+    })),
+    maxRequestsPerMinute: 100,
+    maxTokensPerMinute: 100000,
+    priority: 2,
+    enabled: true,
+  });
+  const registryOf = (...providers: ProviderConfig[]) =>
+    new ProviderRegistry(
+      providers,
+      {
+        reasoning: { preferredProvider: providers[0].id, fallbackOrder: providers.slice(1).map((p) => p.id) },
+        fast: { preferredProvider: providers[0].id, fallbackOrder: providers.slice(1).map((p) => p.id) },
+        cheap: { preferredProvider: providers[0].id, fallbackOrder: providers.slice(1).map((p) => p.id) },
+      },
+      { keys: { ANTHROPIC_API_KEY: "sk-ant-test", OPENAI_API_KEY: "sk-openai" }, fetch: fetchStub as any },
+    );
+  const ledger = () =>
+    db.raw
+      .prepare(
+        "SELECT provider, status, input_tokens, output_tokens, price_in_usd_per_m AS pin, price_out_usd_per_m AS pout, max_output_tokens AS maxOut FROM inference_ledger ORDER BY rowid",
+      )
+      .all() as any[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockState.queue.splice(0, mockState.queue.length);
+    mockState.calls.splice(0, mockState.calls.length);
+    anthropicCalls.length = 0;
+    replies = [];
+    sleeps.length = 0;
+    resetProviderCircuitBreakers();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-anthropic-test-"));
+    db = createDatabase(path.join(tmpDir, "state.db"));
+    installGate();
+  });
+
+  afterEach(() => {
+    resetInferenceGateForTests();
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("posts the codec body to the pinned endpoint with x-api-key, and returns a fenced JSON reply parsed", async () => {
+    replies.push(ok([{ type: "thinking", thinking: "" }, { type: "text", text: '```json\n{"plan":1}\n```' }]));
+    const client = createClient(registryOf(anthropicProvider()));
+    const result = await client.chat({
+      tier: "reasoning",
+      messages: [
+        { role: "system", content: "plan things" },
+        { role: "user", content: "go" },
+      ],
+      temperature: 0.3,
+      maxTokens: 512,
+      responseFormat: { type: "json_object" },
+      purpose: "planner",
+    });
+    expect(JSON.parse(result.content)).toEqual({ plan: 1 });
+    expect(anthropicCalls).toHaveLength(1);
+    const call = anthropicCalls[0];
+    expect(call.url).toBe("https://api.anthropic.com/v1/messages");
+    expect(call.headers["x-api-key"]).toBe("sk-ant-test");
+    expect(call.headers["anthropic-version"]).toBe("2023-06-01");
+    expect(call.body).not.toHaveProperty("temperature");
+    expect(call.body).not.toHaveProperty("thinking");
+    expect(call.body.system).toContain("Reply with one JSON object and nothing else.");
+    // The output floor for a thinking model, also reserved at that size.
+    expect(call.body.max_tokens).toBe(2048);
+    expect(ledger()[0].maxOut).toBe(2048);
+    // The owner's effort for planner calls.
+    expect(call.body.output_config).toEqual({ effort: "high" });
+    expect(mockState.create).not.toHaveBeenCalled();
+  });
+
+  it("known secrets are redacted from what the Anthropic transport sends", async () => {
+    const { registerSecret, clearRegisteredSecrets } = await import("../../security/secret-redaction.js");
+    const secret = "sk-live-" + "q".repeat(40);
+    registerSecret(secret, "test-secret");
+    try {
+      replies.push(ok([{ type: "text", text: "ok" }]));
+      const client = createClient(registryOf(anthropicProvider()));
+      await client.chat({ tier: "fast", messages: [{ role: "user", content: `the key is ${secret}` }] });
+      expect(JSON.stringify(anthropicCalls[0].body)).not.toContain(secret);
+    } finally {
+      clearRegisteredSecrets();
+    }
+  });
+
+  it("classifier calls ask for low effort", async () => {
+    replies.push(ok([{ type: "text", text: "{}" }]));
+    const client = createClient(registryOf(anthropicProvider()));
+    await client.chat({ tier: "cheap", messages: BASE_MESSAGES, purpose: "classify" });
+    expect(anthropicCalls[0].body.output_config).toEqual({ effort: "low" });
+  });
+
+  it("a 401 disables the provider and the call fails over", async () => {
+    replies.push(status(401));
+    queueCompletion({ content: "from-openai" });
+    const registry = registryOf(anthropicProvider(), openaiFallback());
+    const client = createClient(registry);
+    const result = await client.chat({ tier: "fast", messages: BASE_MESSAGES });
+    expect(result.metadata.providerId).toBe("openai");
+    expect(registry.getProviders().find((p) => p.id === "anthropic")?.enabled).toBe(false);
+    expect(ledger().map((r) => [r.provider, r.status])).toEqual([
+      ["anthropic", "released"],
+      ["openai", "committed"],
+    ]);
+  });
+
+  it("a 429 is retried once on the same provider", async () => {
+    replies.push(status(429, { "retry-after": "1" }));
+    replies.push(ok([{ type: "text", text: "second time" }]));
+    const client = createClient(registryOf(anthropicProvider()));
+    const result = await client.chat({ tier: "fast", messages: BASE_MESSAGES });
+    expect(result.content).toBe("second time");
+    expect(anthropicCalls).toHaveLength(2);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it("a refusal is billed at its usage and fails over", async () => {
+    replies.push(ok([], { input_tokens: 70, output_tokens: 3 }, "refusal"));
+    queueCompletion({ content: "from-openai" });
+    const client = createClient(registryOf(anthropicProvider(), openaiFallback()));
+    const result = await client.chat({ tier: "fast", messages: BASE_MESSAGES });
+    expect(result.metadata.providerId).toBe("openai");
+    const rows = ledger();
+    expect(rows[0]).toMatchObject({ provider: "anthropic", status: "committed", input_tokens: 70, output_tokens: 3 });
+    expect(rows[1]).toMatchObject({ provider: "openai", status: "committed" });
+  });
+
+  it("reserves at the long-prompt price once the estimate reaches 70% of the threshold", async () => {
+    replies.push(ok([{ type: "text", text: "short" }]));
+    replies.push(ok([{ type: "text", text: "long" }]));
+    const client = createClient(registryOf(anthropicProvider()));
+    await client.chat({ tier: "fast", messages: BASE_MESSAGES });
+    // Under 80% of 100K by the local estimate, which runs short of the
+    // Claude tokenizer: the real prompt can be over 100K.
+    const long = "word ".repeat(55_000);
+    const est = gate.estimateInputTokens([{ role: "user", content: long }], undefined);
+    expect(est).toBeGreaterThanOrEqual(70_000);
+    expect(est).toBeLessThan(80_000);
+    expect(est).toBeLessThan(100_000);
+    await client.chat({ tier: "fast", messages: [{ role: "user", content: long }] });
+    const rows = ledger();
+    expect(rows[0]).toMatchObject({ pin: 0.1, pout: 0.5 });
+    expect(rows[1]).toMatchObject({ pin: 0.5, pout: 2.5 });
+  });
+
+  it("settles at the long-prompt price when the reported input crosses the threshold the estimate missed", async () => {
+    replies.push(ok([{ type: "text", text: "ok" }], { input_tokens: 140_000, output_tokens: 1000 }));
+    const client = createClient(registryOf(anthropicProvider()));
+    await client.chat({ tier: "fast", messages: BASE_MESSAGES });
+    const row = db.raw.prepare("SELECT price_in_usd_per_m AS pin, cost_micro_usd AS cost FROM inference_ledger").get() as any;
+    expect(row.pin).toBe(0.1);
+    expect(row.cost).toBe(140_000 * 0.5 + 1000 * 2.5);
+  });
+});

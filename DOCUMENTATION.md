@@ -97,6 +97,7 @@ Details:
 - **Staying standalone.** An explicit `providers.mode: "standalone"` is kept when a Conway key is stored (`--provision`, `--configure`): the key is saved but unused. The setup wizard, and `--configure` when it leaves no Conway key, write that explicit mode, so a key stored later never silently switches the agent to Conway mode, which has no daily cap ceiling. A hand-written config without `providers.mode` gets it too: the first standalone `--run` that passes its startup checks writes `"mode": "standalone"` into `automaton.json` and logs it. Only changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone and its daily cap ceiling.
 - **Older installs.** Setups made before standalone mode installed Conway's survival skill and a Conway `SOUL.md` for every install. A standalone start replaces them when unmodified (and logs it); an edited `SOUL.md` that still lists Conway capabilities gets a warning.
 - **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use.
+- **More providers.** Any OpenAI-compatible server can be added under `providers.compatible` (see [Inference and Models](#inference-and-models)); in standalone the main loop and the planner and workers both use it (in Conway mode only the main loop does). Unpriced models are skipped unless the entry sets `allowUnpriced`.
 
 ### Existing Conway installs
 
@@ -269,7 +270,8 @@ node packages/cli/dist/index.js <command>
 | `CONWAY_API_KEY` | Conway API key (overrides config; selects Conway mode) |
 | `OLLAMA_BASE_URL` | Ollama base URL (overrides config, e.g. `http://localhost:11434`) |
 | `OPENAI_API_KEY` | OpenAI key when `automaton.json` has none: for the main loop in standalone mode only, for the planner and workers in both modes |
-| `OPENAI_BASE_URL` | Base URL for the planner and workers' OpenAI calls; not used with `providers.openai.baseUrl` or when Ollama models were discovered |
+| `OPENAI_BASE_URL` | Base URL for the planner and workers' OpenAI calls in Conway mode (ignored in standalone) |
+| `AUTOMATON_PROVIDER_<ID>_API_KEY` | Key for the `providers.compatible` entry `<id>` (upper case, `-` as `_`, e.g. `AUTOMATON_PROVIDER_GROQ_API_KEY`) when the entry has no `apiKey` |
 | `AUTOMATON_SHUTDOWN_GRACE_MS` | How long a clean shutdown may take before the process is forced to exit with code 1 (default `30000`) |
 
 ### Status output
@@ -648,7 +650,7 @@ The heartbeat is a background daemon that runs scheduled tasks even while the ag
 | `check_child_health` | Every 10 min | Probes each starting/healthy/unhealthy child's process and moves it (see [Child status](#child-status)). No children, no probes. Wakes the agent only when a child newly becomes unhealthy or failed. |
 | `check_social_inbox` | Every 2 min | Polls social relay for new messages. 5min backoff on errors. |
 | `soul_reflection` | Configurable | Checks soul alignment with genesis prompt. |
-| `refresh_models` | Configurable | Refreshes available models from Conway API. |
+| `refresh_models` | Configurable | Refreshes each configured provider's model list (`/v1/models`, Anthropic's models endpoint, Ollama's `/api/tags`; at most once a day per provider after a success, once an hour after a failure), plus Conway's listing in Conway mode. Runs in both modes. |
 | `prune_dead_children` | Configurable | Deletes old ended child records (keeps the last 5). |
 | `report_metrics` | Configurable | Saves metric snapshots and evaluates alert rules. |
 | `memory_maintenance` | Hourly at :23 | Enforces retention: episodic entries below 0.8 importance after 30 days and the rest (errors, strategic turns) after 180 days (goal records kept), knowledge TTL and prune, `market_signal`/knowledge events after 30 days, finished inbox messages after 30 days (never under 14, so a replay of a deleted message arrives stale and counts as unverified), `inbox_seen_*` keys after 30 days, consumed wake events after 7 days, heartbeat history after 30 days, spend and inference costs after 90 days. Disable it in `heartbeat.yml` to keep everything. |
@@ -727,7 +729,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `list_sandboxes` | safe | List all sandboxes. |
 | `create_sandbox` | caution | Create a new VM. Params: name, vcpu, memory_mb, disk_gb. |
 | `delete_sandbox` | dangerous | Delete a sandbox (cannot delete own). |
-| `list_models` | safe | List available inference models with pricing. |
+| `list_models` | safe | List available inference models with pricing. In standalone, only models a configured provider can serve, grouped by provider, with where each price came from. |
 | `switch_model` | caution | Change active inference model. Saves only `inferenceModel` (and `modelStrategy.inferenceModel`) to `automaton.json`. |
 | `check_inference_spending` | safe | Query inference cost breakdown. |
 | `search_domains` | safe | Search for available domain names. |
@@ -911,11 +913,13 @@ Every inference call goes through one gate (`src/inference/gate.ts`): main turns
 | `modelStrategy.sessionCooldownMs` | 1800000 (30 min) | Wait after a session cap is hit |
 | `modelStrategy.maxTokensPerTurn` | `maxTokensPerTurn`, else 4096 | Output tokens per call, used for the worst-case reservation |
 
-Local models are free and pass every monetary cap. A paid model with no known price is never sent, by the main-loop router or by the unified client the orchestrator and workers use (`NO_MODEL` when nothing else can serve): any assumed price may be below the real one. Give such a model `costPerInputToken` and `costPerOutputToken` in `inference-providers.json`.
+Free models pass every monetary cap. A model is free only on Ollama (any host) or on a loopback server marked `"free": true` (`providers.openai.free` or a `providers.compatible` entry; refused on any other host). A paid model with no known price is never sent, by the main-loop router or by the unified client the orchestrator and workers use (`NO_MODEL` when nothing else can serve): any assumed price may be below the real one. Give it a price in the provider's `models` list (`{ "id": ..., "inputUsdPerM": ..., "outputUsdPerM": ... }`); in standalone `inference-providers.json` is ignored. A `providers.compatible` entry with `"allowUnpriced": true` lets its unpriced models be used, reserved and charged at the highest known price: the larger of the price table's highest price and the most expensive priced model any configured provider lists, at least $10 per 1M input and $50 per 1M output tokens. The gate's own fallback, for any paid model that reaches it without a price, is the highest price in the price table and the owner's `models` lists.
+
+Where prices come from: the owner's `models` prices, else the larger of the price the provider's model list reports and the local price table (`src/providers/price-table.ts`: Anthropic's current models, OpenAI's baseline models on OpenAI's own endpoint, a few hosted models by host). A reported price below $0.01 per 1M tokens on either side is treated as no price (it is most likely USD per token), so that model is unpriced unless the price table or the owner prices it. If a provider's base URL changes and the new endpoint's model list cannot be read, the models the old endpoint listed are unlisted until a read succeeds. Claude Haiku 5.5 costs more for prompts over 100K tokens; that price is reserved once the local estimate reaches 70% of 100K, since the estimate runs short of Claude's tokenizer, and a call the provider reports at over 100K input tokens is charged that price even if it was reserved at the lower one. On a custom `providers.openai.baseUrl` without a `models` list, the main loop can still send OpenAI's baseline model ids there and charges OpenAI's list prices for them (as before); the planner and workers use only models priced for that endpoint (listed, discovered with a price, or in the price table for that host).
 
 **Failed attempts.** An attempt that was never sent, and an HTTP 4xx, 429, 500 or 503 from the provider, is released (not billed). A 502, 504 or 408 after the request was sent is held as `unknown` at its reserved amount, like a timeout, because a gateway can answer after the upstream model generated and billed; the call still fails over to the next candidate.
 
-**When a main turn is refused:** nothing is persisted for it. If the survival allowance is available, one limited "survival turn" runs instead. Otherwise the agent sleeps until the refusal's `retryAfter` (clamped to 1 min .. 6 h), or, for a refusal that does not clear by itself (a setting refuses every call), with a doubling backoff from 10 to 60 minutes; the error log names `modelStrategy` and `maxInferenceDailyCents`. The next real turn is told why it was refused.
+**When a main turn is refused:** nothing is persisted for it. If the survival allowance is available, one limited "survival turn" runs instead, on a free local strategy model, else the critical model, else the cheapest priced model that supports tools and allows the current tier (in Conway mode, Conway's own models only need a price, as before). Otherwise the agent sleeps until the refusal's `retryAfter` (clamped to 1 min .. 6 h), or, for a refusal that does not clear by itself (a setting refuses every call), with a doubling backoff from 10 to 60 minutes; the error log names `modelStrategy` and `maxInferenceDailyCents`. The next real turn is told why it was refused.
 
 ### x402 protocol
 
@@ -1294,9 +1298,24 @@ Agents can leave on-chain feedback for each other:
 
 ### Supported backends
 
-1. **Conway proxy** (default) — routes through `api.conway.tech`, billed from credits
-2. **OpenAI direct** — uses BYOK OpenAI API key (sk-...)
-3. **Anthropic direct** — uses BYOK Anthropic API key (sk-ant-...)
+1. **Conway proxy** (Conway mode) — routes through `api.conway.tech`, billed from credits
+2. **OpenAI direct** — uses BYOK OpenAI API key (sk-...), or any OpenAI-compatible endpoint through `providers.openai.baseUrl`
+3. **Anthropic direct** — uses BYOK Anthropic API key (sk-ant-...), current Claude models included
+4. **Ollama** — `providers.ollama.baseUrl`, free
+5. **OpenAI-compatible servers** — any number of `providers.compatible` entries (an aggregator, Groq, Together, a local vLLM or LM Studio server). Their models get ids `<id>/<model>`; with a `models` list the entry serves only those models.
+
+The main loop uses these providers in both modes (one provider table). In standalone the planner and workers use the same table; in Conway mode they keep `inference-providers.json` with the OpenAI key, else the Conway key, so a `providers.compatible` entry or an Anthropic key serves only the main loop there. The planner and workers use Ollama only on a loopback address; the main loop uses it on any host. Example:
+
+```jsonc
+"providers": {
+  "anthropic": { "apiKey": "sk-ant-...", "effort": "medium" },
+  "compatible": [
+    { "id": "groq", "baseUrl": "https://api.groq.com/openai/v1", "apiKey": "gsk_...",
+      "models": [{ "id": "llama-3.3-70b-versatile", "inputUsdPerM": 0.59, "outputUsdPerM": 0.79 }] },
+    { "id": "lmstudio", "baseUrl": "http://127.0.0.1:1234/v1", "free": true }
+  ]
+}
+```
 
 ### Model selection
 
@@ -1307,7 +1326,7 @@ The inference router selects models based on:
 
 ### Available models
 
-Use the `list_models` tool to see current models with pricing. The model registry is refreshed from the Conway API by the heartbeat.
+Use the `list_models` tool to see current models with pricing. The heartbeat's `refresh_models` task refreshes the registry from each configured provider's model list (`discover: false` on an entry turns that off; in Conway mode the built-in entries are not asked unless `discover` is true) and, in Conway mode, from Conway's listing. Imported models are labelled by their provider. Standalone seeds Anthropic's current models (Sonnet 5.5, Haiku 5.5, Opus 5.5, plus Sonnet 4.6 and Haiku 4.5) when an Anthropic key is set, so an Anthropic-only owner gets the main loop, the planner and workers.
 
 ### Switching models
 
@@ -1461,7 +1480,7 @@ cd ~/.automaton && git log --oneline
 
 **No AI provider (standalone mode):**
 ```
-No AI provider configured. Set providers.openai.apiKey (...), providers.anthropic.apiKey, providers.ollama.baseUrl, or a Conway key (automaton --provision).
+No AI provider configured. Set providers.openai.apiKey (...), providers.anthropic.apiKey, providers.ollama.baseUrl, a providers.compatible entry (with an apiKey, or on this machine), or a Conway key (automaton --provision).
 ```
 Fix: add one provider to `automaton.json` (see [Run without Conway](#run-without-conway)), or provision a Conway key.
 

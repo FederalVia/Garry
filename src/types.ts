@@ -97,8 +97,9 @@ export interface AutomatonConfig {
   providers?: ProvidersConfig;
 }
 
-/** A model served by an OpenAI-compatible endpoint, priced by the operator. */
+/** A model a provider serves, optionally priced and tiered by the operator. */
 export interface ConfiguredModel {
+  /** The id the provider knows the model by (sent on the wire). */
   id: string;
   /** USD per 1M input tokens. */
   inputUsdPerM?: number;
@@ -107,12 +108,77 @@ export interface ConfiguredModel {
   tierMinimum?: SurvivalTier;
 }
 
+/** Anthropic output_config.effort levels. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** What a model accepts and how it is billed beyond its base price. */
+export interface ModelCapabilities {
+  /** default-on: thinking runs unless turned off; opt-in: only when asked; none: no thinking. */
+  thinking: "default-on" | "opt-in" | "none";
+  /** Accepts output_config.effort. */
+  effort: boolean;
+  /** The effort levels the model accepts, when not every level. */
+  effortLevels?: Effort[];
+  /** Accepts temperature (documentation only: it is never sent to Anthropic). */
+  sampling: boolean;
+  /** Floor for max_tokens: thinking counts toward it. */
+  minOutputTokens?: number;
+  /** A higher price once the prompt passes a size. */
+  longPrompt?: { aboveInputTokens: number; inputUsdPerM: number; outputUsdPerM: number };
+  /** > 0: a per-request fee the gate cannot charge, so the model counts as unpriced. */
+  requestFeeUsd?: number;
+}
+
+/** Where a registry row's price came from. */
+export type PriceSource = "owner" | "listed" | "table" | "baseline" | "conway";
+
+/** One OpenAI-compatible server (an aggregator, Groq, Together, vLLM, LM Studio ...). */
+export interface CompatibleProviderConfig {
+  /** ^[a-z0-9][a-z0-9-]{0,31}$, unique, not a built-in provider's id. */
+  id: string;
+  name?: string;
+  /** The API root /chat/completions and /models hang off. https, or http on loopback. */
+  baseUrl: string;
+  /** Else AUTOMATON_PROVIDER_<ID>_API_KEY. A loopback server may need none. */
+  apiKey?: string;
+  /** With a list, the entry serves only these models. */
+  models?: ConfiguredModel[];
+  /** Fetch the model list. Default true. */
+  discover?: boolean;
+  /** Free like Ollama. Only accepted on a loopback base URL. */
+  free?: boolean;
+  /** Let the router use unpriced models, charged at the highest known price. Default false. */
+  allowUnpriced?: boolean;
+  /** Planner and workers may use it. Default true. */
+  orchestration?: boolean;
+  /** Lower first in orchestration fallback order. Default 100. */
+  priority?: number;
+}
+
 export interface ProvidersConfig {
   /** Absent: "conway" when a Conway key resolves, else "standalone". */
   mode?: "standalone" | "conway";
-  openai?: { apiKey?: string; baseUrl?: string; models?: ConfiguredModel[] };
-  anthropic?: { apiKey?: string };
-  ollama?: { baseUrl?: string };
+  openai?: {
+    apiKey?: string;
+    baseUrl?: string;
+    models?: ConfiguredModel[];
+    /** Fetch the model list. Default: on in standalone, off in Conway mode. */
+    discover?: boolean;
+    /** Free like Ollama. Only accepted on a loopback baseUrl. */
+    free?: boolean;
+  };
+  anthropic?: {
+    apiKey?: string;
+    /** Owner rows: prices and tier floors for Anthropic models. */
+    models?: ConfiguredModel[];
+    /** Effort for agent, planner and worker turns; unset leaves the model's default. */
+    effort?: Effort;
+    /** Fetch the model list. Default: on in standalone, off in Conway mode. */
+    discover?: boolean;
+  };
+  ollama?: { baseUrl?: string; discover?: boolean };
+  /** Any number of OpenAI-compatible servers. */
+  compatible?: CompatibleProviderConfig[];
   conway?: { apiKey?: string; apiUrl?: string };
   survival?: { source?: "fixed" | "conway"; fixedTier?: Exclude<SurvivalTier, "dead"> };
   /** Standalone only: hard ceiling on treasuryPolicy.maxInferenceDailyCents. Default 200. */
@@ -445,6 +511,8 @@ export interface InferenceOptions {
   signal?: AbortSignal;
   /** Open reservation on the installed inference gate; the legacy client refuses to send without one. */
   reservationId?: string;
+  /** Anthropic effort for this call; sent only to models that accept it. */
+  effort?: Effort;
 }
 
 export interface InferenceToolDefinition {
@@ -1350,6 +1418,16 @@ export interface ModelEntry {
   lastSeen: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The provider-table entry serving the row; absent on legacy rows (derived from provider). */
+  providerId?: string | null;
+  /** The id sent on the wire; absent means modelId. */
+  remoteId?: string | null;
+  /** false: the provider's model list no longer has it. Absent counts as listed. */
+  listed?: boolean;
+  priceSource?: PriceSource | null;
+  capabilities?: Partial<ModelCapabilities> | null;
+  /** Set by a registry built with the provider table: a free (loopback) model. */
+  free?: boolean;
 }
 
 export interface ModelPreference {
@@ -1431,6 +1509,12 @@ export interface ModelRegistryRow {
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Written only when given; an upsert without it keeps the stored value. */
+  providerId?: string | null;
+  remoteId?: string | null;
+  listed?: boolean;
+  priceSource?: PriceSource | null;
+  capabilities?: Partial<ModelCapabilities> | null;
 }
 
 export interface ModelStrategyConfig {

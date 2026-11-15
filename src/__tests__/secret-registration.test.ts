@@ -80,6 +80,34 @@ describe("loading the wallet and config registers their secrets", () => {
     expect(leaks(JSON.stringify(entries[0]))).toEqual([]);
   });
 
+  it("loadConfig registers compatible providers' keys, from the file and from their env var", async () => {
+    const { redactChatMessages } = await import("../security/secret-redaction.js");
+    const { loadConfig } = await import("../config.js");
+    const FILE_KEY = "sk-or-compatible-FILEKEY-0123456789";
+    const ENV_KEY = "gsk_compatible_ENVKEY_0123456789";
+    fs.writeFileSync(
+      path.join(tmp, ".automaton", "automaton.json"),
+      JSON.stringify({
+        name: "t",
+        providers: {
+          mode: "standalone",
+          compatible: [
+            { id: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: FILE_KEY },
+            { id: "groq", baseUrl: "https://api.groq.com/openai/v1" },
+          ],
+        },
+      }),
+      { mode: 0o600 },
+    );
+    // Passed to loadConfig only: not in process.env, so only registration can redact it.
+    expect(loadConfig({ AUTOMATON_PROVIDER_GROQ_API_KEY: ENV_KEY })).not.toBeNull();
+    const [msg] = redactChatMessages([{ role: "user", content: `a ${FILE_KEY} b ${ENV_KEY}` }]);
+    expect(String(msg.content)).not.toContain("FILEKEY");
+    expect(String(msg.content)).not.toContain("ENVKEY");
+    expect(String(msg.content)).toContain("[REDACTED:provider-openrouter-api-key]");
+    expect(String(msg.content)).toContain("[REDACTED:provider-groq-api-key]");
+  });
+
   it("redacts custom provider and local provider keys taken from the environment", async () => {
     const { redactChatMessages } = await import("../security/secret-redaction.js");
     process.env.AUTOMATON_PROVIDER_DEEPSEEK_API_KEY = "dsk-0123456789abcdefSECRETVALUE";

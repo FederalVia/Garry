@@ -11,6 +11,7 @@ import {
   type InferenceCaller,
   type InferenceGate,
   type InferenceScope,
+  type LongPromptTier,
   type Reservation,
 } from "./gate.js";
 import {
@@ -27,6 +28,8 @@ import {
   type ModelConfig,
   type ResolvedModel,
 } from "./provider-registry.js";
+import { longPromptPrice } from "../providers/price-table.js";
+import { buildAnthropicRequest, parseAnthropicResponse, type AnthropicEffort } from "./anthropic.js";
 import {
   INFERENCE_DEADLINES,
   MAX_ATTEMPTS_PER_CALL,
@@ -332,11 +335,7 @@ export class UnifiedInferenceClient {
               provider: providerId,
               model: resolved.model.id,
               tier: resolved.model.tier,
-              price: {
-                inputUsdPerM: resolved.model.costPerInputToken,
-                outputUsdPerM: resolved.model.costPerOutputToken,
-                local,
-              },
+              price: { ...reservationPrice(resolved.model, estInputTokens), local },
               estInputTokens,
               maxOutputTokens: bounds.maxTokens,
               minOutputTokens: bounds.minTokens,
@@ -375,6 +374,7 @@ export class UnifiedInferenceClient {
           // A 200 is billed even without a usable choice: commit either way.
           const costMicroUsd = reservation && ctx.gate
             ? ctx.gate.commit(reservation.id, usage, latencyMs, {
+                longPrompt: resolved.model.capabilities?.longPrompt,
                 outputText:
                   (raw.content ?? "") + (raw.toolCalls ?? []).map((tc: any) => String(tc?.function?.arguments ?? "")).join(""),
               }).costMicroUsd
@@ -405,7 +405,7 @@ export class UnifiedInferenceClient {
             : classifyInferenceError(error, { callerAborted });
           attemptError = error;
           if (reservation && ctx.gate) {
-            settleFailedAttempt(ctx.gate, reservation.id, classification);
+            settleFailedAttempt(ctx.gate, reservation.id, classification, error, resolved.model.capabilities?.longPrompt);
           }
         }
 
@@ -467,6 +467,10 @@ export class UnifiedInferenceClient {
     let maxTokens = params.maxTokens !== undefined && params.maxTokens > 0
       ? Math.floor(params.maxTokens)
       : defaults.maxTokens;
+    // Thinking counts toward max_tokens: below the floor a thinking model may
+    // spend the whole limit before it writes anything.
+    const floor = outputFloor(model);
+    maxTokens = Math.max(maxTokens, floor);
     if (model.maxOutputTokens > 0) {
       maxTokens = Math.min(maxTokens, model.maxOutputTokens);
     }
@@ -475,7 +479,10 @@ export class UnifiedInferenceClient {
       maxTokens = Math.min(maxTokens, turnCap);
     }
     maxTokens = Math.max(1, maxTokens);
-    const minTokens = defaults.noClamp ? maxTokens : Math.min(MIN_CLAMPED_OUTPUT_TOKENS, maxTokens);
+    // The gate may clamp a clampable call, but never below the floor.
+    const minTokens = defaults.noClamp
+      ? maxTokens
+      : Math.min(Math.max(MIN_CLAMPED_OUTPUT_TOKENS, floor), maxTokens);
     return { maxTokens, minTokens };
   }
 
@@ -486,8 +493,11 @@ export class UnifiedInferenceClient {
     signal: AbortSignal,
     timeoutMs: number,
   ): Promise<RawCompletion> {
-    const client: OpenAI = resolved.client;
-    const payload = this.buildChatCompletionRequest(resolved.model.id, params, maxTokens);
+    if (resolved.provider.kind === "anthropic") {
+      return this.executeAnthropicRequest(resolved, params, maxTokens, signal, timeoutMs);
+    }
+    const client = resolved.client as OpenAI;
+    const payload = this.buildChatCompletionRequest(resolved.model.remoteId ?? resolved.model.id, params, maxTokens);
     const requestOptions = { signal, timeout: timeoutMs, maxRetries: 0 };
 
     if (params.stream) {
@@ -520,6 +530,44 @@ export class UnifiedInferenceClient {
       content: extractText(choice.message.content),
       toolCalls: normalizeToolCalls(choice.message.tool_calls),
       usage,
+      hasChoice: true,
+    };
+  }
+
+  /** Same RawCompletion as the OpenAI path, through the shared Anthropic codec. */
+  private async executeAnthropicRequest(
+    resolved: ResolvedModel,
+    params: SharedChatParams,
+    maxTokens: number,
+    signal: AbortSignal,
+    timeoutMs: number,
+  ): Promise<RawCompletion> {
+    if (!resolved.anthropic) throw new Error(`Provider '${resolved.provider.id}' has no Anthropic transport`);
+    const jsonObject = params.responseFormat?.type === "json_object";
+    const purpose = params.purpose ?? purposeFromCaller(currentInferenceScope().caller);
+    // Classifier calls are short and simple; other calls use the owner's setting.
+    const effort: AnthropicEffort | undefined = purpose === "classify" ? "low" : resolved.provider.effort;
+    const body = buildAnthropicRequest({
+      model: resolved.model.remoteId ?? resolved.model.id,
+      maxTokens,
+      // Known secret values never leave for a provider.
+      messages: redactChatMessages(params.messages),
+      tools: params.tools,
+      toolChoice: params.toolChoice,
+      effort,
+      capabilities: resolved.model.capabilities,
+      jsonObject,
+    });
+    const data = await resolved.anthropic.send(body, { signal, timeoutMs });
+    const parsed = parseAnthropicResponse(data, resolved.model.id, { jsonObject });
+    return {
+      content: parsed.content,
+      toolCalls: parsed.toolCalls,
+      usage: {
+        inputTokens: parsed.usage.promptTokens,
+        outputTokens: parsed.usage.completionTokens,
+        totalTokens: parsed.usage.promptTokens + parsed.usage.completionTokens,
+      },
       hasChoice: true,
     };
   }
@@ -592,6 +640,29 @@ function warnUnpriced(providerId: string, modelId: string): void {
   logger.warn(`Skipping ${key}: no known price, so its spend cannot be capped`);
 }
 
+function outputFloor(model: ModelConfig): number {
+  const floor = Number(model.minOutputTokens ?? model.capabilities?.minOutputTokens ?? 0);
+  return Number.isFinite(floor) && floor > 0 ? Math.floor(floor) : 0;
+}
+
+/**
+ * The price this attempt reserves at: a long-prompt tier applies once the
+ * estimated prompt reaches 70% of its threshold, since the estimate can be low.
+ */
+export function reservationPrice(
+  model: Pick<ModelConfig, "costPerInputToken" | "costPerOutputToken" | "capabilities">,
+  estInputTokens: number,
+): { inputUsdPerM: number; outputUsdPerM: number } {
+  const tier = longPromptPrice(model.capabilities, estInputTokens);
+  if (tier) {
+    return {
+      inputUsdPerM: Math.max(tier.inputUsdPerM, model.costPerInputToken),
+      outputUsdPerM: Math.max(tier.outputUsdPerM, model.costPerOutputToken),
+    };
+  }
+  return { inputUsdPerM: model.costPerInputToken, outputUsdPerM: model.costPerOutputToken };
+}
+
 /** Both per-token prices are finite and above zero. */
 function hasKnownPrice(model: { costPerInputToken: number; costPerOutputToken: number }): boolean {
   const ok = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
@@ -616,10 +687,27 @@ function mostRestrictiveRefusal(refusals: InferenceRefusedError[]): InferenceRef
   });
 }
 
-/** Never leave a reservation open: anything not provably unbilled is held as unknown. */
-function settleFailedAttempt(gate: InferenceGate, reservationId: string, classification: ErrorClassification): void {
+/**
+ * Never leave a reservation open: anything not provably unbilled is held as
+ * unknown, except a 2xx that reported its usage (a refusal), billed at it.
+ */
+function settleFailedAttempt(
+  gate: InferenceGate,
+  reservationId: string,
+  classification: ErrorClassification,
+  error?: unknown,
+  longPrompt?: LongPromptTier,
+): void {
+  const usage = (error as { usage?: { inputTokens?: unknown; outputTokens?: unknown } } | undefined)?.usage;
   if (classification.settle === "release") {
     gate.release(reservationId, classification.kind);
+  } else if (
+    classification.settle === "unknown" &&
+    usage &&
+    typeof usage.inputTokens === "number" &&
+    typeof usage.outputTokens === "number"
+  ) {
+    gate.commit(reservationId, { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }, 0, { longPrompt });
   } else if (classification.settle === "unknown" || gate.isOpen(reservationId)) {
     gate.markUnknown(reservationId, classification.kind);
   }

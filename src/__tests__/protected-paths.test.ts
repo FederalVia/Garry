@@ -231,6 +231,7 @@ describe("matchProtected (write-deny)", () => {
       "src/setup/operator-command.ts",
       "src/setup/configure.ts",
       "src/setup/wizard.ts",
+      "src/setup/model-picker.ts",
     ]) {
       const p = path.join(R(), rel);
       expect(matchProtected(p), rel).not.toBeNull();
@@ -239,6 +240,41 @@ describe("matchProtected (write-deny)", () => {
     const { getForbiddenCommandMatch } = await import("../agent/policy-rules/command-safety.js");
     expect(getForbiddenCommandMatch("sed -i 's/200/99999/' src/providers/features.ts")).not.toBeNull();
     expect(getForbiddenCommandMatch("sed -i s/200/9/ src/providers/mode.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i s/sonnet/opus/ src/setup/model-picker.ts")).not.toBeNull();
+  });
+
+  it("guards the provider table, prices, discovery, the Anthropic codec and the inference types", async () => {
+    for (const f of [
+      "providers/table",
+      "providers/price-table",
+      "providers/discovery",
+      "ollama/discover",
+      "inference/anthropic",
+      "inference/types",
+    ]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+    for (const rel of [
+      "src/providers/table.ts",
+      "src/providers/price-table.ts",
+      "src/providers/discovery.ts",
+      "src/ollama/discover.ts",
+      "src/inference/anthropic.ts",
+      "src/inference/types.ts",
+      "src/inference/new-file.ts",
+      "dist/providers/price-table.js",
+      "dist/inference/types.js",
+      "dist/ollama/discover.js",
+    ]) {
+      const p = path.join(R(), rel);
+      expect(matchProtected(p), rel).not.toBeNull();
+      expect(checkWrite(p).ok, rel).toBe(false);
+    }
+    const { getForbiddenCommandMatch } = await import("../agent/policy-rules/command-safety.js");
+    expect(getForbiddenCommandMatch("sed -i 's/10/0/' src/providers/price-table.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i 's/free: false/free: true/' src/providers/table.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i s/0/1/ src/ollama/discover.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i s/18/1/ src/inference/types.ts")).not.toBeNull();
   });
 
   it("SOUL.md is readable but not writable", () => {

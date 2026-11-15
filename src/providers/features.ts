@@ -15,7 +15,7 @@ export interface FeatureSet {
   topups: boolean;
   /** Domains and DNS through Conway. */
   domains: boolean;
-  /** Model discovery through Conway's /v1/models. */
+  /** Model discovery through Conway's /v1/models (other providers are discovered in every mode). */
   conwayModels: boolean;
   /** The social relay (inbox and send_message). */
   relay: boolean;
@@ -119,7 +119,8 @@ export const TASK_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[
   check_credits: ["conwayCredits"],
   check_usdc_balance: ["topups", "payments"],
   check_social_inbox: ["relay"],
-  refresh_models: ["conwayModels"],
+  // refresh_models runs in both modes: it refreshes each configured
+  // provider's model list, and Conway's listing only in Conway mode.
   check_child_health: ["children"],
   prune_dead_children: ["children"],
   dead_agent_cleanup: ["children"],

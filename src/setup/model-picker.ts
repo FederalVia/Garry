@@ -12,6 +12,8 @@ import { loadConfig, saveConfig, resolvePath, ConfigError } from "../config.js";
 import { createDatabase } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
 import { discoverOllamaModels } from "../ollama/discover.js";
+import { canServeModel, providerIdForRow, resolveProviderTable, type ProviderTable } from "../providers/table.js";
+import { refreshProviderModels } from "../providers/discovery.js";
 import type { AutomatonConfig, ModelEntry } from "../types.js";
 import { promptOptional, closePrompts } from "./prompts.js";
 
@@ -24,13 +26,22 @@ const PROVIDER_LABEL: Record<string, string> = {
 };
 
 export type ProviderCredentials = Partial<
-  Pick<AutomatonConfig, "conwayApiKey" | "openaiApiKey" | "anthropicApiKey" | "ollamaBaseUrl">
+  Pick<AutomatonConfig, "conwayApiKey" | "openaiApiKey" | "anthropicApiKey" | "ollamaBaseUrl" | "providers">
 >;
+
+function tableFor(config: ProviderCredentials, env: NodeJS.ProcessEnv): ProviderTable | null {
+  try {
+    return resolveProviderTable(config as AutomatonConfig, env);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Models the configured providers can serve. A Conway key serves every row
  * (Conway proxies all providers), so a keyed install lists what it always
- * did; without one, only rows whose own provider has a credential.
+ * did; without one, the provider table's serve rule decides, so a compatible
+ * entry's models appear and an unservable baseline row does not.
  */
 export function pickableModels(
   models: ModelEntry[],
@@ -38,12 +49,22 @@ export function pickableModels(
   env: NodeJS.ProcessEnv = process.env,
 ): ModelEntry[] {
   if (config.conwayApiKey) return models;
+  const table = tableFor(config, env);
+  if (table) return models.filter((m) => canServeModel(table, m));
   const has: Record<string, boolean> = {
     openai: !!config.openaiApiKey,
     anthropic: !!config.anthropicApiKey,
     ollama: !!(env.OLLAMA_BASE_URL || config.ollamaBaseUrl),
   };
   return models.filter((m) => has[m.provider] === true);
+}
+
+/** A row's provider label: a compatible entry by its name. */
+export function rowProviderLabel(m: ModelEntry, config: ProviderCredentials, table?: ProviderTable | null): string {
+  const id = m.providerId ? providerIdForRow(m) : undefined;
+  const entry = id ? table?.get(id) : undefined;
+  if (entry && entry.kind === "openai" && entry.id !== "openai") return entry.label;
+  return providerLabel(m.provider, config);
 }
 
 /** Provider column label; "Conway" is shown only when a Conway key is set. */
@@ -79,16 +100,33 @@ export async function runModelPicker(): Promise<void> {
   const db = createDatabase(dbPath);
 
   // Seed static baseline + discover Ollama models
-  const registry = new ModelRegistry(db.raw);
+  const table = resolveProviderTable(config);
+  const registry = new ModelRegistry(db.raw, { table, config });
   registry.initialize();
+  registry.seedFromPriceTable(table);
 
   const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
   if (ollamaBaseUrl) {
     console.log(chalk.dim(`  Checking Ollama at ${ollamaBaseUrl}...`));
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
+  // A fresh list from every provider that lists its models, cache or not.
+  const discoverIds = table.entries
+    .filter((e) => e.discover && e.kind !== "ollama" && e.kind !== "conway")
+    .map((e) => e.id);
+  if (discoverIds.length > 0) {
+    console.log(chalk.dim(`  Fetching model lists from ${discoverIds.join(", ")}...`));
+    try {
+      await refreshProviderModels(table, registry, db, { providerIds: discoverIds, force: true });
+    } catch {
+      console.log(chalk.yellow("  Some model lists could not be fetched; showing the models already known."));
+    }
+  }
 
-  const models = pickableModels(registry.getAll().filter((m) => m.enabled), config);
+  const models = pickableModels(
+    registry.getAll().filter((m) => m.enabled && m.listed !== false),
+    config,
+  );
 
   if (models.length === 0) {
     console.log(chalk.yellow("  No models available for your configured providers."));
@@ -98,7 +136,7 @@ export async function runModelPicker(): Promise<void> {
   }
 
   console.log(chalk.cyan("\n  Available Models\n"));
-  printModelTable(models, config.inferenceModel, config);
+  printModelTable(models, config.inferenceModel, config, table);
 
   console.log("");
   const input = await promptOptional("Enter model number (or press Enter to cancel)");
@@ -130,16 +168,24 @@ export async function runModelPicker(): Promise<void> {
   db.close();
 }
 
-function printModelTable(models: ModelEntry[], currentModelId: string, config: ProviderCredentials): void {
+function printModelTable(
+  models: ModelEntry[],
+  currentModelId: string,
+  config: ProviderCredentials,
+  table?: ProviderTable,
+): void {
   const numWidth = String(models.length).length;
 
   for (let i = 0; i < models.length; i++) {
     const m = models[i];
     const num = String(i + 1).padStart(numWidth);
-    const provider = providerLabel(m.provider, config).padEnd(9);
-    const cost = m.costPer1kInput === 0
+    const provider = rowProviderLabel(m, config, table).padEnd(9);
+    const free = m.free === true || m.provider === "ollama";
+    const cost = free
       ? chalk.green("free     ")
-      : chalk.dim(formatInputPrice(m.costPer1kInput));
+      : m.costPer1kInput > 0
+        ? chalk.dim(formatInputPrice(m.costPer1kInput))
+        : chalk.yellow("no price ");
     const active = m.modelId === currentModelId ? chalk.green(" ◀ active") : "";
     const tools = m.supportsTools ? "" : chalk.dim(" (no tools)");
 

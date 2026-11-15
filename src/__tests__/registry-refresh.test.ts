@@ -76,6 +76,18 @@ describe("refresh_models sequence", () => {
     expect(reg.get("claude-new-x")?.enabled).toBe(true);
   });
 
+  it("labels an unlabelled Conway model 'other' (never 'conway') and pins it to Conway", () => {
+    const reg = new ModelRegistry(db.raw);
+    reg.initialize();
+    reg.refreshFromApi([{ id: "kimi-k2" }, { id: "claude-new-x", provider: "anthropic" }]);
+    expect(reg.get("kimi-k2")).toMatchObject({ provider: "other", providerId: "conway", enabled: true });
+    // A labelled row keeps its label and a NULL provider_id: routed exactly as before.
+    expect(reg.get("claude-new-x")).toMatchObject({ provider: "anthropic", providerId: null });
+    // initialize() never disables an 'other' row.
+    reg.initialize();
+    expect(reg.get("kimi-k2")?.enabled).toBe(true);
+  });
+
   it("keeps an operator's disable of an API model", () => {
     const reg = new ModelRegistry(db.raw);
     reg.initialize();

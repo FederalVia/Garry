@@ -123,7 +123,9 @@ describe("agent loop under a fixed tier", () => {
     expect(inference.calls.length).toBe(1);
     expect(db.getAgentState()).not.toBe("dead");
     expect(credits).not.toHaveBeenCalled();
-    expect(fetchSpy).not.toHaveBeenCalled();
+    // Rewritten on purpose: the loop now reads the configured providers'
+    // model lists at cycle start; nothing else may go out (no balance read).
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).endsWith("/models"))).toEqual([]);
     const system = String(inference.calls[0].messages[0].content);
     expect(system).toContain("Survival tier: normal (fixed)");
     expect(system).toContain("Credits: not tracked in standalone mode");
