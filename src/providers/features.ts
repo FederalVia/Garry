@@ -11,6 +11,10 @@ export interface FeatureSet {
   children: boolean;
   /** A Conway credit balance (reads and transfers). */
   conwayCredits: boolean;
+  /** A readable balance: Conway credits, or the owner's budget. */
+  balance: boolean;
+  /** The owner's budget (standalone only). */
+  budget: boolean;
   /** Buying Conway credits with USDC. */
   topups: boolean;
   /** Domains and DNS through Conway. */
@@ -42,6 +46,8 @@ export const ALL_FEATURES: Readonly<FeatureSet> = Object.freeze({
   conwayCompute: true,
   children: true,
   conwayCredits: true,
+  balance: true,
+  budget: false,
   topups: true,
   domains: true,
   conwayModels: true,
@@ -52,12 +58,19 @@ export const ALL_FEATURES: Readonly<FeatureSet> = Object.freeze({
   mcp: true,
 });
 
-/** Standalone mode: only the relay and payments can be switched on. */
-export function standaloneFeatures(opts: { relay: boolean; payments: boolean; orchestration?: boolean }): FeatureSet {
+/** Standalone mode: only the relay, payments and the owner's budget can be switched on. */
+export function standaloneFeatures(opts: {
+  relay: boolean;
+  payments: boolean;
+  orchestration?: boolean;
+  budget?: boolean;
+}): FeatureSet {
   return {
     conwayCompute: false,
     children: false,
     conwayCredits: false,
+    balance: opts.budget === true,
+    budget: opts.budget === true,
     topups: false,
     domains: false,
     conwayModels: false,
@@ -83,11 +96,11 @@ export const TOOL_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[
   verify_child_constitution: ["children"],
   prune_dead_children: ["children"],
   message_child: ["children", "relay"],
-  // These read the Conway balance and point the agent at Conway.
-  check_credits: ["conwayCredits"],
+  // These read the balance (Conway credits, or the owner's budget).
+  check_credits: ["balance"],
+  heartbeat_ping: ["balance"],
+  distress_signal: ["balance"],
   transfer_credits: ["conwayCredits"],
-  heartbeat_ping: ["conwayCredits"],
-  distress_signal: ["conwayCredits"],
   topup_credits: ["topups", "payments"],
   search_domains: ["domains"],
   register_domain: ["domains"],
@@ -117,6 +130,10 @@ export const MCP_TOOL_FEATURES: readonly (keyof FeatureSet)[] = Object.freeze(["
 /** Every feature a heartbeat task function needs, keyed on the resolved function name. */
 export const TASK_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[]>> = Object.freeze({
   check_credits: ["conwayCredits"],
+  // The owner's budget: dead timer, revival and grant notices.
+  check_budget: ["budget"],
+  // Approved transfers move Conway credits.
+  execute_approved_transfers: ["conwayCredits"],
   check_usdc_balance: ["topups", "payments"],
   check_social_inbox: ["relay"],
   // refresh_models runs in both modes: it refreshes each configured

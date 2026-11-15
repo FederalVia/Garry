@@ -12,7 +12,7 @@
 
 import type Database from "better-sqlite3";
 import type { AmountBasis, BudgetId, LedgerStatus } from "./types.js";
-import { MIGRATION_V12 } from "../state/schema.js";
+import { MIGRATION_V12, MIGRATION_V20_APPROVAL_COLUMN, MIGRATION_V20_ORIGIN_REF_COLUMN, MIGRATION_V20_TREASURY } from "../state/schema.js";
 
 export const TREASURY_LEDGER_DDL = MIGRATION_V12;
 
@@ -61,9 +61,11 @@ export function ensureTreasuryLedger(db: Database.Database, nowMs: number): Ensu
     .transaction((): EnsureLedgerResult => {
       if (tableExists(db, "treasury_ledger")) {
         db.exec(TREASURY_LEDGER_DDL);
+        ensureApprovalSchema(db);
         return { created: false, legacyCopied: 0 };
       }
       db.exec(TREASURY_LEDGER_DDL);
+      ensureApprovalSchema(db);
       if (!tableExists(db, "spend_tracking")) return { created: true, legacyCopied: 0 };
       const info = db
         .prepare(LEGACY_COPY_SQL)
@@ -71,6 +73,15 @@ export function ensureTreasuryLedger(db: Database.Database, nowMs: number): Ensu
       return { created: true, legacyCopied: info.changes };
     })
     .immediate();
+}
+
+/** approval_id on the ledger (added once) and the approval requests table. */
+function ensureApprovalSchema(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(treasury_ledger)").all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === "approval_id")) db.exec(MIGRATION_V20_APPROVAL_COLUMN);
+  db.exec(MIGRATION_V20_TREASURY);
+  const reqColumns = db.prepare("PRAGMA table_info(transfer_approval_requests)").all() as Array<{ name: string }>;
+  if (!reqColumns.some((c) => c.name === "origin_ref")) db.exec(MIGRATION_V20_ORIGIN_REF_COLUMN);
 }
 
 /** A treasury_ledger row as stored. */
@@ -111,6 +122,8 @@ export interface LedgerRow {
   sent_at_ms: number | null;
   settled_at_ms: number | null;
   updated_at_ms: number;
+  /** The owner-approved request this transfer executes, if any. */
+  approval_id: string | null;
 }
 
 /** Statuses that count against budgets. */

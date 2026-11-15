@@ -141,7 +141,11 @@ describe("mode resolution", () => {
     const r = resolveRuntime(createTestConfig());
     expect(r.survival).toEqual({ kind: "conway" });
     expect(r.dailyCapCeilingCents).toBeNull();
-    expect(Object.values(r.features).every(Boolean)).toBe(true);
+    // Everything but the owner's budget, which is standalone only.
+    const { budget, ...rest } = r.features;
+    expect(budget).toBe(false);
+    expect(Object.values(rest).every(Boolean)).toBe(true);
+    expect(r.budget).toBeNull();
   });
 });
 
@@ -278,6 +282,39 @@ describe("validation", () => {
       expect(() => load()).toThrow(cfg.ConfigError);
     });
   }
+
+  it("refuses to start with an invalid budget block (a dropped budget would remove the cap)", () => {
+    for (const budget of [
+      { allowanceCents: -5 },
+      { allowanceCents: 2500, resetDay: 31 },
+      { allowanceCents: 2500, period: "one-off" },
+      { allowance: 2500 },
+      "25 dollars",
+    ]) {
+      write({ providers: { mode: "standalone", openai: { apiKey: "k" } }, budget });
+      expect(() => load(), JSON.stringify(budget)).toThrow(cfg.ConfigError);
+    }
+    write({ ownerDbPath: "" });
+    expect(() => load()).toThrow(cfg.ConfigError);
+  });
+
+  it("standalone: infrastructure caps are 0 unless the file sets them, and the default is never saved", () => {
+    write({ providers: { mode: "standalone", openai: { apiKey: "k" } }, budget: { allowanceCents: 2500 } });
+    const c = load();
+    expect(c.treasuryPolicy!.maxInfraSingleCents).toBe(0);
+    expect(c.treasuryPolicy!.maxInfraDailyCents).toBe(0);
+    expect(c.budget).toEqual({ allowanceCents: 2500 });
+    cfg.saveConfig(c);
+    expect(disk().treasuryPolicy.maxInfraSingleCents).toBeUndefined();
+    expect(disk().treasuryPolicy.maxInfraDailyCents).toBeUndefined();
+    expect(disk().budget).toEqual({ allowanceCents: 2500 });
+    write({ providers: { mode: "standalone", openai: { apiKey: "k" } }, treasuryPolicy: { maxInfraSingleCents: 300 } });
+    expect(load().treasuryPolicy!.maxInfraSingleCents).toBe(300);
+    expect(load().treasuryPolicy!.maxInfraDailyCents).toBe(0);
+    // Conway mode keeps its defaults.
+    write({ conwayApiKey: "cnwy_k_x" });
+    expect(load().treasuryPolicy!.maxInfraSingleCents).toBe(2500);
+  });
 
   it("accepts loopback http and a valid block", () => {
     write({

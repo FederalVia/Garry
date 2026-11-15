@@ -233,6 +233,8 @@ export interface HarnessOptions {
   conwayApiUrl?: string;
   /** Run before the Treasury is constructed (seed legacy or crashed rows). */
   beforeTreasury?: (raw: Database.Database) => void;
+  /** Extra treasury dependencies (the owner's budget, approval decisions, a balance reader). */
+  treasuryDeps?: (raw: Database.Database) => Partial<TreasuryDeps>;
 }
 
 export interface ExecOptions {
@@ -282,6 +284,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     spendTracker: tracker,
     now: clock.now,
     conwayApiUrl: opts.conwayApiUrl ?? "https://api.conway.tech",
+    ...(opts.treasuryDeps?.(raw) ?? {}),
   };
   const treasury = new Treasury(deps);
   if (opts.install !== false) installTreasury(treasury);

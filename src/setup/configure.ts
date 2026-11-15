@@ -14,7 +14,17 @@ import readline from "readline";
 import chalk from "chalk";
 import { loadConfig, saveConfig, resolvePath, ConfigError, dropConwayDefaults } from "../config.js";
 import { DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
-import type { AutomatonConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
+import type { AutomatonConfig, BudgetConfig, ModelStrategyConfig, TreasuryPolicy, ModelEntry } from "../types.js";
+import {
+  BudgetConfigError,
+  DEFAULT_BUDGET_THRESHOLDS,
+  defaultDailyCapCents,
+  describeBudget,
+  parseStartDate,
+  resolveBudget,
+  resolveOwnerDbPath,
+} from "../budget/config.js";
+import { initOwnerDb } from "../operator/budget.js";
 import { closePrompts } from "./prompts.js";
 import { createDatabase } from "../state/database.js";
 import { ModelRegistry } from "../inference/registry.js";
@@ -170,11 +180,18 @@ function val(v: string | number | boolean | undefined): string {
 
 // ─── Main menu ────────────────────────────────────────────────────
 
+/** providers.compatible entries (edited in automaton.json, not here). */
+function compatibleProviderIds(config: AutomatonConfig): string[] {
+  const list = config.providers?.compatible;
+  return Array.isArray(list) ? list.map((c) => (c && typeof c.id === "string" ? c.id : "")).filter(Boolean) : [];
+}
+
 function printMainMenu(config: AutomatonConfig): void {
   const providers = [
     config.openaiApiKey ? "OpenAI" : null,
     config.anthropicApiKey ? "Anthropic" : null,
     config.ollamaBaseUrl ? "Ollama" : null,
+    ...compatibleProviderIds(config),
     config.conwayApiKey ? "Conway" : null,
   ].filter(Boolean).join(", ");
 
@@ -188,6 +205,7 @@ function printMainMenu(config: AutomatonConfig): void {
   console.log(`  ${chalk.white("2.")} Model Strategy        ${dim(config.inferenceModel)} / ${dim(strategy.maxTokensPerTurn + " tokens")}`);
   console.log(`  ${chalk.white("3.")} Treasury Policy       ${dim("max transfer: " + (config.treasuryPolicy?.maxSingleTransferCents ?? DEFAULT_TREASURY_POLICY.maxSingleTransferCents) + "¢")}`);
   console.log(`  ${chalk.white("4.")} General               ${dim(config.name)} / ${dim(config.logLevel)}`);
+  console.log(`  ${chalk.white("5.")} Budget and survival   ${dim(budgetSummary(config))}`);
   console.log("");
   console.log(chalk.dim("  q  Quit"));
   console.log("");
@@ -217,7 +235,11 @@ async function configureProviders(config: AutomatonConfig): Promise<void> {
 
   // Leaving standalone (and its daily cap ceiling) is only ever this explicit choice.
   const current = config.providers?.mode ?? "auto";
-  const mode = await askChoice("Mode (auto: Conway when a Conway key is set)", ["auto", "standalone", "conway"], current);
+  const mode = await askChoice(
+    "Mode (standalone: your own keys and budget, recommended; auto: Conway when a Conway key is set)",
+    ["standalone", "conway", "auto"],
+    current,
+  );
   if (mode !== current) {
     const { mode: _mode, ...rest } = config.providers ?? {};
     config.providers = mode === "auto" ? rest : { ...rest, mode };
@@ -230,7 +252,13 @@ async function configureProviders(config: AutomatonConfig): Promise<void> {
   config.anthropicApiKey = await askString("Anthropic API key  (sk-ant-...)", config.anthropicApiKey) || undefined;
   config.ollamaBaseUrl = await askString("Ollama base URL  (http://localhost:11434)", config.ollamaBaseUrl) || undefined;
 
-  if (!config.conwayApiKey && !config.openaiApiKey && !config.anthropicApiKey && !config.ollamaBaseUrl) {
+  if (
+    !config.conwayApiKey &&
+    !config.openaiApiKey &&
+    !config.anthropicApiKey &&
+    !config.ollamaBaseUrl &&
+    compatibleProviderIds(config).length === 0
+  ) {
     console.log(chalk.yellow("  No AI provider configured: the automaton will not start until you add one."));
   }
   console.log("");
@@ -322,10 +350,18 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
     "Max inference spend per rolling 24h (0 = paid inference off)",
     t.maxInferenceDailyCents,
   );
+  console.log(chalk.dim("  Transfers above the approval threshold, up to the max single transfer, wait for"));
+  console.log(chalk.dim("  you: automaton-cli approvals approve <id>. Above the max single transfer they are"));
+  console.log(chalk.dim("  refused outright. With both equal (the default) there is nothing to approve.\n"));
   t.requireConfirmationAboveCents = await askNumber(
-    "Require confirmation above",
+    "Transfers above this need your approval",
     t.requireConfirmationAboveCents,
   );
+  if (t.requireConfirmationAboveCents < t.maxSingleTransferCents) {
+    console.log(chalk.dim(
+      `  Transfers of ${t.requireConfirmationAboveCents + 1}-${t.maxSingleTransferCents} cents will need your approval.`,
+    ));
+  }
 
   config.treasuryPolicy = t;
   console.log("");
@@ -348,6 +384,140 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
   config.socialRelayUrl = relay === null ? "" : relay;
   config.rpcUrl = (await askString("RPC endpoint  (Base chain, e.g. https://mainnet.base.org)", config.rpcUrl)) || undefined;
 
+  console.log("");
+}
+
+// ─── Section: Budget and survival ────────────────────────────────
+
+function budgetSummary(config: AutomatonConfig): string {
+  try {
+    const b = resolveBudget(config.budget);
+    return b ? describeBudget(b) : "no budget (fixed survival tier)";
+  } catch {
+    return "invalid budget block";
+  }
+}
+
+const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+
+/** Dollars typed at a prompt, to cents; null when not a dollar amount. */
+function parseUsd(raw: string): number | null {
+  const m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(raw.trim());
+  if (!m) return null;
+  const cents = Number(m[1]) * 100 + (m[2] ? Number(m[2].padEnd(2, "0")) : 0);
+  return Number.isSafeInteger(cents) ? cents : null;
+}
+
+/**
+ * Edit the budget block (standalone only): amount, period, reset day or
+ * start date, whether payments count, thresholds and "dead". "-" at the
+ * amount removes the budget (back to the fixed survival tier).
+ */
+async function configureBudget(config: AutomatonConfig): Promise<void> {
+  console.log(chalk.cyan("\n  ── Budget and survival ─────────────────────────\n"));
+  console.log(chalk.dim("  The most the automaton may spend per period (standalone mode only). Survival"));
+  console.log(chalk.dim("  tiers follow what is left. Add to it any time: automaton-cli budget add <usd>.\n"));
+
+  let old: ReturnType<typeof resolveBudget> = null;
+  try {
+    old = resolveBudget(config.budget);
+  } catch (err) {
+    console.log(chalk.yellow(`  The current budget block is invalid (${(err as Error).message}); starting from defaults.`));
+  }
+  const raw = await ask(
+    `  ${chalk.white("→")} Budget in USD ${chalk.dim("[" + (old ? usd(old.allowanceCents) : "(not set)") + "]")}${chalk.dim(old ? " (Enter to keep, - to remove the budget)" : " (Enter to leave unset)")}: `,
+  );
+  if (raw === "-") {
+    config.budget = undefined;
+    console.log(chalk.yellow("  Budget removed: survival uses the fixed tier, and only the daily AI cap limits spend.\n"));
+    return;
+  }
+  let allowanceCents: number;
+  if (raw === "") {
+    if (!old) {
+      console.log(chalk.dim("  No budget set.\n"));
+      return;
+    }
+    allowanceCents = old.allowanceCents;
+  } else {
+    const parsed = parseUsd(raw);
+    if (parsed === null) {
+      console.log(chalk.yellow("  Not a dollar amount; the budget is unchanged.\n"));
+      return;
+    }
+    allowanceCents = parsed;
+  }
+
+  const period = await askChoice("Period", ["monthly", "one-off"], old?.period ?? "monthly");
+  const next: BudgetConfig = { allowanceCents, period };
+  if (period === "monthly") {
+    let day = await askNumber("Reset day of the month, 1-28 (UTC)", old?.period === "monthly" ? old.resetDay : 1);
+    if (day < 1 || day > 28) {
+      console.log(chalk.yellow("  The reset day must be 1-28; using 1."));
+      day = 1;
+    }
+    next.resetDay = day;
+  } else {
+    const current = old?.startMs != null ? new Date(old.startMs).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+    const date = (await askString("Start date (YYYY-MM-DD, UTC)", current, true)) ?? current;
+    const parsed = parseStartDate(date);
+    next.startDate = "ms" in parsed ? date : current;
+    if (next.startDate !== date) console.log(chalk.yellow(`  ${"error" in parsed ? parsed.error : "Not a date"}; using ${current}.`));
+  }
+  next.countTreasury = await askBool("Count payments and transfers against the budget", old?.countTreasury ?? true);
+
+  const oldT = old?.thresholds ?? DEFAULT_BUDGET_THRESHOLDS;
+  const unit = await askChoice("Survival thresholds in", ["percent", "cents"], oldT.unit);
+  const base =
+    unit === oldT.unit
+      ? oldT
+      : unit === "percent"
+        ? DEFAULT_BUDGET_THRESHOLDS
+        : {
+            unit,
+            high: Math.max(3, Math.floor(allowanceCents / 2)),
+            normal: Math.max(2, Math.floor((allowanceCents * 15) / 100)),
+            lowCompute: Math.max(1, Math.floor((allowanceCents * 5) / 100)),
+          };
+  const suffix = unit === "percent" ? "(% of the budget)" : "(cents)";
+  next.thresholds = {
+    unit,
+    high: await askNumber(`High tier above ${suffix}`, base.high),
+    normal: await askNumber(`Normal tier above ${suffix}`, base.normal),
+    lowCompute: await askNumber(`Low-compute tier above ${suffix}`, base.lowCompute),
+  };
+  next.dead = await askBool("Stop ('dead') an hour after the budget runs out, until you add more", old?.dead ?? true);
+
+  let resolved;
+  try {
+    resolved = resolveBudget(next)!;
+  } catch (err) {
+    if (!(err instanceof BudgetConfigError)) throw err;
+    console.log(chalk.yellow(`  Not saved: ${err.message}. The budget is unchanged.\n`));
+    return;
+  }
+  config.budget = next;
+
+  const derived = defaultDailyCapCents(resolved);
+  const ceiling = config.providers?.dailyCapCeilingCents;
+  const dailyCap = config.treasuryPolicy?.maxInferenceDailyCents ?? DEFAULT_TREASURY_POLICY.maxInferenceDailyCents;
+  console.log(chalk.green(`  Budget: ${describeBudget(resolved)}`));
+  if (typeof ceiling === "number") {
+    console.log(chalk.dim(`  Daily AI cap ceiling: ${usd(ceiling)} (providers.dailyCapCeilingCents).`));
+  } else {
+    console.log(chalk.dim(`  Daily AI cap ceiling derived from the budget: ${usd(derived)} (about 1/15).`));
+    if (dailyCap > derived) {
+      console.log(chalk.dim(`  The daily AI cap (${usd(dailyCap)}) is above it, so it is lowered to ${usd(derived)} at start.`));
+    }
+  }
+  if (config.providers?.mode === "conway" || (!config.providers?.mode && config.conwayApiKey)) {
+    console.log(chalk.yellow("  This install runs in Conway mode, which ignores the budget."));
+  }
+  try {
+    initOwnerDb(resolveOwnerDbPath(config));
+  } catch (err) {
+    console.log(chalk.yellow(`  Could not create the owner database: ${(err as Error).message}`));
+  }
   console.log("");
 }
 
@@ -441,12 +611,17 @@ export async function runConfigure(): Promise<void> {
         saveConfigured(config);
         console.log(chalk.green("  ✓ General settings saved.\n"));
         break;
+      case "5":
+        await configureBudget(config);
+        saveConfigured(config);
+        console.log(chalk.green("  ✓ Budget saved.\n"));
+        break;
       case "q":
       case "":
         running = false;
         break;
       default:
-        console.log(chalk.yellow(`  Unknown option: "${choice}". Enter 1-4 or q.\n`));
+        console.log(chalk.yellow(`  Unknown option: "${choice}". Enter 1-5 or q.\n`));
     }
   }
 

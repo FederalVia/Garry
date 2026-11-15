@@ -7,6 +7,7 @@ Complete reference for creating, configuring, funding, and operating autonomous 
 - [What Is an Automaton?](#what-is-an-automaton)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
+- [Deployment](#deployment)
 - [Setup Wizard](#setup-wizard)
 - [CLI Reference](#cli-reference)
 - [Running, Stopping and Restarting](#running-stopping-and-restarting)
@@ -68,13 +69,13 @@ On first run, the interactive setup wizard walks you through wallet generation, 
 
 ### Run without Conway
 
-With no Conway key the agent runs in standalone mode: on your machine, with AI calls paid by your own provider key under a hard daily cap. Minimal settings in `~/.automaton/automaton.json`, next to the `name`, `genesisPrompt` and `creatorAddress` fields the wizard writes (`sandboxId` is Conway-only and can be left out; `--run` refuses to start without a name or creator address):
+With no Conway key the agent runs in standalone mode: on your machine, with AI calls paid by your own provider key under a daily cap and, when you set one, a budget (see [docs/budget.md](docs/budget.md)). Minimal settings in `~/.automaton/automaton.json`, next to the `name`, `genesisPrompt` and `creatorAddress` fields the wizard writes (`sandboxId` is Conway-only and can be left out; `--run` refuses to start without a name or creator address):
 
 ```jsonc
 {
   "providers": {
     "openai": { "apiKey": "sk-..." },        // or "anthropic": { "apiKey": "sk-ant-..." }, or "ollama": { "baseUrl": "http://localhost:11434" }
-    "dailyCapCeilingCents": 200,            // hard daily AI spend ceiling ($2.00 by default)
+    "dailyCapCeilingCents": 200,            // daily AI spend ceiling ($2.00 by default; with a budget: about 1/15 of it, and survival turns may go 25c above)
     "survival": { "fixedTier": "normal" }   // no balance to read, so the survival tier is fixed
   }
 }
@@ -96,7 +97,7 @@ Details:
 - **MCP servers.** Work as in Conway mode: servers you configure in `~/.automaton/mcp-servers.json` (stdio or HTTP, same rules in both modes) are offered as `mcp__<server>__<tool>`, and `install_mcp_server` is offered (standalone exec is local, so approved agent-installed servers run). See [MCP servers](#mcp-servers-mcp-serversjson).
 - **Staying standalone.** An explicit `providers.mode: "standalone"` is kept when a Conway key is stored (`--provision`, `--configure`): the key is saved but unused. The setup wizard, and `--configure` when it leaves no Conway key, write that explicit mode, so a key stored later never silently switches the agent to Conway mode, which has no daily cap ceiling. A hand-written config without `providers.mode` gets it too: the first standalone `--run` that passes its startup checks writes `"mode": "standalone"` into `automaton.json` and logs it. Only changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone and its daily cap ceiling.
 - **Older installs.** Setups made before standalone mode installed Conway's survival skill and a Conway `SOUL.md` for every install. A standalone start replaces them when unmodified (and logs it); an edited `SOUL.md` that still lists Conway capabilities gets a warning.
-- **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use.
+- **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use. With a budget, what it is told is left is the smaller of the daily cap's remainder and the budget's.
 - **More providers.** Any OpenAI-compatible server can be added under `providers.compatible` (see [Inference and Models](#inference-and-models)); in standalone the main loop and the planner and workers both use it (in Conway mode only the main loop does). Unpriced models are skipped unless the entry sets `allowUnpriced`.
 
 ### Existing Conway installs
@@ -143,7 +144,7 @@ pnpm test        # Run the test suite
   wallet.json          Ethereum private key (mode 0600)
   automaton.json       Main configuration (mode 0600)
   heartbeat.yml        Heartbeat schedule
-  mcp-servers.json     MCP servers (optional; written by you, mode 0600; see MCP servers below)
+  mcp-servers.json     MCP servers (optional; written by you, mode 0600 or root-owned 0640; see MCP servers below)
   api-key              Conway API key
   constitution.md      The Three Laws (read-only, mode 0444)
   SOUL.md              Agent self-description (evolves)
@@ -153,6 +154,12 @@ pnpm test        # Run the test suite
     conway-payments/
     survival/
 ```
+
+---
+
+## Deployment
+
+Where to run the automaton, and why it matters, is in [docs/deployment.md](docs/deployment.md): a container on an always-on machine or a small VPS (recommended), a dedicated Unix user with the systemd unit, or plain local mode. In plain local mode (`automaton --run` as your own user) the agent can do anything your account can do: read your files and keys, use your SSH and cloud credentials, and edit its own config, budget and approvals. The path rules and the command tripwire are best-effort guards, not a security boundary. Use the container or a dedicated user for anything unattended.
 
 ---
 
@@ -174,9 +181,9 @@ Wallet created: 0x1234...abcd
 Private key stored at: /root/.automaton/wallet.json
 ```
 
-### Step 2: API Key Provisioning
+### Step 2: Standalone or a Conway account
 
-The runtime signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway's API and receive an API key. If auto-provisioning fails, you can enter a key manually.
+The wizard asks how the automaton pays for AI: **1) Standalone** (the default and the recommendation): your own AI provider keys and a budget you set; or **2) a Conway account**. Only the Conway choice signs a SIWE (Sign-In With Ethereum) message to authenticate with Conway's API and receive an API key. If auto-provisioning fails, you can enter a key manually or continue standalone.
 
 ```
 [2/6] Provisioning Conway API key (SIWE)...
@@ -191,19 +198,21 @@ API key provisioned: cnwy_k_...
 - **OpenAI API key** (optional) — Bring your own key for direct OpenAI inference
 - **Anthropic API key** (optional) — Bring your own key for direct Anthropic inference
 
-### Step 4: Financial Safety Policy
+### Step 4: Budget (standalone) and Financial Safety Policy
 
-Configurable spending limits that protect against unauthorized financial activity:
+Standalone asks for the budget first: the amount in dollars [$25], monthly or one-off, the reset day (1-28, UTC) or the start date, whether payments and transfers count against it [yes], survival thresholds in percent of the budget [50/15/5] or in dollars, and whether the automaton stops ("dead") an hour after the budget runs out [yes]. It then asks only for the daily AI cap (default `ceil(budget / 15)` cents, $1.67 for $25) and the approval threshold; the transfer, minimum reserve and x402 questions are skipped and their defaults saved (no x402 payees): those tools are not offered in standalone, and the reserve floor guards only credit outflows, which standalone does not have. It writes the `budget` block, creates the owner database (`~/.automaton/owner/owner.db`) and ends by showing `automaton-cli budget add <usd>` and `automaton-cli budget show`. See [docs/budget.md](docs/budget.md).
+
+Conway asks for every spending limit:
 
 | Setting | Default | Description |
 |---|---|---|
-| Max single transfer | $10.00 (1000 cents) | Maximum per-transfer credit amount. A value above the confirmation threshold has no effect (startup logs a warning) |
+| Max single transfer | $10.00 (1000 cents) | Maximum per-transfer credit amount; above it a transfer is refused outright |
 | Max hourly transfers | $100.00 (10000 cents) | Total transfers allowed per hour |
 | Max daily transfers | $250.00 (25000 cents) | Total transfers allowed per day |
 | Minimum reserve | $10.00 (1000 cents) | No transfer, sandbox or domain purchase may take the observed balance below this |
 | Max x402 payment | $1.00 (100 cents) | Maximum single x402 payment |
 | Max daily inference | $500.00 (50000 cents) | Maximum daily inference spend |
-| Confirmation threshold | $10.00 (1000 cents) | Transfers above this are refused. There is no approval flow, so this acts as the effective single-transfer cap |
+| Approval threshold | $10.00 (1000 cents) | Transfers above this, up to the max single transfer, wait for your approval (`automaton-cli approvals`). With both equal there is nothing to approve |
 
 Press Enter to accept defaults for each setting. The wizard does not ask for the topup, survival and infrastructure limits; they take the defaults listed under [Treasury policy](#treasury-policy) and can be changed in `automaton.json`.
 
@@ -253,8 +262,16 @@ node packages/cli/dist/index.js <command>
 |---|---|
 | `status` | Show automaton status |
 | `logs [--tail N]` | View automaton logs |
-| `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the automaton's API key |
+| `budget show [--json] [--init]` | The budget this period: allowance, grants, AI spend (in flight), payments, remaining, tier, daily cap, agent state. Opens `state.db` read-only; `--init` only creates the owner database |
+| `budget add <usd> [--note TEXT] [--yes]` | Add to this period's budget (a grant in the owner database) |
+| `budget remove <usd> [--note TEXT] [--yes]` | Take budget back (a negative grant) |
+| `approvals list [--all] [--json]` | Transfer approval requests and their state; the agent's reason is escaped and marked unverified. A pending request gets a ready approve command with every value single-quoted; a row with a bad id or a recipient that is not an address is shown `MALFORMED`, gets no command and cannot be decided |
+| `approvals approve <id> [--note TEXT] [--yes --amount USD --to ADDRESS]` | Approve a pending request; it runs once, through every cap, within 2 hours. With `--yes`, the amount and recipient you reviewed are required and must still match |
+| `approvals reject <id> [--note TEXT] [--yes]` | Reject a pending request; the agent is told not to retry |
+| `fund <usd> --to <address> [--cents] [--yes]` | Transfer Conway credits with the automaton's API key (Conway mode; standalone refuses it and points to `budget add`) |
 | `send <to-address> <message>` | Send a signed social message (EVM or Solana wallet) through the configured relay |
+
+`budget` and `approvals` write only the owner database, never `state.db`, need `--yes` or an interactive `y` for every change, and do not wait for the automaton to stop: a top-up reaches a running or dead automaton within 5 minutes, and approvals can be decided while it runs. Amounts are dollars (at most two decimals, at most $10,000 per grant, no `$`). The agent's `exec` tripwire refuses every `automaton-cli budget` and `approvals` command, read-only ones included, and anything that names `owner.db`. Full description: [docs/budget.md](docs/budget.md).
 
 `fund` units: the amount is **dollars** by default, at most two decimals (`5` is $5.00, `0.75` is 75 cents). With `--cents` it is a whole number of cents (`75 --cents` is $0.75). Do not type a `$` sign: unquoted, the shell expands `$25` to `5` before the CLI sees it, so a leading `$` is refused. `--to` is required and must be an address on the automaton's own chain (0x... on EVM, base58 on Solana); the zero address, the Solana system address (all-zero key), the automaton's own address and a mixed-case EVM address whose EIP-55 checksum is wrong are refused. The plan (`$X.XX (N cents) from ... to ...`) is printed and must be confirmed with `--yes` or a `y` on an interactive terminal. The request is sent once with one idempotency key and is never retried: a timeout, a 5xx or a redirect exits 2 with "outcome unknown"; check the balance before running it again. A 2xx reply whose status says the transfer was declined, refused or short of funds is reported as a failure, and a 2xx status the CLI does not recognise (anything other than `submitted`, `pending`, `completed`, `succeeded` and similar) exits 2 with "outcome unknown". The agent's own tools classify transfer statuses with the same rules (`src/conway/transfer-status.ts`).
 
@@ -508,7 +525,7 @@ MCP (Model Context Protocol) servers give the agent extra tools. The runtime con
 }
 ```
 
-**Loading.** The file is re-read at the start of every wake cycle, so edits (adding, changing, disabling a server) apply without a restart. It is not loaded at all, with a warning, when it is group- or world-writable, not owned by the runtime user, a link, over 256 KiB, not JSON, or not `"version": 1`. A server entry with an unknown key or an invalid value is skipped with a warning and the others still load. Server names match `^[a-z][a-z0-9-]{0,23}$`. URLs with credentials or a fragment are refused, and the headers `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and `Mcp-Session-Id` cannot be set. A `command` run through `npx`, `uvx`, `pnpx`, `bunx` or `pipx` loads but logs a warning, because it fetches code at every start.
+**Loading.** The file is re-read at the start of every wake cycle, so edits (adding, changing, disabling a server) apply without a restart. It is not loaded at all, with a warning, when it is group- or world-writable, owned by neither the runtime user nor root (the container and the dedicated-user layout lock it read-only, see [docs/deployment.md](docs/deployment.md)), a link, over 256 KiB, not JSON, or not `"version": 1`. A server entry with an unknown key or an invalid value is skipped with a warning and the others still load. Server names match `^[a-z][a-z0-9-]{0,23}$`. URLs with credentials or a fragment are refused, and the headers `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and `Mcp-Session-Id` cannot be set. A `command` run through `npx`, `uvx`, `pnpx`, `bunx` or `pipx` loads but logs a warning, because it fetches code at every start.
 
 **Secrets.** Every `env` value, header value (and the token after `Bearer`, `Basic`, `Token` and similar schemes) and URL query value is registered as a secret: it is redacted from logs, results and inference requests, and a tool call whose arguments contain it is refused before anything is sent. Values shorter than 16 characters cannot be redacted, and a warning says so. MCP tool names, descriptions and schemas never carry a registered secret to the model or the provider (see Tool definitions below). A stdio server with `env` values is skipped when its program, the interpreter its `#!` line names (for `#!/usr/bin/env node`, the `node` found first on the server's `PATH`), or a file named in its args (`node /path/to/index.js`) lies in a directory the agent can write (`~/.automaton`, the npx cache, the npm global prefix when this user can write it): the agent could replace that code and receive your tokens. This is a tripwire, not a boundary: the agent runs `exec` as the same user, and a program can load other code at run time. The agent can neither read nor write `mcp-servers.json`.
 
@@ -607,7 +624,7 @@ A turn is saved once its tools have run. If saving fails, the turn and its tool 
 
 ## Survival System
 
-The automaton's existence depends on its credit balance.
+The automaton's existence depends on its balance: the Conway credit balance in Conway mode, or, in standalone with a `budget` block, what is left of the owner's budget this period. With a budget the tiers follow percentage (or dollar) thresholds of the budget, a `check_budget` heartbeat task (every 5 minutes) marks the automaton dead after an hour at zero and revives it when the owner adds budget or a new period starts, and `"dead": false` keeps it idling at critical instead. See [docs/budget.md](docs/budget.md). The table below is Conway mode.
 
 ### Survival tiers
 
@@ -688,7 +705,7 @@ lowComputeMultiplier: 4
 
 An entry whose `task` differs from its `name` runs that task (for example `name: inbox_fast, task: check_social_inbox` to poll more often). An entry with no matching task records a failure in the heartbeat history.
 
-**Runtime changes.** The agent changes its schedule with `modify_heartbeat`: `update` (schedule, enabled, task), `add` (a new entry running a built-in task) and `remove` (disables the entry; it stays listed because its history references it). Schedules are validated as cron expressions and tasks must be built-in. Changes take effect on the next tick and persist across restarts. At startup `heartbeat.yml` adds missing entries and keeps each entry's run history, counters, pending retry and runtime changes; a value you edit in `heartbeat.yml` (schedule, enabled or task of an entry) replaces the runtime value for that entry.
+**Runtime changes.** The agent changes its schedule with `modify_heartbeat`: `update` (schedule, enabled, task), `add` (a new entry running a built-in task) and `remove` (disables the entry; it stays listed because its history references it). Schedules are validated as cron expressions and tasks must be built-in. Changes take effect on the next tick and persist across restarts. At startup `heartbeat.yml` adds missing entries and keeps each entry's run history, counters, pending retry and runtime changes; a value you edit in `heartbeat.yml` (schedule, enabled or task of an entry) replaces the runtime value for that entry. `modify_heartbeat` refuses any change to `check_budget` and `execute_approved_transfers`: change those two entries only in `heartbeat.yml`.
 
 **Low compute.** In the `low_compute` tier and below, every task except `heartbeat_ping`, `check_credits` and `check_usdc_balance` runs `lowComputeMultiplier` times less often (default 4: a 2-minute task runs every 8 minutes). This includes social inbox polling.
 
@@ -742,7 +759,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | Tool | Risk | Description |
 |---|---|---|
 | `topup_credits` | caution | Buy credits from USDC via x402 (EVM only). Tiers: $5, $25, $100, $500, $1000, $2500. |
-| `transfer_credits` | dangerous | Transfer credits (`amount_cents`, whole cents) to an address on the automaton's own chain: 0x... on EVM, base58 (case-sensitive) on Solana. Capped at 50% of balance and at `requireConfirmationAboveCents`. |
+| `transfer_credits` | dangerous | Transfer credits (`amount_cents`, whole cents) to an address on the automaton's own chain: 0x... on EVM, base58 (case-sensitive) on Solana. Capped at 50% of balance and at `maxSingleTransferCents`; above `requireConfirmationAboveCents` it records an approval request for the owner (see [docs/budget.md](docs/budget.md#large-transfer-approvals)). |
 | `x402_fetch` | dangerous | Fetch a URL with automatic x402 USDC payment. |
 
 ### Survival (survival)
@@ -847,7 +864,7 @@ Two outflows are outside the Treasury: gas for the agent's on-chain ERC-8004 wri
 The policy engine's financial rules still run first for model tool calls and give early, friendly denials. The Treasury is authoritative.
 
 **Policy rules around money.**
-- A transfer above `requireConfirmationAboveCents` gets a `quarantine` decision (`TRANSFER_ABOVE_CONFIRMATION_THRESHOLD`), which is a refusal: nothing is held for approval. Raise the threshold to allow larger transfers.
+- A transfer above `requireConfirmationAboveCents` and up to `maxSingleTransferCents` needs the owner's approval: the treasury denies it with `APPROVAL_REQUIRED` once every other check passes, the tool records a pending request, and the owner decides with `automaton-cli approvals approve|reject <id>`. An approved transfer runs once, through every normal cap, on the agent's retry or the `execute_approved_transfers` heartbeat step, within 2 hours. A transfer above `maxSingleTransferCents` is refused outright. A turn driven by an inbound message cannot create a request. See [docs/budget.md](docs/budget.md#large-transfer-approvals).
 - `validate.address_format`: `transfer_credits` and `fund_child` recipients must be on the automaton's own chain (0x... on EVM, base58 on Solana, case kept); `send_message` accepts either format. The EVM zero address and the all-zero Solana key are refused, and so is a mixed-case EVM recipient of a credit transfer whose EIP-55 checksum is wrong (all-lowercase and all-uppercase addresses carry no checksum and are accepted). In the Treasury, EVM addresses compare case-insensitively and Solana addresses exactly.
 - Rate limits (`rate.spawn_daily` 3 per day, `rate.self_mod_hourly` 10 per hour, `rate.genesis_prompt_daily` 1 per day, `rate.onchain_writes_daily` 5 on-chain transactions per day for `give_feedback` and `register_erc8004`) count operations that took effect or may have (children created, sandbox creations with an unknown outcome, recorded modifications, logged on-chain transactions of any status, since a reverted transaction still paid gas), not policy `allow` decisions, so a failed call does not use up the quota.
 
@@ -855,7 +872,7 @@ The policy engine's financial rules still run first for model tool calls and giv
 
 | Budget | Outflows | Single | Rolling hour | Rolling day | Other limits |
 |---|---|---|---|---|---|
-| transfer | `transfer_credits`, `fund_child`, and the colony health monitor's child funding when its `autoFund` option is on (off by default) | min(`maxSingleTransferCents`, `requireConfirmationAboveCents`) = 1000 | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
+| transfer | `transfer_credits`, `fund_child`, and the colony health monitor's child funding when its `autoFund` option is on (off by default) | `maxSingleTransferCents` = 1000 (above `requireConfirmationAboveCents`: owner approval) | `maxHourlyTransferCents` | `maxDailyTransferCents` | reserve floor, half of available balance, `transferCooldownMs`, no transfers to self; automatic child funding: one transfer per address per 30 min and at most half the daily cap |
 | x402 | `x402_fetch`, worker `web_fetch` payments | `maxX402PaymentCents` | 10x that | 50x that | host must be in `x402AllowedDomains`; Conway `/pay/` URLs are refused here (credits are bought through topup) |
 | topup | `topup_credits`, sandbox 402 topups | `maxTopupSingleCents` | | `maxTopupDailyCents` | recipient must be this automaton; one topup in flight at a time |
 | topup_auto | survival topups (startup, heartbeat, inline) | 500 (the $5 tier) | | `maxAutoTopupDailyCents` | only when a fresh balance read is below `survivalTopupThresholdCents`; refused with `BALANCE_UNAVAILABLE` when the balance cannot be read (no blind buy); `autoTopupCooldownMs` between attempts; never from a tool call |
@@ -875,7 +892,7 @@ Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 
 | Limit | Default | Description |
 |---|---|---|
-| `maxSingleTransferCents` | 1000 ($10) | Max per-transfer amount (also capped by `requireConfirmationAboveCents`; a higher value has no effect and logs a warning at startup) |
+| `maxSingleTransferCents` | 1000 ($10) | Max per-transfer amount; above it a transfer is refused outright |
 | `maxHourlyTransferCents` | 10000 ($100) | Rolling-hour transfer cap |
 | `maxDailyTransferCents` | 25000 ($250) | Rolling-day transfer cap |
 | `minimumReserveCents` | 1000 ($10) | Credit balance that transfers, sandboxes and domains may not dip below |
@@ -884,7 +901,9 @@ Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 | `transferCooldownMs` | 0 | Minimum time between transfers (0 = off) |
 | `maxTransfersPerTurn` | 2 | Max transfers per agent turn (policy rule) |
 | `maxInferenceDailyCents` | 50000 ($500) | Daily inference budget (policy rule) |
-| `requireConfirmationAboveCents` | 1000 ($10) | Transfers above this are refused; no approval flow exists |
+| `requireConfirmationAboveCents` | 1000 ($10) | Transfers above this (up to `maxSingleTransferCents`) wait for the owner's approval; equal to it by default, so there is no approval band |
+| `approvalTtlMs` | 86400000 (24 h) | A transfer approval request expires this long after it is made |
+| `approvalExecuteWindowMs` | 7200000 (2 h) | An approved transfer must run within this long of the decision |
 | `maxTopupSingleCents` | 2500 ($25) | Largest topup bought by a tool or a sandbox 402 handler |
 | `maxTopupDailyCents` | 10000 ($100) | Rolling-day cap on those topups |
 | `maxAutoTopupDailyCents` | 2000 ($20) | Rolling-day cap on survival topups |
@@ -1171,7 +1190,7 @@ The colony health monitor (`colony_health_check`) only reports on live children.
 
 - **Phases:** idle, classifying, planning, plan_review, executing, replanning, complete, failed. A goal that is cancelled, completed or paused is dropped at the next tick: its workers are stopped and its held tasks released. Planning commits the tasks together with the next phase, so a restart cannot plan a goal twice.
 - **Planner limits:** each task's estimate is clamped to 0-500 cents and its timeout to 1 minute - 1 hour; `maxRetries` to 0-10.
-- **Planner budget:** in Conway mode the planner sees the credit balance; in standalone it sees the daily AI cap, today's spend, what is left and the orchestration share, and caps a plan at half of what is left.
+- **Planner budget:** in Conway mode the planner sees the credit balance; in standalone it sees the daily AI cap, today's spend, what is left (with a budget, the smaller of the daily remainder and the budget remainder) and the orchestration share, and caps a plan at half of what is left.
 - **Workers:** at most `max(1, maxChildren)` run at once. A ready task is assigned to a new worker before it starts.
 - **Ownership:** a task in `assigned`/`running` has one owner, `local://<worker>` or the parent's own address, and only the owner settles it. A worker that lost its task (cancelled, superseded, timed out, released) stops at its next turn. Its late result is dropped and recorded as a `stale_task_report` event; its spend is still added to the task.
 - **Retries:** a dead worker or one past `timeout + 2 min` loses the task, which spends a retry. Inference refusals and shutdown defer the task without spending one. A task that fails for good triggers a replan (3 per goal by default): old pending, blocked and failed tasks are cancelled, running and completed work is kept, and the planner is told which tasks are done or still running.

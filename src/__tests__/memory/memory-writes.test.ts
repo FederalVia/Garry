@@ -139,9 +139,10 @@ describe("scores", () => {
   });
 
   it("the version 17 migration repairs TEXT scores", () => {
-    // 18 (the policy_decisions rebuild) and 19 (model_registry provider
-    // columns) came after the version 17 repair.
-    expect(SCHEMA_VERSION).toBe(19);
+    // 18 (the policy_decisions rebuild), 19 (model_registry provider
+    // columns) and 20 (budget rollup, transfer approvals) came after the
+    // version 17 repair.
+    expect(SCHEMA_VERSION).toBe(20);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-v17-"));
     try {
       const file = path.join(dir, "state.db");

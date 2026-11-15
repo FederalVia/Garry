@@ -51,6 +51,33 @@ describe("clampForMode", () => {
     expect(low.policy.maxInferenceDailyCents).toBe(100);
   });
 
+  it("with the owner's budget the ceiling defaults to about 1/15 of the allowance; an explicit ceiling wins", () => {
+    const budget = { allowanceCents: 2500, period: "monthly" };
+    const runtime = resolveRuntime(standalone({ budget }));
+    expect(runtime.dailyCapCeilingCents).toBe(167);
+    expect(runtime.survivalRoomCents).toBe(25);
+    const clamped = clampForMode(normalizeTreasuryPolicy({ maxInferenceDailyCents: 200 }), runtime);
+    expect(clamped.policy.maxInferenceDailyCents).toBe(167);
+    // The old 200c default clamped to 167 still leaves 25c of survival room.
+    const p = resolveInferencePolicy({}, clamped.policy, {
+      ceilingCents: runtime.dailyCapCeilingCents,
+      survivalRoomCents: runtime.survivalRoomCents,
+    });
+    expect(p.dailyCapCents).toBe(167);
+    expect(p.survivalAllowanceCents).toBe(25);
+    expect(resolveRuntime(standalone({ budget, providers: { dailyCapCeilingCents: 300 } })).dailyCapCeilingCents).toBe(300);
+    expect(resolveRuntime(standalone({ budget: { allowanceCents: 3000 } })).dailyCapCeilingCents).toBe(200);
+  });
+
+  it("a budget in Conway mode is ignored (no ceiling, no period cap) and flagged", () => {
+    const runtime = resolveRuntime(createTestConfig({ budget: { allowanceCents: 2500, period: "monthly" } }));
+    expect(runtime.mode).toBe("conway");
+    expect(runtime.budget).toBeNull();
+    expect(runtime.budgetIgnored).toBe(true);
+    expect(runtime.dailyCapCeilingCents).toBeNull();
+    expect(runtime.survivalRoomCents).toBeNull();
+  });
+
   it("never clamps Conway mode", () => {
     const runtime = resolveRuntime(createTestConfig());
     const r = clampForMode(normalizeTreasuryPolicy({}), runtime);

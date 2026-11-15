@@ -39,3 +39,25 @@ export {
   type TreasuryResolver,
 } from "./registry.js";
 export { guardConwayClient } from "./guarded-conway.js";
+export {
+  APPROVAL_ID_RE,
+  APPROVED_TRANSFER_ORIGIN,
+  MAX_APPROVALS_PER_DAY,
+  MAX_OPEN_APPROVALS,
+  approvalExecuteWindowMs,
+  approvalLedgerRows,
+  approvalStatus,
+  approvalTtlMs,
+  createApprovalRequest,
+  executeApprovedTransfers,
+  findUsableApproval,
+  getApprovalRequest,
+  listApprovalViews,
+  pruneApprovalRequests,
+  transferWithApproval,
+  type ApprovalRequest,
+  type ApprovalState,
+  type ApprovalTransferOutcome,
+  type ApprovalView,
+  type DecisionSource,
+} from "./approvals.js";

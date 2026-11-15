@@ -6,6 +6,7 @@ import type { PlannerContext, PlannerOutput } from "./planner.js";
 import type { AgentWorkspace } from "./workspace.js";
 import { getActiveGoals } from "../state/database.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { currentSurvivalThresholds } from "../budget/thresholds.js";
 import { getInstalledInferenceGate } from "../inference/gate.js";
 import { currentRuntime } from "../providers/mode.js";
 import type { PlannerDailyBudget } from "./planner.js";
@@ -48,7 +49,7 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
     usdcBalance,
     // An unread balance is never a phantom zero: it is unknown, unless the
     // creator fixed the tier (no balance is tracked at all).
-    survivalTier: creditsCents === null ? fixedTierOrUnknown() : getSurvivalTier(creditsCents),
+    survivalTier: creditsCents === null ? fixedTierOrUnknown() : getSurvivalTier(creditsCents, currentSurvivalThresholds()),
     availableRoles: normalizeStringList(options.availableRoles, [...DEFAULT_PLANNER_AVAILABLE_ROLES]),
     customRoles: normalizeStringList(options.customRoles, []),
     activeGoals: getActiveGoals(options.db).map((goal) => ({
@@ -67,7 +68,10 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
   };
 }
 
-/** Standalone: the gate's daily cap and rolling 24h spend, the colony's whole budget. */
+/**
+ * Standalone: the gate's daily cap and rolling 24h spend, limited by what is
+ * left of the owner's budget this period (the gate refuses past either).
+ */
 function standaloneDailyBudget(): PlannerDailyBudget | undefined {
   const gate = getInstalledInferenceGate();
   if (!gate) return undefined;
@@ -76,7 +80,7 @@ function standaloneDailyBudget(): PlannerDailyBudget | undefined {
     return {
       capCents: u.caps.dailyCents,
       spentCents: Math.round(u.last24h.cappedCents),
-      remainingCents: Math.floor(u.remaining.dailyCents),
+      remainingCents: Math.floor(Math.min(u.remaining.dailyCents, u.remaining.periodCents ?? Infinity)),
       orchestrationSharePct: u.caps.orchestrationSharePct,
     };
   } catch {

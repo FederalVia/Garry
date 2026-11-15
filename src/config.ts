@@ -19,6 +19,7 @@ import { setConfigSources, type ValueSource } from "./providers/mode.js";
 import { isFixedSurvivalTier } from "./providers/survival-source.js";
 import { isLoopbackHost } from "./conway/http-client.js";
 import { RESERVED_PROVIDER_IDS, PROVIDER_ID_PATTERN, providerKeyEnvVar } from "./providers/table.js";
+import { BudgetConfigError, resolveBudget } from "./budget/config.js";
 
 const logger = createLogger("config");
 const CONFIG_FILENAME = "automaton.json";
@@ -257,6 +258,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AutomatonConfi
 
   const raw = readRawConfig(configPath);
   validateProviders(raw.providers, configPath);
+  // A budget dropped for being invalid would remove the money limit: refuse.
+  try {
+    resolveBudget(raw.budget);
+  } catch (err) {
+    if (err instanceof BudgetConfigError) throw new ConfigError(`${configPath}: ${err.message}`, configPath);
+    throw err;
+  }
+  if (raw.ownerDbPath !== undefined && (typeof raw.ownerDbPath !== "string" || raw.ownerDbPath.trim() === "")) {
+    throw new ConfigError(`${configPath}: ownerDbPath must be a non-empty path`, configPath);
+  }
   const block: Raw = isPlainObject(raw.providers) ? raw.providers : {};
 
   // Precedence, highest first. Keys are registered for redaction, never logged.
@@ -317,6 +328,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AutomatonConfi
   // saved into the file would follow the agent into standalone.
   if (rawDomains === undefined) {
     derived.set("treasuryPolicy.x402AllowedDomains", { value: treasuryPolicy.x402AllowedDomains, fileValue: undefined });
+  }
+  // Standalone has no sandboxes or domains: infrastructure caps stay 0 unless
+  // the file sets them. A mode default, never written back.
+  if (mode === "standalone") {
+    const tp = isPlainObject(rawTreasury) ? rawTreasury : {};
+    for (const key of ["maxInfraSingleCents", "maxInfraDailyCents"] as const) {
+      if (tp[key] === undefined) {
+        (treasuryPolicy as unknown as Record<string, number>)[key] = 0;
+        derived.set(`treasuryPolicy.${key}`, { value: 0, fileValue: undefined });
+      }
+    }
   }
 
   // Deep-merge model strategy config with defaults
@@ -437,10 +459,11 @@ export function saveConfig(config: AutomatonConfig): void {
   const derived = derivedOf(config);
   const unchanged = new Set<string>();
   for (const [field, d] of derived ?? []) {
-    if (field === "treasuryPolicy.x402AllowedDomains") {
-      if (toSave.treasuryPolicy && sameValue(toSave.treasuryPolicy.x402AllowedDomains, d.value)) {
+    if (field.startsWith("treasuryPolicy.")) {
+      const key = field.slice("treasuryPolicy.".length);
+      if (toSave.treasuryPolicy && sameValue(toSave.treasuryPolicy[key], d.value)) {
         toSave.treasuryPolicy = { ...toSave.treasuryPolicy };
-        delete toSave.treasuryPolicy.x402AllowedDomains;
+        delete toSave.treasuryPolicy[key];
       }
       continue;
     }

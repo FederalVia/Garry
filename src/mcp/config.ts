@@ -696,8 +696,10 @@ export function loadMcpConfig(opts: LoadMcpConfigOptions = {}): LoadedMcpConfig 
     warnings.push(`${file} is group- or world-writable; MCP servers are not loaded (chmod 600 it).`);
     return emptyConfig(warnings);
   }
-  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
-    warnings.push(`${file} is not owned by the runtime user; MCP servers are not loaded.`);
+  // Root may own it too: a dedicated-user install locks the owner's files as
+  // root (scripts/lock-owner-files.sh), and root can change anything anyway.
+  if (typeof process.getuid === "function" && st.uid !== process.getuid() && st.uid !== 0) {
+    warnings.push(`${file} is not owned by the runtime user or root; MCP servers are not loaded.`);
     return emptyConfig(warnings);
   }
   const raw = readRegularFileNoFollow(file, { root: path.dirname(file), maxBytes: MAX_CONFIG_BYTES, trusted: true });

@@ -3,6 +3,9 @@ on: [push, pull_request]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      # The image build runs in the container-smoke job below.
+      AUTOMATON_SKIP_DOCKER_SMOKE: "1"
     strategy:
       matrix:
         node-version: [20, 22]
@@ -16,6 +19,9 @@ jobs:
       - run: pnpm run typecheck
       - name: Typecheck tests
         run: pnpm run typecheck:test
+      # Also typechecks the operator CLI against the runtime's package exports.
+      - name: Build
+        run: pnpm run build
       # A timeout fails the job. The suite takes about 30 seconds.
       - name: Run tests
         timeout-minutes: 10
@@ -24,6 +30,39 @@ jobs:
       - name: Run security tests
         timeout-minutes: 5
         run: pnpm exec vitest run -t "security|injection|policy|financial"
+      # The read-only layout checks switch to uid 65534, so they need root;
+      # without root they skip, which must not happen here.
+      - name: Read-only layout tests (as root)
+        if: matrix.node-version == 22
+        timeout-minutes: 5
+        env:
+          AUTOMATON_REQUIRE_ROOT_LAYOUT_TESTS: "1"
+        run: sudo -E env "PATH=$PATH" pnpm exec vitest run src/__tests__/config-readonly-exec.test.ts
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      # The committed digest must be a real one; a placeholder is resolved
+      # here so the rest of the image is still tested, with a warning.
+      - name: Check the base image pin
+        run: |
+          if grep -q '@sha256:0\{64\}' Dockerfile; then
+            echo "::warning file=Dockerfile::The base image digest is a placeholder; run scripts/pin-base-image.sh and commit the result."
+            scripts/pin-base-image.sh
+          fi
+      - name: Build the image and run the entrypoint
+        timeout-minutes: 18
+        env:
+          # Fail instead of skipping if the image cannot be built here.
+          AUTOMATON_REQUIRE_DOCKER_SMOKE: "1"
+        run: pnpm exec vitest run src/__tests__/container-smoke.test.ts
 
   security-audit:
     runs-on: ubuntu-latest

@@ -25,6 +25,7 @@ import type {
 import { createLogger } from "../observability/logger.js";
 import { classifyTransferStatus } from "../conway/transfer-status.js";
 import {
+  approvalDedupeKey,
   domainDedupeKey,
   domainRegistrationCents,
   sandboxDedupeKey,
@@ -155,25 +156,28 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
     createScopedClient: (targetSandboxId) =>
       guardConwayClient(inner.createScopedClient(targetSandboxId), resolve),
 
-    // The caller's OutflowRequestOptions are ignored: the gate supplies the
-    // idempotency key and the send hook.
+    // Of the caller's OutflowRequestOptions only approvalId is used: the gate
+    // supplies the idempotency key and the send hook. An approval id becomes
+    // the dedupe key, so every caller of one approval meets on one key.
     async transferCredits(
       toAddress: string,
       amountCents: number,
       note?: string,
-      _opts?: OutflowRequestOptions,
+      opts?: OutflowRequestOptions,
     ): Promise<CreditTransferResult> {
       const t = requireTreasury(resolve);
       const to = typeof toAddress === "string" ? toAddress : "";
       const origin = currentTreasuryOrigin();
+      const approvalId = typeof opts?.approvalId === "string" && opts.approvalId ? opts.approvalId : undefined;
       const result = await t.guard(
         {
           kind: "credit_transfer",
           amountCents,
           amountBasis: "exact",
           counterparty: to,
-          dedupeKey: to ? transferDedupeKey(to, amountCents, origin.name) : "",
+          dedupeKey: approvalId ? approvalDedupeKey(approvalId) : to ? transferDedupeKey(to, amountCents, origin.name) : "",
           description: note ? `Transfer to ${to}: ${note}` : `Transfer to ${to}`,
+          ...(approvalId ? { approvalId } : {}),
         },
         (r) =>
           inner.transferCredits(to, amountCents, note, {

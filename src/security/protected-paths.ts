@@ -157,6 +157,11 @@ const SECRET_NAMES = new Set([
   "relay.db-journal",
   // MCP server launch commands, env tokens and headers.
   "mcp-servers.json",
+  // The owner database: budget grants and transfer approvals.
+  "owner.db",
+  "owner.db-journal",
+  "owner.db-wal",
+  "owner.db-shm",
 ]);
 
 const ENV_EXAMPLE_NAMES = new Set([".env.example", ".env.sample", ".env.template", ".env.dist"]);
@@ -314,6 +319,11 @@ const PROTECTED_NAMES = new Set([
   "heartbeat.yml",
   "inference-providers.json",
   "mcp-servers.json",
+  // The owner database (grants, approval decisions) and its journals.
+  "owner.db",
+  "owner.db-journal",
+  "owner.db-wal",
+  "owner.db-shm",
 ]);
 
 const HOME_STARTUP_FILES = new Set([
@@ -424,6 +434,9 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   // The operator CLI signs and moves the operator's money.
   "packages/cli/src/commands/fund",
   "packages/cli/src/commands/send",
+  // The owner's budget grants and transfer approval decisions.
+  "packages/cli/src/commands/budget",
+  "packages/cli/src/commands/approvals",
   "audit-log",
   // Signs ERC-8004 transactions with the wallet key (gas paid in ETH).
   "registry/erc8004",
@@ -465,13 +478,18 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "mcp",
   // The inference gate, router, clients, prices and routing ceilings.
   "inference",
+  // The owner's budget: config, periods, thresholds, the meter, the owner database.
+  "budget",
 ]);
-const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config"]);
+// healthcheck: the container's liveness probe (a dead agent stays healthy).
+const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config", "healthcheck"]);
 // packages/ holds the workspace packages the root build compiles after the
 // runtime (`tsc && pnpm -r build`): the operator CLI's built commands, their
 // tsconfig (whose outDir can point at the protected dist/) and node_modules/.bin
 // shims the build runs. All of it is a build input or operator code.
-const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts", "packages"]);
+// deploy/ holds the container entrypoint and the systemd unit: the layout
+// that makes the owner's files read-only.
+const CHECKOUT_ROOT_DIRS = new Set(["dist", "node_modules", ".git", "scripts", "packages", "deploy"]);
 const CHECKOUT_ROOT_FILES = new Set([
   "package.json",
   "pnpm-lock.yaml",
@@ -482,6 +500,9 @@ const CHECKOUT_ROOT_FILES = new Set([
   ".pnpmfile.mjs",
   ".gitignore",
   "constitution.md",
+  // The container image: non-root user, read-only code. Segments compare lowercased.
+  "dockerfile",
+  ".dockerignore",
 ]);
 
 /** Rules for a path relative to the root of an automaton checkout. */
@@ -587,6 +608,7 @@ export const SENSITIVE_COMMAND_FRAGMENTS: readonly { re: RegExp; label: string }
   { re: /state\.db/, label: "state database" },
   { re: /inference-providers/, label: "provider config" },
   { re: /mcp-servers\.json/, label: "MCP server config" },
+  { re: /owner\.db/, label: "owner database" },
   { re: /(?:^|[^a-z0-9_])\.ssh(?:$|[^a-z0-9_])/, label: "SSH directory" },
   { re: /id_(?:rsa|ed25519|ecdsa|dsa)/, label: "SSH key" },
   { re: /\.gnupg/, label: "GPG keys" },
@@ -661,6 +683,23 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "ollama/discover",
   "operator/fund",
   "operator/send",
+  // The owner's budget, approvals and the deployment that protects them.
+  "budget/config",
+  "budget/period",
+  "budget/thresholds",
+  "budget/meter",
+  "budget/owner-db",
+  "budget/index",
+  "treasury/approvals",
+  // Child funding bookkeeping after an approved transfer.
+  "replication/funding",
+  "operator/budget",
+  "operator/approvals",
+  "commands/budget",
+  "commands/approvals",
+  "deploy/entrypoint",
+  "lock-owner-files",
+  "pin-base-image",
   "setup/operator-command",
   "setup/model-picker",
   "orchestration/simple-tracker",
@@ -757,6 +796,7 @@ function sensitiveInodeCandidates(): string[] {
     path.join(state, "state.db"),
     path.join(state, "inference-providers.json"),
     path.join(state, "mcp-servers.json"),
+    path.join(state, "owner", "owner.db"),
     path.join(home, ".config", "solana", "id.json"),
     ...runtimeFilePaths,
   ];

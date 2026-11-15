@@ -868,7 +868,9 @@ describe("Financial Phase 1 Rules", () => {
       expect(decision.action).not.toBe("quarantine");
     });
 
-    it("quarantines transfers above confirmation threshold", () => {
+    // The approval band: the policy rule lets the transfer run so the
+    // treasury can deny APPROVAL_REQUIRED and the tool can record a request.
+    it("lets a transfer inside the approval band through to the treasury", () => {
       const rules = createFinancialRules({ ...DEFAULT_TREASURY_POLICY, maxSingleTransferCents: 5000 });
       const engine = new PolicyEngine(db, rules);
 
@@ -880,17 +882,14 @@ describe("Financial Phase 1 Rules", () => {
       const request = createRequest(tool, { amount_cents: 2000 }, "agent");
 
       const decision = engine.evaluate(request);
-      // Should be quarantined (2000 > 1000 threshold), but may also be denied
-      // by transfer_max_single if over that limit. 2000 < 5000 so it won't be denied.
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
+      // 2000 > 1000 (confirmation) and <= 5000 (single): the owner decides, not the rule.
+      expect(decision.action).toBe("allow");
     });
 
-    it("returns quarantine, not deny, for confirmation threshold", () => {
-      // Use a custom policy with very high transfer limits so only confirmation triggers
+    it("still denies above maxSingleTransferCents, with no approval path", () => {
       const policy: TreasuryPolicy = {
         ...DEFAULT_TREASURY_POLICY,
-        maxSingleTransferCents: 100000,
+        maxSingleTransferCents: 2000,
         requireConfirmationAboveCents: 500,
       };
       const rules = createFinancialRules(policy);
@@ -901,11 +900,10 @@ describe("Financial Phase 1 Rules", () => {
         riskLevel: "dangerous",
         category: "financial",
       });
-      const request = createRequest(tool, { amount_cents: 1000 }, "agent");
-
-      const decision = engine.evaluate(request);
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("TRANSFER_ABOVE_CONFIRMATION_THRESHOLD");
+      expect(engine.evaluate(createRequest(tool, { amount_cents: 1000 }, "agent")).action).toBe("allow");
+      const above = engine.evaluate(createRequest(tool, { amount_cents: 2001 }, "agent"));
+      expect(above.action).toBe("deny");
+      expect(above.reasonCode).toBe("SPEND_LIMIT_EXCEEDED");
     });
   });
 });

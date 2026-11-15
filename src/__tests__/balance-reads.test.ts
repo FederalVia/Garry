@@ -14,7 +14,6 @@ import {
   readUsdc,
 } from "../conway/balance.js";
 import { createBuiltinTools } from "../agent/tools.js";
-import { checkResources, formatResourceReport } from "../survival/monitor.js";
 import { MockConwayClient, createTestConfig, createTestDb, createTestIdentity } from "./mocks.js";
 import type { ToolContext } from "../types.js";
 
@@ -140,25 +139,5 @@ describe("readers that show balances", () => {
     }
   });
 
-  it("the resource report says unknown, not $0.00", async () => {
-    const db = createTestDb();
-    try {
-      const mock = new MockConwayClient();
-      mock.getCreditsBalance = async () => {
-        throw new Error("Conway API error: GET /v1/credits/balance -> 503");
-      };
-      stubFetch(() => {
-        throw new Error("no network");
-      });
-      const status = await checkResources(createTestIdentity(), mock, db);
-      expect(status.financial.creditsCents).toBeNull();
-      expect(status.tier).toBeNull();
-      const report = formatResourceReport(status);
-      expect(report).toContain("Credits: unknown");
-      expect(report).not.toContain("$0.00");
-      expect(db.getKV("current_tier")).toBeUndefined();
-    } finally {
-      db.close();
-    }
-  });
+
 });

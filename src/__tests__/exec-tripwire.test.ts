@@ -277,6 +277,14 @@ describe("the operator CLI's money commands are operator only (review TREASURY-1
     "node ./cli/dist/index.js send 1 --to 0x12",
     "pnpm --dir packages/cli exec tsx src/index.ts fund 5 --to 0x12 --yes",
     "true; 'automaton-cli' \"fund\" 1 --to 0x12 --yes",
+    // The owner's budget and approvals: every subcommand, read-only ones too.
+    "automaton-cli budget add 10 --yes",
+    "automaton-cli budget show",
+    "npx automaton-cli budget show --json",
+    "automaton-cli approvals approve apr_01J0000000000000000000000A --yes",
+    "automaton-cli approvals list",
+    "node packages/cli/dist/index.js budget remove 5 --yes",
+    "node ~/automaton/packages/cli/dist/index.js approvals reject apr_x --yes",
   ];
   const OPERATOR_ALLOWED = [
     "automaton-cli status",
@@ -284,6 +292,8 @@ describe("the operator CLI's money commands are operator only (review TREASURY-1
     "git send-email --to x@example.com patch",
     "echo fund the project",
     "node my-cli/dist/index.js fund 5",
+    "echo budget approvals for the team",
+    "node my-cli/dist/index.js budget show",
   ];
 
   for (const command of OPERATOR_DENIED) {

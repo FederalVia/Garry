@@ -17,6 +17,7 @@ import {
   confirmOnTty,
   FUND_USAGE as USAGE,
 } from "@conway/automaton/operator/fund.js";
+import { standaloneFundRefusal } from "@conway/automaton/operator/budget.js";
 
 // The operator's own transfer, with the automaton's key and outside the
 // agent's treasury budgets; both endpoint shapes share one idempotency key.
@@ -65,6 +66,13 @@ try {
   const config = loadConfig();
   if (!config) {
     console.log("No automaton configuration found.");
+    process.exit(1);
+  }
+
+  // Standalone: no Conway credits to move; the budget replaces them.
+  const refusal = standaloneFundRefusal();
+  if (refusal) {
+    console.log(refusal);
     process.exit(1);
   }
 

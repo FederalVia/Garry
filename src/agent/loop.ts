@@ -47,6 +47,7 @@ import {
 } from "./tools.js";
 import { parseScreen, renderInboundForModel } from "./injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { currentSurvivalThresholds } from "../budget/thresholds.js";
 import { readCredits, readUsdc, usdcNetworkFor } from "../conway/balance.js";
 import {
   claimInboxMessagesFromOneSender,
@@ -97,6 +98,7 @@ import {
 } from "./inbox-isolation.js";
 import { CREDIT_TRANSFER_TOOLS } from "./policy-rules/financial.js";
 import { resolveRuntime, type ResolvedRuntime } from "../providers/mode.js";
+import { createBudget, installBudget, installedBudget, type InstalledBudget } from "../budget/index.js";
 import { visibleTools, type FeatureSet } from "../providers/features.js";
 import {
   buildOrchestrationRegistry,
@@ -122,6 +124,14 @@ const CREDIT_TRANSFER_NAMES: ReadonlySet<string> = new Set(CREDIT_TRANSFER_TOOLS
 /** KV: the last inference refusal, shown to the next real turn. */
 const LAST_REFUSAL_KEY = "inference.last_refusal";
 /** KV: backoff for refusals that do not clear on their own. */
+/** The setting that bounds the daily AI cap: standalone clamps treasuryPolicy to a ceiling. */
+export function dailyCapSetting(runtime: Pick<ResolvedRuntime, "dailyCapCeilingCents" | "budget">): string {
+  if (runtime.dailyCapCeilingCents === null) return "treasuryPolicy.maxInferenceDailyCents";
+  return runtime.budget
+    ? "providers.dailyCapCeilingCents (default 1/15 of the monthly budget)"
+    : "providers.dailyCapCeilingCents";
+}
+
 const REFUSAL_BACKOFF_KEY = "inference.refusal_backoff_ms";
 const REFUSAL_BACKOFF_START_MS = 10 * 60_000;
 const REFUSAL_BACKOFF_MAX_MS = 60 * 60_000;
@@ -418,7 +428,7 @@ export async function runAgentLoop(
       inferenceGate.setSurvival({ tier: inferenceGate.survival().tier, creditsCents: null });
     } else if (financial.credits === "live") {
       inferenceGate.setSurvival({
-        tier: getSurvivalTier(financial.creditsCents),
+        tier: getSurvivalTier(financial.creditsCents, currentSurvivalThresholds()),
         creditsCents: financial.creditsCents,
       });
     } else {
@@ -440,7 +450,7 @@ export async function runAgentLoop(
       db.setKV(REFUSAL_BACKOFF_KEY, String(sleepMs));
       logger.error(
         `Inference refused (${refusal.code}) with no time bound: ${refusal.message}. ` +
-          "Check modelStrategy and treasuryPolicy.maxInferenceDailyCents.",
+          `Check modelStrategy and ${dailyCapSetting(runtime)}.`,
       );
     } else {
       sleepMs = Math.min(Math.max(refusal.retryAfterMs, REFUSAL_SLEEP_MIN_MS), REFUSAL_SLEEP_MAX_MS);
@@ -588,7 +598,7 @@ export async function runAgentLoop(
     if (!runtime.features.topups) return current;
     if (current.credits !== "live" || current.usdc !== "live") return current;
     if (current.creditsCents === null || current.usdcBalance === null || current.usdcBalance < 5) return current;
-    const tier = getSurvivalTier(current.creditsCents);
+    const tier = getSurvivalTier(current.creditsCents, currentSurvivalThresholds());
     if (tier !== "critical" && tier !== "low_compute" && tier !== "dead") return current;
     const lastInlineTopup = db.getKV("last_inline_topup_attempt");
     const cooldownExpired = !lastInlineTopup ||
@@ -627,6 +637,12 @@ export async function runAgentLoop(
   // marked dead under Conway is revived.
   if (db.getAgentState() === "dead" && financial.credits === "fixed") {
     log(config, `[REVIVE] Marked dead by an earlier run; survival is now fixed at ${financial.fixedTier}, so running again.`);
+    db.setAgentState("waking");
+  }
+  // The owner switched dead off: an agent marked dead runs again (at
+  // critical, paid calls wait for budget; free local models still run).
+  if (db.getAgentState() === "dead" && runtime.budget && !runtime.budget.dead) {
+    log(config, "[REVIVE] Marked dead earlier, but dead is switched off for this budget; running again.");
     db.setAgentState("waking");
   }
 
@@ -1777,7 +1793,7 @@ function isLiveFunded(financial: FinancialState): boolean {
 /** The tier of a known balance; a non-live one is never dead (that needs a live read). */
 function routingTier(financial: FinancialState): SurvivalTier {
   if (financial.creditsCents === null) return "low_compute";
-  const tier = getSurvivalTier(financial.creditsCents);
+  const tier = getSurvivalTier(financial.creditsCents, currentSurvivalThresholds());
   return tier === "dead" && financial.credits !== "live" ? "critical" : tier;
 }
 
@@ -1841,16 +1857,29 @@ function resolveProviderKeys(config: AutomatonConfig): {
   return { keys: {} };
 }
 
-/** The installed gate when it uses this database, else a new one installed for it. */
+/**
+ * The installed gate when it uses this database, else a new one installed
+ * for it. A new one gets the same budget as index.ts would give it: the
+ * installed budget when it meters this database, else one built from the
+ * config, so the period cap binds in embedded use too.
+ */
 function ensureInferenceGate(db: AutomatonDatabase, config: AutomatonConfig, runtime: ResolvedRuntime): InferenceGate {
   const installed = getInstalledInferenceGate();
   if (installed && installed.usesDatabase(db.raw)) return installed;
+  let budget: InstalledBudget | null = null;
+  if (runtime.budget) {
+    const current = installedBudget();
+    budget = current && current.meter.usesDatabase(db.raw) ? current : createBudget(db.raw, config);
+    if (budget && budget !== current) installBudget(budget);
+  }
   const gate = new InferenceGate({
     db: db.raw,
     policy: resolveInferencePolicy(config, normalizeTreasuryPolicy(config.treasuryPolicy), {
       ceilingCents: runtime.dailyCapCeilingCents,
+      survivalRoomCents: runtime.survivalRoomCents,
     }),
     fixedTier: runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined,
+    budget: budget?.meter,
   });
   installInferenceGate(gate);
   return gate;

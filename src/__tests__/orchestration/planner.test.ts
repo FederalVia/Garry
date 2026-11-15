@@ -486,6 +486,17 @@ describe("buildPlannerContext", () => {
     try {
       const context = await buildPlannerContext({ db });
       expect(context.dailyBudget).toEqual({ capCents: 200, spentCents: 20, remainingCents: 179, orchestrationSharePct: 50 });
+      // A nearly spent budget limits the plan below the daily cap.
+      spy.mockReturnValue({
+        survival: () => ({ tier: "critical", creditsCents: null }),
+        fixedSurvivalTier: () => null,
+        usage: () => ({
+          caps: { dailyCents: 200, orchestrationSharePct: 50 },
+          last24h: { cappedCents: 20.4 },
+          remaining: { dailyCents: 179.6, periodCents: 30.7 },
+        }),
+      } as never);
+      expect((await buildPlannerContext({ db })).dailyBudget?.remainingCents).toBe(30);
       runtimeSpy.mockReturnValue({ mode: "conway" } as never);
       expect((await buildPlannerContext({ db })).dailyBudget).toBeUndefined();
     } finally {

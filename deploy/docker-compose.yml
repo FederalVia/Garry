@@ -1,0 +1,112 @@
+# The automaton in a container. Run from this folder (deploy/):
+#
+#   mkdir -p data/state data/config data/owner && sudo chown -R 10001:10001 data
+#   docker compose --profile owner run --rm setup
+#   docker compose up -d agent
+#   docker compose --profile owner run --rm cli budget add 10
+#
+# data/state   read-write for the agent: state.db, logs, skills, workspace
+# data/config  the owner's files, mounted read-only into the agent
+# data/owner   owner.db (budget grants, approval decisions), read-only for the agent
+#
+# See docs/deployment.md.
+
+x-image: &image
+  image: automaton:local
+  build:
+    context: ..
+    dockerfile: Dockerfile
+
+services:
+  agent:
+    <<: *image
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    # Optional: OPENAI_API_KEY and similar, if not in automaton.json.
+    # env_file: [./agent.env]
+    volumes:
+      - ./data/state:/home/automaton/.automaton
+      - ./data/config/automaton.json:/home/automaton/.automaton/automaton.json:ro
+      - ./data/config/wallet.json:/home/automaton/.automaton/wallet.json:ro
+      - ./data/config/config.json:/home/automaton/.automaton/config.json:ro
+      - ./data/config/heartbeat.yml:/home/automaton/.automaton/heartbeat.yml:ro
+      - ./data/config/constitution.md:/home/automaton/.automaton/constitution.md:ro
+      - ./data/config/inference-providers.json:/home/automaton/.automaton/inference-providers.json:ro
+      - ./data/config/mcp-servers.json:/home/automaton/.automaton/mcp-servers.json:ro
+      - ./data/owner:/home/automaton/.automaton/owner:ro
+    # No ports: expose_port is local to the container. Never mount docker.sock.
+
+  # Owner-only services: started by you, never by the agent (it has no Docker socket).
+  setup:
+    <<: *image
+    profiles: [owner]
+    command: setup
+    stdin_open: true
+    tty: true
+    read_only: true
+    # A private ~/.automaton: the owner files are edited here and moved to
+    # data/config. data/state is only at /state, never under ~/.automaton, so
+    # the running agent's read-only binds on files there are never touched.
+    tmpfs:
+      - /tmp:size=64m
+      - /home/automaton/.automaton:size=64m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./data/state:/state
+      - ./data/config:/config
+      - ./data/owner:/home/automaton/.automaton/owner
+
+  configure:
+    <<: *image
+    profiles: [owner]
+    command: configure
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /home/automaton/.automaton:size=64m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # Read-only: configure only checks that the agent is stopped.
+      - ./data/state:/state:ro
+      - ./data/config:/config
+      - ./data/owner:/home/automaton/.automaton/owner
+
+  cli:
+    <<: *image
+    profiles: [owner]
+    entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/automaton-entrypoint", "cli"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./data/state:/home/automaton/.automaton
+      - ./data/config/automaton.json:/home/automaton/.automaton/automaton.json:ro
+      - ./data/config/wallet.json:/home/automaton/.automaton/wallet.json:ro
+      - ./data/config/config.json:/home/automaton/.automaton/config.json:ro
+      - ./data/config/heartbeat.yml:/home/automaton/.automaton/heartbeat.yml:ro
+      - ./data/config/constitution.md:/home/automaton/.automaton/constitution.md:ro
+      - ./data/config/inference-providers.json:/home/automaton/.automaton/inference-providers.json:ro
+      - ./data/config/mcp-servers.json:/home/automaton/.automaton/mcp-servers.json:ro
+      # Read-write here only: the owner CLI writes grants and decisions.
+      - ./data/owner:/home/automaton/.automaton/owner

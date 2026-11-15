@@ -205,3 +205,13 @@ describe("unknown balance (F026)", () => {
     expect((db.raw.prepare("SELECT COUNT(*) AS n FROM inference_ledger").get() as { n: number }).n).toBe(1);
   });
 });
+
+describe("the refusal hint names the setting that bounds the daily cap", () => {
+  it("Conway mode points at treasuryPolicy, standalone at the ceiling (and the budget default)", async () => {
+    const { dailyCapSetting } = await import("../agent/loop.js");
+    expect(dailyCapSetting({ dailyCapCeilingCents: null, budget: null })).toBe("treasuryPolicy.maxInferenceDailyCents");
+    expect(dailyCapSetting({ dailyCapCeilingCents: 200, budget: null })).toBe("providers.dailyCapCeilingCents");
+    const budget = { allowanceCents: 3000 } as unknown as NonNullable<Parameters<typeof dailyCapSetting>[0]["budget"]>;
+    expect(dailyCapSetting({ dailyCapCeilingCents: 200, budget })).toMatch(/^providers\.dailyCapCeilingCents \(default 1\/15/);
+  });
+});

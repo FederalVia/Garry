@@ -1,0 +1,47 @@
+# The automaton as a dedicated Unix user (Linux, systemd). See docs/deployment.md.
+#
+# Before enabling: create the user and folders, run --setup as the agent user,
+# then run scripts/lock-owner-files.sh, which creates every path listed under
+# ReadOnlyPaths= (systemd refuses to start the unit when one is missing).
+[Unit]
+Description=Automaton agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automaton
+Group=automaton
+Environment=HOME=/var/lib/automaton
+Environment=NODE_ENV=production
+WorkingDirectory=/opt/automaton
+ExecStart=/usr/bin/node /opt/automaton/dist/index.js --run
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+# The state folder is the only place the agent writes.
+ReadWritePaths=/var/lib/automaton/.automaton
+# The owner's files and the owner database folder: read-only binds, the same
+# layout as the container. The file permissions set by lock-owner-files.sh
+# already deny writes; these binds also deny rename and unlink.
+ReadOnlyPaths=/var/lib/automaton/.automaton/automaton.json
+ReadOnlyPaths=/var/lib/automaton/.automaton/wallet.json
+ReadOnlyPaths=/var/lib/automaton/.automaton/config.json
+ReadOnlyPaths=/var/lib/automaton/.automaton/heartbeat.yml
+ReadOnlyPaths=/var/lib/automaton/.automaton/constitution.md
+ReadOnlyPaths=/var/lib/automaton/.automaton/inference-providers.json
+ReadOnlyPaths=/var/lib/automaton/.automaton/mcp-servers.json
+ReadOnlyPaths=/var/lib/automaton/.automaton/owner
+
+[Install]
+WantedBy=multi-user.target

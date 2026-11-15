@@ -61,6 +61,7 @@ import {
   MIGRATION_V16_INBOX_COLUMNS,
   MIGRATION_V16_RETIRE_BLOCKED,
   MIGRATION_V17,
+  MIGRATION_V20_ROLLUP,
   REGISTRY_CHAIN_KEY_REBUILD,
   MIGRATION_V18_POLICY_DECISIONS,
   MIGRATION_V18_MCP_CALLS,
@@ -735,6 +736,15 @@ function applyMigrations(db: DatabaseType): void {
       // Adds the model_registry provider columns (provider_id, remote_id,
       // listed, price_source, capabilities).
       apply: () => { migrateModelRegistryProviders(db); },
+    },
+    {
+      version: 20,
+      // Inference spend rollup (survives the 30-day prune), the treasury
+      // ledger's approval_id and the transfer approval requests.
+      apply: () => {
+        ensureInferenceLedger(db, Date.now());
+        ensureTreasuryLedger(db, Date.now());
+      },
     },
   ];
 
@@ -2681,9 +2691,11 @@ export function ensureInferenceLedger(
     .transaction(() => {
       if (sqliteTableExists(db, "inference_ledger")) {
         db.exec(MIGRATION_V13);
+        db.exec(MIGRATION_V20_ROLLUP);
         return { created: false, legacyCopied: 0 };
       }
       db.exec(MIGRATION_V13);
+      db.exec(MIGRATION_V20_ROLLUP);
       if (!sqliteTableExists(db, "inference_costs")) return { created: true, legacyCopied: 0 };
       const info = db.prepare(INFERENCE_LEGACY_COPY_SQL).run({ nowSec: Math.floor(nowMs / 1000) });
       return { created: true, legacyCopied: info.changes };

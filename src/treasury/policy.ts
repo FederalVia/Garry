@@ -143,8 +143,9 @@ export function budgetLimits(policy: ResolvedTreasuryPolicy, budget: BudgetId): 
   switch (budget) {
     case "transfer":
       return {
-        // No approval flow exists, so the confirmation threshold is a hard cap.
-        single: Math.min(policy.maxSingleTransferCents, policy.requireConfirmationAboveCents),
+        // Above requireConfirmationAboveCents a transfer also needs the
+        // owner's approval: a separate step in Treasury.evaluate().
+        single: policy.maxSingleTransferCents,
         hourly: policy.maxHourlyTransferCents,
         daily: policy.maxDailyTransferCents,
       };
@@ -239,6 +240,11 @@ export function x402DedupeKey(
 ): string {
   const bodyHash = createHash("sha256").update(body ?? "").digest("hex");
   return `x402|${method.toUpperCase()}|${url}|${bodyHash}|${atomic}`;
+}
+
+/** Every caller of an approved transfer uses this key, so replays and races meet on one key. */
+export function approvalDedupeKey(approvalId: string): string {
+  return `approval|${approvalId}`;
 }
 
 export function topupDedupeKey(purpose: TopupPurpose, amountUsd: number): string {

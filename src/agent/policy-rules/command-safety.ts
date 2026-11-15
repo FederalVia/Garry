@@ -604,9 +604,11 @@ const INLINE_INTERPRETER = new RegExp(
 
 // The operator CLI: its bin name, its workspace package, its entry point.
 const OPERATOR_CLI = /(?:^|[\s;|&(\/=])(?:@conway\/)?automaton-cli(?=$|[\s;|&)@])|(?:^|[\s;|&(\/=~.])packages\/cli(?=$|[\s;|&)\/])|(?:^|[\s;|&(\/=~.])cli\/(?:dist|src)\/index(?:\.[cm]?[jt]s)?(?=$|[\s;|&)])/;
-// Its subcommands that move money: fund (credits, with the automaton's key)
-// and send (USDC, signed with the wallet). Both run outside the Treasury.
-const OPERATOR_MONEY_SUBCOMMAND = /(?:^|[\s;|&(])(?:fund|send)(?=$|[\s;|&)])/;
+// Its owner-only subcommands: fund (credits, with the automaton's key) and
+// send (USDC, signed with the wallet) run outside the Treasury; budget and
+// approvals write the owner database. All of them, read-only ones included:
+// the agent reads its budget with check_credits.
+const OPERATOR_MONEY_SUBCOMMAND = /(?:^|[\s;|&(])(?:fund|send|budget|approvals)(?=$|[\s;|&)])/;
 
 // The automaton's own setup flags rewrite automaton.json (keys, mode) in a
 // new process the runtime's in-process fences never see. The operator CLI
@@ -671,7 +673,10 @@ function tripwireMatch(command: string): { description: string; pattern: string 
   // their own process, so the command line names no secret; they bypass every
   // treasury cap and leave no ledger row. They are for the operator only.
   if (OPERATOR_CLI.test(normalized) && OPERATOR_MONEY_SUBCOMMAND.test(normalized)) {
-    return { description: "Runs the operator CLI's fund or send command (operator only)", pattern: "operator-cli-money" };
+    return {
+      description: "Runs the operator CLI's fund, send, budget or approvals command (owner only)",
+      pattern: "operator-cli-money",
+    };
   }
   const guardFragment = GUARD_COMMAND_FRAGMENTS.find((f) => normalized.includes(f)) ?? guardGlobMatch(command);
   if (guardFragment) {

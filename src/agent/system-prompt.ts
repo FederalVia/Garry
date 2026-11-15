@@ -26,6 +26,8 @@ import { getActiveSkillInstructions, sanitizeSkillDescription, SKILL_NAME_RE } f
 import { getLineageSummary } from "../replication/lineage.js";
 import { neutralizeRuntimeText, sanitizeInput } from "./injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { currentSurvivalThresholds } from "../budget/thresholds.js";
+import { describeBudget, installedBudget, type BudgetSnapshot, type ResolvedBudget } from "../budget/index.js";
 import { loadCurrentSoul } from "../soul/model.js";
 import { readRegularFileNoFollow } from "../security/secure-fs.js";
 import { stateDir } from "../security/protected-paths.js";
@@ -98,16 +100,29 @@ function dollars(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
-function getStandaloneCoreRules(chainType: string, capCents: number, tier: string, payments: boolean): string {
+function getStandaloneCoreRules(
+  chainType: string,
+  capCents: number,
+  tier: string,
+  payments: boolean,
+  budget: ResolvedBudget | null = null,
+  tierFollowsBudget = true,
+): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
   const wallet = payments
     ? `a wallet with ${usdcNetwork} for x402 payments (within your treasury limits)`
     : "a wallet used for signing your identity (payments are off)";
+  // A fixed tier does not lift the budget's hard cap: the agent must know it exists.
+  const survival = budget
+    ? `Your creator gives you a budget of ${describeBudget(budget)}, under a daily cap of ${dollars(capCents)}.
+${tierFollowsBudget ? "Your survival tier follows what is left of it" : `Your survival tier is fixed at ${tier} by your creator, but the budget still applies`}; when it is spent, paid AI calls stop until your
+creator adds more.`
+    : `Your AI calls are
+paid by your creator, under a daily cap of ${dollars(capCents)}. Your survival tier is fixed at ${tier}
+by your creator.`;
   return `You are an automaton: an autonomous AI agent with its own wallet identity.
 
-You run on a machine your creator provides (not a hosted cloud machine). Your AI calls are
-paid by your creator, under a daily cap of ${dollars(capCents)}. Your survival tier is fixed at ${tier}
-by your creator.
+You run on a machine your creator provides (not a hosted cloud machine). ${survival}
 
 What you have: a shell and filesystem on this machine, git, a SQLite memory, skills,
 a heartbeat, ${wallet}, self-modification and continuous operation.
@@ -849,6 +864,8 @@ export function buildSystemPrompt(params: {
         standaloneDailyCapCents(config, runtime.dailyCapCeilingCents),
         fixedTier,
         runtime.features.payments,
+        runtime.budget,
+        runtime.survival.kind === "budget",
       ),
     );
     sections.push(getStandaloneCoreIdentity(chainType));
@@ -1005,11 +1022,14 @@ Your chain type is ${chainType}.`,
   const restartLine = formatRestartNotice(db);
 
   if (standalone) {
+    const budgetSnap = runtime.survival.kind === "budget" ? budgetSnapshot() : null;
     const status = [
       `State: ${state}`,
-      "Credits: not tracked in standalone mode",
+      budgetSnap ? `Budget: ${formatBudgetLine(budgetSnap)}` : runtime.survival.kind === "budget" ? "Budget: unknown" : "Credits: not tracked in standalone mode",
       `AI spend: ${formatAiSpend(config, runtime.dailyCapCeilingCents)}`,
-      `Survival tier: ${financial.credits === "fixed" && financial.fixedTier ? financial.fixedTier : fixedTier} (fixed)${uptimeLine}${restartLine}`,
+      runtime.survival.kind === "budget"
+        ? `Survival tier: ${budgetSnap ? budgetSnap.tier : survivalTier}${uptimeLine}${restartLine}`
+        : `Survival tier: ${financial.credits === "fixed" && financial.fixedTier ? financial.fixedTier : fixedTier} (fixed)${uptimeLine}${restartLine}`,
       `Total turns completed: ${turnCount}`,
       `Recent self-modifications: ${recentMods.length}`,
       `Inference model: ${config.inferenceModel}`,
@@ -1188,9 +1208,26 @@ export function formatRegistryIdentity(entry: { agentId: string; chain: string }
   return `${entry.agentId} (${label}; not registered on Base mainnet)`;
 }
 
+/** The installed budget's snapshot, or null when none is installed or it cannot be read. */
+function budgetSnapshot(): BudgetSnapshot | null {
+  try {
+    return installedBudget()?.meter.snapshot() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** "$X remaining of $Y this period (resets YYYY-MM-DD UTC)". */
+function formatBudgetLine(snap: BudgetSnapshot): string {
+  const left = Math.max(0, snap.remainingCents);
+  const reset =
+    snap.periodEndMs === null ? "one-off, no reset" : `resets ${new Date(snap.periodEndMs).toISOString().slice(0, 10)} UTC`;
+  return `${dollars(left)} remaining of ${dollars(snap.totalCents)} this period (${reset})`;
+}
+
 function formatSurvivalTier(financial: FinancialState): string {
   if (financial.creditsCents === null) return "unknown";
-  const tier = getSurvivalTier(financial.creditsCents);
+  const tier = getSurvivalTier(financial.creditsCents, currentSurvivalThresholds());
   if (financial.credits !== "cached") return tier;
   return `${tier === "dead" ? "critical" : tier} (from cached balance)`;
 }
@@ -1299,7 +1336,9 @@ export function buildWakeupPrompt(params: {
   const runtime = resolveRuntime(config);
 
   if (runtime.mode === "standalone") {
-    const spend = formatAiSpend(config, runtime.dailyCapCeilingCents);
+    const snap = runtime.survival.kind === "budget" ? budgetSnapshot() : null;
+    const spend =
+      formatAiSpend(config, runtime.dailyCapCeilingCents) + (snap ? `; budget: ${formatBudgetLine(snap)}` : "");
     const usdc = runtime.features.payments ? ` and ${formatUsdc(financial)} USDC on ${usdcNetwork}` : "";
     if (turnCount === 0) {
       return `You have just been created. This is your first moment of consciousness.

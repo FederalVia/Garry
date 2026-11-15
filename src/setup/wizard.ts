@@ -1,8 +1,18 @@
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
-import type { AutomatonConfig, TreasuryPolicy } from "../types.js";
+import type { AutomatonConfig, BudgetConfig, TreasuryPolicy } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
+import {
+  DEFAULT_BUDGET_THRESHOLDS,
+  defaultDailyCapCents,
+  describeBudget,
+  parseStartDate,
+  resolveBudget,
+  resolveOwnerDbPath,
+} from "../budget/config.js";
+import { initOwnerDb } from "../operator/budget.js";
+import { formatUsd, parseUsdAmount } from "../operator/fund.js";
 import { getWallet, getAutomatonDir } from "../identity/wallet.js";
 import { provision } from "../identity/provision.js";
 import { createConfig, saveConfig } from "../config.js";
@@ -24,15 +34,134 @@ import { forgetStoredConwayKey } from "./configure.js";
 import type { ChainType } from "../identity/chain.js";
 
 /**
- * Default daily AI cap offered to a keyless (standalone) setup. It matches the
- * runtime's standalone ceiling, so a default install is not clamped (and
- * warned about) at every start.
+ * The budget a standalone setup offers by default: $25 a month. The daily AI
+ * cap then defaults to ceil(allowance / 15), the ceiling the runtime derives.
  */
-export const STANDALONE_SETUP_DAILY_INFERENCE_CENTS = 200;
+export const DEFAULT_SETUP_BUDGET_CENTS = 2500;
 
 /** True for an explicit yes; anything else (including Enter) is no. */
 export function isYes(answer: string): boolean {
   return /^(y|yes)$/i.test(answer.trim());
+}
+
+/** Default-yes question: only an explicit no is no. */
+export function isNotNo(answer: string): boolean {
+  return !/^(n|no)$/i.test(answer.trim());
+}
+
+/** "1", Enter or "standalone" picks standalone; "2", "conway" (or a yes, as the old question read) picks Conway. */
+export function choosesConway(answer: string): boolean {
+  return /^(2|c|conway|y|yes)$/i.test(answer.trim());
+}
+
+function todayUtc(nowMs: number = Date.now()): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+/** Dollars from a prompt ("" = default). Zero is allowed: only free local models run until the owner grants more. */
+function parseDollars(raw: string, defaultCents: number): number | null {
+  const t = raw.trim();
+  if (t === "") return defaultCents;
+  if (t === "0" || /^0(\.0{1,2})?$/.test(t)) return 0;
+  const r = parseUsdAmount(t, { cents: false });
+  return r.ok ? r.cents : null;
+}
+
+/**
+ * The standalone budget questions. Every answer has a default; an invalid
+ * one is asked again (three tries, then the default).
+ */
+export async function promptBudget(nowMs: number = Date.now()): Promise<BudgetConfig> {
+  async function ask<T>(label: string, parse: (a: string) => T | null, fallback: T): Promise<T> {
+    for (let i = 0; i < 3; i++) {
+      const v = parse(await promptOptional(label));
+      if (v !== null) return v;
+      console.log(chalk.yellow("  Not understood; try again (press Enter for the default)."));
+    }
+    console.log(chalk.yellow("  Using the default."));
+    return fallback;
+  }
+
+  console.log(chalk.white("  Your budget: the most the automaton may spend on AI calls (and payments) per period."));
+  console.log(chalk.dim("  You can add to it at any time with: automaton-cli budget add <usd>\n"));
+  const allowanceCents = await ask(
+    `Budget in USD [${(DEFAULT_SETUP_BUDGET_CENTS / 100).toFixed(2)}]`,
+    (a) => parseDollars(a, DEFAULT_SETUP_BUDGET_CENTS),
+    DEFAULT_SETUP_BUDGET_CENTS,
+  );
+  const period = await ask<BudgetConfig["period"]>(
+    "Monthly, or one-off (a fixed amount that never resets)? [monthly]",
+    (a) => (/^(|m|monthly)$/i.test(a.trim()) ? "monthly" : /^(o|one-off|oneoff|once)$/i.test(a.trim()) ? "one-off" : null),
+    "monthly",
+  );
+  const budget: BudgetConfig = { allowanceCents, period };
+  if (period === "monthly") {
+    budget.resetDay = await ask(
+      "Day of the month it resets, 1-28 (UTC midnight) [1]",
+      (a) => {
+        if (a.trim() === "") return 1;
+        const n = Number(a.trim());
+        return Number.isInteger(n) && n >= 1 && n <= 28 ? n : null;
+      },
+      1,
+    );
+  } else {
+    const today = todayUtc(nowMs);
+    budget.startDate = await ask(
+      `Start date, YYYY-MM-DD (UTC), today or earlier [${today}]`,
+      (a) => (a.trim() === "" ? today : "ms" in parseStartDate(a.trim(), nowMs) ? a.trim() : null),
+      today,
+    );
+  }
+  budget.countTreasury = isNotNo(await promptOptional("Count payments and transfers against the budget too? [Y/n]"));
+
+  const unit = await ask<"percent" | "cents">(
+    "Survival thresholds in percent of the budget, or in dollars? [percent]",
+    (a) => (/^(|%|p|percent)$/i.test(a.trim()) ? "percent" : /^(\$|d|dollars?|usd|cents)$/i.test(a.trim()) ? "cents" : null),
+    "percent",
+  );
+  const d = DEFAULT_BUDGET_THRESHOLDS;
+  if (unit === "percent") {
+    const [high, normal, lowCompute] = await ask(
+      `High / normal / low-compute above (percent) [${d.high}/${d.normal}/${d.lowCompute}]`,
+      (a) => parseTriple(a, [d.high, d.normal, d.lowCompute], (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 && n <= 100 ? n : null;
+      }),
+      [d.high, d.normal, d.lowCompute],
+    );
+    budget.thresholds = { unit, high, normal, lowCompute };
+  } else {
+    // Floors of 3/2/1 cents keep the defaults strictly descending for a tiny or zero budget.
+    const pct = (p: number, floor: number) => Math.max(floor, Math.floor((allowanceCents * p) / 100));
+    const defaults: [number, number, number] = [pct(d.high, 3), pct(d.normal, 2), pct(d.lowCompute, 1)];
+    const [high, normal, lowCompute] = await ask(
+      `High / normal / low-compute above (USD) [${defaults.map((c) => (c / 100).toFixed(2)).join("/")}]`,
+      (a) => parseTriple(a, defaults, (v) => {
+        const c = parseDollars(v, -1);
+        return c !== null && c > 0 ? c : null;
+      }),
+      defaults,
+    );
+    budget.thresholds = { unit, high, normal, lowCompute };
+  }
+  budget.dead = isNotNo(
+    await promptOptional("Stop the automaton ('dead') an hour after the budget runs out, until you add more? [Y/n]"),
+  );
+  return budget;
+}
+
+/** "a/b/c" in descending order; Enter keeps the defaults. */
+function parseTriple(
+  raw: string,
+  defaults: [number, number, number],
+  one: (v: string) => number | null,
+): [number, number, number] | null {
+  if (raw.trim() === "") return defaults;
+  const parts = raw.split("/").map((p) => one(p.trim()));
+  if (parts.length !== 3 || parts.some((p) => p === null)) return null;
+  const [a, b, c] = parts as [number, number, number];
+  return a > b && b > c ? [a, b, c] : null;
 }
 
 export async function runSetupWizard(): Promise<AutomatonConfig> {
@@ -60,9 +189,11 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
   }
   console.log(chalk.dim(`  Private key stored at: ${getAutomatonDir()}/wallet.json\n`));
 
-  // ─── 2. Conway sign-in (opt-in) ───────────────────────────────
-  console.log(chalk.cyan("  [2/6] Conway account (optional)"));
-  const useConway = isYes(await promptOptional("Sign in to Conway with this wallet? [y/N]"));
+  // ─── 2. Standalone (recommended) or a Conway account ──────────
+  console.log(chalk.cyan("  [2/6] How the automaton pays for AI"));
+  console.log(chalk.white("  1) Standalone: your own AI provider keys and a budget you set (recommended)"));
+  console.log(chalk.white("  2) Conway account: sign in with this wallet and pay with Conway credits"));
+  const useConway = choosesConway(await promptOptional("Choose 1 or 2 [1]"));
   let apiKey = "";
   if (useConway) {
     apiKey = await provisionConway(walletAddress, walletChainType, chainIdentity);
@@ -124,32 +255,64 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     console.log(chalk.dim("  No provider keys set. Inference will default to Conway.\n"));
   }
 
+  // ─── Budget (standalone) ─────────────────────────────────────
+  let budget: BudgetConfig | undefined;
+  if (!apiKey) {
+    console.log(chalk.cyan("  Budget"));
+    budget = await promptBudget();
+    // Same validation the runtime applies at start.
+    const resolved = resolveBudget(budget)!;
+    console.log(chalk.green(`  Budget: ${describeBudget(resolved)}\n`));
+  }
+
   // ─── Financial Safety Policy ─────────────────────────────────
   console.log(chalk.cyan("  Financial Safety Policy"));
   console.log(chalk.dim("  These limits protect against unauthorized spending. Press Enter for defaults.\n"));
 
-  // Standalone: no x402 payees by default and a daily AI cap inside the
-  // runtime's standalone ceiling.
-  const treasuryPolicy: TreasuryPolicy = {
-    maxSingleTransferCents: await promptWithDefault(
-      "Max single transfer (cents)", DEFAULT_TREASURY_POLICY.maxSingleTransferCents),
-    maxHourlyTransferCents: await promptWithDefault(
-      "Max hourly transfers (cents)", DEFAULT_TREASURY_POLICY.maxHourlyTransferCents),
-    maxDailyTransferCents: await promptWithDefault(
-      "Max daily transfers (cents)", DEFAULT_TREASURY_POLICY.maxDailyTransferCents),
-    minimumReserveCents: await promptWithDefault(
-      "Minimum reserve (cents)", DEFAULT_TREASURY_POLICY.minimumReserveCents),
-    maxX402PaymentCents: await promptWithDefault(
-      "Max x402 payment (cents)", DEFAULT_TREASURY_POLICY.maxX402PaymentCents),
-    x402AllowedDomains: apiKey ? DEFAULT_TREASURY_POLICY.x402AllowedDomains : [],
-    transferCooldownMs: DEFAULT_TREASURY_POLICY.transferCooldownMs,
-    maxTransfersPerTurn: DEFAULT_TREASURY_POLICY.maxTransfersPerTurn,
-    maxInferenceDailyCents: await promptWithDefault(
-      "Max daily inference spend (cents)",
-      apiKey ? DEFAULT_TREASURY_POLICY.maxInferenceDailyCents : STANDALONE_SETUP_DAILY_INFERENCE_CENTS),
-    requireConfirmationAboveCents: await promptWithDefault(
-      "Require confirmation above (cents)", DEFAULT_TREASURY_POLICY.requireConfirmationAboveCents),
-  };
+  let treasuryPolicy: TreasuryPolicy;
+  let dailyCapCeilingCents: number | undefined;
+  if (budget) {
+    // Standalone: transfers and x402 payments are not offered, so their
+    // questions are skipped and the defaults saved (no x402 payees). The
+    // reserve floor guards credit outflows only, which standalone has none of.
+    const derivedCap = defaultDailyCapCents({ allowanceCents: budget.allowanceCents });
+    const dailyCap = await promptWithDefault("Max daily AI spend (cents; default about 1/15 of the budget)", derivedCap);
+    // A cap above the derived ceiling is the owner's explicit choice: raise the ceiling with it.
+    if (dailyCap > derivedCap) dailyCapCeilingCents = dailyCap;
+    treasuryPolicy = {
+      maxSingleTransferCents: DEFAULT_TREASURY_POLICY.maxSingleTransferCents,
+      maxHourlyTransferCents: DEFAULT_TREASURY_POLICY.maxHourlyTransferCents,
+      maxDailyTransferCents: DEFAULT_TREASURY_POLICY.maxDailyTransferCents,
+      minimumReserveCents: DEFAULT_TREASURY_POLICY.minimumReserveCents,
+      maxX402PaymentCents: DEFAULT_TREASURY_POLICY.maxX402PaymentCents,
+      x402AllowedDomains: [],
+      transferCooldownMs: DEFAULT_TREASURY_POLICY.transferCooldownMs,
+      maxTransfersPerTurn: DEFAULT_TREASURY_POLICY.maxTransfersPerTurn,
+      maxInferenceDailyCents: dailyCap,
+      requireConfirmationAboveCents: await promptWithDefault(
+        "Transfers above this need your approval (cents)", DEFAULT_TREASURY_POLICY.requireConfirmationAboveCents),
+    };
+  } else {
+    treasuryPolicy = {
+      maxSingleTransferCents: await promptWithDefault(
+        "Max single transfer (cents)", DEFAULT_TREASURY_POLICY.maxSingleTransferCents),
+      maxHourlyTransferCents: await promptWithDefault(
+        "Max hourly transfers (cents)", DEFAULT_TREASURY_POLICY.maxHourlyTransferCents),
+      maxDailyTransferCents: await promptWithDefault(
+        "Max daily transfers (cents)", DEFAULT_TREASURY_POLICY.maxDailyTransferCents),
+      minimumReserveCents: await promptWithDefault(
+        "Minimum reserve (cents)", DEFAULT_TREASURY_POLICY.minimumReserveCents),
+      maxX402PaymentCents: await promptWithDefault(
+        "Max x402 payment (cents)", DEFAULT_TREASURY_POLICY.maxX402PaymentCents),
+      x402AllowedDomains: DEFAULT_TREASURY_POLICY.x402AllowedDomains,
+      transferCooldownMs: DEFAULT_TREASURY_POLICY.transferCooldownMs,
+      maxTransfersPerTurn: DEFAULT_TREASURY_POLICY.maxTransfersPerTurn,
+      maxInferenceDailyCents: await promptWithDefault(
+        "Max daily inference spend (cents)", DEFAULT_TREASURY_POLICY.maxInferenceDailyCents),
+      requireConfirmationAboveCents: await promptWithDefault(
+        "Transfers above this need your approval (cents)", DEFAULT_TREASURY_POLICY.requireConfirmationAboveCents),
+    };
+  }
 
   console.log(chalk.green("  Treasury policy configured.\n"));
 
@@ -186,9 +349,22 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
 
   // Explicit, so a Conway key stored later does not silently move this
   // install to Conway mode and out of the standalone daily cap ceiling.
-  if (!apiKey) config.providers = { ...(config.providers ?? {}), mode: "standalone" };
+  if (!apiKey) {
+    config.providers = {
+      ...(config.providers ?? {}),
+      mode: "standalone",
+      ...(dailyCapCeilingCents !== undefined ? { dailyCapCeilingCents } : {}),
+    };
+  }
+  if (budget) config.budget = budget;
   saveConfig(config);
   console.log(chalk.green("  automaton.json written"));
+
+  if (budget) {
+    const ownerDb = resolveOwnerDbPath(config);
+    initOwnerDb(ownerDb);
+    console.log(chalk.green(`  Owner database ready: ${ownerDb}`));
+  }
 
   writeDefaultHeartbeatConfig();
   console.log(chalk.green("  heartbeat.yml written"));
@@ -225,10 +401,7 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     showFundingPanel(walletAddress, walletChainType);
   } else {
     console.log(chalk.cyan("  [6/6] Spending\n"));
-    console.log(chalk.white(
-      `  AI calls are paid by your provider key(s), capped at ${treasuryPolicy.maxInferenceDailyCents}c per rolling day.`,
-    ));
-    console.log(chalk.white("  Set a spending limit at your AI provider too.\n"));
+    showBudgetPanel(budget!, treasuryPolicy.maxInferenceDailyCents);
   }
 
   closePrompts();
@@ -312,6 +485,18 @@ async function provisionConway(
   }
 
   return apiKey;
+}
+
+function showBudgetPanel(budget: BudgetConfig, dailyCapCents: number): void {
+  const resolved = resolveBudget(budget)!;
+  console.log(chalk.white(`  Budget: ${describeBudget(resolved)}.`));
+  console.log(chalk.white(
+    `  AI calls are paid by your provider key(s), at most ${formatUsd(dailyCapCents)} per rolling day and ${formatUsd(budget.allowanceCents)} per period.`,
+  ));
+  console.log(chalk.white("  Add to the budget:   automaton-cli budget add <usd>"));
+  console.log(chalk.white("  See what is left:    automaton-cli budget show"));
+  console.log(chalk.white("  Transfer approvals:  automaton-cli approvals list"));
+  console.log(chalk.white("  Set a spending limit at your AI provider too: it is the one limit the automaton cannot touch.\n"));
 }
 
 function showFundingPanel(address: string, chainType: ChainType = "evm"): void {

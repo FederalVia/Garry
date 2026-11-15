@@ -60,6 +60,7 @@ import { readUsdcAuthorizationState } from "./conway/x402.js";
 import { Treasury, installTreasury, normalizeTreasuryPolicy } from "./treasury/index.js";
 import { InferenceGate, installInferenceGate } from "./inference/gate.js";
 import { getSurvivalTier } from "./conway/credits.js";
+import { currentSurvivalThresholds } from "./budget/thresholds.js";
 import { resolveInferencePolicy, registryPrice, checkPolicySanity } from "./inference/policy.js";
 import { DEFAULT_ROUTING_MATRIX } from "./inference/types.js";
 import { protectRuntimeFile } from "./security/protected-paths.js";
@@ -73,6 +74,7 @@ import {
   configuredOpenAiModelIds,
 } from "./providers/mode.js";
 import { createStandaloneClient } from "./providers/standalone-client.js";
+import { createBudget, installBudget, resolveOwnerDbPath, OwnerDbReader } from "./budget/index.js";
 import { BalanceUnavailableError } from "./conway/balance.js";
 import { holdsSlot } from "./replication/child-status.js";
 import { randomUUID } from "crypto";
@@ -366,6 +368,15 @@ async function run(): Promise<void> {
   // ─── Mode: one line, before anything else starts ───
   const runtime = resolveRuntime(config);
   logger.info(describeRuntime(runtime, describeRelay(config)));
+  if (runtime.budgetIgnored) {
+    logger.warn(
+      [
+        "!!! automaton.json has a budget block, but this agent runs in Conway mode !!!",
+        "!!! The budget is IGNORED: Conway credits are the balance and no period cap applies.",
+        '!!! Set providers.mode to "standalone" to use the budget.',
+      ].join("\n"),
+    );
+  }
   if (runtime.mode === "conway" && !config.conwayApiKey) {
     fail(
       'No Conway API key found. Run: automaton --provision, or set providers.mode to "standalone" ' +
@@ -445,7 +456,17 @@ async function run(): Promise<void> {
         );
       }
     } catch (err: any) {
-      fail(`Could not save providers.mode "standalone" to ${getConfigPath()}: ${err?.message || String(err)}`);
+      // A read-only automaton.json (container mount, locked owner files)
+      // cannot gain a Conway key either: pin in memory and say how to fix it.
+      if (["EROFS", "EACCES", "EPERM", "EBUSY", "EXDEV"].includes(err?.code)) {
+        config.providers = { ...(config.providers ?? {}), mode: "standalone" };
+        logger.warn(
+          `automaton.json is read-only, so providers.mode "standalone" was not saved; it applies to this run. ` +
+            'Add "providers": { "mode": "standalone" } to automaton.json so a Conway key can never switch modes.',
+        );
+      } else {
+        fail(`Could not save providers.mode "standalone" to ${getConfigPath()}: ${err?.message || String(err)}`);
+      }
     }
   }
   // The Conway egress fence reads this.
@@ -571,6 +592,19 @@ async function run(): Promise<void> {
   // anything can spend.
   // Standalone: local commands, files and ports; every Conway-only call
   // fails with FEATURE_DISABLED before any I/O.
+  // The owner's budget (standalone): a meter over this database and the
+  // read-only owner database. In every mode the owner database also holds
+  // the owner's transfer approval decisions.
+  const budget = runtime.budget ? createBudget(db.raw, config) : null;
+  const ownerDb = budget?.owner ?? new OwnerDbReader(resolveOwnerDbPath(config));
+  installBudget(budget);
+  if (budget) {
+    const snap = budget.meter.snapshot();
+    logger.info(
+      `Budget: $${(Math.max(0, snap.remainingCents) / 100).toFixed(2)} of $${(snap.totalCents / 100).toFixed(2)} left this period ` +
+        `(tier ${snap.tier}; owner database ${ownerDb.path}${snap.ownerDbStale ? ", unreadable: using 0 grants" : ""}).`,
+    );
+  }
   const conway =
     runtime.mode === "conway"
       ? createConwayClient({
@@ -578,7 +612,7 @@ async function run(): Promise<void> {
           apiKey,
           sandboxId: config.sandboxId,
         })
-      : createStandaloneClient();
+      : createStandaloneClient({ budget: budget?.meter });
 
   // Treasury: the one spending gate. The normalized policy is shared by the
   // policy rules and the gate, so both enforce the same numbers. Standalone
@@ -590,12 +624,16 @@ async function run(): Promise<void> {
   // The gate's balance reads use their own client, so a circuit breaker
   // opened by unrelated failures (sandbox exec) does not refuse every outflow.
   // It also throws on a missing balance instead of reading it as zero.
+  // Standalone with a budget: the budget is the balance, unclamped, so the
+  // reserve floor and half-balance rules apply to it.
   const readCreditBalance =
     runtime.mode === "conway"
       ? createCreditBalanceReader({ apiUrl: config.conwayApiUrl, apiKey })
-      : async (): Promise<number> => {
-          throw new BalanceUnavailableError("disabled", "no credit balance in standalone mode");
-        };
+      : budget
+        ? async (): Promise<number> => budget.meter.snapshot().remainingCents
+        : async (): Promise<number> => {
+            throw new BalanceUnavailableError("disabled", "no credit balance in standalone mode");
+          };
   const treasury = new Treasury({
     db: db.raw,
     policy: treasuryPolicy,
@@ -607,6 +645,8 @@ async function run(): Promise<void> {
     conwayApiUrl: config.conwayApiUrl,
     // acquireInstanceLock above: no other boot is alive on this database.
     holdsInstanceLock: true,
+    budget: budget ? { remainingCents: (now) => budget.meter.remainingCents(now), countsTreasury: budget.budget.countTreasury } : undefined,
+    approvals: { decision: (id) => ownerDb.decision(id) },
   });
   installTreasury(treasury);
 
@@ -615,9 +655,10 @@ async function run(): Promise<void> {
   // treasuryPolicy.maxInferenceDailyCents.
   const inferencePolicy = resolveInferencePolicy(config, treasuryPolicy, {
     ceilingCents: runtime.dailyCapCeilingCents,
+    survivalRoomCents: runtime.survivalRoomCents,
   });
   const fixedTier = runtime.survival.kind === "fixed" ? runtime.survival.tier : undefined;
-  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy, fixedTier });
+  const inferenceGate = new InferenceGate({ db: db.raw, policy: inferencePolicy, fixedTier, budget: budget?.meter });
   installInferenceGate(inferenceGate);
   if (runtime.payments) {
     // Resolve payments a previous run left without an answer.
@@ -849,7 +890,7 @@ async function run(): Promise<void> {
         sinceSurvivalRefresh = 0;
         try {
           const creditsCents = await conway.getCreditsBalance();
-          inferenceGate.setSurvival({ tier: getSurvivalTier(creditsCents), creditsCents });
+          inferenceGate.setSurvival({ tier: getSurvivalTier(creditsCents, currentSurvivalThresholds()), creditsCents });
         } catch (err: any) {
           logger.warn(`Survival tier refresh failed: ${err?.message || String(err)}`);
         }

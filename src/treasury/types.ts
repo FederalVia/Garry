@@ -54,7 +54,15 @@ export type TreasuryDenyCode =
   | "TOPUP_NOT_NEEDED"
   | "ORIGIN_NOT_ALLOWED"
   | "PRICE_UNKNOWN"
-  | "TREASURY_NOT_INSTALLED";
+  | "TREASURY_NOT_INSTALLED"
+  /** Above requireConfirmationAboveCents: needs the owner's approval. Everything else passed. */
+  | "APPROVAL_REQUIRED"
+  /** The approval does not exist, is not approved, has expired, or differs from the transfer. */
+  | "APPROVAL_INVALID"
+  /** The approval already executed (or is executing). */
+  | "APPROVAL_USED"
+  /** More than the owner's budget has left this period. */
+  | "BUDGET_EXHAUSTED";
 
 /** Who started an outflow. Stored on every ledger row. */
 export interface TreasuryOrigin {
@@ -99,6 +107,11 @@ export interface OutflowQuote {
   amountAtomic?: bigint;
   /** x402_payment / credit_topup: required. */
   x402?: X402AuthorizationFields;
+  /**
+   * credit_transfer only: the owner-approved request this executes. The
+   * dedupe key must then be "approval|<id>".
+   */
+  approvalId?: string;
 }
 
 export interface Reservation {

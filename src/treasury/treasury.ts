@@ -32,6 +32,7 @@ import {
   HOUR_MS,
   USDC_KINDS,
   X402_MAX_VALIDITY_SECONDS,
+  approvalDedupeKey,
   autoFundDailyCap,
   budgetFor,
   budgetLimits,
@@ -47,6 +48,7 @@ import {
   type LedgerRow,
 } from "./ledger.js";
 import { currentTreasuryOrigin, processBootId } from "./registry.js";
+import type { ApprovalDecision } from "../budget/owner-db.js";
 import {
   OutcomeUnknownError,
   TreasuryDeniedError,
@@ -128,6 +130,14 @@ export interface TreasuryDeps {
    * not leave them open). The hourly recovery pass keeps the time condition.
    */
   holdsInstanceLock?: boolean;
+  /**
+   * The owner's budget (standalone). With countsTreasury, an outflow above
+   * what the budget has left this period is denied BUDGET_EXHAUSTED.
+   * remainingCents is read inside the reserve transaction.
+   */
+  budget?: { remainingCents(nowMs: number): number; countsTreasury: boolean };
+  /** The owner's transfer approval decisions, read-only from the owner database. */
+  approvals?: { decision(requestId: string): ApprovalDecision | null };
 }
 
 /** What an authorizationState read can say; see TreasuryDeps.readAuthorizationState. */
@@ -297,14 +307,15 @@ export class Treasury {
            amount_atomic, amount_basis, debits_credits, counterparty, dedupe_key, origin_type, origin_name,
            input_source, boot_id, topup_purpose, url, description, x402_nonce, x402_valid_before, x402_from,
            x402_network, x402_asset, balance_observed_cents, balance_read_started_ms, balance_unknown,
-           created_at_ms, updated_at_ms)
+           approval_id, created_at_ms, updated_at_ms)
          VALUES (@id, @idempotencyKey, @replayOf, @kind, @budget, 'reserved', @amount, @atomic, @basis,
            @debits, @counterparty, @dedupeKey, @originType, @originName, @inputSource, @bootId,
            @topupPurpose, @url, @description, @nonce, @validBefore, @from, @network, @asset,
-           @balance, @balanceStarted, @balanceUnknown, @now, @now)`,
+           @balance, @balanceStarted, @balanceUnknown, @approvalId, @now, @now)`,
       )
       .run({
         id,
+        approvalId: typeof quote.approvalId === "string" ? quote.approvalId : null,
         idempotencyKey,
         replayOf: verdict.pass.replayOf ?? null,
         kind: quote.kind,
@@ -412,6 +423,16 @@ export class Treasury {
     if (kind === "credit_transfer" && sameAddress(quote.counterparty, this.deps.selfAddress)) {
       return no("SELF_TRANSFER", "Credit transfers to this automaton's own address are refused");
     }
+
+    // An approved transfer: valid only against the owner's decision row
+    // (never the agent-written request), and only once.
+    const approvalId = quote.approvalId;
+    let approvalUnknownRow = false;
+    if (approvalId !== undefined) {
+      const approval = this.checkApproval(quote, approvalId, now);
+      if (!approval.ok) return approval;
+      approvalUnknownRow = approval.unknownRow;
+    }
     if (kind === "x402_payment") {
       if (!isX402HostAllowed(quote.url!, policy.x402AllowedDomains)) {
         return no(
@@ -445,6 +466,11 @@ export class Treasury {
     let pass: Pass = {};
     if (kind === "credit_transfer") {
       const replay = this.replayTarget(quote.dedupeKey, now);
+      // An approval whose transfer has an unknown outcome runs again only as
+      // a replay with the original idempotency key.
+      if (approvalUnknownRow && !replay) {
+        return no("APPROVAL_USED", `Approval ${approvalId} was used; its transfer has an unknown outcome`);
+      }
       if (replay) {
         if (replay.replays >= MAX_TRANSFER_REPLAYS) {
           return no(
@@ -589,6 +615,18 @@ export class Treasury {
       }
     }
 
+    // The owner's budget: the hard cap for every outflow kind (x402 too).
+    if (this.deps.budget?.countsTreasury) {
+      const left = this.deps.budget.remainingCents(now);
+      if (amount > left) {
+        return no(
+          "BUDGET_EXHAUSTED",
+          `${amount}c exceeds what the owner's budget has left this period (${Math.max(0, left)}c); ` +
+            "your owner can add more with: automaton-cli budget add <usd>",
+        );
+      }
+    }
+
     // I3 reserve floor, I4 half balance.
     if (debits) {
       if (prep.balanceCents === null || prep.balanceReadStartedMs === null) {
@@ -606,7 +644,67 @@ export class Treasury {
       }
     }
 
+    // Last, so the denial means every other check passes right now.
+    if (budget === "transfer" && approvalId === undefined && amount > policy.requireConfirmationAboveCents) {
+      return no(
+        "APPROVAL_REQUIRED",
+        `${amount}c is above ${policy.requireConfirmationAboveCents}c and needs the owner's approval`,
+      );
+    }
+
     return ok(pass);
+  }
+
+  /**
+   * The approval must be the owner's 'approved' decision for exactly this
+   * kind, recipient and amount, within its execute-by time, and must not have
+   * been used: a reserved, sent or committed row with it means used; an
+   * unknown row allows only a replay (unknownRow).
+   */
+  private checkApproval(
+    quote: OutflowQuote,
+    approvalId: string,
+    now: number,
+  ): { ok: true; unknownRow: boolean } | { ok: false; fail: Fail } {
+    const invalid = (why: string) => ({ ok: false as const, fail: { code: "APPROVAL_INVALID" as const, message: `Approval ${approvalId}: ${why}` } });
+    if (quote.kind !== "credit_transfer") return invalid("only credit transfers can be approved");
+    if (quote.dedupeKey !== approvalDedupeKey(approvalId)) return invalid("the dedupe key must be the approval's");
+    const d = this.deps.approvals?.decision(approvalId) ?? null;
+    if (!d) return invalid("no owner decision");
+    if (d.requestId !== approvalId) return invalid("decision does not belong to this request");
+    if (d.decision !== "approved") return invalid(`the owner ${d.decision} it`);
+    if (d.kind !== "credit_transfer") return invalid("the decision is not for a credit transfer");
+    if (d.amountCents !== quote.amountCents) {
+      return invalid(`the owner approved ${d.amountCents}c, not ${quote.amountCents}c`);
+    }
+    if (!sameAddress(d.counterparty, quote.counterparty)) {
+      return invalid(`the owner approved a transfer to ${d.counterparty}, not ${quote.counterparty}`);
+    }
+    if (d.executeByMs === null || now > d.executeByMs) return invalid("the approval expired");
+    const rows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS n FROM treasury_ledger WHERE approval_id = ? AND status != 'denied' GROUP BY status`,
+      )
+      .all(approvalId) as Array<{ status: string; n: number }>;
+    if (rows.some((r) => r.status === "reserved" || r.status === "sent" || r.status === "committed")) {
+      return { ok: false, fail: { code: "APPROVAL_USED", message: `Approval ${approvalId} was already used` } };
+    }
+    return { ok: true, unknownRow: rows.some((r) => r.status === "unknown") };
+  }
+
+  /** The treasury's clock (approval requests and their expiry use it too). */
+  nowMs(): number {
+    return this.now();
+  }
+
+  /** The owner's decision on an approval request, or null (read-only). */
+  approvalDecision(requestId: string): ApprovalDecision | null {
+    try {
+      return this.deps.approvals?.decision(requestId) ?? null;
+    } catch (err) {
+      logger.warn("Approval decision read failed", { error: errMessage(err) });
+      return null;
+    }
   }
 
   /**
@@ -742,8 +840,8 @@ export class Treasury {
         `INSERT INTO treasury_ledger (id, idempotency_key, kind, budget, status, amount_cents, amount_atomic,
            amount_basis, debits_credits, counterparty, dedupe_key, origin_type, origin_name, input_source,
            boot_id, topup_purpose, url, description, deny_code, reason, balance_observed_cents,
-           balance_read_started_ms, balance_unknown, created_at_ms, settled_at_ms, updated_at_ms)
-         VALUES (?, ?, ?, ?, 'denied', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           balance_read_started_ms, balance_unknown, approval_id, created_at_ms, settled_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, 'denied', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -768,6 +866,7 @@ export class Treasury {
         prep.balanceCents,
         prep.balanceReadStartedMs,
         prep.balanceReadStartedMs !== null && prep.balanceCents === null ? 1 : 0,
+        typeof quote.approvalId === "string" ? quote.approvalId : null,
         now,
         now,
         now,

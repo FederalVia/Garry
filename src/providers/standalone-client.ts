@@ -4,6 +4,10 @@
  * Conway-only call throws FEATURE_DISABLED before any I/O, so nothing can
  * reach api.conway.tech by accident.
  *
+ * With the owner's budget, getCreditsBalance reports what the budget has
+ * left this period (never below 0), so the heartbeat, the loop, the tools
+ * and the treasury see it through their existing balance reads.
+ *
  * Not wrapped in the treasury guard: it cannot move value, and the guard
  * would record ledger rows and turn the clear error into a balance error.
  */
@@ -16,7 +20,12 @@ export { FeatureDisabledError } from "./features.js";
 
 const CONWAY_KEY_SETTING = "providers.conway.apiKey";
 
-export function createStandaloneClient(): ConwayClient {
+export interface StandaloneClientOptions {
+  /** The budget meter; without it the balance is FEATURE_DISABLED. */
+  budget?: { snapshot(): { remainingCents: number } };
+}
+
+export function createStandaloneClient(opts: StandaloneClientOptions = {}): ConwayClient {
   // An empty sandbox id selects the local branches, which make no HTTP call.
   const local = createConwayClient({ apiUrl: "", apiKey: "", sandboxId: "" });
   const disabled = (feature: string) => async (): Promise<never> => {
@@ -31,7 +40,9 @@ export function createStandaloneClient(): ConwayClient {
     createSandbox: disabled("sandboxes"),
     deleteSandbox: disabled("sandboxes"),
     listSandboxes: disabled("sandboxes"),
-    getCreditsBalance: disabled("Conway credits"),
+    getCreditsBalance: opts.budget
+      ? async () => Math.max(0, opts.budget!.snapshot().remainingCents)
+      : disabled("Conway credits"),
     getCreditsPricing: disabled("Conway credits"),
     transferCredits: disabled("credit transfers"),
     registerAutomaton: disabled("Conway registration"),

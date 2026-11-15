@@ -92,6 +92,30 @@ describe("tool lists per feature set", () => {
     expect(names({ ...ALL_FEATURES })).toContain("discover_agents");
   });
 
+  it("standalone with the owner's budget adds the balance tools, worded for the budget (no transfers)", () => {
+    const config = createTestConfig({
+      conwayApiKey: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk",
+      providers: { mode: "standalone" },
+      budget: { allowanceCents: 2500, period: "monthly" },
+    });
+    const f = resolveRuntime(config).features;
+    expect(f.budget).toBe(true);
+    expect(f.balance).toBe(true);
+    expect(f.conwayCredits).toBe(false);
+    expect(names(f).filter((n) => !STANDALONE_DEFAULT.includes(n)).sort()).toEqual(
+      ["check_credits", "distress_signal", "heartbeat_ping"],
+    );
+    const tools = visibleTools(createBuiltinTools("", { standalone: true }), f);
+    const describe = (n: string) => tools.find((t) => t.name === n)!.description;
+    expect(describe("check_credits")).toBe("Check how much of your owner's budget is left this period.");
+    expect(describe("distress_signal")).toMatch(/asking your owner for more budget/);
+    expect(describe("heartbeat_ping")).not.toMatch(/Conway/);
+    expect(names(f)).not.toContain("transfer_credits");
+    expect(names(f)).not.toContain("fund_child");
+  });
+
   it("every name in the feature table is a real built-in tool", () => {
     const all = new Set(builtinNames());
     for (const name of Object.keys(TOOL_FEATURES)) expect(all.has(name), name).toBe(true);
@@ -136,8 +160,13 @@ describe("heartbeat tasks per feature set", () => {
     for (const task of Object.keys(TASK_FEATURES)) {
       expect(BUILTIN_TASKS[task], task).toBeTypeOf("function");
       expect(taskAllowed(task, f), task).toBe(false);
-      expect(taskAllowed(task, ALL_FEATURES), task).toBe(true);
+      // check_budget is the one task Conway mode does not run: it has no owner budget.
+      expect(taskAllowed(task, ALL_FEATURES), task).toBe(task !== "check_budget");
     }
+    const budget = standaloneFeatures({ relay: false, payments: false, budget: true });
+    expect(taskAllowed("check_budget", budget)).toBe(true);
+    expect(taskAllowed("execute_approved_transfers", budget)).toBe(false);
+    expect(taskAllowed("check_credits", budget)).toBe(false);
     for (const task of ["heartbeat_ping", "check_for_updates", "soul_reflection", "health_check", "report_metrics"]) {
       expect(taskAllowed(task, f), task).toBe(true);
     }

@@ -275,31 +275,21 @@ function createInferenceDailyCapRule(policy: TreasuryPolicy): PolicyRule {
 }
 
 /**
- * Refuse transfers above requireConfirmationAboveCents. No confirmation flow
- * exists, so this is a hard cap (the treasury caps every transfer at the same
- * threshold); the action stays 'quarantine' so the decision log keeps the
- * distinction, and the message says plainly that nothing will confirm it.
+ * Transfers above requireConfirmationAboveCents and not above
+ * maxSingleTransferCents need the owner's approval. The treasury enforces it
+ * (APPROVAL_REQUIRED, then a pending request the owner decides with
+ * automaton-cli approvals), so the tool must run to record the request:
+ * this rule lets the band through. Above maxSingleTransferCents
+ * financial.transfer_max_single denies first.
  */
 function createRequireConfirmationRule(policy: TreasuryPolicy): PolicyRule {
   const threshold = policy.requireConfirmationAboveCents;
   return {
     id: "financial.require_confirmation",
-    description: `Refuse transfers above ${threshold} cents (no confirmation flow exists)`,
+    description: `Transfers above ${threshold} cents need the owner's approval (enforced by the treasury)`,
     priority: 500,
     appliesTo: { by: "name", names: [...CREDIT_TRANSFER_TOOLS] },
-    evaluate(request: PolicyRequest): PolicyRuleResult | null {
-      const amount = request.args.amount_cents;
-      if (typeof amount !== "number") return null;
-
-      if (amount > threshold) {
-        return {
-          rule: "financial.require_confirmation",
-          action: "quarantine",
-          reasonCode: "TRANSFER_ABOVE_CONFIRMATION_THRESHOLD",
-          humanMessage: `Transfer of ${amount} cents (${usd(amount)}) refused: transfers above ${usd(threshold)} are refused because no confirmation flow exists. The operator can raise treasuryPolicy.requireConfirmationAboveCents.`,
-        };
-      }
-
+    evaluate(): PolicyRuleResult | null {
       return null;
     },
   };
@@ -310,12 +300,12 @@ function usd(cents: number): string {
 }
 
 /**
- * The warning createFinancialRules logs when maxSingleTransferCents is above
- * the confirmation threshold (which then caps every transfer), else null.
+ * The line createFinancialRules logs when an approval band exists
+ * (maxSingleTransferCents above the confirmation threshold), else null.
  */
 export function transferCapWarning(policy: TreasuryPolicy): string | null {
   if (policy.maxSingleTransferCents > policy.requireConfirmationAboveCents) {
-    return `treasuryPolicy.maxSingleTransferCents (${policy.maxSingleTransferCents}c) has no effect above requireConfirmationAboveCents (${policy.requireConfirmationAboveCents}c): transfers above ${usd(policy.requireConfirmationAboveCents)} are refused because no confirmation flow exists.`;
+    return `Transfers from ${usd(policy.requireConfirmationAboveCents + 1)} to ${usd(policy.maxSingleTransferCents)} need the owner's approval (automaton-cli approvals approve <id>); above ${usd(policy.maxSingleTransferCents)} they are refused.`;
   }
   return null;
 }
@@ -326,8 +316,8 @@ export function transferCapWarning(policy: TreasuryPolicy): string | null {
 export function createFinancialRules(
   treasuryPolicy: TreasuryPolicy,
 ): PolicyRule[] {
-  const warning = transferCapWarning(treasuryPolicy);
-  if (warning) logger.warn(warning);
+  const band = transferCapWarning(treasuryPolicy);
+  if (band) logger.info(band);
   // Same priority: the first deny in this order wins, so the amount shape is
   // checked before any rule compares the amount.
   return [
