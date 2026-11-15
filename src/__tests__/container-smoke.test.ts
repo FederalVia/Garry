@@ -30,8 +30,13 @@ const PLACEHOLDER_DIGEST_RE = /^ARG NODE_IMAGE=[^@\s]+@sha256:0{64}\s*$/m;
 const NODE_IMAGE_OVERRIDE = process.env.AUTOMATON_SMOKE_NODE_IMAGE?.trim() || "";
 
 /** Why the smoke test cannot run here, or null. */
-function smokeSkipReason(dockerfile: string, overrideImage: string, dockerInfo: () => string | null): string | null {
-  if (process.env.AUTOMATON_SKIP_DOCKER_SMOKE) return "AUTOMATON_SKIP_DOCKER_SMOKE is set";
+function smokeSkipReason(
+  dockerfile: string,
+  overrideImage: string,
+  dockerInfo: () => string | null,
+  skipRequested = !!process.env.AUTOMATON_SKIP_DOCKER_SMOKE,
+): string | null {
+  if (skipRequested) return "AUTOMATON_SKIP_DOCKER_SMOKE is set";
   if (!overrideImage && PLACEHOLDER_DIGEST_RE.test(dockerfile)) {
     return "the Dockerfile's base image digest is a placeholder (run scripts/pin-base-image.sh, or set AUTOMATON_SMOKE_NODE_IMAGE)";
   }
@@ -57,11 +62,13 @@ describe("security: container smoke test preconditions", () => {
   const placeholder = "ARG NODE_IMAGE=node:22-bookworm-slim@sha256:" + "0".repeat(64) + "\n";
   const daemon = () => null;
 
+  // The last argument pins the skip switch, which CI sets for the main suite.
   it("skips with a reason while the base digest is the placeholder, even with a daemon", () => {
-    expect(smokeSkipReason(`# x\n${placeholder}FROM \${NODE_IMAGE}\n`, "", daemon)).toMatch(/digest is a placeholder/);
-    expect(smokeSkipReason(pinned, "", daemon)).toBeNull();
-    expect(smokeSkipReason(placeholder, "node:22-bookworm-slim@sha256:" + "cd".repeat(32), daemon)).toBeNull();
-    expect(smokeSkipReason(pinned, "", () => "no Docker daemon reachable")).toBe("no Docker daemon reachable");
+    expect(smokeSkipReason(`# x\n${placeholder}FROM \${NODE_IMAGE}\n`, "", daemon, false)).toMatch(/digest is a placeholder/);
+    expect(smokeSkipReason(pinned, "", daemon, false)).toBeNull();
+    expect(smokeSkipReason(placeholder, "node:22-bookworm-slim@sha256:" + "cd".repeat(32), daemon, false)).toBeNull();
+    expect(smokeSkipReason(pinned, "", () => "no Docker daemon reachable", false)).toBe("no Docker daemon reachable");
+    expect(smokeSkipReason(pinned, "", daemon, true)).toBe("AUTOMATON_SKIP_DOCKER_SMOKE is set");
   });
 
   it("does not skip where CI requires it", () => {
