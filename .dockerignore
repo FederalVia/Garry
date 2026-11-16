@@ -33,3 +33,10 @@ heartbeat.yml
 .automaton
 **/.automaton
 *.log
+# Public-access credentials (tunnel tokens and credential files).
+public-access
+**/public-access
+ngrok.yml
+**/ngrok.yml
+.cloudflared
+**/.cloudflared

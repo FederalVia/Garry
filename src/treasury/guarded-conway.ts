@@ -295,6 +295,8 @@ export function guardConwayClient(inner: ConwayClient, resolve?: TreasuryResolve
           inner.registerDomain(name, years, {
             idempotencyKey: r.idempotencyKey,
             onSend: () => t.markSent(r),
+            // A registrar that takes a price is sent exactly what was reserved.
+            quotedCents: amountCents,
           }),
         classifyPost,
       );

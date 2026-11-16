@@ -45,8 +45,8 @@ function shape(raw: Database.Database) {
 }
 
 describe("migration to version 20", () => {
-  it("is the latest version", () => {
-    expect(SCHEMA_VERSION).toBe(20);
+  it("is followed only by migration 21 (public access DNS tables)", () => {
+    expect(SCHEMA_VERSION).toBe(21);
   });
 
   it.each([16, 17, 18, 19])("upgrades a version %i database once, and a second open changes nothing", (from) => {
@@ -68,7 +68,7 @@ describe("migration to version 20", () => {
       const applied = (
         db.raw.prepare("SELECT version FROM schema_version WHERE version > ? ORDER BY version").all(from) as { version: number }[]
       ).map((r) => r.version);
-      expect(applied).toEqual(Array.from({ length: 20 - from }, (_, i) => from + 1 + i));
+      expect(applied).toEqual(Array.from({ length: SCHEMA_VERSION - from }, (_, i) => from + 1 + i));
       db.raw
         .prepare(
           `INSERT INTO transfer_approval_requests (id, kind, counterparty, amount_cents, created_at_ms, expires_at_ms)
@@ -83,7 +83,7 @@ describe("migration to version 20", () => {
     try {
       expect(shape(again.raw)).toEqual(first);
       expect((again.raw.prepare("SELECT COUNT(*) AS c FROM transfer_approval_requests").get() as { c: number }).c).toBe(1);
-      expect((again.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(20);
+      expect((again.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }).v).toBe(SCHEMA_VERSION);
     } finally {
       again.close();
     }

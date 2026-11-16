@@ -79,6 +79,11 @@ export function serializeAgentCard(card: AgentCard): string {
  * Host the agent card at /.well-known/agent-card.json
  * by exposing a simple HTTP server on a port.
  *
+ * For a remote Conway sandbox only: it starts an untracked process that
+ * listens on all interfaces. On the machine the runtime runs on, the card is
+ * served in-process and published through the port exposer
+ * (src/edge/card-server.ts, Edge.publishAgentCard).
+ *
  * Phase 3.2: CRITICAL FIX (S-P0-3) — Write card as a SEPARATE JSON file.
  * Server script reads the file at request time, NOT interpolated into JS.
  * Added CORS headers and X-Content-Type-Options: nosniff.

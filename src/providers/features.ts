@@ -17,8 +17,10 @@ export interface FeatureSet {
   budget: boolean;
   /** Buying Conway credits with USDC. */
   topups: boolean;
-  /** Domains and DNS through Conway. */
-  domains: boolean;
+  /** DNS records: Conway's domains, or an owner-configured zone. */
+  dns: boolean;
+  /** Domain search and registration: Conway, or an enabled registrar with a readable balance. */
+  domainPurchase: boolean;
   /** Model discovery through Conway's /v1/models (other providers are discovered in every mode). */
   conwayModels: boolean;
   /** The social relay (inbox and send_message). */
@@ -49,7 +51,8 @@ export const ALL_FEATURES: Readonly<FeatureSet> = Object.freeze({
   balance: true,
   budget: false,
   topups: true,
-  domains: true,
+  dns: true,
+  domainPurchase: true,
   conwayModels: true,
   relay: true,
   payments: true,
@@ -58,12 +61,17 @@ export const ALL_FEATURES: Readonly<FeatureSet> = Object.freeze({
   mcp: true,
 });
 
-/** Standalone mode: only the relay, payments and the owner's budget can be switched on. */
+/**
+ * Standalone mode: the relay, payments, the owner's budget, an owner's DNS zone and registrar can
+ * be switched on.
+ */
 export function standaloneFeatures(opts: {
   relay: boolean;
   payments: boolean;
   orchestration?: boolean;
   budget?: boolean;
+  dns?: boolean;
+  domainPurchase?: boolean;
 }): FeatureSet {
   return {
     conwayCompute: false,
@@ -72,7 +80,8 @@ export function standaloneFeatures(opts: {
     balance: opts.budget === true,
     budget: opts.budget === true,
     topups: false,
-    domains: false,
+    dns: opts.dns ?? false,
+    domainPurchase: opts.domainPurchase ?? false,
     conwayModels: false,
     relay: opts.relay,
     payments: opts.payments,
@@ -102,9 +111,9 @@ export const TOOL_FEATURES: Readonly<Record<string, readonly (keyof FeatureSet)[
   distress_signal: ["balance"],
   transfer_credits: ["conwayCredits"],
   topup_credits: ["topups", "payments"],
-  search_domains: ["domains"],
-  register_domain: ["domains"],
-  manage_dns: ["domains"],
+  search_domains: ["domainPurchase"],
+  register_domain: ["domainPurchase"],
+  manage_dns: ["dns"],
   send_message: ["relay"],
   x402_fetch: ["payments"],
   check_usdc_balance: ["payments"],

@@ -59,6 +59,7 @@ it before building.
 | `/app` (runtime code, guard code, CLI) | image, root-owned, read-only root filesystem | read only |
 | `~/.automaton/automaton.json`, `wallet.json`, `config.json`, `heartbeat.yml`, `constitution.md`, `inference-providers.json`, `mcp-servers.json` | `data/config/*`, read-only binds | read only |
 | `~/.automaton/owner/` (`owner.db`: budget grants, approval decisions) | `data/owner`, read-only bind | read only |
+| `~/.automaton/public-access/` (credential files a public-access tunnel reads; usually empty) | `data/config/public-access`, read-only bind | read only |
 | `~/.automaton/` (state.db, logs, skills, workspace, SOUL.md, WORKLOG.md) | `data/state`, read-write | read and write |
 | `/tmp` | tmpfs, 256 MB | read and write |
 
@@ -72,9 +73,21 @@ your tokens, and approves the ones the agent installed. Setup writes it with
 MCP off (`{ "version": 1, "enabled": false }`); edit `data/config/mcp-servers.json`
 to add servers (see "MCP servers" in DOCUMENTATION.md) and restart the agent.
 
+The optional `publicAccess` block (public addresses, DNS, a registrar; see
+[public-access.md](public-access.md)) lives in `automaton.json`, so it is
+read-only like the rest of that file. Tokens go there, in the agent service's
+`env_file`, or, for a tunnel that reads a credential file, in
+`data/config/public-access/`. None of the three hides a token from the agent:
+the `env_file` stays on the host, but its variables are in the runtime's
+environment, and a command the agent runs can read that, `automaton.json` and
+the folder (see "What these limits do not stop" in
+[public-access.md](public-access.md)).
+
 The agent service also runs with no Linux capabilities, `no-new-privileges`,
-a process limit, 2 GB of memory and 2 CPUs. It publishes no ports and never
-gets the Docker socket, so it cannot start the owner's `setup`, `configure` or
+a process limit, 2 GB of memory and 2 CPUs. It publishes no ports by default
+(for public-access proxy mode you publish the gateway on the host's loopback
+only, `127.0.0.1:8480:8480`; see "Proxy mode in the container" in
+[public-access.md](public-access.md)) and never gets the Docker socket, so it cannot start the owner's `setup`, `configure` or
 `cli` services, which are the only ones that mount the owner's files
 read-write.
 
@@ -109,7 +122,8 @@ pulling the checkout and rebuilding the image.
 `run` (the default command) refuses to start, with exit code 64, when:
 
 - it runs as root (override: `AUTOMATON_ALLOW_ROOT=1`);
-- any owner file or the owner folder could be changed by the agent user:
+- any owner file, the owner folder or the `public-access` folder (or anything
+  in those folders) could be changed by the agent user:
   missing (the agent could create it), writable, owned by the agent user, or
   in a folder the agent user can write without the sticky protection (so it
   could be renamed and replaced). A read-only mount always passes (override:
@@ -125,11 +139,25 @@ heartbeat has recorded a task in the last 45 minutes
 (`AUTOMATON_HEALTH_MAX_AGE_MIN` changes it). A dead agent (out of budget) is
 healthy: its heartbeat keeps running, and a restart would not help it.
 
+### Public addresses in the container
+
+Proxy mode needs `"gateway": { "host": "0.0.0.0" }` in `automaton.json` and
+the commented `ports` entry of the agent service (`127.0.0.1:8480:8480`),
+or a reverse-proxy or tunnel sidecar that reaches `http://agent:8480`. Tunnel
+mode needs the tunnel binary in a derived image; the official image does not
+ship or download one. Both are described in
+[public-access.md](public-access.md#in-a-container-or-as-a-dedicated-user).
+
 ### Updating
 
 ```sh
 git pull && docker compose build && docker compose up -d agent
 ```
+
+An update that adds a bind (such as `data/config/public-access`) needs the
+folder on the host: `mkdir -p data/config/public-access` before
+`docker compose up` (otherwise Docker creates it, owned by root, which also
+works).
 
 ## 2. Dedicated Unix user (Linux, systemd)
 
@@ -163,6 +191,10 @@ sudo env HOME=/var/lib/automaton node /opt/automaton/packages/cli/dist/index.js 
 - makes the owner files `root:<group> 0640` (`constitution.md` 0444);
 - makes `<state>/owner` `root:<group> 0750` and `owner.db` in it
   `root:<group> 0640` (it creates `owner.db` when the CLI is built);
+- makes `<state>/public-access` (credential files a public-access tunnel
+  reads; see [public-access.md](public-access.md)) `root:<group> 0750` and
+  each file in it `root:<group> 0640`, creating the folder when missing, and
+  refuses a file there that root does not own (the agent may have planted it);
 - makes the state folder `root:<group> 1770`: the agent can create its own
   files there, but the sticky bit stops it renaming or deleting root's;
 - refuses to run as non-root, a symbolic link as the state folder or an owner
@@ -190,9 +222,38 @@ Saved as root, the file is `root:root 0600` until the lock script makes it
 `deploy/automaton.service` runs `node dist/index.js --run` as `automaton`
 with `NoNewPrivileges`, `ProtectSystem=strict` (the whole file system
 read-only except the state folder), `ProtectHome`, `PrivateTmp`, and
-`ReadOnlyPaths=` for each owner file and the owner folder. systemd refuses
-to start the unit when one of those paths is missing; the lock script creates
-them.
+`ReadOnlyPaths=` for each owner file, the owner folder and the
+`public-access` folder. systemd refuses to start the unit when one of those
+paths is missing; the lock script creates them (after an update that adds a
+path, run it again before restarting). For public-access proxy mode the
+gateway's default `127.0.0.1:8480` is already what a reverse proxy on the same
+host needs.
+
+### Updating
+
+```sh
+sudo systemctl stop automaton
+cd /opt/automaton && sudo git pull && sudo pnpm install --frozen-lockfile && sudo pnpm run build
+# Creates and locks any owner path the new version adds:
+sudo /opt/automaton/scripts/lock-owner-files.sh /var/lib/automaton/.automaton automaton
+# The unit lists the read-only paths, so install the new one every time:
+sudo install -m 0644 /opt/automaton/deploy/automaton.service /etc/systemd/system/automaton.service
+sudo systemctl daemon-reload && sudo systemctl start automaton
+```
+
+Run the lock script before installing the unit: the new unit does not start
+while a path it lists is missing. Keeping the old unit instead leaves the new
+paths unprotected, and the agent could create them first.
+
+If the lock script stops with `unexpected entry in .../public-access`,
+`... is a symbolic link` or `... is not owned by root`, something is in that
+folder that root did not put there (with an old unit, the agent could create
+the folder itself). The script takes the folder for root and stops without
+accepting the entry. Keep the service stopped, look at what is there, then
+either remove the folder as root
+(`sudo rm -rf /var/lib/automaton/.automaton/public-access`) or, for a file
+you did put there, `sudo chown root` it; run the lock script again (it
+creates a missing folder empty) and start the service.
 
 Self-modification works in this layout only if you make `/opt/automaton`
 writable by the agent user, which gives it its guard code. The default

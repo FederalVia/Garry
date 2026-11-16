@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { describe, expect, it } from "vitest";
+import { agentMounts, agentMountsWithout, agentVolumes } from "./fixtures/container-mounts.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 const read = (p: string) => fs.readFileSync(path.join(ROOT, p), "utf8");
@@ -104,9 +105,34 @@ describe("security: docker-compose agent service", () => {
       expect(volumes, f).toContain(`./data/config/${f}:${AGENT_STATE}/${f}:ro`);
     }
     expect(volumes).toContain(`./data/owner:${AGENT_STATE}/owner:ro`);
+    // Tunnel credential files for public access: owner files like the rest.
+    expect(volumes).toContain(`./data/config/public-access:${AGENT_STATE}/public-access:ro`);
     // Nothing else is mounted read-write except the state folder.
     const rw = volumes.filter((v) => !v.endsWith(":ro"));
     expect(rw).toEqual([`./data/state:${AGENT_STATE}`]);
+  });
+
+  it("the container smoke test runs the image with exactly these volumes", () => {
+    expect([...agentVolumes("./data")].sort()).toEqual([...volumes].sort());
+  });
+
+  it("the smoke test's docker arguments pair every -v with a volume", () => {
+    // Checked here because the smoke test itself only runs where Docker does.
+    const wellFormed = (args: string[]) => {
+      expect(args.length % 2).toBe(0);
+      for (let i = 0; i < args.length; i += 2) {
+        expect(args[i]).toBe("-v");
+        expect(args[i + 1]).toMatch(/^\.\/data\/[^:]+:\/[^:]+(:ro)?$/);
+      }
+    };
+    const all = agentMounts("./data");
+    wellFormed(all);
+    expect(all.filter((a) => a !== "-v")).toEqual(agentVolumes("./data"));
+    const without = agentMountsWithout("./data", "public-access", "state-bare");
+    wellFormed(without);
+    expect(without).toHaveLength(all.length - 2);
+    expect(without.join(" ")).not.toContain("public-access");
+    expect(without).toContain(`./data/state-bare:${AGENT_STATE}`);
   });
 
   it("never mounts the Docker socket and publishes no ports", () => {
@@ -116,6 +142,13 @@ describe("security: docker-compose agent service", () => {
       expect(svc.network_mode, name).not.toBe("host");
       expect(svc.privileged, name).toBeUndefined();
     }
+  });
+
+  it("documents the proxy gateway mapping bound to the host's loopback only", () => {
+    const text = read("deploy/docker-compose.yml");
+    expect(text).toMatch(/#\s+-\s+"127\.0\.0\.1:8480:8480"/);
+    // Only as a comment: the agent service publishes nothing by default.
+    expect(agent.ports).toBeUndefined();
   });
 
   it("setup and configure never mount data/state where the agent binds its owner files", () => {
@@ -146,6 +179,7 @@ describe("security: entrypoint", () => {
     expect(sh).toMatch(/AUTOMATON_ALLOW_ROOT/);
     for (const f of OWNER_FILES) expect(sh).toContain(f);
     expect(sh).toMatch(/\$STATE\/owner/);
+    expect(sh).toMatch(/OWNER_DIRS="owner public-access"/);
     // Writable is not enough: a missing or replaceable file is refused too.
     expect(sh).toMatch(/is missing/);
     expect(sh).toMatch(/could be renamed or replaced/);
@@ -155,7 +189,7 @@ describe("security: entrypoint", () => {
 describe("security: .dockerignore", () => {
   const lines = read(".dockerignore").split("\n").map((l) => l.trim());
   it("keeps secrets and local state out of the build context", () => {
-    for (const name of ["wallet.json", "automaton.json", "config.json", "inference-providers.json", ".env", ".env.*", "**/*.db", ".git", "node_modules"]) {
+    for (const name of ["wallet.json", "automaton.json", "config.json", "inference-providers.json", ".env", ".env.*", "**/*.db", ".git", "node_modules", "public-access", "**/public-access"]) {
       expect(lines, name).toContain(name);
     }
   });
@@ -174,6 +208,7 @@ describe("security: systemd unit (dedicated user)", () => {
     const ro = values("ReadOnlyPaths");
     for (const f of OWNER_FILES) expect(ro, f).toContain(`/var/lib/automaton/.automaton/${f}`);
     expect(ro).toContain("/var/lib/automaton/.automaton/owner");
+    expect(ro).toContain("/var/lib/automaton/.automaton/public-access");
     // A "-" prefix would silently skip a missing path, which the agent could then create.
     for (const p of ro) expect(p.startsWith("-"), p).toBe(false);
   });
@@ -181,6 +216,7 @@ describe("security: systemd unit (dedicated user)", () => {
   it("the lock script creates every read-only path the unit lists", () => {
     const lock = read("scripts/lock-owner-files.sh");
     for (const f of OWNER_FILES) expect(lock, f).toContain(f);
+    expect(lock).toMatch(/PA="\$STATE\/public-access"/);
     expect(lock).toMatch(/1770/);
   });
 });

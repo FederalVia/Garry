@@ -53,8 +53,8 @@ function makeOld(dbPath: string, from: number): void {
 }
 
 describe("migration to version 18", () => {
-  it("is followed only by the model_registry provider columns (19) and the budget and approvals tables (20)", () => {
-    expect(SCHEMA_VERSION).toBe(20);
+  it("is followed only by the model_registry provider columns (19), the budget and approvals tables (20) and the DNS tables (21)", () => {
+    expect(SCHEMA_VERSION).toBe(21);
   });
 
   // 17 is the memory/inbox index migration; 16 also runs it on the way up.
@@ -81,9 +81,9 @@ describe("migration to version 18", () => {
       );
       db.raw.prepare("INSERT INTO mcp_calls (server, tool, sent_at) VALUES ('a', 'b', '2026-01-01T00:00:00.000Z')").run();
       const v = db.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
-      expect(v.v).toBe(20);
+      expect(v.v).toBe(21);
       const applied = (db.raw.prepare("SELECT version FROM schema_version WHERE version > ? ORDER BY version").all(from) as { version: number }[]).map((r) => r.version);
-      expect(applied).toEqual(from === 16 ? [17, 18, 19, 20] : [18, 19, 20]);
+      expect(applied).toEqual(from === 16 ? [17, 18, 19, 20, 21] : [18, 19, 20, 21]);
 
       // Running it again changes nothing.
       const before = db.raw.prepare("SELECT sql FROM sqlite_master WHERE name = 'policy_decisions'").get();

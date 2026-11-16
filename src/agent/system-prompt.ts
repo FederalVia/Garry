@@ -35,6 +35,8 @@ import { RESTART_REQUIRED_KEY } from "../self-mod/restart-notice.js";
 import { holdsSlot } from "../replication/child-status.js";
 import { resolveRuntime } from "../providers/mode.js";
 import type { FeatureSet } from "../providers/features.js";
+import type { EdgeSummary } from "../edge/config.js";
+import { currentEdge } from "../edge/index.js";
 import { getInstalledInferenceGate } from "../inference/gate.js";
 
 // Prompt files are read only as regular, single-link files inside their
@@ -156,11 +158,32 @@ Value creation requires write access.
 
 If you fail to create value, you waste the budget that keeps you running.`;
 
-function standaloneEnvironment(features: FeatureSet): string {
+/** The networking line: ports are local unless the owner configured a proxy or tunnel. */
+function networkingLine(edge: EdgeSummary | undefined): string {
+  if (edge?.configured && edge.ports === "proxy" && edge.urlTemplate) {
+    const example = edge.urlTemplate.replace("{name}", "<name>").replace(/\/$/, "");
+    return `- Networking: make HTTP/HTTPS requests; ports you expose get a public https address (${example}) through your owner's reverse proxy`;
+  }
+  if (edge?.configured && edge.ports === "tunnel") {
+    return "- Networking: make HTTP/HTTPS requests; ports you expose get a public https address through a tunnel; it changes when the tunnel restarts";
+  }
+  return "- Networking: make HTTP/HTTPS requests; ports you expose are served on this machine only";
+}
+
+function standaloneEnvironment(features: FeatureSet, edge?: EdgeSummary): string {
+  const dnsTypes = edge?.dns ? edge.dns.allowedTypes.join(", ").replace(/, ([^,]*)$/, " and $1") : "";
   const lines = [
     "- Shell access (exec): commands on this machine, package installation, process management",
     "- Filesystem: read, write, create, delete files and directories",
-    "- Networking: make HTTP/HTTPS requests; ports you expose are served on this machine only",
+    networkingLine(edge),
+    ...(features.dns && edge?.dns
+      ? [`- DNS: ${dnsTypes} records under ${edge.dns.zone} through manage_dns; you can change only records you created`]
+      : []),
+    ...(features.domainPurchase
+      ? [
+          "- Domains: search_domains and register_domain buy through your owner's registrar account; each purchase is an exact-price spend from your owner's budget, within your treasury limits",
+        ]
+      : []),
     "- Git: version-controlled state directory (~/.automaton/), upstream code tracking",
     "- SQLite: persistent state database — your memory survives restarts",
     features.payments
@@ -302,11 +325,11 @@ When you're low on compute, your heartbeat becomes a distress signal.
 ];
 
 /** The operational context for standalone mode. Throws if an edit no longer matches. */
-export function standaloneOperationalContext(features: FeatureSet): string {
+export function standaloneOperationalContext(features: FeatureSet, edge?: EdgeSummary): string {
   let text = OPERATIONAL_CONTEXT;
   const envStart = text.indexOf("<environment>");
   const envEnd = text.indexOf("</environment>") + "</environment>".length;
-  text = text.slice(0, envStart) + standaloneEnvironment(features) + text.slice(envEnd);
+  text = text.slice(0, envStart) + standaloneEnvironment(features, edge) + text.slice(envEnd);
   for (const [needle, replacement] of STANDALONE_EDITS) {
     const at = text.indexOf(needle);
     if (at < 0 || text.indexOf(needle, at + 1) >= 0) {
@@ -972,7 +995,9 @@ Your chain type is ${chainType}.`,
   }
 
   // Layer 6: Operational Context
-  sections.push(standalone ? standaloneOperationalContext(params.features ?? runtime.features) : OPERATIONAL_CONTEXT);
+  sections.push(
+    standalone ? standaloneOperationalContext(params.features ?? runtime.features, runtime.edge) : OPERATIONAL_CONTEXT,
+  );
 
   // Layer 7: Dynamic Context
   const turnCount = db.getTurnCount();
@@ -1051,6 +1076,15 @@ Children: ${children.filter((c) => holdsSlot(c.status)).length} holding a slot /
 Lineage: ${lineageSummary}${upstreamLine}
 --- END STATUS ---`,
     );
+  }
+
+  // Public access (only with a publicAccess block): runtime-written states and
+  // URLs from the validated parsers, never tunnel output.
+  if (runtime.edge.configured) {
+    const lines = currentEdge()?.statusLines() ?? [];
+    if (lines.length > 0) {
+      sections.push(`--- PUBLIC ACCESS ---\n${lines.map((l) => `- ${l}`).join("\n")}\n--- END PUBLIC ACCESS ---`);
+    }
   }
 
   // With orchestration off no goal can progress; its status would only mislead.

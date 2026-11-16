@@ -453,6 +453,8 @@ const CHECKOUT_GUARD_SURFACE: readonly string[] = Object.freeze([
   // Abort classification, and so ledger settlement of aborted paid calls.
   "runtime/cancellation",
   "runtime/shutdown",
+  // Process groups of MCP servers and tunnels, and the exit hook that kills them.
+  "runtime/process-group",
   // Heals children by funding them (fundChild).
   "orchestration/health-monitor",
 ]);
@@ -480,6 +482,9 @@ const CHECKOUT_GUARD_DIRS = new Set([
   "inference",
   // The owner's budget: config, periods, thresholds, the meter, the owner database.
   "budget",
+  // Public edge: port rules, the gateway, tunnel env, DNS zone policy, token
+  // handling and registrar sends.
+  "edge",
 ]);
 // healthcheck: the container's liveness probe (a dead agent stays healthy).
 const CHECKOUT_GUARD_FILES = new Set(["index", "types", "config", "healthcheck"]);
@@ -616,6 +621,8 @@ export const SENSITIVE_COMMAND_FRAGMENTS: readonly { re: RegExp; label: string }
   { re: /\/proc\/self\//, label: "process memory or environment" },
   { re: /\/proc\/thread-self\//, label: "process memory or environment" },
   { re: /\/proc\/[^\s/]+\/(?:environ|mem|cmdline|maps)/, label: "process memory or environment" },
+  // The same files named by a glob, a bracket or a variable (/proc/$PPID/env*, .../envi[r]on, .../$f).
+  { re: /\/proc\/(?:\d+|[^\s/]*[$*?[\]{}][^\s/]*)\/[^\s/;&|)<>]*[*?[\]${]/, label: "process memory or environment" },
 ]);
 
 /**
@@ -681,6 +688,10 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "providers/price-table",
   "providers/discovery",
   "ollama/discover",
+  // Public edge (port rules, zone policy, tokens, registrar) and tunnel process groups.
+  "src/edge/",
+  "dist/edge/",
+  "runtime/process-group",
   "operator/fund",
   "operator/send",
   // The owner's budget, approvals and the deployment that protects them.
@@ -698,6 +709,9 @@ export const GUARD_COMMAND_FRAGMENTS: readonly string[] = Object.freeze([
   "commands/budget",
   "commands/approvals",
   "deploy/entrypoint",
+  // ReadOnlyPaths of the dedicated-user layout. deploy/docker-compose is
+  // left to the write guard: ordinary projects use that name too.
+  "deploy/automaton.service",
   "lock-owner-files",
   "pin-base-image",
   "setup/operator-command",

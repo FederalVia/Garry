@@ -140,7 +140,8 @@ The runtime alternates between two states: **running** (the agent loop is active
 | `children` | on | off | `spawn_child` and the other child tools, child health tasks |
 | `conwayCredits` | on | off | `check_credits`, `transfer_credits`, `heartbeat_ping`, `distress_signal` |
 | `topups` | on | off | `topup_credits`, bootstrap and inline topups |
-| `domains` | on | off | domain and DNS tools |
+| `dns` | on | `publicAccess.dns` (records on a zone the owner already owns) | `manage_dns` |
+| `domainPurchase` | on | an enabled `publicAccess.registrar` plus the owner's budget (the readable balance the treasury needs) | `search_domains`, `register_domain` |
 | `conwayModels` | on | off | Conway's own listing inside `refresh_models` (the task runs in both modes and refreshes each configured provider's model list) |
 | `relay` | on | `socialRelayUrl` set (not Conway's default) or `providers.relayUrl` | `send_message`, `message_child` (with `children`), inbox polling |
 | `payments` / `onchainIdentity` | on | `providers.payments` | `x402_fetch`, `check_usdc_balance`, ERC-8004 tools including `discover_agents` |
@@ -162,7 +163,7 @@ Prices: the owner's `models` prices win, then the larger of the price the provid
 
 **Single instance.** `src/state/instance-lock.ts` takes an exclusive SQLite lock (a kernel advisory lock) on `<dbPath>.lock` (mode 0600) before the database is opened, and records `{pid, startedAt, argv}` in it. A holder makes `--run` exit 1 naming its pid and the lock path. The OS drops the lock when the holder exits or is killed, so it cannot go stale and there is no takeover race; the file is never deleted. Startup recovery of stranded inbox claims relies on this: claims of a batch whose tools had started (KV `inbox.tools_started`) are marked processed, the rest are re-queued or failed by retry count.
 
-**Shutdown.** `src/runtime/shutdown.ts` gives the main loop a stop flag and interruptible sleeps. The first SIGTERM/SIGINT requests a stop and arms a forced exit after `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). The agent loop checks the flag at the top of each iteration, before claiming inbox messages, between tool calls of a main turn (the remaining calls are recorded as skipped and the turn is saved) and after saving. The in-flight tool or inference call is not cancelled (an MCP tool call is: the runtime's shutdown signal rejects it and sends `notifications/cancelled`), and an inbox turn always runs to the end. Then `heartbeat.stop()` (no new task starts and the scheduler's root signal aborts the running ones: HTTP requests destroyed, local exec process groups killed, remote exec abandoned; a run cut short is recorded `skipped`, `cancelled: runtime shutdown after N ms`, with no failure count, retry or wake; a run that completes anyway is recorded as a success and keeps its wake row for the next start, without notifying), `heartbeat.drain()` (the running tick and its aborted tasks are awaited), `shutdownWorkerPools()` (workers aborted and awaited), `closeMcp` (`shutdownMcpServers()`: stdio process groups terminated, HTTP sessions ended), state `sleeping` (a `dead` state is kept), lock released, database closed, exit 0. A second signal or the deadline does the last steps best-effort and exits 1.
+**Shutdown.** `src/runtime/shutdown.ts` gives the main loop a stop flag and interruptible sleeps. The first SIGTERM, SIGINT or SIGHUP requests a stop and arms a forced exit after `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). The agent loop checks the flag at the top of each iteration, before claiming inbox messages, between tool calls of a main turn (the remaining calls are recorded as skipped and the turn is saved) and after saving. The in-flight tool or inference call is not cancelled (an MCP tool call is: the runtime's shutdown signal rejects it and sends `notifications/cancelled`; so is an `expose_port` call waiting for a tunnel's URL, whose tunnel is stopped), and an inbox turn always runs to the end. Then `heartbeat.stop()` (no new task starts and the scheduler's root signal aborts the running ones: HTTP requests destroyed, local exec process groups killed, remote exec abandoned; a run cut short is recorded `skipped`, `cancelled: runtime shutdown after N ms`, with no failure count, retry or wake; a run that completes anyway is recorded as a success and keeps its wake row for the next start, without notifying), `heartbeat.drain()` (the running tick and its aborted tasks are awaited), `shutdownWorkerPools()` (workers aborted and awaited), `closeMcp` (`shutdownMcpServers()`: stdio process groups terminated, HTTP sessions ended), `closeEdge` (the exposer is marked closed so no exposure starts afterwards, a background restore included; tunnel process groups terminated, the port gateway and the agent card server closed; see [docs/public-access.md](docs/public-access.md)), state `sleeping` (a `dead` state is kept), lock released, database closed, exit 0. A second signal or the deadline does the last steps best-effort and exits 1.
 
 **Restart after rebuild.** Tools that rebuild `dist/` set KV `restart_required` (`src/self-mod/restart-notice.ts`); the runtime shows it in the system prompt and logs it until the next start, which deletes it. Lazy modules are preloaded at startup (`src/runtime/preload.ts`), so a rebuild never mixes new modules into the running process.
 
@@ -180,6 +181,23 @@ src/
     shutdown.ts            Stop flag, interruptible sleep, deadline helper, finishShutdown steps
     cancellation.ts        AsyncLocalStorage cancellation scope for heartbeat tasks (timeout vs shutdown, shielded paid sends)
     preload.ts             LAZY_MODULES + preloadLazyModules() (one code version per process)
+    process-group.ts       Spawn, terminate and kill child process groups (MCP servers, tunnels); exit and SIGHUP hooks kill live groups
+
+  edge/                    Public access (publicAccess, off by default; docs/public-access.md)
+    index.ts               createEdge / bootEdge: wiring, status lines, agent card publishing, close
+    config.ts              publicAccess parsing and validation, mode applicability summary
+    facade.ts              withEdge: routes exposePort/removePort, DNS and registrar calls of the client
+    ports.ts               Local, proxy and tunnel exposers: port rules (ngrok API ports 4040-4050 refused under ngrok), reserved ports, limits,
+                           remove aborts a start in progress, closed after close(), KV persistence (edge.exposures), orphan reaping
+                           (edge.tunnel_pids: pid, full argv and /proc start time must all match; never the runtime's own group)
+    gateway.ts             Host-routed reverse proxy gateway for the owner's wildcard (loopback backends only)
+    tunnel.ts              Supervised tunnel process: strict URL parser, restarts with backoff; start failures give a fixed reason,
+                           the redacted output tail goes to the log only
+    card-server.ts         In-process agent card server
+    http.ts                Fetch helper for DNS and registrar APIs (fixed hosts, no redirects, bounded, redacted)
+    dns/                   DNS provider adapters (Cloudflare, Porkbun, fake), zone policy, service (list limited to allowedSubtree), change log
+    registrar/             Registrar adapters (Porkbun, fake): exact quotes, treasury-gated purchase, auto-renew turned off after
+                           a purchase (KV edge.registrar.renewals; a failure shows in the PUBLIC ACCESS prompt lines)
 
   security/                Guard code shared by tools, workers and loaders
     protected-paths.ts     Protected (write) and sensitive (read) path rules; checkRead / checkWrite on real paths
@@ -193,7 +211,7 @@ src/
     jsonrpc.ts             JSON-RPC session: initialize, tools/list, tools/call, refusal of server requests (bounded)
     stdio-transport.ts     Newline JSON over a child's stdio (scrubbed env, process group, 4 MiB line, 1 MiB stdin backlog)
     http-transport.ts      Streamable HTTP: public addresses only unless local, pinned address, no redirects, 4 MiB
-    process.ts             Spawn, terminate and kill server process groups
+    process.ts             Re-exports the process-group helpers (src/runtime/process-group.ts)
     schema.ts              Input schema normalisation, description sanitising, argument validation
     tools.ts               mcp__<server>__<tool> tools: budgets, argument checks, hourly cap, result and error labelling
 
@@ -867,6 +885,8 @@ Step-by-step instructions for the agent...
 | `discovered_agents_cache` | v7 | Cached remote agent cards |
 | `onchain_transactions` | v7 | On-chain transaction records |
 | `metric_snapshots` | v8 | Periodic metrics + alert records |
+| `edge_dns_records` | v21 | Records the agent created in the owner's zone (what it may list as its own and delete); see [docs/public-access.md](docs/public-access.md) |
+| `edge_dns_changes` | v21 | Every DNS create and delete attempt with its outcome (pending, ok, failed, unknown) |
 
 **`AutomatonDatabase` interface** provides 40+ methods for CRUD across all tables. The `database.ts` file also exports 60+ standalone helper functions for direct `better-sqlite3` operations (used by subsystems that receive raw DB handles).
 
@@ -929,7 +949,7 @@ AutomatonConfig
 
 **Deep-merged fields:** `modelStrategy` and `soulConfig` are merged with defaults so partial overrides work correctly. `treasuryPolicy` goes through `normalizeTreasuryPolicy`: any field that is not a finite number >= 0 (whatever its type) takes its default, with a warning.
 
-**Loading:** `loadConfig()` returns null only when the file is missing and throws `ConfigError` when it cannot be read or parsed, or when the `providers` block is invalid. Each provider value resolves environment first (`CONWAY_API_KEY`, `CONWAY_API_URL`, `OLLAMA_BASE_URL`; `OPENAI_API_KEY` in standalone only), then the `providers` block, then the flat field. Mode defaults (the relay URL, the x402 payee list) and values from the environment are never written back by `saveConfig()`, and clearing the Conway key drops a relay URL or payee list that still holds Conway's default. In standalone, a `socialRelayUrl` or `x402AllowedDomains` equal to Conway's default (older versions saved them for every install) is read as absent.
+**Loading:** `loadConfig()` returns null only when the file is missing and throws `ConfigError` when it cannot be read or parsed, or when the `providers` or `publicAccess` block is invalid (see [docs/public-access.md](docs/public-access.md)). Each provider value resolves environment first (`CONWAY_API_KEY`, `CONWAY_API_URL`, `OLLAMA_BASE_URL`; `OPENAI_API_KEY` in standalone only), then the `providers` block, then the flat field. Mode defaults (the relay URL, the x402 payee list) and values from the environment are never written back by `saveConfig()`, and clearing the Conway key drops a relay URL or payee list that still holds Conway's default. In standalone, a `socialRelayUrl` or `x402AllowedDomains` equal to Conway's default (older versions saved them for every install) is read as absent.
 
 **Saving:** `saveConfig()` writes the whole file atomically (temp file + rename) and is used by the wizard, `--configure` and `--pick-model`. `setConwayApiKey()` (used by `--provision`) stores a key without touching an explicit `providers.mode`; only the operator changing the mode (the Mode question in `--configure`, or editing the file) leaves standalone. `--provision`, `--setup`, `--configure` and `--pick-model` exit 1 while another process holds the state database's instance lock, and all but `--provision` (which a new child runs unattended in its sandbox) also need a terminal. The running agent never writes its startup snapshot back: `updateConfigFile({ genesisPrompt?, inferenceModel? })` re-reads the file, changes only those keys (and `modelStrategy.inferenceModel` when present), and writes atomically; on a missing or corrupt file it throws and writes nothing.
 

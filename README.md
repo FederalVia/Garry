@@ -93,9 +93,9 @@ State lives in `~/.automaton/`:
 
 Other runtime commands: `--setup`, `--configure`, `--pick-model`, `--init`, `--provision`, `--status`, `--version` and `--help`. These print through the JSON logger, one log line each; pipe through `jq -r .message` to read them.
 
-Environment variables: `OLLAMA_BASE_URL` overrides `ollamaBaseUrl`. `OPENAI_API_KEY` is used in standalone mode when no OpenAI key is configured. `CONWAY_API_KEY` and `CONWAY_API_URL` override the Conway key and URL in automaton.json (an explicit `providers.mode: "standalone"` keeps the key unused). `AUTOMATON_SHUTDOWN_GRACE_MS` (default 30000) sets how long a stop may take. `AUTOMATON_RPC_URL` and `SOLANA_RPC_URL` override the public Base and Solana RPC endpoints (`rpcUrl` in automaton.json takes precedence for the ERC-8004 tools). `SOCIAL_RELAY_URL` is the relay `automaton-cli send` uses when automaton.json sets none. `CONWAY_SANDBOX_ID` tells the wizard it is inside a sandbox.
+Environment variables: `OLLAMA_BASE_URL` overrides `ollamaBaseUrl`. `OPENAI_API_KEY` is used in standalone mode when no OpenAI key is configured. `CONWAY_API_KEY` and `CONWAY_API_URL` override the Conway key and URL in automaton.json (an explicit `providers.mode: "standalone"` keeps the key unused). `AUTOMATON_SHUTDOWN_GRACE_MS` (default 30000) sets how long a stop may take. `AUTOMATON_RPC_URL` and `SOLANA_RPC_URL` override the public Base and Solana RPC endpoints (`rpcUrl` in automaton.json takes precedence for the ERC-8004 tools). `SOCIAL_RELAY_URL` is the relay `automaton-cli send` uses when automaton.json sets none. `CONWAY_SANDBOX_ID` tells the wizard it is inside a sandbox. For `publicAccess` (below), `AUTOMATON_DNS_API_TOKEN` (Cloudflare) or `AUTOMATON_DNS_API_KEY` and `AUTOMATON_DNS_SECRET_API_KEY` (Porkbun) carry the DNS credentials, and `AUTOMATON_REGISTRAR_API_KEY` and `AUTOMATON_REGISTRAR_SECRET_API_KEY` the registrar's, when the config holds none; their values are redacted and kept out of child processes.
 
-The first SIGTERM or SIGINT stops the agent at the next tool boundary. A second signal, or `AUTOMATON_SHUTDOWN_GRACE_MS` passing, forces exit with code 1.
+The first SIGTERM, SIGINT or SIGHUP stops the agent at the next tool boundary. A second signal, or `AUTOMATON_SHUTDOWN_GRACE_MS` passing, forces exit with code 1.
 
 ## How it works
 
@@ -134,7 +134,7 @@ The full model is in [DOCUMENTATION.md, Security and Constitution](DOCUMENTATION
 | `x402AllowedDomains` | `["conway.tech"]` (standalone: none) | Hosts x402 may pay |
 | `maxTopupSingleCents` / `maxTopupDailyCents` | 2500 / 10000 | Credit topups bought by the agent |
 | `maxAutoTopupDailyCents` | 2000 | Automatic survival topups per day |
-| `maxInfraSingleCents` / `maxInfraDailyCents` | 2500 / 5000 | Sandbox and domain purchases |
+| `maxInfraSingleCents` / `maxInfraDailyCents` | 2500 / 5000 (standalone: 0 unless set) | Sandbox and domain purchases |
 | `maxInferenceDailyCents` | 50000 | Rolling 24-hour inference spend (0 allows only free local models). Standalone forces it to at most `providers.dailyCapCeilingCents` (200), with a loud warning |
 
 The Treasury also refuses any credit transfer above half the available balance, and automatic child funding may use at most half of the daily transfer budget.
@@ -213,6 +213,7 @@ The configuration file is `~/.automaton/automaton.json`. It is written by `--set
 - `maxChildren`, `childSandboxMemoryMb`, `childRuntimeRepo`, `childRuntimeRef`
 - `socialRelayUrl` (unset or `""`: off in standalone; Conway mode default `https://social.conway.tech`), `relay.conwayCompat`, `distressWebhookUrl`, `rpcUrl` (Base RPC for the ERC-8004 tools), `logLevel` (default `info`)
 - `sandboxId`: Conway only; empty means local mode, where `exec` and file tools act on this machine (standalone always runs locally)
+- `publicAccess` (optional, off by default): public ports through your reverse proxy or a supervised tunnel, DNS records on a domain you own, optional treasury-gated domain registration, and the published agent card. See [docs/public-access.md](docs/public-access.md)
 
 The rest is in the [Configuration Reference](DOCUMENTATION.md#configuration-reference).
 
@@ -259,9 +260,11 @@ src/
   orchestration/   Goal planner, task graph and local workers
   providers/       Mode resolution (standalone or Conway), the feature table that
                    hides tools and tasks, the standalone client, the survival source
+  edge/            Optional public access: port exposure (gateway, tunnels), DNS on
+                   an owner zone, registrar adapter, the published agent card
   registry/        ERC-8004 registration, agent cards, discovery with safe fetch
   replication/     Child spawn, lifecycle, health, messaging, constitution checks
-  runtime/         Module preloading and cooperative shutdown
+  runtime/         Module preloading, cooperative shutdown, process groups
   security/        Protected paths, secure file I/O, secret redaction, child env
   self-mod/        Code editing, upstream review and pull, installs, audit log
   setup/           Setup wizard, --configure, model picker, genesis bootstrap

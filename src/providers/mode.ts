@@ -14,6 +14,7 @@ import { resolveSurvivalSource, type SurvivalSource } from "./survival-source.js
 import { isLoopbackHost } from "../conway/http-client.js";
 import { defaultDailyCapCents, describeBudget, resolveBudget, type ResolvedBudget } from "../budget/config.js";
 import { DEFAULT_SURVIVAL_ALLOWANCE_CENTS } from "../inference/policy.js";
+import { summarizeEdge, type EdgeSummary } from "../edge/config.js";
 
 const logger = createLogger("providers");
 
@@ -75,6 +76,8 @@ export interface ResolvedRuntime {
   /** The social relay URL in use; "" when the relay is off. */
   relayUrl: string;
   payments: boolean;
+  /** What publicAccess offers in this mode (no secrets); configured false without the block. */
+  edge: EdgeSummary;
 }
 
 function nonEmpty(v: unknown): string | undefined {
@@ -174,6 +177,7 @@ export function resolveRuntime(config: AutomatonConfig, env: NodeJS.ProcessEnv =
   // loadConfig refuses an invalid block, so this only throws for a config built in code.
   const configured = resolveBudget(config.budget);
   const budget = mode === "standalone" ? configured : null;
+  const edge = summarizeEdge(config, mode, env);
   return {
     mode,
     reason,
@@ -193,9 +197,18 @@ export function resolveRuntime(config: AutomatonConfig, env: NodeJS.ProcessEnv =
     features:
       mode === "conway"
         ? { ...ALL_FEATURES }
-        : standaloneFeatures({ relay: relayUrl !== "", payments, budget: budget !== null }),
+        : standaloneFeatures({
+            relay: relayUrl !== "",
+            payments,
+            budget: budget !== null,
+            dns: edge.dns !== undefined,
+            // Without a budget the treasury has no readable balance and refuses every purchase
+            // (BALANCE_UNAVAILABLE), so the registrar stays hidden until one is set.
+            domainPurchase: edge.registrar !== undefined && budget !== null,
+          }),
     relayUrl,
     payments,
+    edge,
   };
 }
 
@@ -264,8 +277,18 @@ export function describeRuntime(r: ResolvedRuntime, relayLabel?: string): string
   const relay = r.relayUrl ? relayLabel || r.relayUrl : "off";
   return (
     `Mode: ${r.mode} (${why}). Providers: ${parts.length > 0 ? parts.join(", ") : "none"}. ` +
-    `Survival: ${survival}. Daily AI cap: ${cap}. Relay: ${relay}. Payments: ${r.payments ? "on" : "off"}.`
+    `Survival: ${survival}. Daily AI cap: ${cap}. Relay: ${relay}. Payments: ${r.payments ? "on" : "off"}.` +
+    describeEdge(r.edge)
   );
+}
+
+/** " Public access: ..." when publicAccess changes anything; "" otherwise. */
+function describeEdge(e: EdgeSummary | undefined): string {
+  if (!e?.configured) return "";
+  const parts = [e.ports === "tunnel" && e.tunnelPreset ? `tunnel (${e.tunnelPreset})` : e.ports];
+  if (e.dns) parts.push(`DNS ${e.dns.provider} ${e.dns.zone}`);
+  if (e.registrar) parts.push(`registrar ${e.registrar.provider}`);
+  return ` Public access: ${parts.join(", ")}.`;
 }
 
 // ─── Process-wide runtime (read only by the Conway egress fence) ───

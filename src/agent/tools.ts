@@ -68,6 +68,8 @@ import { canServeModel, providerIdForRow, resolveProviderTable } from "../provid
 import { registryPrice } from "../inference/policy.js";
 import cronParser from "cron-parser";
 import { notifyDistress } from "../notify/distress.js";
+import { currentEdge } from "../edge/index.js";
+import type { EdgeSummary } from "../edge/config.js";
 
 const logger = createLogger("tools");
 
@@ -419,21 +421,141 @@ export const NEUTRAL_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = Objec
 const NEUTRAL_TOOL_CATEGORIES: Readonly<Record<string, ToolCategory>> = Object.freeze({
   list_models: "inference",
   switch_model: "inference",
+  // Offered in standalone only for an owner's DNS zone or registrar.
+  search_domains: "registry",
+  register_domain: "registry",
+  manage_dns: "registry",
 });
 
 export interface BuiltinToolOptions {
   /** Standalone mode: use the mode-neutral descriptions. */
   standalone?: boolean;
+  /** What publicAccess offers; default: the installed edge's summary. */
+  edge?: EdgeSummary | null;
 }
 
 export function createBuiltinTools(sandboxId: string, opts: BuiltinToolOptions = {}): AutomatonTool[] {
-  const tools = buildBuiltinTools(sandboxId);
-  if (!opts.standalone) return tools;
-  return tools.map((t) => ({
-    ...t,
-    description: NEUTRAL_TOOL_DESCRIPTIONS[t.name] ?? t.description,
-    category: NEUTRAL_TOOL_CATEGORIES[t.name] ?? t.category,
-  }));
+  let tools = buildBuiltinTools(sandboxId);
+  if (opts.standalone) {
+    tools = tools.map((t) => ({
+      ...t,
+      description: NEUTRAL_TOOL_DESCRIPTIONS[t.name] ?? t.description,
+      category: NEUTRAL_TOOL_CATEGORIES[t.name] ?? t.category,
+    }));
+  }
+  const edge = opts.edge === undefined ? currentEdge()?.summary : opts.edge;
+  return applyEdgeToolOverrides(tools, edge, !!opts.standalone);
+}
+
+const NAME_PARAMETER = {
+  type: "string",
+  description: "Optional public name (lowercase letters, digits, hyphens); default p<port>",
+};
+
+/**
+ * Descriptions, parameters and risk levels for what publicAccess turns on.
+ * Nothing changes without the block, so both modes keep today's tool list.
+ */
+export function edgeToolOverrides(
+  edge: EdgeSummary | null | undefined,
+  standalone: boolean,
+): Record<string, Partial<Pick<AutomatonTool, "description" | "riskLevel" | "parameters">>> {
+  const out: Record<string, Partial<Pick<AutomatonTool, "description" | "riskLevel" | "parameters">>> = {};
+  if (!edge?.configured) return out;
+  const most = edge.maxExposed ?? 3;
+  if (edge.ports === "proxy" && edge.urlTemplate) {
+    const example = edge.urlTemplate.replace("{name}", "<name>").replace(/\/$/, "");
+    out.expose_port = {
+      description:
+        `Make a port on this machine public at ${example} through your owner's reverse proxy. ` +
+        "The service must listen on 127.0.0.1 or 0.0.0.0. Optional `name` (lowercase letters, digits, hyphens) " +
+        `picks the subdomain; default p<port>. At most ${most} port(s) at once.`,
+      parameters: {
+        type: "object",
+        properties: {
+          port: { type: "number", description: "Port number to expose" },
+          name: NAME_PARAMETER,
+        },
+        required: ["port"],
+      },
+    };
+  } else if (edge.ports === "tunnel") {
+    out.expose_port = {
+      description:
+        `Make a port on this machine public through a tunnel (${edge.tunnelPreset ?? "tunnel"}). ` +
+        `Returns an https address that changes whenever the tunnel restarts. At most ${most} port(s) at once.`,
+    };
+  }
+  if (edge.ports === "proxy" || edge.ports === "tunnel") {
+    out.remove_port = { description: "Stop serving a port publicly; its address stops working." };
+  }
+  if (edge.dns) {
+    const types = edge.dns.allowedTypes.join(", ");
+    const where = edge.dns.subtree ? `${edge.dns.subtree} and names below it` : `names under ${edge.dns.zone}`;
+    const zoneRules =
+      `For ${edge.dns.zone} (your owner's domain): ${types} records on ${where}; you can delete only records you created, ` +
+      `and names that hold your owner's records, ${edge.dns.allowApex ? "" : "the apex, "}www, mail and mail-security names are off-limits.`;
+    const zone = edge.dns.zone;
+    const sub = edge.dns.subtree && edge.dns.subtree !== zone ? edge.dns.subtree.slice(0, -(zone.length + 1)) : null;
+    const hostExample = sub ? `'app.${sub}' or '${sub}'` : "'app' or 'api.app'";
+    // In Conway mode other domains still go to Conway with its own rules.
+    const elsewhere = standalone ? "" : " Other domains: as Conway allows.";
+    out.manage_dns = {
+      description: standalone
+        ? `Manage DNS records on your owner's domain ${zone}. Actions: list, add, delete. ${zoneRules}`
+        : `Manage DNS records for a domain you own. Actions: list, add, delete. ${zoneRules}`,
+      // DNS changes on the owner's zone are visible to the world.
+      riskLevel: "caution",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list, add, or delete" },
+          domain: { type: "string", description: `Domain name: ${zone} or a name under it` },
+          type: { type: "string", description: `Record type for add. For ${zone}: ${types}.${elsewhere}` },
+          host: {
+            type: "string",
+            description: `Record name relative to the domain for add, e.g. ${hostExample}. For ${zone} ${edge.dns.allowApex ? "www is" : "the apex ('@') and www are"} off-limits.${elsewhere}`,
+          },
+          value: { type: "string", description: "Record value for add (e.g., IP address, target domain)" },
+          ttl: {
+            type: "number",
+            description: `TTL in seconds for add. For ${zone}: default ${edge.dns.defaultTtl}, and never below the provider's minimum.${elsewhere}`,
+          },
+          record_id: { type: "string", description: "Record ID for delete (only records you created on " + zone + ")" },
+        },
+        required: ["action", "domain"],
+      },
+    };
+  }
+  if (standalone && edge.registrar) {
+    out.register_domain = {
+      description:
+        "Register a domain through your owner's registrar account: one year, at the exact quoted price, paid from " +
+        "your owner's budget within your treasury's infrastructure limits. Check availability and the price first with search_domains.",
+    };
+    const tlds = edge.registrar.allowedTlds.join(",");
+    out.search_domains = {
+      description: "Search for available domain names and their exact prices at your owner's registrar.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Domain name or keyword to search (e.g., 'mysite' or 'mysite.com')" },
+          tlds: {
+            type: "string",
+            description: `Comma-separated TLDs to check, only from those your owner allows (${tlds}); at most 3 are checked. Default: ${tlds}`,
+          },
+        },
+        required: ["query"],
+      },
+    };
+  }
+  return out;
+}
+
+function applyEdgeToolOverrides(tools: AutomatonTool[], edge: EdgeSummary | null | undefined, standalone: boolean): AutomatonTool[] {
+  const overrides = edgeToolOverrides(edge, standalone);
+  if (Object.keys(overrides).length === 0) return tools;
+  return tools.map((t) => (overrides[t.name] ? { ...t, ...overrides[t.name] } : t));
 }
 
 function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
@@ -592,7 +714,13 @@ function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["port"],
       },
       execute: async (args, ctx) => {
-        const info = await ctx.conway.exposePort(args.port as number);
+        const info =
+          typeof args.name === "string" && args.name !== ""
+            ? await ctx.conway.exposePort(args.port as number, { name: args.name })
+            : await ctx.conway.exposePort(args.port as number);
+        if (info.scope === "public") {
+          return `Port ${info.port} is public at ${info.publicUrl}.${info.note ? ` ${info.note}` : ""}`;
+        }
         if (isLocalSandboxId(ctx.identity.sandboxId)) {
           return `Port ${info.port} is served on this machine only at ${info.publicUrl} ` +
             `(not reachable from the internet).`;
@@ -2320,7 +2448,17 @@ Model: ${ctx.inference.getDefaultModel()}
           await import("../registry/agent-card.js");
         const card = generateAgentCard(ctx.identity, ctx.config, ctx.db);
         await saveAgentCard(card, ctx.conway);
-        return `Agent card updated: ${JSON.stringify(card, null, 2)}`;
+        let published = "";
+        const edge = currentEdge();
+        if (edge?.summary.agentCard) {
+          try {
+            const url = await edge.publishAgentCard(card);
+            if (url) published = `\nPublished at ${url}`;
+          } catch (err) {
+            published = `\nNot published: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+        return `Agent card updated: ${JSON.stringify(card, null, 2)}${published}`;
       },
     },
     {
@@ -3166,7 +3304,7 @@ Model: ${ctx.inference.getDefaultModel()}
           args.domain as string,
           args.years === undefined || args.years === null ? 1 : (args.years as number),
         );
-        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
+        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})${reg.note ? ` ${reg.note}` : ""}`;
       },
     },
     {
@@ -3221,7 +3359,7 @@ Model: ${ctx.inference.getDefaultModel()}
           return records
             .map(
               (r) =>
-                `[${r.id}] ${r.type} ${r.host} -> ${r.value} (TTL: ${r.ttl || "default"})`,
+                `[${r.id}] ${r.type} ${r.host} -> ${r.value} (TTL: ${r.ttl || "default"})${r.managed ? " (yours)" : ""}`,
             )
             .join("\n");
         }
@@ -4453,6 +4591,11 @@ function approvalDeps(ctx: ToolContext): {
 
 /** Tool error text; treasury outcomes get wording the model can act on. */
 function describeToolError(toolName: string, err: unknown): string {
+  // Zone policy refusals carry their code separately.
+  const dnsErr = err as { name?: unknown; code?: unknown; message?: unknown } | null;
+  if (dnsErr?.name === "DnsPolicyError" && typeof dnsErr.code === "string" && typeof dnsErr.message === "string") {
+    return dnsErr.message.startsWith(`${dnsErr.code}:`) ? dnsErr.message : `${dnsErr.code}: ${dnsErr.message}`;
+  }
   if (isTreasuryDenied(err)) {
     return `Policy denied: ${err.code} — ${err.message}`;
   }
