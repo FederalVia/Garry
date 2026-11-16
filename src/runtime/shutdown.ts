@@ -107,7 +107,9 @@ export interface ShutdownSignals {
 export function installShutdownSignals(opts: ShutdownSignalsOptions): ShutdownSignals {
   const { controller, graceMs, forceExit } = opts;
   const log = opts.log ?? (() => {});
-  const signals = opts.signals ?? ["SIGTERM", "SIGINT"];
+  // SIGHUP (terminal hangup, ssh disconnect) would otherwise end the
+  // process without an exit event, leaving tunnels and MCP servers running.
+  const signals = opts.signals ?? ["SIGTERM", "SIGINT", "SIGHUP"];
   let deadline: number | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -158,6 +160,8 @@ export interface ShutdownSteps {
   drainWorkers(ms: number): Promise<unknown>;
   /** Closes the MCP servers (rejects their calls, stops their processes). */
   closeMcp?(ms: number): Promise<unknown>;
+  /** Stops tunnels, the gateway and the agent card server. */
+  closeEdge?(ms: number): Promise<unknown>;
   /** Leaves the agent state as a stopped runtime should. */
   leaveState(): void;
   releaseLock(): void;
@@ -192,6 +196,13 @@ export async function finishShutdown(steps: ShutdownSteps): Promise<void> {
     const closeMcp = steps.closeMcp;
     await withDeadline(
       Promise.resolve().then(() => closeMcp(steps.remainingMs())),
+      steps.remainingMs(),
+    );
+  }
+  if (steps.closeEdge) {
+    const closeEdge = steps.closeEdge;
+    await withDeadline(
+      Promise.resolve().then(() => closeEdge(steps.remainingMs())),
       steps.remainingMs(),
     );
   }

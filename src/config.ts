@@ -14,6 +14,7 @@ import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
 import { writeFileSafe } from "./security/secure-fs.js";
 import { registerSecret } from "./security/secret-redaction.js";
+import { registerEdgeEnvSecrets, validatePublicAccess } from "./edge/config.js";
 import type { ChainType } from "./identity/chain.js";
 import { setConfigSources, type ValueSource } from "./providers/mode.js";
 import { isFixedSurvivalTier } from "./providers/survival-source.js";
@@ -268,6 +269,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AutomatonConfi
   if (raw.ownerDbPath !== undefined && (typeof raw.ownerDbPath !== "string" || raw.ownerDbPath.trim() === "")) {
     throw new ConfigError(`${configPath}: ownerDbPath must be a non-empty path`, configPath);
   }
+  // Shape errors refuse the file; every edge secret is registered for redaction.
+  validatePublicAccess(raw.publicAccess, configPath, env, (m) => new ConfigError(m, configPath));
+  registerEdgeEnvSecrets(env);
   const block: Raw = isPlainObject(raw.providers) ? raw.providers : {};
 
   // Precedence, highest first. Keys are registered for redaction, never logged.
@@ -332,7 +336,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AutomatonConfi
   // Standalone has no sandboxes or domains: infrastructure caps stay 0 unless
   // the file sets them. A mode default, never written back.
   if (mode === "standalone") {
-    const tp = isPlainObject(rawTreasury) ? rawTreasury : {};
+    const tp = isPlainObject(standaloneView.treasuryPolicy) ? standaloneView.treasuryPolicy : {};
     for (const key of ["maxInfraSingleCents", "maxInfraDailyCents"] as const) {
       if (tp[key] === undefined) {
         (treasuryPolicy as unknown as Record<string, number>)[key] = 0;
@@ -504,6 +508,18 @@ export function dropConwayDefaults(target: { socialRelayUrl?: string; treasuryPo
   const tp = target.treasuryPolicy;
   if (isPlainObject(tp) && sameValue(tp.x402AllowedDomains, DEFAULT_TREASURY_POLICY.x402AllowedDomains)) {
     const { x402AllowedDomains: _drop, ...rest } = tp;
+    target.treasuryPolicy = rest;
+  }
+  // Conway's infrastructure caps, saved as a pair by every Conway-mode save,
+  // are not the owner's choice for standalone: there they would let a
+  // registrar purchase through caps nobody set. Standalone resolves them to 0.
+  const t = target.treasuryPolicy;
+  if (
+    isPlainObject(t) &&
+    t.maxInfraSingleCents === DEFAULT_TREASURY_POLICY.maxInfraSingleCents &&
+    t.maxInfraDailyCents === DEFAULT_TREASURY_POLICY.maxInfraDailyCents
+  ) {
+    const { maxInfraSingleCents: _s, maxInfraDailyCents: _d, ...rest } = t;
     target.treasuryPolicy = rest;
   }
 }

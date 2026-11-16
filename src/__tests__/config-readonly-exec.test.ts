@@ -199,6 +199,22 @@ rootOnly("security: dedicated-user layout (lock-owner-files.sh)", () => {
     expect(fs.statSync(path.join(state, "owner")).uid).toBe(0);
   });
 
+  it("locks the public-access folder: root-owned, and the agent cannot plant or replace a credential file", () => {
+    const pa = path.join(state, "public-access");
+    expect([fs.statSync(pa).uid, fs.statSync(pa).gid, fs.statSync(pa).mode & 0o777]).toEqual([0, AGENT, 0o750]);
+    for (const cmd of ["touch public-access/tunnel.json", "mv public-access public-access.old", "rm -rf public-access"]) {
+      expect(asAgent(cmd, { cwd: state }).status, cmd).not.toBe(0);
+    }
+    expect(fs.readdirSync(pa)).toEqual([]);
+    // A credential the owner puts there (as root) is locked like the other owner files.
+    fs.writeFileSync(path.join(pa, "tunnel.json"), '{"token":"t"}', { mode: 0o600 });
+    expect(lock(state).status).toBe(0);
+    const st = fs.statSync(path.join(pa, "tunnel.json"));
+    expect([st.uid, st.gid, st.mode & 0o777]).toEqual([0, AGENT, 0o640]);
+    expect(asAgent("cat public-access/tunnel.json", { cwd: state }).status).toBe(0);
+    expect(asAgent("echo x >> public-access/tunnel.json", { cwd: state }).status).not.toBe(0);
+  });
+
   it("the agent can still create and change its own files in the state folder", () => {
     const r = asAgent("echo hi > agent-note.txt && echo more >> agent-note.txt && mkdir -p workspace && touch workspace/x", { cwd: state });
     expect(r.status, r.stderr).toBe(0);
@@ -295,6 +311,26 @@ rootOnly("security: the entrypoint refuses a layout the agent could change", () 
     expect(r.status).toBe(64);
     expect(r.stderr).toMatch(/inference-providers\.json is missing/);
     expect(r.stderr).toMatch(/heartbeat\.yml is owned by the agent user/);
+  });
+
+  it("refuses a missing public-access folder, and the lock script refuses a credential file the agent owns", () => {
+    const { home, state } = layout("public-access");
+    expect(lock(state).status).toBe(0);
+    const pa = path.join(state, "public-access");
+    fs.rmSync(pa, { recursive: true });
+    const r = start(home);
+    expect(r.status).toBe(64);
+    expect(r.stderr).toMatch(/public-access is missing/);
+    // As if the agent created the folder first and planted a file in it.
+    fs.mkdirSync(pa);
+    fs.writeFileSync(path.join(pa, "tunnel.json"), "{}");
+    fs.chownSync(pa, AGENT, AGENT);
+    fs.chownSync(path.join(pa, "tunnel.json"), AGENT, AGENT);
+    const l = lock(state);
+    expect(l.status).not.toBe(0);
+    expect(l.stderr).toMatch(/tunnel\.json is not owned by root/);
+    expect(fs.statSync(path.join(pa, "tunnel.json")).uid).toBe(AGENT);
+    expect(fs.statSync(pa).uid).toBe(0);
   });
 
   it("refuses a writable owner database", () => {

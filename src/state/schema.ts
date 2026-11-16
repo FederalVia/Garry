@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -1075,4 +1075,23 @@ export const MIGRATION_V20_TREASURY = `
     executor_attempt_at_ms INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_apr_created ON transfer_approval_requests(created_at_ms);
+`;
+
+// === Public edge: DNS records the agent created and the DNS change log ===
+// Applied by the version 21 entry of applyMigrations (database.ts), and
+// again, idempotently, by ensureDnsTables, so a DNS service built on a bare
+// database has them. Earlier builds created the same tables with
+// IF NOT EXISTS outside this chain, so running it over them changes nothing.
+export const MIGRATION_V21_EDGE_DNS = `
+  CREATE TABLE IF NOT EXISTS edge_dns_records (
+    provider TEXT NOT NULL, zone TEXT NOT NULL, record_id TEXT NOT NULL,
+    type TEXT NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL, ttl INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL, deleted_at_ms INTEGER,
+    PRIMARY KEY (provider, zone, record_id));
+  CREATE TABLE IF NOT EXISTS edge_dns_changes (
+    id TEXT PRIMARY KEY, at_ms INTEGER NOT NULL, provider TEXT NOT NULL, zone TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create','delete')),
+    record_id TEXT, type TEXT, name TEXT, content TEXT, ttl INTEGER,
+    outcome TEXT NOT NULL CHECK (outcome IN ('pending','ok','failed','unknown')), error TEXT);
+  CREATE INDEX IF NOT EXISTS edge_dns_changes_zone_at ON edge_dns_changes (zone, at_ms);
 `;

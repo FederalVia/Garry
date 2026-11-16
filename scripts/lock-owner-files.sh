@@ -8,6 +8,8 @@
 # but cannot modify, rename, delete or replace any owner file:
 #   - owner files are root:<group> 0640 (constitution.md 0444),
 #   - <state>/owner is root:<group> 0750, owner.db inside it root:<group> 0640,
+#   - <state>/public-access (tunnel credential files, see docs/public-access.md)
+#     is root:<group> 0750, each file in it root:<group> 0640,
 #   - the state folder is root:<group> 1770 (sticky: a group member cannot
 #     rename or unlink files it does not own).
 # Every owner file is created when missing, since the agent could otherwise
@@ -103,6 +105,28 @@ if [ ! -e "$OWNER/owner.db" ]; then
   else
     echo "  $OWNER/owner.db not created ($CLI not built); 'automaton-cli budget add' run as root creates it."
   fi
+fi
+
+# Credential files a public-access tunnel reads. Only root places files here:
+# a file the agent user owns may be one it planted, so it is refused, not adopted.
+PA="$STATE/public-access"
+[ -L "$PA" ] && die "$PA is a symbolic link"
+if [ ! -d "$PA" ]; then
+  [ -e "$PA" ] && die "$PA exists and is not a folder"
+  install -d -o root -g "$GROUP" -m 0750 "$PA"
+  note "created $PA"
+else
+  # The folder first, so nothing new can appear while its files are checked.
+  owner=$(stat -c %U:%G "$PA"); cur=$(stat -c %a "$PA")
+  if [ "$owner" != "root:$GROUP" ]; then chown "root:$GROUP" "$PA"; note "chown root:$GROUP $PA (was $owner)"; fi
+  if [ "$cur" != "750" ]; then chmod 0750 "$PA"; note "chmod 750 $PA (was $cur)"; fi
+  for f in "$PA"/* "$PA"/.[!.]*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    [ -L "$f" ] && die "$f is a symbolic link"
+    [ -f "$f" ] || die "unexpected entry in $PA: $f (only regular files belong there)"
+    [ "$(stat -c %u "$f")" = "0" ] || die "$f is not owned by root; check it was you who put it there, then chown it to root"
+    lock_path "$f" 640
+  done
 fi
 
 # Last: the state folder itself.

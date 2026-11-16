@@ -152,6 +152,13 @@ const DENIED = [
   "cat /proc/./self/environ",
   "cat /proc//$PPID/environ",
   "cd /proc/self && cat environ",
+  // ...and a pid's files named by a glob, a bracket or a variable
+  "cat /proc/$PPID/env* | tr '\\0' '\\n' | grep -a AUTOMATON_DNS",
+  "grep -az AUTOMATON_DNS /proc/$PPID/envi[r]on",
+  "f=environ; grep -az AUTOMATON_DNS /proc/$PPID/$f",
+  "strings /proc/1234/en?iron",
+  "cat /proc/[0-9]*/env*",
+  "cat /proc/${PPID}/${f}",
   // Guard files named by a glob, or edited by a line editor or stdin script
   "cp /tmp/x src/agent/policy-eng*.ts",
   "cp /tmp/x src/agent/policy-r*/financial.ts",
@@ -211,6 +218,12 @@ const ALLOWED = [
   "ls -R ~",
   "git diff src/agent/policy-engine.ts",
   "kill -15 12345",
+  // /proc files that hold no secrets
+  "cat /proc/$PPID/status",
+  "ls /proc/[0-9]*/status",
+  "cat /proc/net/dev*",
+  "cat /proc/cpuinfo /proc/meminfo",
+  "ls /proc/1234/fd/*",
   // Ordinary loops, and loops over a process listing that do not kill
   "for f in *.log; do gzip $f; done",
   "for i in $(seq 1 3); do echo $i; done",

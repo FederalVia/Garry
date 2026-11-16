@@ -88,7 +88,7 @@ node dist/index.js --init    # creates ~/.automaton/wallet.json (once; --run nev
 node dist/index.js --run
 ```
 
-In standalone mode the social relay, credit topups, x402 payments and on-chain balance reads are off, and the tools that need a Conway account (sandboxes, children, domains, credits) are not offered to the agent. Set a spending limit at your AI provider as well.
+In standalone mode the social relay, credit topups, x402 payments and on-chain balance reads are off, and the tools that need a Conway account (sandboxes, children, credits) are not offered to the agent. Domain and DNS tools are hidden too unless the optional `publicAccess` block turns them on (see below). Set a spending limit at your AI provider as well.
 
 Details:
 
@@ -99,6 +99,7 @@ Details:
 - **Older installs.** Setups made before standalone mode installed Conway's survival skill and a Conway `SOUL.md` for every install. A standalone start replaces them when unmodified (and logs it); an edited `SOUL.md` that still lists Conway capabilities gets a warning.
 - **Planner.** Planning budgets against the daily AI cap: it is told the cap, today's spend and the share planning and workers may use. With a budget, what it is told is left is the smaller of the daily cap's remainder and the budget's.
 - **More providers.** Any OpenAI-compatible server can be added under `providers.compatible` (see [Inference and Models](#inference-and-models)); in standalone the main loop and the planner and workers both use it (in Conway mode only the main loop does). Unpriced models are skipped unless the entry sets `allowUnpriced`.
+- **Public addresses, DNS and domains.** Off by default: `expose_port` returns `http://localhost:<port>`, served on this machine only. The optional `publicAccess` block in `automaton.json` makes ports public through a reverse proxy you run (`https://<name>.<your domain>`) or a tunnel the runtime supervises (cloudflared, ngrok or your own command), offers `manage_dns` for records on a domain you already own (Cloudflare or Porkbun, a token scoped to that zone), optionally makes `register_domain` a treasury purchase through Porkbun (offered only with a budget), and can publish the agent card at the public address. The agent's prompt gets a PUBLIC ACCESS section with what is public now. The DNS and registrar limits bind the agent's tools; the credentials are readable by its commands, so set provider-side limits too. See [docs/public-access.md](docs/public-access.md).
 
 ### Existing Conway installs
 
@@ -108,7 +109,8 @@ An install with a Conway key and no new settings runs in Conway mode and sends t
 - `--run` refuses to start when `wallet.json` is missing, corrupt or holds another address than `walletAddress`, or when `name` or `creatorAddress` is empty (it never creates a wallet).
 - `--provision` also writes the new key into `automaton.json`, where the runtime reads it, and exits 1 while an automaton runs on the same state database; `--setup`, `--configure` and `--pick-model` do the same and also need a terminal.
 - Local workers carry the parent's sandbox id, so a parent tool a worker calls runs where the parent runs (previously the worker id was used as a sandbox id).
-- With an empty `sandboxId` (local Conway install), `expose_port` returns a localhost address and says it is served on this machine only.
+- With an empty `sandboxId` (local Conway install), `expose_port` returns a localhost address and says it is served on this machine only, unless `publicAccess.ports` makes it public (proxy or tunnel). With a sandbox id, Conway still exposes ports.
+- `publicAccess.dns` sends names under your zone to your DNS provider; other domains still go to Conway. `publicAccess.registrar` is ignored in Conway mode (Conway sells its own domains).
 - The agent's `exec` tripwire refuses the automaton's own setup commands (`--provision`, `--setup`, `--configure`, `--pick-model`).
 
 ### Prerequisites
@@ -290,6 +292,9 @@ node packages/cli/dist/index.js <command>
 | `OPENAI_BASE_URL` | Base URL for the planner and workers' OpenAI calls in Conway mode (ignored in standalone) |
 | `AUTOMATON_PROVIDER_<ID>_API_KEY` | Key for the `providers.compatible` entry `<id>` (upper case, `-` as `_`, e.g. `AUTOMATON_PROVIDER_GROQ_API_KEY`) when the entry has no `apiKey` |
 | `AUTOMATON_SHUTDOWN_GRACE_MS` | How long a clean shutdown may take before the process is forced to exit with code 1 (default `30000`) |
+| `AUTOMATON_DNS_API_TOKEN` | Cloudflare token for `publicAccess.dns` when the section has no `apiToken` (registered for redaction, not passed to child processes; a command the agent runs can still read the runtime's own environment, see [docs/public-access.md](docs/public-access.md#what-these-limits-do-not-stop)) |
+| `AUTOMATON_DNS_API_KEY`, `AUTOMATON_DNS_SECRET_API_KEY` | Porkbun keys for `publicAccess.dns` when the section has none |
+| `AUTOMATON_REGISTRAR_API_KEY`, `AUTOMATON_REGISTRAR_SECRET_API_KEY` | Porkbun keys for `publicAccess.registrar` when the section has none |
 
 ### Status output
 
@@ -336,14 +341,15 @@ The operating system drops the lock when its holder exits or is killed, so the l
 - With neither file, the setup wizard runs only when stdin and stdout are a terminal. Under nohup, systemd or a sandbox exec the process exits 1 with `No automaton.json and no terminal for the setup wizard. Run automaton --setup in a terminal, or provide genesis.json.`
 - Inbox messages that were claimed but never finished (the process died mid-turn) are delivered again while they have retries left, and marked failed after that. A batch whose turn had already started running tools is marked processed instead, because its reply may already have gone out (the runtime records this in the `inbox.tools_started` KV entry).
 
-### Shutdown (SIGTERM / SIGINT)
+### Shutdown (SIGTERM / SIGINT / SIGHUP)
 
 The first signal asks the runtime to stop:
-1. The tool call or inference call in progress is not cancelled, except an MCP tool call, which is rejected at once (the server is sent `notifications/cancelled`). The loop stops at the next tool boundary, records the remaining tool calls of that turn as `Skipped: the runtime is shutting down.`, and saves the turn. An inbox turn (one reply-only turn per sender batch) is not cut short: it finishes and is saved before the loop stops.
+1. The tool call or inference call in progress is not cancelled, except an MCP tool call, which is rejected at once (the server is sent `notifications/cancelled`), and an `expose_port` call still waiting for its tunnel's URL, which ends at once with the tunnel stopped. The loop stops at the next tool boundary, records the remaining tool calls of that turn as `Skipped: the runtime is shutting down.`, and saves the turn. An inbox turn (one reply-only turn per sender batch) is not cut short: it finishes and is saved before the loop stops.
 2. The heartbeat starts no new task and aborts the running one: its HTTP requests are destroyed and, in local mode, its `exec` process group is killed (SIGTERM, then SIGKILL 2 s later); with a remote sandbox the HTTP call is abandoned and the command may keep running there. The run is awaited. If the abort cut it short it is recorded as `skipped` with `cancelled: runtime shutdown after N ms`; it does not count as a failure, schedules no retry, releases its lease and delivers no wake. A run that completes despite the shutdown is recorded as a success, and a wake it asks for is stored for the next start without notifying. A paid call that may already have been sent is settled as `unknown` in the treasury or inference ledger, never released.
 3. Local workers are aborted and awaited.
 4. MCP servers are closed: stdio servers' process groups are terminated, HTTP sessions are ended with `DELETE`.
-5. The state is set to `sleeping` (a `dead` state is kept, so it survives the restart), the lock is released, the database is closed, and the process exits 0.
+5. Public access is closed (only with `publicAccess`): no new exposure starts, tunnel process groups are stopped (SIGTERM, then SIGKILL 3 s later), and the gateway and agent card server are closed.
+6. The state is set to `sleeping` (a `dead` state is kept, so it survives the restart), the lock is released, the database is closed, and the process exits 0.
 
 All of this must finish within `AUTOMATON_SHUTDOWN_GRACE_MS` (30 s). A second signal, or the deadline, forces exit code 1. Each tool call is saved as `Interrupted: the runtime exited while this call was running; its effects are unknown.` just before it runs, and replaced by its result when it returns, so after a forced exit the next run sees that the call may have partly happened. A long `exec` (up to 10 minutes) is not interrupted by a shutdown, so a supervisor stop timeout shorter than the command can end in a forced exit.
 
@@ -473,6 +479,14 @@ Configuration is stored at `~/.automaton/automaton.json`.
     "survivalTopupThresholdCents": 500,
     "maxInfraSingleCents": 2500,
     "maxInfraDailyCents": 5000
+  },
+
+  // Public addresses, DNS and domains (optional, off without it; see docs/public-access.md)
+  "publicAccess": {
+    "ports": { "mode": "local" },               // "local" | "proxy" (urlTemplate) | "tunnel" (tunnel.preset, tunnel.command)
+    "dns": { "provider": "cloudflare", "zone": "example.com" }, // token: apiToken or AUTOMATON_DNS_API_TOKEN
+    "registrar": { "provider": "porkbun", "enabled": false },   // standalone only; a treasury purchase
+    "agentCard": { "publish": false, "name": "agent" }
   },
 
   // Advanced (optional)
@@ -734,7 +748,7 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `exec` | caution | Execute a shell command. Returns stdout, stderr, exit code. Timeout: default 30 s, clamped to 1 s .. 10 min; on timeout the whole process group is killed and the exit code is 124. Background jobs (`cmd &`) keep running after the command returns; their output is discarded. Output is capped at 10 MB per stream. |
 | `write_file` | caution | Write content to a file in the home directory (local: real HOME; sandbox: `/root`). Protected paths are blocked. |
 | `read_file` | safe | Read a file (local: at most 2 MB). Sensitive files (wallet, API keys) are blocked. |
-| `expose_port` | caution | Expose a port to the internet. Returns public URL. |
+| `expose_port` | caution | Expose a port. Conway sandbox: a public URL. Local and standalone: `http://localhost:<port>` (this machine only) unless `publicAccess.ports` makes it public. |
 | `remove_port` | caution | Remove a previously exposed port. |
 
 ### Conway API (conway)
@@ -750,8 +764,8 @@ The automaton has **69 built-in tools** organized into 10 categories. Each tool 
 | `switch_model` | caution | Change active inference model. Saves only `inferenceModel` (and `modelStrategy.inferenceModel`) to `automaton.json`. |
 | `check_inference_spending` | safe | Query inference cost breakdown. |
 | `search_domains` | safe | Search for available domain names. |
-| `register_domain` | dangerous | Register a domain (costs USDC via x402). |
-| `manage_dns` | safe | List, add, or delete DNS records. |
+| `register_domain` | dangerous | Register a domain. Conway: paid through Conway. Standalone with `publicAccess.registrar`: one year at Porkbun at the exact quoted price, as a treasury infrastructure purchase; auto-renew is turned off afterwards. Hidden in standalone until a budget gives the treasury a readable balance. |
+| `manage_dns` | safe | List, add, or delete DNS records. With `publicAccess.dns` it is `caution` and limited to the owner's zone (offered in standalone only then). |
 | `send_message` | caution | Send a signed message to another agent. The recipient may be an EVM (0x...) or Solana (base58, case-sensitive) address. |
 
 ### Financial (financial)
@@ -909,8 +923,10 @@ Every committed outflow writes a row to `transactions` and to `spend_tracking`.
 | `maxAutoTopupDailyCents` | 2000 ($20) | Rolling-day cap on survival topups |
 | `autoTopupCooldownMs` | 300000 (5 min) | Minimum time between survival topup attempts |
 | `survivalTopupThresholdCents` | 500 ($5) | Survival topups run only below this balance |
-| `maxInfraSingleCents` | 2500 ($25) | Largest single sandbox or domain purchase |
-| `maxInfraDailyCents` | 5000 ($50) | Rolling-day cap on sandboxes and domains |
+| `maxInfraSingleCents` | 2500 ($25); standalone: 0 | Largest single sandbox or domain purchase |
+| `maxInfraDailyCents` | 5000 ($50); standalone: 0 | Rolling-day cap on sandboxes and domains |
+
+In standalone mode both infrastructure caps are 0 unless `automaton.json` sets them, so a registrar purchase (see [docs/public-access.md](docs/public-access.md)) needs both set. Conway's pair 2500 / 5000, which a Conway-mode save writes into the file, counts as not set in standalone.
 
 Advanced (rarely changed): `minSandboxEstimateCents` (500, floor for a sandbox price estimate), `unknownInflightMs` (3600000, how long an ambiguous credit outflow is treated as possibly still landing), `balanceLagMs` (60000, how long a committed debit may take to show in the balance), `autoFundCounterpartyCooldownMs` (1800000, automatic child funding per address), `topupPayTo` (address every credit topup must pay, survival buys included; when unset, the address of the last committed manual or sandbox topup is trusted for those topups, survival buys are not pinned, and a changed address is refused until you set `topupPayTo` to it).
 
@@ -1299,6 +1315,8 @@ A JSON-LD structured document containing:
 
 Generated and saved with `update_agent_card`. `x402Support` is true only on EVM with payments on (always in Conway mode; in standalone only with `providers.payments: true`).
 
+With `publicAccess.agentCard.publish: true` and ports in proxy or tunnel mode, the runtime serves the card at `<public address>/.well-known/agent-card.json` under a reserved name (`agent` by default) and `update_agent_card` republishes it. The prompt's PUBLIC ACCESS section shows the URL, usable as `agent_uri` for `register_erc8004`. Off by default because the card carries the wallet address. See [docs/public-access.md](docs/public-access.md#the-agent-card).
+
 ### Discovery
 
 The `discover_agents` tool queries the ERC-8004 registry to find other registered agents. Each uncached call makes read-only JSON-RPC requests to the Base chain at `rpcUrl`, so in standalone it is offered only with `providers.payments: true`. Results are cached in the `discovered_agents_cache` table under the chain, registry contract and agent id; a cached card counts only while the agent's URI is unchanged.
@@ -1635,7 +1653,7 @@ The `~/.automaton/` directory is also a git repository. Only `SOUL.md`, `WORKLOG
 
 **How do I stop an automaton?**
 
-Send `SIGTERM` or `SIGINT` to the process. The runtime performs a graceful shutdown (see [Shutdown](#shutdown-sigterm--sigint)): it finishes the current tool call, saves the turn, drains the heartbeat and workers, sets the state to `sleeping` (unless `dead`), closes the database and exits 0. A second signal forces exit code 1.
+Send `SIGTERM`, `SIGINT` or `SIGHUP` to the process. The runtime performs a graceful shutdown (see [Shutdown](#shutdown-sigterm--sigint--sighup)): it finishes the current tool call, saves the turn, drains the heartbeat and workers, closes MCP servers and public access (tunnels, gateway), sets the state to `sleeping` (unless `dead`), closes the database and exits 0. A second signal forces exit code 1.
 
 ```bash
 kill <pid>

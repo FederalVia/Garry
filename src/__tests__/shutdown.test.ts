@@ -208,6 +208,16 @@ process.exit(0);
     expect(fs.existsSync(path.join(dir, "forced"))).toBe(false);
   });
 
+  it("SIGHUP takes the same clean stop path as SIGTERM", { timeout: 60_000 }, async () => {
+    const child = await start("step");
+    const exited = exitOf(child);
+    child.kill("SIGHUP");
+    const { code } = await exited;
+    expect(code).toBe(0);
+    expect(fs.existsSync(path.join(dir, "cleanup"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "forced"))).toBe(false);
+  });
+
   it("a step that never ends is forced out with exit 1 at the grace deadline", { timeout: 60_000 }, async () => {
     const child = await start("hang", { AUTOMATON_SHUTDOWN_GRACE_MS: "300" });
     const exited = exitOf(child);

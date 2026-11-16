@@ -268,6 +268,62 @@ describe("system prompt golden text", () => {
     expect(shown).toEqual(["exec"]);
   });
 
+  it("standalone with a reverse proxy and an owner DNS zone describes both, with no Conway and no token", async () => {
+    const { buildSystemPrompt } = await import("../agent/system-prompt.js");
+    const { createBuiltinTools } = await import("../agent/tools.js");
+    const { visibleTools } = await import("../providers/features.js");
+    const { resolveRuntime } = await import("../providers/mode.js");
+    const { createEdge, installEdge, withEdge } = await import("../edge/index.js");
+    const { FakeDnsProvider } = await import("../edge/dns/fake.js");
+    const { createStandaloneClient } = await import("../providers/standalone-client.js");
+    const { createTestDb, createTestIdentity, createTestConfig } = await import("./mocks.js");
+    const token = "cf-golden-token-" + "g".repeat(24);
+    const config = createTestConfig({
+      conwayApiKey: undefined,
+      sandboxId: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk-x",
+      publicAccess: {
+        ports: { mode: "proxy", urlTemplate: "https://{name}.agents.example.com", gateway: { port: 18_480 + Math.floor(Math.random() * 1000) } },
+        dns: { provider: "cloudflare", zone: "example.com", apiToken: token },
+      },
+    });
+    const runtime = resolveRuntime(config);
+    const db = createTestDb();
+    const inner = createStandaloneClient();
+    const edge = createEdge({ config, runtime, db, inner, env: {}, deps: { dnsProvider: new FakeDnsProvider("example.com"), probe: async () => true } });
+    installEdge(edge);
+    try {
+      await edge.start();
+      await withEdge(inner, edge, "standalone").exposePort(3000, { name: "api" });
+      const tools = visibleTools(createBuiltinTools("", { standalone: true }), runtime.features);
+      const prompt = buildSystemPrompt({
+        identity: { ...createTestIdentity(), sandboxId: "" },
+        config,
+        financial: { creditsCents: null, usdcBalance: null, credits: "fixed", fixedTier: "normal", lastChecked: FIXED_DATE },
+        state: "running",
+        db,
+        tools,
+        isFirstRun: false,
+      });
+      expect(prompt).toContain(
+        "- Networking: make HTTP/HTTPS requests; ports you expose get a public https address (https://<name>.agents.example.com) through your owner's reverse proxy",
+      );
+      expect(prompt).toContain("- DNS: A, AAAA, CNAME and TXT records under example.com through manage_dns; you can change only records you created");
+      expect(prompt).toContain("--- PUBLIC ACCESS ---");
+      expect(prompt).toContain("- port 3000 (api): https://api.agents.example.com up");
+      expect(prompt).toContain("- manage_dns (registry): Manage DNS records on your owner's domain example.com");
+      expect(prompt).toContain("- expose_port (vm): Make a port on this machine public at https://<name>.agents.example.com");
+      expect(prompt).not.toContain(token);
+      const offending = prompt.split("\n").filter((l) => /conway|sandbox/i.test(l));
+      expect(offending).toEqual([]);
+    } finally {
+      installEdge(null);
+      await edge.close(1_000);
+      db.close();
+    }
+  });
+
   it("every standalone edit of the operational context still matches", async () => {
     const { standaloneOperationalContext } = await import("../agent/system-prompt.js");
     const { standaloneFeatures } = await import("../providers/features.js");

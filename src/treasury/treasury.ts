@@ -135,7 +135,16 @@ export interface TreasuryDeps {
    * what the budget has left this period is denied BUDGET_EXHAUSTED.
    * remainingCents is read inside the reserve transaction.
    */
-  budget?: { remainingCents(nowMs: number): number; countsTreasury: boolean };
+  budget?: {
+    remainingCents(nowMs: number): number;
+    countsTreasury: boolean;
+    /**
+     * True when readCreditBalance is this budget's remainder (standalone).
+     * A budget that counts treasury spending already holds every open and
+     * settled ledger row, so the reserve check must not subtract them again.
+     */
+    isBalance?: boolean;
+  };
   /** The owner's transfer approval decisions, read-only from the owner database. */
   approvals?: { decision(requestId: string): ApprovalDecision | null };
 }
@@ -632,7 +641,11 @@ export class Treasury {
       if (prep.balanceCents === null || prep.balanceReadStartedMs === null) {
         return no("BALANCE_UNAVAILABLE", "The credit balance could not be read, so the reserve cannot be checked");
       }
-      const available = prep.balanceCents - this.inflightDebits(prep.balanceReadStartedMs, now);
+      const meter = this.deps.budget;
+      const available =
+        meter?.isBalance && meter.countsTreasury
+          ? meter.remainingCents(now)
+          : prep.balanceCents - this.inflightDebits(prep.balanceReadStartedMs, now);
       if (available - amount < policy.minimumReserveCents) {
         return no(
           "RESERVE_VIOLATION",

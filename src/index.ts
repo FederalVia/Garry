@@ -75,6 +75,7 @@ import {
 } from "./providers/mode.js";
 import { createStandaloneClient } from "./providers/standalone-client.js";
 import { createBudget, installBudget, resolveOwnerDbPath, OwnerDbReader } from "./budget/index.js";
+import { bootEdge } from "./edge/index.js";
 import { BalanceUnavailableError } from "./conway/balance.js";
 import { holdsSlot } from "./replication/child-status.js";
 import { randomUUID } from "crypto";
@@ -121,6 +122,9 @@ Environment:
   AUTOMATON_PROVIDER_<ID>_API_KEY  Key for providers.compatible entry <id> (upper case, - as _)
                            when the entry has no apiKey
   AUTOMATON_SHUTDOWN_GRACE_MS  Time a stop may take before exit is forced (default 30000)
+  AUTOMATON_DNS_API_TOKEN  Cloudflare token for publicAccess.dns (when the config has none)
+  AUTOMATON_DNS_API_KEY, AUTOMATON_DNS_SECRET_API_KEY            Porkbun keys for publicAccess.dns
+  AUTOMATON_REGISTRAR_API_KEY, AUTOMATON_REGISTRAR_SECRET_API_KEY  Porkbun keys for publicAccess.registrar
 
 Providers (automaton.json "providers" block, all optional):
   mode: "standalone" | "conway" (default: conway with a Conway key, else standalone);
@@ -133,6 +137,10 @@ Providers (automaton.json "providers" block, all optional):
   survival {fixedTier}, dailyCapCeilingCents (standalone, default 200), payments (default false),
   relayUrl (standalone: the only way to use Conway's relay). Only an explicit mode change leaves
   standalone; a new Conway key does not.
+
+Public access (automaton.json "publicAccess" block, optional, off without it): ports {mode: local |
+  proxy | tunnel}, dns on a zone you own, registrar (Porkbun, off unless enabled), agentCard
+  {publish}. See docs/public-access.md.
 `);
     process.exit(0);
   }
@@ -605,7 +613,7 @@ async function run(): Promise<void> {
         `(tier ${snap.tier}; owner database ${ownerDb.path}${snap.ownerDbStale ? ", unreadable: using 0 grants" : ""}).`,
     );
   }
-  const conway =
+  const baseConway =
     runtime.mode === "conway"
       ? createConwayClient({
           apiUrl: config.conwayApiUrl,
@@ -613,6 +621,10 @@ async function run(): Promise<void> {
           sandboxId: config.sandboxId,
         })
       : createStandaloneClient({ budget: budget?.meter });
+  // publicAccess: ports, DNS and (standalone) a registrar the owner set up.
+  // Without the block the client is baseConway itself.
+  const edgeBoot = bootEdge({ config, runtime, db, inner: baseConway, identity, shutdownSignal: ctl.signal });
+  const conway = edgeBoot.conway;
 
   // Treasury: the one spending gate. The normalized policy is shared by the
   // policy rules and the gate, so both enforce the same numbers. Standalone
@@ -645,10 +657,14 @@ async function run(): Promise<void> {
     conwayApiUrl: config.conwayApiUrl,
     // acquireInstanceLock above: no other boot is alive on this database.
     holdsInstanceLock: true,
-    budget: budget ? { remainingCents: (now) => budget.meter.remainingCents(now), countsTreasury: budget.budget.countTreasury } : undefined,
+    // readCreditBalance above is this same meter.
+    budget: budget
+      ? { remainingCents: (now) => budget.meter.remainingCents(now), countsTreasury: budget.budget.countTreasury, isBalance: true }
+      : undefined,
     approvals: { decision: (id) => ownerDb.decision(id) },
   });
   installTreasury(treasury);
+  edgeBoot.start();
 
   // Inference spend gate: every inference attempt (main loop, orchestrator,
   // workers) reserves against the same caps, including the daily cap from
@@ -1011,6 +1027,7 @@ async function run(): Promise<void> {
     drainHeartbeat: (ms) => hb.drain(ms),
     drainWorkers: (ms) => shutdownWorkerPools(ms),
     closeMcp: (ms) => shutdownMcpServers(ms),
+    closeEdge: edgeBoot.closeEdge,
     leaveState,
     releaseLock: () => instanceLock.release(),
     closeDb: () => db.close(),

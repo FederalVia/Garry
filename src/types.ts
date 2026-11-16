@@ -102,6 +102,20 @@ export interface AutomatonConfig {
   budget?: BudgetConfig;
   /** The owner database (budget grants, approval decisions). Default ~/.automaton/owner/owner.db. */
   ownerDbPath?: string;
+  /**
+   * Public addresses, DNS on a domain the owner owns, an optional registrar
+   * and the agent card. Absent: local only, nothing changes. The raw block
+   * as written; src/edge/config.ts validates and resolves it.
+   */
+  publicAccess?: PublicAccessConfig;
+}
+
+/** The owner's publicAccess block (loosely typed; validated by src/edge/config.ts). */
+export interface PublicAccessConfig {
+  ports?: Record<string, unknown>;
+  dns?: Record<string, unknown>;
+  registrar?: Record<string, unknown>;
+  agentCard?: { publish?: boolean; name?: string };
 }
 
 /** The owner's budget block in automaton.json. Validated by resolveBudget (src/budget/config.ts). */
@@ -554,7 +568,8 @@ export interface ConwayClient {
   exec(command: string, timeout?: number): Promise<ExecResult>;
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string>;
-  exposePort(port: number): Promise<PortInfo>;
+  /** opts.name: the public name the agent asks for (proxy mode); other clients ignore it. */
+  exposePort(port: number, opts?: { name?: string }): Promise<PortInfo>;
   removePort(port: number): Promise<void>;
   createSandbox(options: CreateSandboxOptions): Promise<SandboxInfo>;
   deleteSandbox(sandboxId: string): Promise<void>;
@@ -611,6 +626,10 @@ export interface PortInfo {
   port: number;
   publicUrl: string;
   sandboxId: string;
+  /** "public" when an owner-configured proxy or tunnel serves it; absent means today's behaviour. */
+  scope?: "local" | "public";
+  /** Caveats for the agent (mode, nothing listening yet). */
+  note?: string;
 }
 
 /**
@@ -627,6 +646,8 @@ export interface OutflowRequestOptions {
    * The guarded client turns it into the treasury quote; raw clients ignore it.
    */
   approvalId?: string;
+  /** The amount the treasury reserved; a raw call that takes a price must send exactly this. */
+  quotedCents?: number;
 }
 
 export interface CreateSandboxOptions extends OutflowRequestOptions {
@@ -679,6 +700,8 @@ export interface DomainRegistration {
   status: string;
   expiresAt?: string;
   transactionId?: string;
+  /** Something the agent should know or tell its owner (for example about renewal). */
+  note?: string;
 }
 
 export interface DnsRecord {
@@ -688,6 +711,8 @@ export interface DnsRecord {
   value: string;
   ttl?: number;
   distance?: number;
+  /** True when the agent created it on an owner zone (and so may delete it). */
+  managed?: boolean;
 }
 
 export interface ModelInfo {

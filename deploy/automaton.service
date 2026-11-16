@@ -31,7 +31,8 @@ LockPersonality=yes
 UMask=0077
 # The state folder is the only place the agent writes.
 ReadWritePaths=/var/lib/automaton/.automaton
-# The owner's files and the owner database folder: read-only binds, the same
+# The owner's files, the owner database folder and the public-access
+# credentials folder: read-only binds, the same
 # layout as the container. The file permissions set by lock-owner-files.sh
 # already deny writes; these binds also deny rename and unlink.
 ReadOnlyPaths=/var/lib/automaton/.automaton/automaton.json
@@ -42,6 +43,8 @@ ReadOnlyPaths=/var/lib/automaton/.automaton/constitution.md
 ReadOnlyPaths=/var/lib/automaton/.automaton/inference-providers.json
 ReadOnlyPaths=/var/lib/automaton/.automaton/mcp-servers.json
 ReadOnlyPaths=/var/lib/automaton/.automaton/owner
+# Credential files a public-access tunnel reads (docs/public-access.md).
+ReadOnlyPaths=/var/lib/automaton/.automaton/public-access
 
 [Install]
 WantedBy=multi-user.target

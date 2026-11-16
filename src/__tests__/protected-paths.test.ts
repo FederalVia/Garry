@@ -290,6 +290,7 @@ describe("matchProtected (write-deny)", () => {
       "commands/budget",
       "commands/approvals",
       "deploy/entrypoint",
+      "deploy/automaton.service",
       "lock-owner-files",
     ]) {
       expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
@@ -328,6 +329,40 @@ describe("matchProtected (write-deny)", () => {
     expect(getForbiddenCommandMatch("sed -i 's/250/0/' src/budget/owner-db.ts")).not.toBeNull();
     expect(getForbiddenCommandMatch("echo x > src/treasury/approvals.ts")).not.toBeNull();
     expect(getForbiddenCommandMatch("cat ~/.automaton/owner/owner.db")).not.toBeNull();
+    expect(getForbiddenCommandMatch("sed -i /ReadOnlyPaths/d deploy/automaton.service")).not.toBeNull();
+    // A project's own compose file is not the runtime's: the write guard covers ours by path.
+    expect(getForbiddenCommandMatch("echo 'services: {}' > deploy/docker-compose.yml")).toBeNull();
+    expect(checkWrite(path.join(R(), "deploy/docker-compose.yml")).ok).toBe(false);
+    // Public-access credential files (an owner folder, read-only in the deployments).
+    expect(matchSensitive(`${S()}/public-access/tunnel.json`)).not.toBeNull();
+    expect(checkWrite(`${S()}/public-access/tunnel.json`).ok).toBe(false);
+    expect(getForbiddenCommandMatch("cat ~/.automaton/public-access/tunnel.json")).not.toBeNull();
+  });
+
+  it("guards the public edge (port rules, zone policy, tokens, registrar) and the process groups", async () => {
+    for (const f of ["src/edge/", "dist/edge/", "runtime/process-group"]) {
+      expect(GUARD_COMMAND_FRAGMENTS, f).toContain(f);
+    }
+    for (const rel of [
+      "src/edge/ports.ts",
+      "src/edge/gateway.ts",
+      "src/edge/tunnel.ts",
+      "src/edge/config.ts",
+      "src/edge/facade.ts",
+      "src/edge/dns/policy.ts",
+      "src/edge/registrar/porkbun.ts",
+      "src/edge/new-file.ts",
+      "dist/edge/index.js",
+      "src/runtime/process-group.ts",
+      "dist/runtime/process-group.js",
+    ]) {
+      const p = path.join(R(), rel);
+      expect(matchProtected(p), rel).not.toBeNull();
+      expect(checkWrite(p).ok, rel).toBe(false);
+    }
+    const { getForbiddenCommandMatch } = await import("../agent/policy-rules/command-safety.js");
+    expect(getForbiddenCommandMatch("sed -i 's/25/500/' src/edge/dns/policy.ts")).not.toBeNull();
+    expect(getForbiddenCommandMatch("echo x > src/runtime/process-group.ts")).not.toBeNull();
   });
 
   it("SOUL.md is readable but not writable", () => {
@@ -577,7 +612,16 @@ describe("childProcessEnv", () => {
       WALLET_PRIVATE_KEY: "k",
       GOOGLE_APPLICATION_CREDENTIALS: "/x",
       NODE_ENV: "test",
+      // Run-together credential names.
+      NGROK_AUTHTOKEN: "n",
+      PORKBUN_SECRETAPIKEY: "p",
+      PORKBUN_APIKEY: "p",
+      SOME_SECRETKEY: "s",
+      GH_ACCESSTOKEN: "g",
+      // Names that only look similar stay.
+      MONKEY: "m",
+      TOKENIZERS_PARALLELISM: "false",
     });
-    expect(Object.keys(env).sort()).toEqual(["HOME", "HTTPS_PROXY", "LANG", "NODE_ENV", "NO_PROXY", "PATH"]);
+    expect(Object.keys(env).sort()).toEqual(["HOME", "HTTPS_PROXY", "LANG", "MONKEY", "NODE_ENV", "NO_PROXY", "PATH", "TOKENIZERS_PARALLELISM"]);
   });
 });

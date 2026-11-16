@@ -62,6 +62,7 @@ import {
   MIGRATION_V16_RETIRE_BLOCKED,
   MIGRATION_V17,
   MIGRATION_V20_ROLLUP,
+  MIGRATION_V21_EDGE_DNS,
   REGISTRY_CHAIN_KEY_REBUILD,
   MIGRATION_V18_POLICY_DECISIONS,
   MIGRATION_V18_MCP_CALLS,
@@ -745,6 +746,12 @@ function applyMigrations(db: DatabaseType): void {
         ensureInferenceLedger(db, Date.now());
         ensureTreasuryLedger(db, Date.now());
       },
+    },
+    {
+      version: 21,
+      // The DNS records the agent created and the DNS change log (public
+      // access). Idempotent: earlier builds may already have created them.
+      apply: () => { db.exec(MIGRATION_V21_EDGE_DNS); },
     },
   ];
 

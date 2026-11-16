@@ -155,6 +155,31 @@ describe("security: container owner services and the agent's bind targets", () =
     expect(fs.readdirSync(L.state).sort()).toEqual([...OWNER_FILES].sort());
   });
 
+  it("setup creates data/config/public-access empty and private; configure keeps what the owner put there", () => {
+    expect(run("setup").status).toBe(0);
+    const pa = path.join(L.config, "public-access");
+    const st = fs.lstatSync(pa);
+    expect(st.isDirectory()).toBe(true);
+    expect(st.mode & 0o077).toBe(0);
+    expect(fs.readdirSync(pa)).toEqual([]);
+    // Only data/config gets it: the agent's state folder is not touched.
+    expect(fs.existsSync(path.join(L.state, "public-access"))).toBe(false);
+
+    fs.writeFileSync(path.join(pa, "cred.json"), '{"token":"t"}', { mode: 0o600 });
+    const ino = fs.statSync(path.join(pa, "cred.json")).ino;
+    expect(run("configure").status).toBe(0);
+    expect(fs.readFileSync(path.join(pa, "cred.json"), "utf8")).toBe('{"token":"t"}');
+    expect(fs.statSync(path.join(pa, "cred.json")).ino).toBe(ino);
+    expect(fs.lstatSync(pa).mode & 0o077).toBe(0);
+  });
+
+  it("configure creates the folder for an install made before it existed", () => {
+    fs.writeFileSync(path.join(L.config, "automaton.json"), JSON.stringify({ name: "a", providers: { mode: "standalone" } }));
+    expect(fs.existsSync(path.join(L.config, "public-access"))).toBe(false);
+    expect(run("configure").status).toBe(0);
+    expect(fs.lstatSync(path.join(L.config, "public-access")).isDirectory()).toBe(true);
+  });
+
   it("refuses the old layout, with data/state as ~/.automaton, before staging anything", () => {
     fs.writeFileSync(path.join(L.config, "automaton.json"), "{}");
     fs.mkdirSync(path.join(L.state, "owner"));

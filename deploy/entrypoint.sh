@@ -21,6 +21,10 @@ CONFIG_OUT=/config
 # sets the prices the inference gate charges, and mcp-servers.json holds the
 # owner's MCP servers and approvals, so both are locked as well.
 OWNER_FILES="automaton.json wallet.json config.json heartbeat.yml constitution.md inference-providers.json mcp-servers.json"
+# Folders the agent reads but must never change, with everything in them:
+# owner (owner.db) and public-access (credential files a tunnel command reads,
+# such as a named tunnel's credentials; see docs/public-access.md).
+OWNER_DIRS="owner public-access"
 
 die() {
   code="$1"
@@ -90,22 +94,24 @@ check_locked() {
     [ -f "$p" ] || bad="$bad
   $p is not a regular file"
   done
-  owner="$STATE/owner"
-  why=$(unlocked_reason "$owner")
-  if [ -n "$why" ]; then
-    bad="$bad
+  for d in $OWNER_DIRS; do
+    owner="$STATE/$d"
+    why=$(unlocked_reason "$owner")
+    if [ -n "$why" ]; then
+      bad="$bad
   $owner $why"
-  elif [ ! -d "$owner" ]; then
-    bad="$bad
+    elif [ ! -d "$owner" ]; then
+      bad="$bad
   $owner is not a folder"
-  else
-    for f in "$owner"/* "$owner"/.[!.]*; do
-      [ -e "$f" ] || [ -L "$f" ] || continue
-      why=$(unlocked_reason "$f")
-      [ -n "$why" ] && bad="$bad
+    else
+      for f in "$owner"/* "$owner"/.[!.]*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        why=$(unlocked_reason "$f")
+        [ -n "$why" ] && bad="$bad
   $f $why"
-    done
-  fi
+      done
+    fi
+  done
   if [ -n "$bad" ]; then
     if [ "${AUTOMATON_ALLOW_WRITABLE_CONFIG:-}" = "1" ]; then
       echo "automaton-entrypoint: WARNING: AUTOMATON_ALLOW_WRITABLE_CONFIG=1, starting although:$bad" >&2
@@ -218,6 +224,8 @@ stage_out() {
     (umask 077 && printf '{ "version": 1, "enabled": false }\n' > "$CONFIG_OUT/mcp-servers.json")
   [ -s "$CONFIG_OUT/heartbeat.yml" ] || printf 'entries: []\n' > "$CONFIG_OUT/heartbeat.yml"
   [ -s "$CONFIG_OUT/constitution.md" ] || cp "$APP/constitution.md" "$CONFIG_OUT/constitution.md"
+  # Bound read-only into the agent; empty unless you add tunnel credentials.
+  [ -d "$CONFIG_OUT/public-access" ] || (umask 077 && mkdir "$CONFIG_OUT/public-access")
 }
 
 # The agent's own starting files (SOUL.md, default skills) go to data/state

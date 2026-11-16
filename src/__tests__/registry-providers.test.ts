@@ -438,15 +438,16 @@ describe("model_registry provider columns migration", () => {
       for (const c of ["provider_id", "remote_id", "listed", "price_source", "capabilities"]) {
         expect(cols.filter((n) => n === c), c).toHaveLength(1);
       }
-      // Version 19 adds them (20, the budget and approvals tables, follows);
-      // every later version on the way up is recorded once.
-      expect(SCHEMA_VERSION).toBe(20);
+      // Version 19 adds them (20, the budget and approvals tables, and 21,
+      // the public access DNS tables, follow); every later version on the
+      // way up is recorded once.
+      expect(SCHEMA_VERSION).toBe(21);
       const v = migrated.raw.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
       expect(v.v).toBe(SCHEMA_VERSION);
       const applied = (
         migrated.raw.prepare("SELECT version FROM schema_version WHERE version > ? ORDER BY version").all(from) as { version: number }[]
       ).map((r) => r.version);
-      expect(applied).toEqual(Array.from({ length: 20 - from }, (_, i) => from + 1 + i));
+      expect(applied).toEqual(Array.from({ length: SCHEMA_VERSION - from }, (_, i) => from + 1 + i));
       // Running it again is a no-op.
       migrateModelRegistryProviders(migrated.raw);
       const again = (migrated.raw.prepare("PRAGMA table_info(model_registry)").all() as Array<{ name: string }>).length;

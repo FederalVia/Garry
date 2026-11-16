@@ -316,6 +316,31 @@ describe("validation", () => {
     expect(load().treasuryPolicy!.maxInfraSingleCents).toBe(2500);
   });
 
+  it("standalone: Conway's saved infrastructure caps count as absent, so no purchase runs on caps the owner never set", () => {
+    // What a Conway-mode save writes, then the install moves to standalone.
+    write({
+      providers: { mode: "standalone", openai: { apiKey: "k" } },
+      treasuryPolicy: { maxInfraSingleCents: 2500, maxInfraDailyCents: 5000, minimumReserveCents: 1000 },
+    });
+    const c = load();
+    expect(c.treasuryPolicy!.maxInfraSingleCents).toBe(0);
+    expect(c.treasuryPolicy!.maxInfraDailyCents).toBe(0);
+    cfg.saveConfig(c);
+    expect(disk().treasuryPolicy.maxInfraSingleCents).toBeUndefined();
+    expect(disk().treasuryPolicy.maxInfraDailyCents).toBeUndefined();
+    expect(disk().treasuryPolicy.minimumReserveCents).toBe(1000);
+    // Any other value is the owner's choice and kept.
+    write({
+      providers: { mode: "standalone", openai: { apiKey: "k" } },
+      treasuryPolicy: { maxInfraSingleCents: 2500, maxInfraDailyCents: 4000 },
+    });
+    expect(load().treasuryPolicy!.maxInfraSingleCents).toBe(2500);
+    expect(load().treasuryPolicy!.maxInfraDailyCents).toBe(4000);
+    // Conway mode keeps them.
+    write({ conwayApiKey: "cnwy_k_x", treasuryPolicy: { maxInfraSingleCents: 2500, maxInfraDailyCents: 5000 } });
+    expect(load().treasuryPolicy!.maxInfraDailyCents).toBe(5000);
+  });
+
   it("accepts loopback http and a valid block", () => {
     write({
       providers: {
@@ -416,5 +441,54 @@ describe("describeRuntime", () => {
     expect(line).toContain("openai (key from automaton.json");
     expect(line).toContain("ollama (http://localhost:11434, from OLLAMA_BASE_URL)");
     expect(line).not.toMatch(/SECRET/);
+  });
+});
+
+describe("describeRuntime and publicAccess", () => {
+  it("summarises publicAccess with the environment it was given, as createEdge does", () => {
+    const token = "cf-env-token-" + "e".repeat(24);
+    const config = createTestConfig({
+      conwayApiKey: "",
+      sandboxId: "",
+      providers: { mode: "standalone" },
+      publicAccess: { dns: { provider: "cloudflare", zone: "example.com" } },
+    });
+    expect(resolveRuntime(config, { AUTOMATON_DNS_API_TOKEN: token }).edge).toMatchObject({ configured: true, dns: { zone: "example.com" } });
+    const saved = process.env.AUTOMATON_DNS_API_TOKEN;
+    process.env.AUTOMATON_DNS_API_TOKEN = token;
+    try {
+      // The process environment is not the one handed in.
+      const edge = resolveRuntime(config, {}).edge;
+      expect(edge.configured).toBe(false);
+      expect(edge.dns).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.AUTOMATON_DNS_API_TOKEN;
+      else process.env.AUTOMATON_DNS_API_TOKEN = saved;
+    }
+  });
+
+
+  it("is unchanged without the block and names mode, DNS zone and registrar with it, never a token", () => {
+    write({ openaiApiKey: "sk-x", providers: { mode: "standalone" } });
+    const plain = describeRuntime(resolveRuntime(load()));
+    expect(plain).toMatch(/Payments: off\.$/);
+    expect(plain).not.toContain("Public access");
+
+    const token = "cf-describe-token-" + "d".repeat(24);
+    write({
+      openaiApiKey: "sk-x",
+      providers: { mode: "standalone" },
+      publicAccess: {
+        ports: { mode: "proxy", urlTemplate: "https://{name}.agents.example.com" },
+        dns: { provider: "cloudflare", zone: "example.com", apiToken: token },
+        registrar: { provider: "porkbun", enabled: true, apiKey: "pk1_" + "k".repeat(30), secretApiKey: "sk1_" + "s".repeat(30) },
+      },
+    });
+    const line = describeRuntime(resolveRuntime(load()));
+    expect(line).toBe(`${plain} Public access: proxy, DNS cloudflare example.com, registrar porkbun.`);
+    expect(line).not.toContain(token);
+
+    write({ conwayApiKey: "cnwy_k_x", sandboxId: "sbx-1", publicAccess: { ports: { mode: "proxy", urlTemplate: "https://{name}.agents.example.com" } } });
+    expect(describeRuntime(resolveRuntime(load()))).not.toContain("Public access");
   });
 });

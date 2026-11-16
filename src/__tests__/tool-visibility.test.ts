@@ -116,6 +116,69 @@ describe("tool lists per feature set", () => {
     expect(names(f)).not.toContain("fund_child");
   });
 
+  it("standalone with an owner DNS zone adds manage_dns only", () => {
+    const f = standaloneFeatures({ relay: false, payments: false, dns: true });
+    expect(names(f).filter((n) => !STANDALONE_DEFAULT.includes(n))).toEqual(["manage_dns"]);
+    const cfg = createTestConfig({
+      conwayApiKey: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk",
+      publicAccess: { dns: { provider: "cloudflare", zone: "example.com", apiToken: "cf-visibility-token-" + "v".repeat(20) } },
+    });
+    expect(names(resolveRuntime(cfg).features).filter((n) => !STANDALONE_DEFAULT.includes(n))).toEqual(["manage_dns"]);
+  });
+
+  it("standalone with domain purchases adds search_domains and register_domain", () => {
+    const f = standaloneFeatures({ relay: false, payments: false, domainPurchase: true });
+    expect(names(f).filter((n) => !STANDALONE_DEFAULT.includes(n)).sort()).toEqual(["register_domain", "search_domains"]);
+  });
+
+  it("an enabled registrar adds nothing while standalone has no readable balance", () => {
+    const cfg = createTestConfig({
+      conwayApiKey: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk",
+      publicAccess: { registrar: { provider: "porkbun", enabled: true, apiKey: "pk1_" + "k".repeat(30), secretApiKey: "sk1_" + "s".repeat(30) } },
+    });
+    const r = resolveRuntime(cfg);
+    expect(r.edge.registrar).toEqual({ provider: "porkbun", allowedTlds: ["com", "net", "org", "dev"] });
+    expect(names(r.features)).toEqual(STANDALONE_DEFAULT);
+  });
+
+  it("an enabled registrar with the owner's budget adds search_domains and register_domain", () => {
+    const registrar = { provider: "porkbun", enabled: true, apiKey: "pk1_" + "k".repeat(30), secretApiKey: "sk1_" + "s".repeat(30) };
+    const cfg = createTestConfig({
+      conwayApiKey: "",
+      socialRelayUrl: "",
+      openaiApiKey: "sk",
+      providers: { mode: "standalone" },
+      budget: { allowanceCents: 2500, period: "monthly" },
+      publicAccess: { registrar },
+    });
+    const f = resolveRuntime(cfg).features;
+    expect(f.domainPurchase).toBe(true);
+    expect(names(f).filter((n) => !STANDALONE_DEFAULT.includes(n)).sort()).toEqual(
+      ["check_credits", "distress_signal", "heartbeat_ping", "register_domain", "search_domains"],
+    );
+    // A budget alone, or a registrar that is not enabled, buys nothing.
+    const noRegistrar = createTestConfig({ ...cfg, publicAccess: undefined });
+    expect(resolveRuntime(noRegistrar).features.domainPurchase).toBe(false);
+    const disabled = createTestConfig({ ...cfg, publicAccess: { registrar: { ...registrar, enabled: false } } });
+    expect(resolveRuntime(disabled).features.domainPurchase).toBe(false);
+  });
+
+  it("Conway lists are unchanged with publicAccess configured", () => {
+    const cfg = createTestConfig({
+      sandboxId: "",
+      publicAccess: {
+        ports: { mode: "proxy", urlTemplate: "https://{name}.agents.example.com" },
+        dns: { provider: "cloudflare", zone: "example.com", apiToken: "cf-visibility-token-" + "v".repeat(20) },
+        registrar: { provider: "porkbun", enabled: true, apiKey: "pk1_" + "k".repeat(30), secretApiKey: "sk1_" + "s".repeat(30) },
+      },
+    });
+    expect(names(resolveRuntime(cfg).features)).toEqual(builtinNames());
+  });
+
   it("every name in the feature table is a real built-in tool", () => {
     const all = new Set(builtinNames());
     for (const name of Object.keys(TOOL_FEATURES)) expect(all.has(name), name).toBe(true);

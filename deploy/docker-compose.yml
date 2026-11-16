@@ -7,6 +7,7 @@
 #
 # data/state   read-write for the agent: state.db, logs, skills, workspace
 # data/config  the owner's files, mounted read-only into the agent
+#              (data/config/public-access: tunnel credential files, if any)
 # data/owner   owner.db (budget grants, approval decisions), read-only for the agent
 #
 # See docs/deployment.md.
@@ -43,7 +44,14 @@ services:
       - ./data/config/inference-providers.json:/home/automaton/.automaton/inference-providers.json:ro
       - ./data/config/mcp-servers.json:/home/automaton/.automaton/mcp-servers.json:ro
       - ./data/owner:/home/automaton/.automaton/owner:ro
+      # Credential files a public-access tunnel reads (docs/public-access.md).
+      - ./data/config/public-access:/home/automaton/.automaton/public-access:ro
     # No ports: expose_port is local to the container. Never mount docker.sock.
+    # publicAccess proxy mode (docs/public-access.md): set "gateway": { "host": "0.0.0.0" }
+    # and publish the gateway to the host's loopback only, for your reverse proxy there.
+    # Never "8480:8480": that publishes it on every interface.
+    # ports:
+    #   - "127.0.0.1:8480:8480"
 
   # Owner-only services: started by you, never by the agent (it has no Docker socket).
   setup:
